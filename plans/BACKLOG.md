@@ -1,8 +1,8 @@
 # UltimateWrap — parked items
 
 Items deliberately deferred, with enough detail to act on without re-deriving them.
-Parked 2026-09-03 by the user's decision. Neither blocks Phase A or Phase B execution
-up to Task B6.
+Parked 2026-09-03 by the user's decision. None of them blocks Phase A or Phase B
+execution up to Task B6, with one exception: item 2 must be settled before B6 lands.
 
 ---
 
@@ -137,6 +137,149 @@ which forwards to Anthropic.
 Doing item 1 first makes this one nearly free: the resolution logic it builds is exactly
 the predicate this guard wants. Doing them in the other order means building the list
 twice, and a hand-maintained second copy would go stale the same way `testModel` did.
+
+---
+
+## 3. `uw doctor` exits 127 on every run, so no script can read its verdict
+
+**Status:** parked 2026-09-03, raised during the HUD statusline work.
+**Blocked on:** nothing technical. A one-line change with a proven fix; parked only
+because the HUD defect took priority.
+**Touches:** `menu/doctor.mjs:479`.
+
+### The symptom, measured rather than remembered
+
+Both branches of the exit contract collapse to the same wrong value:
+
+```
+$ node menu/doctor.mjs        # verdict: amber -> contract says exit 0
+Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+exit=127
+
+$ EDITOR=bogus node menu/doctor.mjs   # verdict: red -> contract says exit 1
+Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+exit=127
+```
+
+The last line of `main()` is `process.exit(r.verdict === "red" ? 1 : 0)`, so the intended
+contract is 0 for green or amber and 1 for red. Neither survives. The printed report is
+correct throughout — this is purely the exit status, which is the half a script reads.
+
+### Why 127 specifically is worse than an arbitrary wrong number
+
+127 is the conventional shell code for "command not found". A CI gate or wrapper script
+that runs `uw doctor` sees a value indistinguishable from the binary being missing, and
+the two call for opposite responses: one means the machine is misconfigured, the other
+means the diagnostic never ran. The tool is currently unusable as a gate in either
+direction — it cannot report health, and it cannot report its own absence.
+
+### Cause, narrowed by bisection
+
+Isolating each external call reproduced nothing. `execFileSync("claude", ["doctor"])`
+alone is clean; a single `rpc()` alone is clean; both together in either order are clean;
+`fetch` followed immediately by `process.exit()` is clean. The reproducer is
+`probeRpcSurface()` followed immediately by `process.exit()`:
+
+| sequence | result |
+|---|---|
+| `probeRpcSurface()` then `process.exit(0)` | assertion, exit 127 |
+| `probeRpcSurface()` then natural drain | clean, exit 0 |
+| `probeRpcSurface()` then `process.exit(0)` after 250 ms | clean, exit 0 |
+| `probeRpcSurface()` then `process.exitCode = 1`, natural drain | clean, **exit 1** |
+
+`probeRpcSurface()` fires concurrent probes, and the only async handles on that path are
+the `AbortSignal.timeout(timeoutMs)` at `ccr-client.mjs:129` and `:171` plus undici's
+sockets. `process.exit()` inside that window forces libuv to tear down a handle that is
+already closing, which is exactly what the assertion names. Which of the two handle kinds
+is the one being double-closed has not been established — the delay test rules in "some
+handle needs time to settle" without identifying it, and it does not need to be identified
+to fix this.
+
+### The fix
+
+Set `process.exitCode` and let the event loop drain, rather than calling `process.exit()`.
+This is the idiomatic Node form for exactly this reason and is verified above to produce
+the correct code with no assertion. One line, at `doctor.mjs:479`.
+
+Node v25.0.0, win32. Worth re-checking whether the assertion still fires on a later Node
+before assuming the underlying libuv behaviour is permanent — but the fix is correct
+regardless, because `process.exit()` discarding pending work is a hazard independent of
+this particular assertion.
+
+### What a test for it looks like
+
+The suite cannot currently catch this: nothing runs `doctor.mjs` as a subprocess and
+asserts on its status. A test would spawn it and assert the code is 0 or 1 and never 127.
+That test needs a scratch environment rather than the live one, since the verdict depends
+on the real `EDITOR` and the real CCR gateway.
+
+---
+
+## 4. `unwrapCommand` is an unused export whose strictness disagrees with the check that ships
+
+**Status:** parked 2026-09-03, raised during the HUD statusline work.
+**Blocked on:** a decision about which of the two recognisers is authoritative. Not urgent
+— see "why this is latent" below.
+**Touches:** `menu/hud-shim.mjs:61-70`, `menu/install.ps1:141`.
+
+### The two recognisers, and how they disagree
+
+`hud-shim.mjs:61` recognises UW's statusline wrapper with
+
+```js
+const PREFIX_RE = /^node\s+"([^"]*hud-shim\.mjs)"\s+--\s+/;
+```
+
+which demands the command begin with literal `node`, and demands a literal `"` on both
+sides of the shim path. `install.ps1:141` recognises the same wrapper with a substring
+test:
+
+```powershell
+if ($currentCommand -notlike "*hud-shim.mjs*") { ... }
+```
+
+These do not agree on the same inputs. Any value that contains `hud-shim.mjs` but does not
+match the anchored pattern — an unquoted path, an absolute `node.exe`, a leading `cmd /c`,
+extra whitespace — is "ours" to the installer and "not ours" to the shim module.
+
+That divergence is not hypothetical. It is exactly what the live `settings.json` looked
+like between the `-Hud` install and its repair, when PowerShell 5.1's quote stripping left
+
+```
+node C:/Users/osami/.uw/menu/hud-shim.mjs -- C:\nvm4w\nodejs\node.exe C:/.../omc-hud.mjs
+```
+
+`install.ps1` still recognised that as UW's wrapper, correctly. `unwrapCommand` returned
+`null` for it.
+
+### Why this is latent rather than a live bug
+
+`unwrapCommand` has no production consumer. Grepping the whole tree, the only callers are
+`test/hud-shim.test.mjs` and `test/install.test.mjs`. `-HudUninstall` does not use it: it
+recognises the wrapper with the substring test above and restores the original from
+`hud-install.json`'s `previousCommand`, which is a stored value rather than a parsed one.
+`doctor.mjs`'s `hud` check reads the same stored value.
+
+So the strict pattern is currently unreachable code that only tests exercise, and the
+quote-stripping incident did no harm through this path. The hazard is future-tense: the
+first time someone wires `unwrapCommand` into the uninstall or the doctor — which is the
+obvious thing to do, since it is exported and named for it — the product acquires a
+recogniser stricter than the one it has been shipping, and any hand-edited or
+differently-quoted wrapper stops being recognised as removable.
+
+### The decision to make
+
+Either make one of them authoritative and delete the other, or make them agree by
+construction. The substring test is the more permissive and is the one with production
+history; the regex is the more precise and is the one that can actually extract the
+wrapped command. A single exported recogniser that both callers use, with the PowerShell
+side calling into it, removes the possibility of drift — at the cost of a Node invocation
+inside a guard that currently costs nothing.
+
+Whichever is chosen, `wrapCommand` and the recogniser must stay symmetric: `wrapCommand`
+always emits quotes, so a recogniser that requires them is correct for everything UW
+writes and wrong only for values someone else has touched. That is a defensible position;
+it is just not the position `install.ps1` currently takes.
 
 ---
 
