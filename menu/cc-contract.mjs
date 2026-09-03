@@ -6,7 +6,7 @@
 // one named check in `uw doctor`, not a renderer that silently writes into a file
 // nobody reads.
 //
-// MEASURED against 2.1.258 on this machine:
+// MEASURED against 2.1.259 on this machine:
 //   - ctrl+g calls enterAlternateScreen(), then spawnSync($EDITOR, [tmpfile],
 //     {stdio:"inherit"}). The buffer path is argv[2] for a bare `node script.mjs`
 //     invocation.
@@ -22,7 +22,7 @@ import { admitId } from "./sanitize.mjs";
 
 export const CONTRACT = Object.freeze({
   product: "claude-code",
-  fingerprint: "2.1.258",
+  fingerprint: "2.1.259",
   handoff: Object.freeze({ argvIndex: 2, acceptExit: 0, discardExit: 1 }),
   command: Object.freeze({ model: "/model " }),
   // The only Claude Code paths this project may name. `uw doctor` and the

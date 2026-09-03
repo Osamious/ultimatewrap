@@ -59,7 +59,11 @@ test("usedTokens sums input plus both cache counters", () => {
 test("both CONTRACT objects are frozen and fingerprinted", () => {
   assert.equal(Object.isFrozen(CC.CONTRACT), true);
   assert.equal(Object.isFrozen(CCR.CONTRACT), true);
-  assert.equal(CC.CONTRACT.fingerprint, "2.1.258");
+  // Deliberately a literal, not CC.CONTRACT.fingerprint compared to itself. This
+  // assertion is a tripwire: it fails whenever the constant moves, which forces
+  // whoever moved it to have re-verified the handoff and the statusline shape
+  // rather than bumping a number to make a doctor check go green.
+  assert.equal(CC.CONTRACT.fingerprint, "2.1.259");
   assert.match(CCR.CONTRACT.rpcPath, /^\/api\//);
 });
 
