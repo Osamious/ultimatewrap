@@ -1,0 +1,9 @@
+=== retry recovery with the fix (gateway is currently DOWN) ===
+recovery took 718.9s
+harness relay   (44517):   UP
+harness gateway (39456): UP
+
+=== LIVE untouched ===
+3456=True 4517=True
+
+[exited with code 0]

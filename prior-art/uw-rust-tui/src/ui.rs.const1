@@ -1,0 +1,535 @@
+//! Rendering for the two-level picker.
+//!
+//! Ported from Maestro's `apps/tui/src/ui/modals.rs` (`render_model_menu`,
+//! `filter_header`, `menu_layout`, `centered_rect`). Maestro's `menu_layout`
+//! measures its footer with `ui::transcript::line_heights`, a helper that
+//! belongs to its transcript renderer; UW measures with its own local
+//! [`wrapped_height`] instead, which is the same idea without dragging a
+//! second module across. Everything else - the always-reserved filter header,
+//! the second sizing pass once the scroll note is appended, the row/footer
+//! split - is the original approach.
+//!
+//! Rows are measured the same way the footer is, because they are drawn the
+//! same way: through `Paragraph::wrap`. Budgeting one terminal line per row
+//! pushes the footer off the bottom the moment a row wraps.
+//!
+//! The one addition: a per-model [`ModelTier`] and a per-credential
+//! [`ProviderPlanHint`] are rendered as visibly different claims. See
+//! [`tier_label`].
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+use crate::menu::{ModelMenu, ProviderTier, window_for};
+use crate::model_tier::{ModelTier, ProviderPlanHint, TierLabel, resolve_label};
+
+/// How a tier claim is drawn: its text and its color.
+///
+/// A real per-model tier uses `ModelTier::label_suffix`'s parenthesised word
+/// (`(free)` / `(paid)`) in a bright colour. A provider-plan hint is square-
+/// bracketed, carries the word "plan", and is drawn dim and in a different
+/// colour - three independent signals that it is the weaker claim, so the
+/// distinction survives a monochrome terminal, a colour-blind reader, and a
+/// screenshot alike. `None` draws nothing: an unsupported guess is worse than
+/// no label.
+pub fn tier_label(label: TierLabel) -> Option<(String, Color)> {
+    match label {
+        TierLabel::None | TierLabel::Model(ModelTier::Unknown) => None,
+        TierLabel::Model(t) => {
+            let color = match t {
+                ModelTier::Free => Color::Green,
+                _ => Color::Yellow,
+            };
+            Some((t.label_suffix().trim().to_string(), color))
+        }
+        TierLabel::Plan(h) => Some((h.label().to_string(), Color::DarkGray)),
+    }
+}
+
+/// Level 1's tier column.
+///
+/// Routed through the same `resolve_label` + [`tier_label`] pair level 2 uses,
+/// so the two levels physically cannot disagree about *whether* a plan hint is
+/// shown in place of a missing per-model claim, or about how the weaker claim
+/// is styled. A second inline copy of that mapping here is what let a
+/// group-level plan-hint bug ship untested once already.
+///
+/// The one thing that differs is wording: a group's `Free` is an aggregate
+/// claim - "at least one member is free", not "this is free" - so it says so,
+/// in the same parenthesised style [`tier_label`] gives a per-model claim.
+pub fn provider_tier_label(
+    tier: Option<ProviderTier>,
+    hint: Option<ProviderPlanHint>,
+) -> Option<(String, Color)> {
+    let aggregate = match tier {
+        Some(ProviderTier::FreeAvailable) => ModelTier::Free,
+        Some(ProviderTier::Paid) => ModelTier::Paid,
+        None => ModelTier::Unknown,
+    };
+    let (text, color) = tier_label(resolve_label(aggregate, hint))?;
+    let text = match tier {
+        Some(ProviderTier::FreeAvailable) => "(free available)".to_string(),
+        _ => text,
+    };
+    Some((text, color))
+}
+
+/// One picker row, split into the pieces both the layout pass and the render
+/// pass need. Built once so the height the layout budgets against is measured
+/// from exactly the text that gets drawn.
+struct Row {
+    /// The row's leading text - name and id, or name and model count.
+    head: String,
+    /// The tier or plan claim, already decided and styled.
+    claim: Option<(String, Color)>,
+    /// The current-model marker, `" *"` or empty.
+    marker: &'static str,
+}
+
+impl Row {
+    /// The plain text `Paragraph::wrap` will lay out, joined the same way
+    /// [`Row::line`] joins the spans.
+    fn text(&self) -> String {
+        let mut s = self.head.clone();
+        if let Some((claim, _)) = &self.claim {
+            s.push_str("  ");
+            s.push_str(claim);
+        }
+        s.push_str(self.marker);
+        s
+    }
+
+    /// The row as styled spans. The claim is its own span so its colour
+    /// survives the row's REVERSED highlight, and so a per-model tier and a
+    /// provider-plan hint can never share styling by accident.
+    fn line(&self, hit: bool) -> Line<'static> {
+        let base = if hit {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![Span::styled(self.head.clone(), base)];
+        if let Some((claim, color)) = &self.claim {
+            let mut style = Style::default().fg(*color);
+            if hit {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            spans.push(Span::styled(format!("  {claim}"), style));
+        }
+        if !self.marker.is_empty() {
+            spans.push(Span::styled(self.marker, base));
+        }
+        Line::from(spans)
+    }
+}
+
+/// The always-reserved filter header, one line at both levels. Reserved
+/// rather than conditional on purpose: a header that appeared only once a
+/// query existed would shift the visible row window by one on the first
+/// keystroke, exactly when the user is least able to track what moved.
+/// Empty, it carries the `type to filter` affordance instead of nothing.
+fn filter_header(query: &str, dim: Style) -> Line<'static> {
+    if query.is_empty() {
+        Line::from(Span::styled("type to filter", dim))
+    } else {
+        Line::from(Span::styled(
+            format!("filter: {query}_"),
+            Style::default().fg(Color::Cyan),
+        ))
+    }
+}
+
+/// Lays out the picker against the modal's real, possibly-wrapped heights -
+/// both the footer's and the rows' own. At a narrow width a hint line or a row
+/// can itself wrap, so a fixed line-count budget would silently let the footer
+/// (and the scroll note with it) run past the modal's bottom border. Everything
+/// is rendered through `Paragraph::wrap`, so everything is measured wrapped.
+/// `chrome_h` is the non-footer chrome above the rows (here: the
+/// always-reserved filter header). `footer` is the fixed text below the rows;
+/// `matching` reports the rows as filter matches.
+///
+/// Returns the window of positions to render and the footer text to append
+/// after them, with a "(x-y of n)" scroll note folded onto its last line once
+/// the rows overflow the viewport. Sized by a second pass against the noted
+/// footer's own height, so the note cannot push the footer past the border
+/// either.
+fn menu_layout(
+    modal: Rect,
+    rows: &[Row],
+    selected: usize,
+    chrome_h: u16,
+    matching: bool,
+    footer: Vec<String>,
+) -> (std::ops::Range<usize>, Vec<String>) {
+    let width = modal.width.saturating_sub(2); // left + right border
+    let inner_h = modal.height.saturating_sub(2); // top + bottom border
+    let budget_for = |footer: &[String]| -> u16 {
+        let footer_h: u16 = footer.iter().map(|l| wrapped_height(l, width)).sum();
+        inner_h
+            .saturating_sub(footer_h)
+            .saturating_sub(chrome_h)
+            .max(1)
+    };
+
+    let window = window_fitting(rows, selected, width, budget_for(&footer));
+    if window.len() >= rows.len() {
+        return (window, footer);
+    }
+
+    let mut noted = footer;
+    if let Some(last) = noted.last_mut() {
+        let suffix = if matching { " matching" } else { "" };
+        last.push_str(&format!(
+            "   ({}-{} of {}{suffix})",
+            window.start + 1,
+            window.end,
+            rows.len()
+        ));
+    }
+    let window = window_fitting(rows, selected, width, budget_for(&noted));
+    (window, noted)
+}
+
+/// The widest window around `selected` whose rows' *wrapped* heights sum to no
+/// more than `budget` terminal lines. Row count is only an upper bound on the
+/// lines a window costs: on a narrow terminal one row can take two or three,
+/// which is how a footer gets pushed off-screen by a budget that counted rows.
+fn window_fitting(
+    rows: &[Row],
+    selected: usize,
+    width: u16,
+    budget: u16,
+) -> std::ops::Range<usize> {
+    let len = rows.len();
+    if len == 0 || budget == 0 {
+        return 0..0;
+    }
+    let mut count = len.min(budget as usize);
+    loop {
+        let window = window_for(len, selected, count);
+        let height: u16 = window
+            .clone()
+            .map(|i| wrapped_height(&rows[i].text(), width))
+            .sum();
+        // One row always renders, even when it alone overflows: dropping to
+        // zero would hide the cursor's own row rather than the footer.
+        if height <= budget || count <= 1 {
+            return window;
+        }
+        count -= 1;
+    }
+}
+
+/// How many terminal rows a line occupies once `Paragraph::wrap` has laid it
+/// out at `width`.
+///
+/// Greedy *word* wrap, because that is what ratatui does: a word that does not
+/// fit starts a new line, and one longer than the whole width is broken across
+/// several. A plain `chars / width` divide under-counts every line that breaks
+/// early - and an under-counted budget is exactly how the footer gets pushed
+/// off the bottom of the modal.
+fn wrapped_height(_text: &str, _width: u16) -> u16 { 1 }
+
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area)[1];
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(v)[1]
+}
+
+/// The model picker. Level 1 is one row per provider - its name, how many
+/// models it offers, and its aggregate tier or plan claim. Level 2 is that
+/// provider's models. Both levels carry a live text filter. ASCII only.
+pub fn render_model_menu(f: &mut Frame, area: Rect, menu: &ModelMenu, current_model: &str) {
+    let modal = centered_rect(70, 60, area);
+    f.render_widget(Clear, modal);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut body: Vec<Line> = Vec::new();
+    let mut title = " model ".to_string();
+
+    if menu.is_empty() {
+        // An empty *catalog*, which is a different and much more alarming
+        // state than a filter that happens to match nothing.
+        body.push(Line::from(Span::styled("No models in the catalog.", dim)));
+        body.push(Line::raw(""));
+        body.push(Line::from(Span::styled("[esc] close", dim)));
+    } else if let Some(models) = &menu.models {
+        let provider = menu.drilled_provider();
+        if let Some(p) = provider {
+            title = format!(" model - {} ", p.provider);
+        }
+        let footer = vec![
+            String::new(),
+            "[up/down] move   [enter] select   [esc] back".to_string(),
+        ];
+        let rows: Vec<Row> = (0..models.visible_len())
+            .filter_map(|pos| models.row_at(pos))
+            .map(|c| Row {
+                head: format!("{}  ({})", c.label, c.model),
+                claim: tier_label(resolve_label(c.tier, c.plan_hint)),
+                marker: if c.model == current_model { " *" } else { "" },
+            })
+            .collect();
+        let (window, footer) = menu_layout(
+            modal,
+            &rows,
+            models.selected,
+            1,
+            !models.query.is_empty(),
+            footer,
+        );
+        body.push(filter_header(&models.query, dim));
+        if models.visible_len() == 0 {
+            body.push(Line::from(Span::styled(
+                format!("no models match \"{}\"", models.query),
+                dim,
+            )));
+        }
+        for pos in window {
+            body.push(rows[pos].line(pos == models.selected));
+        }
+        body.extend(footer.into_iter().map(|l| Line::from(Span::styled(l, dim))));
+    } else {
+        let providers = &menu.providers;
+        let footer = vec![
+            String::new(),
+            "[up/down] move   [enter] open   [esc] close".to_string(),
+        ];
+        let rows: Vec<Row> = (0..providers.visible_len())
+            .filter_map(|pos| providers.row_at(pos))
+            .map(|p| Row {
+                head: format!("{}  ({})", p.provider, p.model_idx.len()),
+                // Same fallback ordering as a single row, decided by the same
+                // function - see `provider_tier_label`.
+                claim: provider_tier_label(p.tier, p.plan_hint),
+                marker: if p.is_current { " *" } else { "" },
+            })
+            .collect();
+        let (window, footer) = menu_layout(
+            modal,
+            &rows,
+            providers.selected,
+            1,
+            !providers.query.is_empty(),
+            footer,
+        );
+        body.push(filter_header(&providers.query, dim));
+        if providers.visible_len() == 0 {
+            body.push(Line::from(Span::styled(
+                format!("no providers match \"{}\"", providers.query),
+                dim,
+            )));
+        }
+        for pos in window {
+            body.push(rows[pos].line(pos == providers.selected));
+        }
+        body.extend(footer.into_iter().map(|l| Line::from(Span::styled(l, dim))));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    f.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_tier_label, tier_label};
+    use crate::menu::ProviderTier;
+    use crate::model_tier::{ModelTier, ProviderPlanHint, TierLabel};
+    use ratatui::style::Color;
+
+    #[test]
+    fn a_plan_hint_never_renders_like_a_per_model_tier() {
+        let model_free = tier_label(TierLabel::Model(ModelTier::Free)).expect("labelled");
+        let plan_free = tier_label(TierLabel::Plan(ProviderPlanHint::Free)).expect("labelled");
+        assert_ne!(model_free.0, plan_free.0, "the text must differ");
+        assert_ne!(model_free.1, plan_free.1, "the colour must differ too");
+
+        let model_paid = tier_label(TierLabel::Model(ModelTier::Paid)).expect("labelled");
+        let plan_paid = tier_label(TierLabel::Plan(ProviderPlanHint::Paid)).expect("labelled");
+        assert_ne!(model_paid.0, plan_paid.0);
+        assert_ne!(model_paid.1, plan_paid.1);
+    }
+
+    #[test]
+    fn plan_hints_are_bracketed_and_say_plan_so_they_read_as_weaker_in_monochrome() {
+        for hint in [ProviderPlanHint::Free, ProviderPlanHint::Paid] {
+            let (text, _) = tier_label(TierLabel::Plan(hint)).expect("labelled");
+            assert!(text.starts_with('[') && text.ends_with(']'), "{text}");
+            assert!(text.contains("plan"), "{text}");
+        }
+        for tier in [ModelTier::Free, ModelTier::Paid] {
+            let (text, _) = tier_label(TierLabel::Model(tier)).expect("labelled");
+            assert!(!text.contains('['));
+            assert!(!text.contains("plan"));
+        }
+    }
+
+    #[test]
+    fn nothing_is_drawn_when_nothing_is_claimed() {
+        assert!(tier_label(TierLabel::None).is_none());
+        assert!(tier_label(TierLabel::Model(ModelTier::Unknown)).is_none());
+    }
+
+    // --- level 1: the same decision function, so the two levels agree ---
+
+    #[test]
+    fn a_group_with_an_aggregate_claim_shows_it_and_never_the_plan_hint() {
+        let (text, color) = provider_tier_label(
+            Some(ProviderTier::FreeAvailable),
+            Some(ProviderPlanHint::Paid),
+        )
+        .expect("labelled");
+        assert_eq!(
+            text, "(free available)",
+            "a group's free is an aggregate claim, in the per-model claim's style"
+        );
+        assert_eq!(color, Color::Green);
+
+        let (text, color) =
+            provider_tier_label(Some(ProviderTier::Paid), Some(ProviderPlanHint::Free))
+                .expect("labelled");
+        assert_eq!(text, "(paid)");
+        assert_eq!(color, Color::Yellow);
+        assert!(!text.contains("plan"), "an aggregate claim is not a plan claim");
+    }
+
+    /// The level-1 shape the fixture's `chutes` group has, and the real
+    /// vault's `groq` shape: some members priced, some not, so no aggregate
+    /// per-model claim is honest - and the vault's weaker plan claim is all
+    /// that is left to say. It must render as the weaker claim, exactly as
+    /// level 2 renders it.
+    #[test]
+    fn a_group_with_no_aggregate_claim_falls_back_to_the_plan_hint_styled_as_weaker() {
+        for (hint, level_two) in [
+            (ProviderPlanHint::Free, TierLabel::Plan(ProviderPlanHint::Free)),
+            (ProviderPlanHint::Paid, TierLabel::Plan(ProviderPlanHint::Paid)),
+        ] {
+            let level_one = provider_tier_label(None, Some(hint)).expect("labelled");
+            assert_eq!(
+                level_one,
+                tier_label(level_two).expect("labelled"),
+                "level 1 and level 2 must render the same plan hint identically"
+            );
+            assert!(level_one.0.starts_with('[') && level_one.0.ends_with(']'));
+            assert!(level_one.0.contains("plan"));
+            assert_eq!(level_one.1, Color::DarkGray);
+            assert_ne!(level_one.1, Color::Green);
+            assert_ne!(level_one.1, Color::Yellow);
+        }
+    }
+
+    #[test]
+    fn a_group_with_neither_an_aggregate_claim_nor_a_hint_draws_nothing() {
+        assert!(provider_tier_label(None, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod critic_probe {
+    use super::wrapped_height;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Wrap};
+
+    /// Ground truth: render the line through the exact widget config the picker
+    /// uses and count the terminal rows it actually consumed.
+    fn real_height(text: &str, width: u16) -> u16 {
+        let h = 60u16;
+        let mut t = Terminal::new(TestBackend::new(width, h)).unwrap();
+        t.draw(|f| {
+            f.render_widget(
+                Paragraph::new(vec![Line::raw(text.to_string())]).wrap(Wrap { trim: false }),
+                f.area(),
+            )
+        })
+        .unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut last = 0u16;
+        for y in 0..h {
+            let row: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+            if !row.trim().is_empty() {
+                last = y + 1;
+            }
+        }
+        last.max(1)
+    }
+
+    #[test]
+    fn wrapped_height_matches_real_ratatui_wrapping() {
+        let samples = [
+            "aion-labs  (1)  (paid)",
+            "plainprovider  (1)",
+            "chutes  (2)  [paid plan]",
+            "Qwen 3 Coder 480B  (cerebras/qwen-3-coder-480b)  [paid plan]",
+            "[up/down] move   [enter] select   [esc] back",
+            "[up/down] move   [enter] open   [esc] close   (1-3 of 10 matching)",
+            "Grok 4 Fast (1M context)  (xai/grok-4-fast[1m])  [paid plan] *",
+            "supercalifragilisticexpialidocious",
+            "ab supercalifragilisticexpialidocious",
+            "x",
+            "",
+            "aaaaaaaaaa bbbbbbbbbb",
+        ];
+        let mut bad = Vec::new();
+        for s in samples {
+            for w in 1u16..=70 {
+                let mine = wrapped_height(s, w);
+                let real = real_height(s, w);
+                if mine != real {
+                    bad.push(format!(
+                        "w={w:2} mine={mine} real={real}  {s:?}"
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} mismatches:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    #[test]
+    fn wrapped_height_never_undercounts() {
+        let samples = [
+            "aion-labs  (1)  (paid)",
+            "plainprovider  (1)",
+            "chutes  (2)  [paid plan]",
+            "Qwen 3 Coder 480B  (cerebras/qwen-3-coder-480b)  [paid plan]",
+            "[up/down] move   [enter] select   [esc] back",
+            "[up/down] move   [enter] open   [esc] close   (1-3 of 10 matching)",
+            "Grok 4 Fast (1M context)  (xai/grok-4-fast[1m])  [paid plan] *",
+            "supercalifragilisticexpialidocious",
+            "ab supercalifragilisticexpialidocious",
+        ];
+        let mut under = Vec::new();
+        for s in samples {
+            for w in 1u16..=70 {
+                let (mine, real) = (wrapped_height(s, w), real_height(s, w));
+                if mine < real {
+                    under.push(format!("w={w:2} mine={mine} real={real}  {s:?}"));
+                }
+            }
+        }
+        assert!(under.is_empty(), "UNDERCOUNTS (footer-clipping direction):\n{}", under.join("\n"));
+    }
+}

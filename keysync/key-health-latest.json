@@ -1,0 +1,352 @@
+{
+  "at": "2026-09-02T16:53:01.850Z",
+  "results": [
+    {
+      "id": "personal_maestro.deepseek.paid",
+      "state": "broken",
+      "ms": 915,
+      "status": 402,
+      "why": "Insufficient Balance",
+      "model": "deepseek-chat"
+    },
+    {
+      "id": "personal_mxene.alibaba.paid",
+      "state": "auth",
+      "ms": 1186,
+      "status": 403,
+      "why": "Access to model denied. Please make sure you are eligible for using the model.",
+      "model": "qwen3.8-27b"
+    },
+    {
+      "id": "personal_mxene.deepseek.paid",
+      "state": "broken",
+      "ms": 797,
+      "status": 402,
+      "why": "Insufficient Balance",
+      "model": "deepseek-chat"
+    },
+    {
+      "id": "personal.agentrouter.free",
+      "state": "broken",
+      "ms": 1162,
+      "status": 402,
+      "why": "Budget pool quota has been exhausted. Please ask an administrator to increase the limit or",
+      "model": "gpt-5.6-sol"
+    },
+    {
+      "id": "personal.agnes.free",
+      "state": "ok",
+      "ms": 5491,
+      "why": "",
+      "model": "agnes-2.0-flash"
+    },
+    {
+      "id": "personal.aihubmix.free",
+      "state": "ok",
+      "ms": 851,
+      "why": "",
+      "model": "coding-glm-5.2-free"
+    },
+    {
+      "id": "personal.aionlabs.free",
+      "state": "ok",
+      "ms": 1604,
+      "why": "",
+      "model": "aion-labs/aion-3.0-mini"
+    },
+    {
+      "id": "personal.bai.free",
+      "state": "ok",
+      "ms": 40577,
+      "why": "",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "id": "personal.bigmodel.free",
+      "state": "ok",
+      "ms": 1413,
+      "why": "",
+      "model": "glm-4.5-air"
+    },
+    {
+      "id": "personal.bluesminds.free",
+      "state": "broken",
+      "ms": 897,
+      "status": 410,
+      "why": "The model 'meta/llama-3.1-8b-instruct' has reached its end of life on 2026-08-26T09:00:00Z",
+      "model": "meta/llama-3.1-8b-instruct"
+    },
+    {
+      "id": "personal.cerebras.paid",
+      "state": "broken",
+      "ms": 563,
+      "status": 402,
+      "why": "Payment required to access this resource. Visit your billing tab.",
+      "model": "gpt-oss-120b"
+    },
+    {
+      "id": "personal.chutes.paid",
+      "state": "broken",
+      "ms": 1211,
+      "status": 402,
+      "why": "",
+      "model": "unsloth/Mistral-Nemo-Instruct-2407-TEE"
+    },
+    {
+      "id": "personal.cloudflare.free",
+      "state": "ok",
+      "ms": 2485,
+      "why": "",
+      "model": "@cf/openai/gpt-oss-120b"
+    },
+    {
+      "id": "personal.cohere.free",
+      "state": "ok",
+      "ms": 1177,
+      "why": "",
+      "model": "command-r7b-12-2024"
+    },
+    {
+      "id": "personal.commandcode.free",
+      "state": "broken",
+      "ms": 3837,
+      "status": 400,
+      "why": "You have insufficient credits to make this request. Please purchase more credits to contin",
+      "model": "deepseek/deepseek-v4-flash"
+    },
+    {
+      "id": "personal.fanar.free",
+      "state": "ok",
+      "ms": 1642,
+      "why": "",
+      "model": "Fanar"
+    },
+    {
+      "id": "personal.gmicloudai.free",
+      "state": "ok",
+      "ms": 2714,
+      "why": "",
+      "model": "MiniMaxAI/MiniMax-M2.7"
+    },
+    {
+      "id": "personal.google.free",
+      "state": "ok",
+      "ms": 1809,
+      "why": "",
+      "model": "gemini-3.5-flash-lite"
+    },
+    {
+      "id": "personal.gorouter.free",
+      "state": "broken",
+      "ms": 1403,
+      "status": 503,
+      "why": "No available channel for model claude-opus-4-8 under group default (distributor) (request ",
+      "model": "claude-opus-4-8"
+    },
+    {
+      "id": "personal.groq.free",
+      "state": "ok",
+      "ms": 1430,
+      "why": "",
+      "model": "openai/gpt-oss-20b"
+    },
+    {
+      "id": "personal.huggingface.free",
+      "state": "ok",
+      "ms": 1012,
+      "why": "",
+      "model": "prism-ml/Ternary-Bonsai-27B-AWQ-4bit:together"
+    },
+    {
+      "id": "personal.indeedwebid.free",
+      "state": "auth",
+      "ms": 1121,
+      "status": 401,
+      "why": "Invalid or inactive API key",
+      "model": "ineed/freetier"
+    },
+    {
+      "id": "personal.kilo.free",
+      "state": "broken",
+      "ms": 1351,
+      "status": 429,
+      "why": "Provider returned error",
+      "model": "kilo-auto/free"
+    },
+    {
+      "id": "personal.llm7.free",
+      "state": "broken",
+      "ms": 812,
+      "status": 400,
+      "why": "Model 'DeepSeek-V4-Flash-0731' is currently unavailable.",
+      "model": "DeepSeek-V4-Flash-0731"
+    },
+    {
+      "id": "personal.mistral.free",
+      "state": "ok",
+      "ms": 838,
+      "why": "",
+      "model": "mistral-small-latest"
+    },
+    {
+      "id": "personal.nararouter.free",
+      "state": "broken",
+      "ms": 2717,
+      "status": 404,
+      "why": "The requested model does not exist.",
+      "model": "deepseek-v4-pro-free"
+    },
+    {
+      "id": "personal.nousresearch.free",
+      "state": "broken",
+      "ms": 1318,
+      "status": 400,
+      "why": "This request is not valid. Check the model name and other parameters. Additional info: mis",
+      "model": "upstage/solar-pro4:free"
+    },
+    {
+      "id": "personal.nscale.free",
+      "state": "ok",
+      "ms": 1726,
+      "why": "",
+      "model": "Qwen/Qwen3-4B-Instruct-2507"
+    },
+    {
+      "id": "personal.ollama.free",
+      "state": "ok",
+      "ms": 1417,
+      "why": "",
+      "model": "gpt-oss:20b"
+    },
+    {
+      "id": "personal.openai.paid",
+      "state": "ok",
+      "ms": 2232,
+      "why": "",
+      "model": "gpt-5-nano"
+    },
+    {
+      "id": "personal.opencode.free",
+      "state": "broken",
+      "ms": 983,
+      "status": 400,
+      "why": "Error from provider (Console): Upstream request failed: Model is unavailable.",
+      "model": "deepseek-v4-flash-free"
+    },
+    {
+      "id": "personal.openrouter.free",
+      "state": "broken",
+      "ms": 1349,
+      "status": 429,
+      "why": "Provider returned error",
+      "model": "google/gemma-4-26b-a4b-it:free"
+    },
+    {
+      "id": "personal.orcarouter.free",
+      "state": "ok",
+      "ms": 1859,
+      "why": "",
+      "model": "orcarouter/free"
+    },
+    {
+      "id": "personal.pollinations.free",
+      "state": "ok",
+      "ms": 1316,
+      "why": "",
+      "model": "openai"
+    },
+    {
+      "id": "personal.routllm.free",
+      "state": "broken",
+      "ms": 5989,
+      "status": 402,
+      "why": "No credits remaining — top up to continue",
+      "model": "deepseek/deepseek-v4-flash"
+    },
+    {
+      "id": "personal.sambanova.paid",
+      "state": "broken",
+      "ms": 898,
+      "status": 402,
+      "why": "A payment method is required. Add one at https://cloud.sambanova.ai/plans/billing to conti",
+      "model": "Meta-Llama-3.3-70B-Instruct"
+    },
+    {
+      "id": "personal.seekai.free",
+      "state": "broken",
+      "ms": 1342,
+      "status": 503,
+      "why": "No available channel for model deepseek-v4-flash under group default (distributor) (reques",
+      "model": "deepseek-v4-flash"
+    },
+    {
+      "id": "personal.tabiai.free",
+      "state": "broken",
+      "ms": 1007,
+      "status": 503,
+      "why": "No available channel for model claude-opus-4-8 under group default (distributor) (request ",
+      "model": "claude-opus-4-8"
+    },
+    {
+      "id": "personal.teamorouter.free",
+      "state": "broken",
+      "ms": 1540,
+      "status": 400,
+      "why": "TeamoRouter 钱包余额不足，请前往 https://teamorouter.cn/dashboard?buy=1 充值后继续使用",
+      "model": "deepseek-v4-flash-free"
+    },
+    {
+      "id": "personal.tokenharbor.free",
+      "state": "ok",
+      "ms": 2686,
+      "why": "",
+      "model": "deepseek-v4-flash:free"
+    },
+    {
+      "id": "personal.tokenrouter.free",
+      "state": "broken",
+      "ms": 1119,
+      "status": 503,
+      "why": "No available channel for model qwen/qwen3.8-max-free under group default (distributor) (re",
+      "model": "qwen/qwen3.8-max-free"
+    },
+    {
+      "id": "personal.veniceai.free",
+      "state": "broken",
+      "ms": 1172,
+      "status": 402,
+      "why": "Insufficient USD or Diem balance to complete request. Visit https://venice.ai/settings/api",
+      "model": "venice-uncensored-1-2"
+    },
+    {
+      "id": "personal.xai.paid",
+      "state": "auth",
+      "ms": 964,
+      "status": 403,
+      "why": "Your newly created team doesn't have any credits or licenses yet. You can purchase those o",
+      "model": "grok-4-fast"
+    },
+    {
+      "id": "personal.zenmux.free",
+      "state": "broken",
+      "ms": 1707,
+      "status": 404,
+      "why": "Requested model is not valid (request_id: 1efac3fecc894ff693e37f92f1a92138)",
+      "model": "z-ai/glm-5.3-free"
+    },
+    {
+      "id": "tamu.groq.free",
+      "state": "ok",
+      "ms": 1417,
+      "why": "",
+      "model": "openai/gpt-oss-20b"
+    },
+    {
+      "id": "tamu.nvidia.free",
+      "state": "broken",
+      "ms": 45002,
+      "why": "timeout 45s",
+      "model": "deepseek-ai/deepseek-v4-flash-0731"
+    }
+  ]
+}

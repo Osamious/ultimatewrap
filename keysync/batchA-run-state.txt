@@ -1,0 +1,32 @@
+=== pre-applyProfile state 2026-09-02T09:29:19+03:00 ===
+apiKeyHelper cmd sha256: \db30492b2c9388c
+settings.json sha256:    0d6d8b0f7e72eb0b
+daemon pid:              44540
+picker rows:             18
+model pin:               google/gemini-3.5-flash-lite
+anchor:                  anthropic/claude-opus-5[1m]
+vault: 56 keys -> 46 after filter -> 44 distinct providers
+catalog: 217 providers, generated 2026-08-24T12:22:28.162Z
+deliberate multi-key choices: {"groq":"personal.groq.free","deepseek":"personal_maestro.deepseek.paid"}
+--verified-only: 13 providers / 14 rows survive
+anthropic relay live -> +1 provider / +4 Claude rows
+built: 14 providers, 18 picker rows (9 catalog-covered, 5 on vault testModel)
+validation OK: count, alias uniqueness, picker<=models, credentials present
+settings backup -> C:\Users\osami\.claude\settings.json.uw-backup-2026-09-02T06-29-50-280Z
+config.sqlite snapshot -> C:\Users\osami\AppData\Local\uw-keysync\backups\config-2026-09-02T06-29-50-280Z.sqlite.dpapi
+config changed -> CCR will restart the gateway
+WARNING: 3 other Claude Code session(s) running (pid 21184, 42688, 19448). The gateway restart may interrupt an in-flight request; a session already running keeps its loaded settings until it is restarted.
+gateway healthy on 3456
+saved: 14 providers, profile.model=anthropic/claude-opus-5
+deleted stale WIF token copy -> ccr-claude-code-wif-token-default-claude-code.txt
+kept user's /model pin: google/gemini-3.5-flash-lite
+  NOTE: that pin differs from the profile anchor (anthropic/claude-opus-5).
+  New sessions will default to the pin. Remove "model" from settings.json to follow the anchor.
+verified: apiKeyHelper + ANTHROPIC_BASE_URL=http://127.0.0.1:3456 + 18 picker rows
+keysync complete
+cleaned 3 stale backup(s); kept the newest settings backup
+
+=== post-applyProfile state 2026-09-02T09:30:08+03:00 ===
+apiKeyHelper cmd sha256: \db30492b2c9388c   (pre: \db30492b2c9388c)
+settings.json sha256:    0d6d8b0f7e72eb0b   (pre: 0d6d8b0f7e72eb0b)
+daemon pid:              44540   (pre: 44540)

@@ -1,0 +1,34 @@
+verifying 22 rows by running Claude Code itself
+
+(node:58944) [DEP0190] DeprecationWarning: Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+fail  anthropic/claude-opus-5                        11381ms  Hi. What you need?
+fail  anthropic/claude-sonnet-5                      13599ms  Yo. What need done?
+fail  anthropic/claude-haiku-4-5-20251001            14293ms  Ready. Caveman mode active—terse responses, no fluff. What's the task?
+fail  anthropic/claude-fable-5-1                     12928ms  Here. What need?
+fail  tokenharbor/deepseek-v4-flash:free             36522ms  Ready. What task?
+fail  groq/openai/gpt-oss-20b                         8921ms  API Error: 400 All target providers failed.
+fail  google/gemini-3.5-flash-lite                   11347ms  Ready. Task?
+fail  fanar/Fanar                                    12280ms  I'm sorry, I couldn't find any relevant information to answer your question. Try rephrasin
+fail  openrouter/hy3                                 24991ms  Need task. "Reply" empty. State what you want built, fixed, or asked.
+fail  ollama/gpt-oss:20b                             15866ms  Ready.
+fail  aionlabs/aion-labs/aion-3.0-mini               18860ms  User?
+fail  cohere/command-r7b-12-2024                     10669ms  API Error: 400 All target providers failed.
+fail  agnes/agnes-2.0-flash                          17746ms  Caveman mode active. Full. State at 2026-09-02. Ready.
+fail  kilo/kilo-auto/free                            16940ms  Ready. What work?
+fail  cloudflare/@cf/openai/gpt-oss-120b             18471ms  Ready.
+fail  nscale/Qwen/Qwen3-4B-Instruct-2507             30167ms  Caveman mode active. Response terse. No fluff. Only technical substance.
+fail  bigmodel/glm-4.5-air                           35878ms  Using superpowers:using-superpowers to establish how to find and use skills.
+fail  bai/deepseek-v4-flash                          18236ms  Caveman mode on (full). Ready.
+fail  opencode/big-pickle                            12533ms  Caveman mode active. Ready. What task?
+fail  alibaba/qwen3.8-27b                            23026ms  Ready. What work.
+fail  alibaba/glm-5.2                                15184ms  Ready.
+fail  gmicloudai/MiniMaxAI/MiniMax-M2.7              16095ms  (no prompt yet)
+
+=== 0/22 rows work through Claude Code, across 0 providers ===
+providers: 
+
+re-run keysync to prune the failures:
+  node run.mjs --target live --verified-only --i-know
+
+[exited with code 0]

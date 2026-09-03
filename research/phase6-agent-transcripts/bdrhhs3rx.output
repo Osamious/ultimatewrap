@@ -1,0 +1,42 @@
+test catalog::tests::real_ccr_shaped_catalog_collapses_into_one_bogus_group ... ignored, known Phase 5 gap: CCR route ids need hex-decoding and carry no pricing
+test http::tests::user_agent_matches_ccrs_claude_code_branch ... ok
+test menu::tests::window_for_keeps_the_cursor_in_view ... ok
+test model_tier::tests::a_plan_hint_is_never_the_same_value_as_a_model_tier ... ok
+test catalog::tests::providers_differing_only_in_case_are_one_group ... ok
+test menu::tests::entering_a_provider_opens_only_that_providers_models ... ok
+test menu::tests::provider_tier_aggregates_free_available_and_all_paid ... ok
+test menu::tests::esc_ladder_clears_query_then_leaves_level_then_closes ... ok
+test menu::tests::filter_ands_whitespace_tokens_and_is_case_insensitive ... ok
+test menu::tests::refilter_resets_the_cursor_to_the_first_match ... ok
+test model_tier::tests::infer_tier_from_array_shaped_pricing ... ok
+test model_tier::tests::infer_tier_from_free_suffix_id ... ok
+test catalog::tests::a_groups_plan_hint_does_not_depend_on_catalog_order ... ok
+test catalog::tests::provider_defaults_to_the_id_prefix ... ok
+test model_tier::tests::infer_tier_from_nested_object_pricing_with_string_numbers ... ok
+test catalog::tests::fixture_covers_every_infer_tier_shape ... ok
+test model_tier::tests::infer_tier_unknown_when_nothing_price_shaped_present ... ok
+test catalog::tests::plan_hint_attaches_only_to_rows_with_no_model_pricing_signal ... ok
+test model_tier::tests::infer_tier_zero_pricing_is_free_not_unknown ... ok
+test model_tier::tests::plan_hint_fills_in_only_where_the_model_tier_is_unknown ... ok
+test model_tier::tests::registry_makes_no_claim_for_management_keys_or_conflicting_ones ... ok
+test model_tier::tests::registry_maps_free_and_paid_tiers_to_plan_hints ... ok
+test model_tier::tests::registry_tolerates_a_utf8_bom ... ok
+test ui::tests::a_group_with_neither_an_aggregate_claim_nor_a_hint_draws_nothing ... ok
+test ui::tests::a_group_with_an_aggregate_claim_shows_it_and_never_the_plan_hint ... ok
+test ui::tests::a_group_with_no_aggregate_claim_falls_back_to_the_plan_hint_styled_as_weaker ... ok
+test ui::tests::a_plan_hint_never_renders_like_a_per_model_tier ... ok
+test ui::tests::nothing_is_drawn_when_nothing_is_claimed ... ok
+test ui::tests::plan_hints_are_bracketed_and_say_plan_so_they_read_as_weaker_in_monochrome ... ok
+test http::tests::client_builds ... ok
+test credman::tests::absent_target_reads_as_none ... ok
+test model_tier::tests::an_absent_vault_and_a_corrupt_vault_are_different_answers ... ok
+test ui::critic_probe::wrapped_height_never_undercounts ... ok
+test ui::critic_probe::wrapped_height_matches_real_ratatui_wrapping ... FAILED
+test ui::critic_layout_probe::the_scroll_note_always_describes_the_window_that_is_actually_drawn has been running for over 60 seconds
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `C:\Users\osami\.uw\prior-art\uw-rust-tui\target\debug\deps\uw-d335f12aa02b009a.exe` (exit code: 143)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.
+
+[exited with code 0]

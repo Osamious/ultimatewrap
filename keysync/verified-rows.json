@@ -1,0 +1,158 @@
+{
+  "generatedAt": "2026-09-01T21:46:19.342Z",
+  "probe": "real Claude Code CLI (ground truth)",
+  "working": [
+    "anthropic/claude-opus-5",
+    "anthropic/claude-sonnet-5",
+    "anthropic/claude-haiku-4-5-20251001",
+    "anthropic/claude-fable-5-1",
+    "tokenharbor/deepseek-v4-flash:free",
+    "google/gemini-3.5-flash-lite",
+    "openrouter/hy3",
+    "ollama/gpt-oss:20b",
+    "agnes/agnes-2.0-flash",
+    "kilo/kilo-auto/free",
+    "cloudflare/@cf/openai/gpt-oss-120b",
+    "nscale/Qwen/Qwen3-4B-Instruct-2507",
+    "bigmodel/glm-4.5-air",
+    "bai/deepseek-v4-flash",
+    "opencode/big-pickle",
+    "alibaba/qwen3.8-27b",
+    "alibaba/glm-5.2",
+    "gmicloudai/MiniMaxAI/MiniMax-M2.7"
+  ],
+  "results": [
+    {
+      "model": "anthropic/claude-opus-5",
+      "ok": true,
+      "ms": 12590,
+      "why": ""
+    },
+    {
+      "model": "anthropic/claude-sonnet-5",
+      "ok": true,
+      "ms": 11890,
+      "why": ""
+    },
+    {
+      "model": "anthropic/claude-haiku-4-5-20251001",
+      "ok": true,
+      "ms": 11403,
+      "why": ""
+    },
+    {
+      "model": "anthropic/claude-fable-5-1",
+      "ok": true,
+      "ms": 11975,
+      "why": ""
+    },
+    {
+      "model": "tokenharbor/deepseek-v4-flash:free",
+      "ok": true,
+      "ms": 27837,
+      "why": ""
+    },
+    {
+      "model": "groq/openai/gpt-oss-20b",
+      "ok": false,
+      "ms": 8875,
+      "why": "API Error: 400 All target providers failed."
+    },
+    {
+      "model": "google/gemini-3.5-flash-lite",
+      "ok": true,
+      "ms": 11751,
+      "why": ""
+    },
+    {
+      "model": "fanar/Fanar",
+      "ok": false,
+      "ms": 11066,
+      "why": "Request too large (max 32MB). Accumulated images and attachments in the conversation pushe"
+    },
+    {
+      "model": "openrouter/hy3",
+      "ok": true,
+      "ms": 19485,
+      "why": ""
+    },
+    {
+      "model": "ollama/gpt-oss:20b",
+      "ok": true,
+      "ms": 13489,
+      "why": ""
+    },
+    {
+      "model": "aionlabs/aion-labs/aion-3.0-mini",
+      "ok": false,
+      "ms": 120061,
+      "why": "Warning: no stdin data received in 3s, proceeding without it. If piping from a slow comman"
+    },
+    {
+      "model": "cohere/command-r7b-12-2024",
+      "ok": false,
+      "ms": 9729,
+      "why": "API Error: 400 All target providers failed."
+    },
+    {
+      "model": "agnes/agnes-2.0-flash",
+      "ok": true,
+      "ms": 11019,
+      "why": ""
+    },
+    {
+      "model": "kilo/kilo-auto/free",
+      "ok": true,
+      "ms": 14865,
+      "why": ""
+    },
+    {
+      "model": "cloudflare/@cf/openai/gpt-oss-120b",
+      "ok": true,
+      "ms": 15525,
+      "why": ""
+    },
+    {
+      "model": "nscale/Qwen/Qwen3-4B-Instruct-2507",
+      "ok": true,
+      "ms": 36665,
+      "why": ""
+    },
+    {
+      "model": "bigmodel/glm-4.5-air",
+      "ok": true,
+      "ms": 35598,
+      "why": ""
+    },
+    {
+      "model": "bai/deepseek-v4-flash",
+      "ok": true,
+      "ms": 14110,
+      "why": ""
+    },
+    {
+      "model": "opencode/big-pickle",
+      "ok": true,
+      "ms": 13334,
+      "why": ""
+    },
+    {
+      "model": "alibaba/qwen3.8-27b",
+      "ok": true,
+      "ms": 13636,
+      "why": ""
+    },
+    {
+      "model": "alibaba/glm-5.2",
+      "ok": true,
+      "ms": 11390,
+      "why": ""
+    },
+    {
+      "model": "gmicloudai/MiniMaxAI/MiniMax-M2.7",
+      "ok": true,
+      "ms": 12058,
+      "why": ""
+    }
+  ]
+}

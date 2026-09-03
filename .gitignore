@@ -1,0 +1,43 @@
+# Logs and tool output — regenerated, never reviewed, sometimes large.
+*.log
+logs/
+out.log
+err.log
+render.out
+render.err
+diag*.txt
+*.tsv
+
+# Backups written by keysync's safety machinery.
+*.bak
+*.bak-*
+*.bak*
+settings.json.bak-*
+
+# Anything that has ever held credential material or credential ids.
+keys.log
+probe-account-endpoints.json
+last-test-results.json
+
+# Spike scratch: hand-made buffers from the ctrl+g handoff experiments.
+spike/buf*.md
+spike/d.md
+spike/crlf.md
+spike/probe.md
+spike/t*.txt
+spike/cc_strings.txt
+spike/Usersosami*
+
+# Isolated-test scratch tree — recreated by harness/bootstrap.mjs.
+harness/scratch/
+
+# Runtime state: per-machine, not source.
+state/
+catalog/
+research/phase6/_tmp/
+
+# Rust build output from the rescued prior-art crate. The crate is kept for its
+# working model_tier.rs; its compiled artifacts are 3,225 files of regenerable
+# object code, .pdb and .rlib. Discovered at Task A1 execution: `git add -A`
+# staged them because no rule here covered them.
+prior-art/uw-rust-tui/target/

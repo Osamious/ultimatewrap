@@ -1,0 +1,32 @@
+verifying 22 rows by running Claude Code itself
+
+PASS  anthropic/claude-opus-5                        12590ms  
+PASS  anthropic/claude-sonnet-5                      11890ms  
+PASS  anthropic/claude-haiku-4-5-20251001            11403ms  
+PASS  anthropic/claude-fable-5-1                     11975ms  
+PASS  tokenharbor/deepseek-v4-flash:free             27837ms  
+fail  groq/openai/gpt-oss-20b                         8875ms  API Error: 400 All target providers failed.
+PASS  google/gemini-3.5-flash-lite                   11751ms  
+fail  fanar/Fanar                                    11066ms  Request too large (max 32MB). Accumulated images and attachments in the conversation pushe
+PASS  openrouter/hy3                                 19485ms  
+PASS  ollama/gpt-oss:20b                             13489ms  
+fail  aionlabs/aion-labs/aion-3.0-mini               120061ms  Warning: no stdin data received in 3s, proceeding without it. If piping from a slow comman
+fail  cohere/command-r7b-12-2024                      9729ms  API Error: 400 All target providers failed.
+PASS  agnes/agnes-2.0-flash                          11019ms  
+PASS  kilo/kilo-auto/free                            14865ms  
+PASS  cloudflare/@cf/openai/gpt-oss-120b             15525ms  
+PASS  nscale/Qwen/Qwen3-4B-Instruct-2507             36665ms  
+PASS  bigmodel/glm-4.5-air                           35598ms  
+PASS  bai/deepseek-v4-flash                          14110ms  
+PASS  opencode/big-pickle                            13334ms  
+PASS  alibaba/qwen3.8-27b                            13636ms  
+PASS  alibaba/glm-5.2                                11390ms  
+PASS  gmicloudai/MiniMaxAI/MiniMax-M2.7              12058ms  
+
+=== 18/22 rows work through Claude Code, across 14 providers ===
+providers: agnes, alibaba, anthropic, bai, bigmodel, cloudflare, gmicloudai, google, kilo, nscale, ollama, opencode, openrouter, tokenharbor
+
+re-run keysync to prune the failures:
+  node run.mjs --target live --verified-only --i-know
+
+[exited with code 0]

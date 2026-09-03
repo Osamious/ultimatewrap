@@ -1,0 +1,42 @@
+node:events:486
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use 127.0.0.1:7999
+    at Server.setupListenHandle [as _listen2] (node:net:1940:16)
+    at listenInCluster (node:net:1997:12)
+    at node:net:2206:7
+    at process.processTicksAndRejections (node:internal/process/task_queues:89:21)
+Emitted 'error' event on Server instance at:
+ 
+SELECTED  personal.google.free  ->  gemini-2-5-flash-lite
+
+SELECTED  personal.google.free  ->  gemini-2-5-flash-lite
+
+SELECTED  personal.google.free  ->  gemini-2-5-flash-lite
+
+SELECTED  personal.google.free  ->  gemini-2-5-flash-lite
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite-preview-09-2025
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite:batch
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite:batch
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite-preview-06-17
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite-preview-06-17
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite:batch
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite-preview-06-17
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite:batch
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-nothinking
+
+SELECTED  personal.google.free  ->  gemini-2.5-flash-lite-preview-09-2025-thinking
+
+SELECTED  personal.google.free  ->  gemini-3-1-flash-lite
+
+SELECTED  personal.tokenharbor.free  ->  deepseek-v4-flash:free

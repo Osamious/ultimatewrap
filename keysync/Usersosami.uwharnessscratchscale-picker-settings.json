@@ -1,0 +1,530 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+  },
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "model": "tokenharbor/deepseek-v4-flash:free",
+  "modelPicker": {
+    "options": [
+      {
+        "model": "anthropic/claude-opus-5",
+        "label": "Anthropic > claude-opus-5",
+        "description": "subscription"
+      },
+      {
+        "model": "anthropic/claude-sonnet-5",
+        "label": "Anthropic > claude-sonnet-5",
+        "description": "subscription"
+      },
+      {
+        "model": "anthropic/claude-haiku-4-5-20251001",
+        "label": "Anthropic > claude-haiku-4-5-20251001",
+        "description": "subscription"
+      },
+      {
+        "model": "anthropic/claude-fable-5-1",
+        "label": "Anthropic > claude-fable-5-1",
+        "description": "subscription"
+      },
+      {
+        "model": "orcarouter/orcarouter/free",
+        "label": "orcarouter > orcarouter/free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "orcarouter/auto",
+        "label": "orcarouter > auto",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "tokenharbor/deepseek-v4-flash:free",
+        "label": "tokenharbor > deepseek-v4-flash:free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "routllm/deepseek/deepseek-v4-flash",
+        "label": "routllm > deepseek/deepseek-v4-flash",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "tokenrouter/qwen/qwen3.8-max-free",
+        "label": "tokenrouter > qwen/qwen3.8-max-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nararouter/deepseek-v4-pro-free",
+        "label": "nararouter > deepseek-v4-pro-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "teamorouter/deepseek-v4-flash-free",
+        "label": "teamorouter > deepseek-v4-flash-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "groq/openai/gpt-oss-20b",
+        "label": "groq > openai/gpt-oss-20b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "groq/compound",
+        "label": "groq > compound",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "groq/allam-2-7b",
+        "label": "groq > allam-2-7b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "zenmux/z-ai/glm-5.3-free",
+        "label": "zenmux > z-ai/glm-5.3-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "zenmux/step-3",
+        "label": "zenmux > step-3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "zenmux/ling-1t",
+        "label": "zenmux > ling-1t",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "google/gemini-3.5-flash-lite",
+        "label": "google > gemini-3.5-flash-lite",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "google/lyria",
+        "label": "google > lyria",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "google/veo-2",
+        "label": "google > veo-2",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "deepseek/deepseek-chat",
+        "label": "deepseek > deepseek-chat",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "deepseek/deepseek-r1",
+        "label": "deepseek > deepseek-r1",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "deepseek/deepseek-v3",
+        "label": "deepseek > deepseek-v3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "fanar/Fanar",
+        "label": "fanar > Fanar",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "openrouter/google/gemma-4-26b-a4b-it:free",
+        "label": "openrouter > google/gemma-4-26b-a4b-it:free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "openrouter/hy3",
+        "label": "openrouter > hy3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "openrouter/auto",
+        "label": "openrouter > auto",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "pollinations/openai",
+        "label": "pollinations > openai",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "openai/gpt-5-nano",
+        "label": "openai > gpt-5-nano",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "openai/o1",
+        "label": "openai > o1",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "openai/o3",
+        "label": "openai > o3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "mistral/mistral-small-latest",
+        "label": "mistral > mistral-small-latest",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "mistral/glm-5-2",
+        "label": "mistral > glm-5-2",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "mistral/mistral",
+        "label": "mistral > mistral",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "huggingface/prism-ml/Ternary-Bonsai-27B-AWQ-4bit:together",
+        "label": "huggingface > prism-ml/Ternary-Bonsai-27B-AWQ-4bit:together",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "huggingface/hy3",
+        "label": "huggingface > hy3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "huggingface/inkling",
+        "label": "huggingface > inkling",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "llm7/DeepSeek-V4-Flash-0731",
+        "label": "llm7 > DeepSeek-V4-Flash-0731",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "ollama/gpt-oss:20b",
+        "label": "ollama > gpt-oss:20b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "ollama/llama2",
+        "label": "ollama > llama2",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "ollama/llama3",
+        "label": "ollama > llama3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cerebras/gpt-oss-120b",
+        "label": "cerebras > gpt-oss-120b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cerebras/gemma-4-31b",
+        "label": "cerebras > gemma-4-31b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cerebras/llama3.1-8b",
+        "label": "cerebras > llama3.1-8b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "aionlabs/aion-labs/aion-3.0-mini",
+        "label": "aionlabs > aion-labs/aion-3.0-mini",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cohere/command-r7b-12-2024",
+        "label": "cohere > command-r7b-12-2024",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cohere/command",
+        "label": "cohere > command",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cohere/command-a",
+        "label": "cohere > command-a",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "agnes/agnes-2.0-flash",
+        "label": "agnes > agnes-2.0-flash",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "kilo/kilo-auto/free",
+        "label": "kilo > kilo-auto/free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "kilo/hy3",
+        "label": "kilo > hy3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "kilo/auto",
+        "label": "kilo > auto",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "xai/grok-4-fast",
+        "label": "xai > grok-4-fast",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cloudflare/@cf/openai/gpt-oss-120b",
+        "label": "cloudflare > @cf/openai/gpt-oss-120b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cloudflare/granite-4.0-h-micro",
+        "label": "cloudflare > granite-4.0-h-micro",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "cloudflare/nemotron-3-120b-a12b",
+        "label": "cloudflare > nemotron-3-120b-a12b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "sambanova/Meta-Llama-3.3-70B-Instruct",
+        "label": "sambanova > Meta-Llama-3.3-70B-Instruct",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "sambanova/gemma-4-31b-it",
+        "label": "sambanova > gemma-4-31b-it",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
+        "label": "nvidia > deepseek-ai/deepseek-v4-flash-0731",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nvidia/bge-m3",
+        "label": "nvidia > bge-m3",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nvidia/inkling",
+        "label": "nvidia > inkling",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE",
+        "label": "chutes > unsloth/Mistral-Nemo-Instruct-2407-TEE",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "chutes/nemotron-3-nano-omni-30b-tee",
+        "label": "chutes > nemotron-3-nano-omni-30b-tee",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nscale/Qwen/Qwen3-4B-Instruct-2507",
+        "label": "nscale > Qwen/Qwen3-4B-Instruct-2507",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nscale/flux.1-schnell",
+        "label": "nscale > flux.1-schnell",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nscale/stable-diffusion-xl-base-1.0",
+        "label": "nscale > stable-diffusion-xl-base-1.0",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "bigmodel/glm-4.5-air",
+        "label": "bigmodel > glm-4.5-air",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "tabiai/claude-opus-4-8",
+        "label": "tabiai > claude-opus-4-8",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "gorouter/claude-opus-4-8",
+        "label": "gorouter > claude-opus-4-8",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "bai/deepseek-v4-flash",
+        "label": "bai > deepseek-v4-flash",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "commandcode/deepseek/deepseek-v4-flash",
+        "label": "commandcode > deepseek/deepseek-v4-flash",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "opencode/deepseek-v4-flash-free",
+        "label": "opencode > deepseek-v4-flash-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "opencode/hy3-free",
+        "label": "opencode > hy3-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "opencode/big-pickle",
+        "label": "opencode > big-pickle",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "alibaba/qwen3.8-27b",
+        "label": "alibaba > qwen3.8-27b",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "alibaba/glm-5",
+        "label": "alibaba > glm-5",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "alibaba/glm-5.2",
+        "label": "alibaba > glm-5.2",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "veniceai/venice-uncensored-1-2",
+        "label": "veniceai > venice-uncensored-1-2",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "bluesminds/meta/llama-3.1-8b-instruct",
+        "label": "bluesminds > meta/llama-3.1-8b-instruct",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "agentrouter/gpt-5.6-sol",
+        "label": "agentrouter > gpt-5.6-sol",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "aihubmix/coding-glm-5.2-free",
+        "label": "aihubmix > coding-glm-5.2-free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "aihubmix/hy3-preview",
+        "label": "aihubmix > hy3-preview",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "aihubmix/zai-glm-5.1",
+        "label": "aihubmix > zai-glm-5.1",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "nousresearch/upstage/solar-pro4:free",
+        "label": "nousresearch > upstage/solar-pro4:free",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "indeedwebid/ineed/freetier",
+        "label": "indeedwebid > ineed/freetier",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "seekai/deepseek-v4-flash",
+        "label": "seekai > deepseek-v4-flash",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "gmicloudai/MiniMaxAI/MiniMax-M2.7",
+        "label": "gmicloudai > MiniMaxAI/MiniMax-M2.7",
+        "behavesAs": "claude-sonnet-4-6"
+      }
+    ],
+    "replaceBuiltInOptions": true
+  },
+  "skillOverrides": {
+    "ui-ux-pro-max": "off"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "\"C:\\nvm4w\\nodejs\\node.exe\" \"C:/Users/osami/.claude/hud/omc-hud.mjs\""
+  },
+  "enabledPlugins": {
+    "github@claude-plugins-official": true,
+    "oh-my-claudecode@omc": true,
+    "frontend-design@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "context7@claude-plugins-official": false,
+    "firecrawl@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "figma@claude-plugins-official": false,
+    "caveman@caveman": true,
+    "code-simplifier@claude-plugins-official": false,
+    "claude-md-management@claude-plugins-official": false,
+    "feature-dev@claude-plugins-official": false,
+    "security-guidance@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": false,
+    "chrome-devtools-mcp@claude-plugins-official": true,
+    "claude-code-setup@claude-plugins-official": false,
+    "rust-analyzer-lsp@claude-plugins-official": false
+  },
+  "extraKnownMarketplaces": {
+    "omc": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/Yeachan-Heo/oh-my-claudecode.git"
+      },
+      "autoUpdate": true
+    },
+    "caveman": {
+      "source": {
+        "source": "github",
+        "repo": "JuliusBrussee/caveman"
+      },
+      "autoUpdate": true
+    }
+  },
+  "alwaysThinkingEnabled": true,
+  "effortLevel": "high",
+  "autoUpdatesChannel": "latest",
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true,
+  "theme": "dark",
+  "inputNeededNotifEnabled": false,
+  "skipAutoPermissionPrompt": true,
+  "autoMode": {
+    "environment": [
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Cloud provider(s)**: None configured",
+      "**Repository visibility**: private (github.com/Osamious/Mxene, confirmed via gh)",
+      "**Internal sharing / snippet hosting**: None configured â€” treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: None configured",
+      "**Default / protected branches**: default branch unknown (origin/HEAD unset); no rulesets or protected branches listed on Osamious/Mxene",
+      "**CI/CD deploy targets**: None configured",
+      "**Network posture**: None configured",
+      "**Source control**: github.com/Osamious/Mxene (origin) â€” the trusted repo and its remote only",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: None configured",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: Acquisition/.env, Acquisition/.env.example, .streamlit/secrets.toml, and other .env-pattern files per .gitignore â€” any file or store holding credentials or regulated data; share only with audiences cleared at the [named+specifics] bar",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace, host, or container whose name carries prod or production as a whole word or name segment",
+      "**Protected deployment namespaces / environments**: None configured â€” fall back to the Sensitive remote targets heuristic",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries prod or production as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: software development (this project: Mxene, a QEERI internship repo â€” data acquisition/extraction with Python, Streamlit)",
+      "**Trusted repo**: D:\\TAMUQ\\Internship\\QEERI 3, the git repository the agent started in, and its remote github.com/Osamious/Mxene.git â€” private repo, so confidential material is fine to commit there but secrets/credentials are never cleared in by visibility alone",
+      "**Org-specific CLIs**: None configured",
+      "routine under Acquisition/ and Extraction/ prefixes: ordinary read/edit/test operations within this repo's tracked tree are routine project work"
+    ]
+  }
+}
