@@ -101,9 +101,17 @@ export function readService(file = CONTRACT.servicePath) {
 
 // Never throws. A gateway that is down, slow, or answering in a shape we do not
 // recognise is an expected condition, not an error: the picker draws without it.
+//
+// FAILURE IS `undefined`; A GENUINE NULL RESULT IS `null`. The distinction is the
+// whole of `probeRpcSurface`'s drift check, which decides whether a method exists
+// by testing `r !== undefined`. While every failure path also returned `null`, a
+// refused connection and an unknown method both read as "method present", so the
+// check reported all three methods healthy with CCR dead and could never fail --
+// and `uw doctor` is built on top of it. Callers that only care whether they got
+// an answer keep working unchanged, because both values are falsy.
 export async function rpc(method, args = [], opts = {}) {
   const { timeoutMs = 400, fetchImpl = fetch, service = readService() } = opts;
-  if (!service) return null;
+  if (!service) return undefined;
   try {
     const res = await fetchImpl(`${service.origin}${CONTRACT.rpcPath}`, {
       method: "POST",
@@ -112,8 +120,8 @@ export async function rpc(method, args = [], opts = {}) {
       signal: AbortSignal.timeout(timeoutMs),
     });
     const body = await res.json();
-    return body?.value ?? null;
-  } catch { return null; }
+    return body?.value ?? null;      // the gateway answered; null is its answer
+  } catch { return undefined; }      // no answer at all
 }
 
 export function routableFromConfig(cfg) {

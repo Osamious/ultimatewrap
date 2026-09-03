@@ -87,11 +87,37 @@ test("routableFromConfig flattens providers and models", () => {
   assert.equal(CCR.routableFromConfig(null).size, 0);
 });
 
-test("rpc returns null instead of throwing when the gateway misbehaves", async () => {
+const SVC = { origin: "http://x", token: "t" };
+
+test("rpc never throws when the gateway misbehaves", async () => {
   const boom = () => { throw new Error("ECONNREFUSED"); };
-  assert.equal(await CCR.rpc("getConfig", [], { fetchImpl: boom, service: { origin: "http://x", token: "t" } }), null);
+  assert.equal(await CCR.rpc("getConfig", [], { fetchImpl: boom, service: SVC }), undefined);
   const slow = () => new Promise((_, rej) => setTimeout(() => rej(new Error("aborted")), 5));
-  assert.equal(await CCR.rpc("getConfig", [], { fetchImpl: slow, timeoutMs: 1, service: { origin: "http://x", token: "t" } }), null);
+  assert.equal(await CCR.rpc("getConfig", [], { fetchImpl: slow, timeoutMs: 1, service: SVC }), undefined);
+});
+
+test("rpc distinguishes no answer from an answer of null", async () => {
+  // This is the whole of probeRpcSurface's drift check, which decides a method
+  // exists by testing `r !== undefined`. While every failure path returned null,
+  // a refused connection and an unknown method both read as "present", so the
+  // check reported three healthy methods against a dead gateway and could never
+  // fail -- and uw doctor is built on it.
+  const boom = () => { throw new Error("ECONNREFUSED"); };
+  const answersNull = async () => ({ json: async () => ({ value: null }) });
+  const answersValue = async () => ({ json: async () => ({ value: { version: "3.0.22" } }) });
+
+  assert.equal(await CCR.rpc("m", [], { fetchImpl: boom, service: SVC }), undefined,
+    "a transport failure is not an answer");
+  assert.equal(await CCR.rpc("m", [], { fetchImpl: boom, service: null }), undefined,
+    "no service descriptor is not an answer either");
+  assert.equal(await CCR.rpc("m", [], { fetchImpl: answersNull, service: SVC }), null,
+    "the gateway answered, and its answer was null");
+  assert.deepEqual(await CCR.rpc("m", [], { fetchImpl: answersValue, service: SVC }),
+    { version: "3.0.22" });
+
+  // And the property that matters downstream: both failure forms stay falsy, so
+  // `if (!cfg)` callers such as catalog.mjs:routableSet are unaffected.
+  for (const f of [boom]) assert.ok(!(await CCR.rpc("m", [], { fetchImpl: f, service: SVC })));
 });
 
 test("no file anywhere in UW hard-codes an OMC path", () => {
