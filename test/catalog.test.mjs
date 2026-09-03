@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { priceOf, isTextOut, badgeOf, buildFrom, routableSet, makeRoutableOf } from "../menu/catalog.mjs";
+import { priceOf, isTextOut, badgeOf, buildFrom, routableSet, makeRoutableOf,
+         writeSlot, readSlot } from "../menu/catalog.mjs";
 import { writeAtomic, readJsonOr } from "../menu/atomic.mjs";
 
 const doc = JSON.parse(fs.readFileSync(new URL("./fixtures/catalog.json", import.meta.url), "utf8"));
@@ -216,6 +217,29 @@ test("buildFrom stays silent: the display path must not write to the console", (
                 catalog: c });
   } finally { console.warn = realWarn; }
   assert.deepEqual(said, [], "the picker's build path must print nothing");
+});
+
+test("the slot round-trips atomically and survives a missing or corrupt file", () => {
+  const dir = path.join(process.env.HOME ?? process.env.USERPROFILE,
+                        ".uw", "harness", "scratch", "slot");
+  fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, "slot.json");
+  fs.rmSync(f, { force: true });
+
+  assert.equal(readSlot(f), "", "a missing slot reads as no pin, not a throw");
+
+  writeSlot("acme/acme-chat-1", f);
+  assert.equal(readSlot(f), "acme/acme-chat-1");
+  // Through writeAtomic: a plain write truncates in place, so an interrupt leaves
+  // a prefix that readSlot's catch turns into "" -- a pin silently forgotten
+  // rather than an error. No temp file may survive either.
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")), []);
+
+  writeSlot("zeta/zeta-two", f);
+  assert.equal(readSlot(f), "zeta/zeta-two", "a rewrite replaces rather than appends");
+
+  fs.writeFileSync(f, '{"model": "acme/hal');   // the truncation shape itself
+  assert.equal(readSlot(f), "", "a half-written slot reads as no pin");
 });
 
 test("readJsonOr never throws", () => {

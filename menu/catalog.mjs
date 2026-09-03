@@ -228,15 +228,19 @@ export function build() {
   });
 }
 
-export function writeSlot(target) {
-  fs.mkdirSync(path.dirname(SLOT), { recursive: true });
+// Both take an optional path for the same reason every function in state.mjs
+// does: without one, the only way to exercise them is to write the live
+// ~/.uw/state/slot.json, so they were untestable by the isolation rule and
+// therefore untested. That is the defect, not a consequence of it.
+export function writeSlot(target, file = SLOT) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   // Through writeAtomic like every other state file. writeAtomic was imported here
   // and never called: a plain write truncates slot.json in place, so ctrl+c during
   // it leaves a prefix, and readSlot's catch turns that into "" -- a silently
   // forgotten model pin rather than a visible error.
-  writeAtomic(SLOT, JSON.stringify({ model: target }, null, 2));
+  writeAtomic(file, JSON.stringify({ model: target }, null, 2));
 }
 
-export function readSlot() {
-  try { return JSON.parse(fs.readFileSync(SLOT, "utf8")).model ?? ""; } catch { return ""; }
+export function readSlot(file = SLOT) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")).model ?? ""; } catch { return ""; }
 }
