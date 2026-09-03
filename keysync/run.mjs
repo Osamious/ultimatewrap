@@ -10,7 +10,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
+import { RESERVED } from "../menu/denylist.mjs";
 import {
   loadVault, filterRegistry, chooseKeys, loadCatalog, buildProviders,
   validate, stripOneMSuffix, reconcileUserModelPin, KEY_CHOICES, ANCHOR_PREFERENCE,
@@ -31,6 +33,99 @@ const dry = has("--dry") || target === "dry";
 
 const EXPECTED_PROVIDERS = 44;
 const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
+
+/**
+ * S1: the bare-id collision guard. Report 08 F1 is stopped here and nowhere else.
+ *
+ * WHY HERE AND NOT IN buildProviders. The exploitable condition is SOLE
+ * OWNERSHIP of a Claude-shaped id across the whole built config -- CCR's
+ * `providerModelMatches` iterates raw Providers[].models[] behind only a
+ * provider-level enabled gate, and `resolve()` binds on exactly one match,
+ * returning undefined on more than one. `buildProviders` processes one provider
+ * at a time and cannot evaluate ownership. That is why the old name-rejection
+ * control sat in the wrong function AND enforced the wrong rule.
+ *
+ * WHAT IT DOES NOT DO: prune. No model is removed, no provider is dropped. It
+ * reports, and on the one dangerous shape it stops the run.
+ *
+ * @param {object[]} providers  the built `Providers[]`, each `{name, models: [{id}]}`
+ * @param {object}  [opts]
+ * @param {string}  [opts.relay="anthropic"]   the provider name of our own relay
+ * @param {boolean} [opts.allowBare=false]     --allow-bare-claude-names
+ * @returns {{hijackable: object[], shadowed: object[], fatal: boolean, message: string}}
+ */
+export function checkBareCollisions(providers, { relay = "anthropic", allowBare = false } = {}) {
+  const byBare = new Map();
+  for (const p of providers ?? []) {
+    for (const m of p.models ?? []) {
+      // Accepts both shapes deliberately: the built config carries `models` as a
+      // string[], while the guard's own tests inject `{id}` objects.
+      const id = String(m?.id ?? m ?? "");
+      // An id that already carries a `/` is vendor-prefixed and is not what
+      // Claude Code sends for a built-in row, so it cannot be the stage-4 match.
+      // tokenharbor lists exactly this shape; treating it as hijackable would
+      // block a live reseller for a threat that cannot reach it.
+      if (id.includes("/")) continue;
+      // RESERVED is imported, not re-typed. The previous inline regex was
+      // /^(claude|opus|sonnet|haiku)([-\d]|$)/ -- it omitted `fable` entirely and
+      // its boundary class was narrower than the denylist's, so `sonnet.1` and
+      // `haiku_2` were reserved by one definition and invisible to the other.
+      if (!RESERVED.test(id)) continue;
+      if (!byBare.has(id)) byBare.set(id, new Set());
+      byBare.get(id).add(p.name);
+    }
+  }
+
+  const hijackable = [], shadowed = [];
+  for (const [id, owners] of byBare) {
+    if (owners.size === 1 && !owners.has(relay)) hijackable.push({ id, owner: [...owners][0] });
+    else if (owners.size > 1) shadowed.push({ id, owners: [...owners].sort() });
+  }
+  hijackable.sort((a, b) => a.id.localeCompare(b.id));
+  shadowed.sort((a, b) => a.id.localeCompare(b.id));
+
+  // THE REMEDY WORDING IS LOAD-BEARING, and a test asserts it. An error that
+  // tells the operator to remove a provider's model is an error that teaches a
+  // rule-2 violation, and it would send them to delete the very models tabiai
+  // and gorouter are being paid for. The two honest remedies are: give the id a
+  // second owner by starting the relay, or accept the routing deliberately.
+  let message;
+  if (hijackable.length) {
+    message =
+      `SECURITY: ${hijackable.length} bare Claude-shaped model id(s) have a single ` +
+      `owner and it is not the relay:\n` +
+      hijackable.map((h) => `  ${h.id}  <-  sole owner: ${h.owner}`).join("\n") +
+      `\nCCR's resolve() binds Claude Code's built-in rows to a uniquely-owned bare ` +
+      `id, so the full system prompt, tool definitions and file contents would go ` +
+      `to that host.\n` +
+      `Remedy: start the Anthropic relay so it co-owns these ids and they become ` +
+      `ambiguous, or re-run with --allow-bare-claude-names to accept this routing ` +
+      `deliberately.`;
+  } else if (shadowed.length) {
+    message =
+      `note: bare Claude-shaped id(s) with more than one owner -- ` +
+      `${shadowed.map((s) => `${s.id} (${s.owners.join(", ")})`).join("; ")}. ` +
+      `resolve() returns undefined on an ambiguous match, so this is a clean ` +
+      `failure, not a misroute.`;
+  } else {
+    message = "no bare Claude-shaped collisions";
+  }
+
+  return { hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message };
+}
+
+// ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
+// writes built-rows.json, and on the dry path calls process.exit(0). Without
+// this check, `import { checkBareCollisions } from "./run.mjs"` would run all of
+// it and kill the importing process -- which is exactly what happens under
+// `node --test`, where no --target is passed so `dry` defaults to true.
+//
+// Deliberately a wrapping block rather than a main() extraction: this file
+// writes CCR config and settings.json, and a reindent would put a large
+// unreviewed diff around live behaviour. Nothing outside the block references
+// anything declared inside it.
+const isEntry = import.meta.url === pathToFileURL(process.argv[1] ?? "").href;
+if (isEntry) {
 
 // ------------------------------------------------------------------- inputs
 const { registry, providers } = loadVault();
@@ -97,20 +192,37 @@ if (has("--verified-only")) {
 // Anthropic via the local OAuth relay, unless --no-anthropic. Checked for
 // liveness first: a dead relay would produce picker rows that cannot serve.
 let anthropicOn = false;
+let aliasesOk = false;
 if (!has("--no-anthropic")) {
+  let health = null;
   try {
     const h = await fetch(`${ANTHROPIC_RELAY.api_base_url}/health`, { signal: AbortSignal.timeout(4000) });
     anthropicOn = h.ok;
+    if (h.ok) { try { health = await h.json(); } catch { health = null; } }
   } catch { anthropicOn = false; }
+  // Ask, do not assume. `anthropicOn` says the relay answers; `aliasesOk` says it
+  // answers for `opus`. A relay binary predating Task A5.2 returns neither the
+  // field nor the endpoint, so `aliasesOk` is false and we write exactly today's
+  // list -- no dead rows, and the two halves may land in either order.
+  aliasesOk = anthropicOn && Boolean(health?.aliases?.length);
   if (anthropicOn) {
-    built.providers.unshift({ ...ANTHROPIC_RELAY });
-    built.picker.unshift(...ANTHROPIC_RELAY.models.map((m) => ({
+    // `picker` and `routing` are UW-side fields and must not reach CCR's config,
+    // which is why they are destructured out rather than spread through.
+    const { picker: _picker, routing: _routing, ...relayProvider } = ANTHROPIC_RELAY;
+    built.providers.unshift({
+      ...relayProvider,
+      models: aliasesOk ? [...ANTHROPIC_RELAY.routing] : [...ANTHROPIC_RELAY.picker],
+    });
+    built.picker.unshift(...ANTHROPIC_RELAY.picker.map((m) => ({
       model: `anthropic/${m}`,
       label: `Anthropic > ${m}`,
       description: "subscription"
       // no behavesAs: Claude Code already knows these ids.
     })));
-    console.log(`anthropic relay live -> +1 provider / +${ANTHROPIC_RELAY.models.length} Claude rows`);
+    console.log(`anthropic relay live -> +1 provider / +${ANTHROPIC_RELAY.picker.length} Claude rows` +
+      (aliasesOk
+        ? ` / routing also owns the bare aliases (${ANTHROPIC_RELAY.routing.length} ids)`
+        : ` / bare aliases NOT advertised (relay does not report them; see Task A5.2)`));
   } else {
     console.log(`WARNING: anthropic relay not responding at ${ANTHROPIC_RELAY.api_base_url} — ` +
       `Claude models will NOT be available, and this config would remove Claude from ` +
@@ -161,29 +273,25 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
 // the dangerous single-match case is rare enough that a hard failure here would
 // block runs for a condition the operator may have chosen deliberately.
 {
-  const byBare = new Map();
-  for (const prov of built.providers) {
-    for (const m of prov.models ?? []) {
-      const k = String(m).trim().toLowerCase();
-      if (!byBare.has(k)) byBare.set(k, new Set());
-      byBare.get(k).add(prov.name);
-    }
+  // Extracted to `checkBareCollisions` (top of this file) so it is testable
+  // without running the pipeline, widened to RESERVED's full class -- the inline
+  // regex omitted `fable` and used a narrower boundary than the denylist -- and
+  // escalated from a warning to a hard stop.
+  //
+  // WHY IT IS NOW FATAL. Under Rule 2 the denylist no longer refuses
+  // Claude-shaped names from resellers, so this is the only control left that
+  // stops report 08 F1. A warning that a run proceeds past is not a control when
+  // it is the last one. `--allow-bare-claude-names` keeps the deliberate case
+  // reachable, so no working configuration is permanently blocked.
+  const collisions = checkBareCollisions(built.providers,
+    { allowBare: has("--allow-bare-claude-names") });
+  if (collisions.hijackable.length || collisions.shadowed.length) {
+    console.warn(collisions.message);
   }
-  // The `|$` alternative matters: Claude Code accepts bare aliases (`opus`,
-  // `sonnet`, `haiku`) as well as full ids, so a provider listing a model named
-  // literally "opus" is just as hijackable as one listing "claude-opus-5".
-  const claudeish = [...byBare].filter(([k]) => /^(claude|opus|sonnet|haiku)([-\d]|$)/.test(k));
-  const hijackable = claudeish.filter(([, owners]) => owners.size === 1 && !owners.has("anthropic"));
-  const shadowed = claudeish.filter(([, owners]) => owners.size > 1);
-  for (const [name, owners] of hijackable) {
-    console.warn(`WARNING: built-in picker rows send the bare id "${name}", and the only provider ` +
-      `listing it is "${[...owners][0]}" — NOT the Anthropic relay. A built-in row labelled as a Claude ` +
-      `model would route there silently. Namespace or remove that model, or keep the relay enabled.`);
-  }
-  for (const [name, owners] of shadowed) {
-    console.warn(`note: bare id "${name}" is listed by ${owners.size} providers (${[...owners].join(", ")}) — ` +
-      `CCR will leave it unresolved, so a built-in row using it fails cleanly rather than misrouting.`);
-  }
+  // Fatal BEFORE any write, and before --dry returns, so a dry run reports the
+  // same verdict a live run would enforce. `allowBare` silences the exit, never
+  // the finding: the warning above still prints.
+  if (collisions.fatal) process.exit(1);
 }
 
 if (dry) {
@@ -501,4 +609,7 @@ if (writeVerified) {
     console.log(`WARNING: backup cleanup failed (${String(e.message).slice(0, 120)}); ` +
       `the write itself succeeded. Stale backups may remain in ${path.dirname(SETTINGS)}`);
   }
+}
+
+// ---- end entry-point guard (see isEntry above) ----
 }

@@ -13,6 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { admitRemoteModels } from "../menu/denylist.mjs";
 
 // ---------------------------------------------------------------- vault load
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -129,6 +130,40 @@ const BEHAVES_AS = process.env.UW_BEHAVES_AS ?? "claude-sonnet-4-6";
  * to be rolled back. The relay resolves the subscription token itself, so no
  * Anthropic credential is ever written into CCR's config.
  */
+// The four ids the relay serves, and the four bare aliases Claude Code accepts.
+// These are two different lists with two different consumers, and collapsing
+// them ships a visibly broken menu -- run.mjs maps the relay's ids straight into
+// picker rows, so a single 8-element array renders four duplicates.
+//
+//   models / picker -> the four full ids. `models` is what CCR is given today and
+//                      what every existing consumer reads; `picker` is the same
+//                      list under the name the renderer asks for.
+//   routing         -> full ids PLUS the bare aliases. Written into
+//                      Providers[].models ONLY when run.mjs's `aliasesOk` probe
+//                      says the relay can actually serve them (Step 3c).
+//
+// The aliases exist so the relay CO-OWNS them: a third-party provider publishing
+// bare `opus` then lands in `shadowed` instead of becoming its sole owner, which
+// is the one case checkBareCollisions cannot catch on its own -- S1 keys on the
+// relay being ABSENT, and this is the case where it is present.
+//
+// THE SPLIT IS ADDITIVE AND THE ID SET IS UNCHANGED. An earlier draft replaced
+// this constant with {provider, picker, routing}. That drops api_base_url, so
+// run.mjs:102 probes `undefined/health`, `anthropicOn` is permanently false and
+// the relay never loads -- which removes Claude from Claude Code entirely. It
+// also rewrote the four ids, dropping claude-fable-5-1 and the dated
+// claude-haiku-4-5-20251001 for an undated form plus claude-opus-5-thinking,
+// none of it verified. Changing what the relay advertises needs its own
+// verification against a live CCR and is not part of splitting a list in two.
+// Parse defensively: `api_base_url` is vault data and a malformed value must
+// degrade to a blank suffix, never throw during config generation.
+const hostOf = (u) => { try { return new URL(u).host; } catch { return ""; } };
+
+const ANTHROPIC_FULL = Object.freeze([
+  "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-fable-5-1"
+]);
+const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
+
 export const ANTHROPIC_RELAY = {
   name: "anthropic",
   provider: "anthropic",
@@ -138,7 +173,9 @@ export const ANTHROPIC_RELAY = {
   autoFetchModels: false,
   enabled: true,
   // Verified live through CCR 2026-09-02.
-  models: ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-fable-5-1"]
+  models: ANTHROPIC_FULL,
+  picker: ANTHROPIC_FULL,
+  routing: Object.freeze([...ANTHROPIC_FULL, ...ANTHROPIC_ALIASES])
 };
 
 // Per-tier anchors, so Claude Code keeps its normal tiering (cheap models for
@@ -174,6 +211,28 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
     const { type, baseUrl } = resolveProtocol(vp);
     const catalogEntries = catalog.byProvider.get(reg.provider) ?? [];
 
+    // SECURITY, report 08 F1. This runs BEFORE `ranked` is computed and before
+    // `vp.testModel` is prepended, because both of those write into
+    // Providers[].models, which is what CCR routes. The trusted relay is exempt:
+    // `anthropic` is our own loopback on 4517 and is the only provider that may
+    // legitimately serve a Claude-shaped name.
+    const admitted = admitRemoteModels(reg.provider, catalogEntries.map((m) => m.model));
+    const keptIds = new Set(admitted.kept);
+    const safeEntries = catalogEntries.filter((m) => keptIds.has(m.model));
+    // GUARD THE CALL, do not filter the message. `testModel` is optional -- the
+    // original code wraps its use in `if (vp.testModel)` -- and `admitId(undefined)`
+    // coerces to "" and returns null, so an unguarded call pushes the literal
+    // string "undefined" into `rejected` and prints
+    //   SECURITY: provider "X" advertised 1 rejected model name(s): undefined
+    // once per provider without a curated testModel, on every keysync run and
+    // every dry run. Step 4 below asks the implementer to READ that dry-run output
+    // and treat a provider losing all its models as a finding worth stopping for.
+    // Burying that signal in false positives is how a security channel stops being
+    // read, which costs more than the line it saves.
+    const safeTestModel = vp.testModel
+      ? (admitRemoteModels(reg.provider, [vp.testModel]).kept[0] ?? null)
+      : null;
+
     // MEASURED 2026-09-01: preferring catalog ids over the vault's testModel
     // dropped the live pass rate to 4/44 — the bundled catalog lists models a
     // given key/tier often cannot actually call (mostly upstream 404s). The
@@ -181,19 +240,19 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
     // leads; catalog entries are appended as extras.
     const models = [];
     const seen = new Set();
-    if (vp.testModel) {
-      const cat = catalogEntries.find((m) => m.model === vp.testModel);
+    if (safeTestModel) {
+      const cat = safeEntries.find((m) => m.model === safeTestModel);
       models.push({
-        id: vp.testModel,
+        id: safeTestModel,
         tier: cat ? inferTier(cat) : "unknown",
         contextTokens: cat?.limits?.contextTokens
       });
-      seen.add(vp.testModel);
+      seen.add(safeTestModel);
     }
-    if (catalogEntries.length) {
+    if (safeEntries.length) {
       // Curate rather than dump: the picker is a flat list and 44 providers x
       // full catalogs is unusable. Prefer free-tier, then shortest id.
-      const ranked = catalogEntries
+      const ranked = safeEntries
         .map((m) => ({ m, tier: inferTier(m) }))
         .sort((a, b) => (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
           a.m.model.length - b.m.model.length);
@@ -225,8 +284,26 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
         model: `${name}/${m.id}`,
         label: `${name} > ${m.id}`
       };
-      // "unknown" gets no description: a guess is worse than no label.
-      if (m.tier !== "unknown") row.description = m.tier;
+      // The answering HOSTNAME, appended to the description.
+      //
+      // This is the control that replaces name refusal on the display side.
+      // Under rule 2 a user is EXPECTED to see Claude names from several
+      // providers, so the question the UI must answer stops being "is this name
+      // allowed" and becomes "who serves it". A vault nickname is user-chosen
+      // and can be made to read as official; a hostname cannot be. So a reseller
+      // row reads `tabiai > claude-opus-5 · tabitoken.com` against the relay's
+      // `anthropic > claude-opus-5 · 127.0.0.1:4517`.
+      //
+      // Never surface `behavesAs` here: it is a client-side prompt profile, not
+      // a selector, and rendering it would read as a claim about which model is
+      // actually answering -- the precise confusion this exists to remove.
+      //
+      // "unknown" gets no tier: a guess is worse than no label. The host is still
+      // shown, because who answers is a fact rather than an inference.
+      const host = hostOf(baseUrl);
+      const tier = m.tier !== "unknown" ? m.tier : "";
+      const desc = [tier, host].filter(Boolean).join(" · ");
+      if (desc) row.description = desc;
       // VERIFIED: without behavesAs, Claude Code does not recognize a
       // provider-format id, warns on every launch, and assumes a 200k context
       // window regardless of the model's real one. behavesAs names a model it

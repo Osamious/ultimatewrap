@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { sanitizeDisplay, admitId } from "./sanitize.mjs";
+import { admitRemoteModels } from "./denylist.mjs";
 import { writeAtomic } from "./atomic.mjs";
 import * as CCR from "./ccr-client.mjs";
 
@@ -159,21 +160,27 @@ export function buildFrom({ chosen, providers, catalog, relay,
   for (const cred of chosen) {
     const prof = providers.get(cred.provider) ?? {};
     const opts = { ...(cadenceOf(cred.provider) ?? {}), providerName: cred.provider };
+    const entries = catalog.byProvider.get(cred.provider) ?? [];
+    const { kept } = admitRemoteModels(cred.provider, entries.map((e) => e.model));
+    const keptSet = new Set(kept);
     const models = [];
-    for (const e of catalog.byProvider.get(cred.provider) ?? []) {
-      const id = admitId(e.model);
-      if (!id) continue;                 // reject, never sanitize, a routing selector
+    for (const e of entries) {
+      if (!keptSet.has(e.model)) continue;
       const p = priceOf(e, cred.provider), caps = e?.capabilities ?? {};
       models.push({
-        id, ctx: e?.limits?.contextTokens ?? null,
+        id: e.model, ctx: e?.limits?.contextTokens ?? null,
         pin: p ? p.in : null, pout: p ? p.out : null, badge: badgeOf(e, opts),
         tools: !!caps.toolCalling, vision: !!caps.imageInput, reason: !!caps.reasoning,
         // Q1.3: a value, not a promise. null means nobody checked and does not dim.
-        routable: routableOf(`${cred.provider}/${id}`),
+        routable: routableOf(`${cred.provider}/${e.model}`),
       });
     }
     // testModel leads: measured, catalogue-first dropped the live pass rate to 4/44.
-    const tm = admitId(prof.testModel);
+    // Guarded for the same reason as the routing path: an absent testModel is
+    // ordinary configuration, not a rejected advertisement.
+    const tm = prof.testModel
+      ? (admitRemoteModels(cred.provider, [prof.testModel]).kept[0] ?? null)
+      : null;
     if (tm && !models.some((m) => m.id === tm)) {
       models.unshift({ id: tm, ctx: null, pin: null, pout: null,
                        badge: opts.planCovered ? "PLAN" : "",
