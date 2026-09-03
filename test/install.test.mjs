@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
+import { wrapCommand, unwrapCommand } from "../menu/hud-shim.mjs";
 
 // `import`, not `require`. This file is ESM, where `require` is not defined, so
 // the original `require("node:path")` calls threw ReferenceError before any
@@ -130,4 +131,75 @@ test("-Hud -HudUninstall refuses to revert a command someone else rewrote", () =
   assert.match(out, /no longer UW's wrapper/i);
   assert.equal(JSON.parse(fs.readFileSync(f, "utf8")).statusLine.command,
                '"C:/node.exe" "C:/hud/omc-hud.mjs" --brand-new', "it must be left alone");
+});
+
+// --- the write path itself ---------------------------------------------------
+// The six tests above all run under -WhatIf, which is what let a real defect
+// ship: install.ps1 passed the wrapped command as an argument to a native
+// command, PowerShell 5.1 stripped the embedded quotes, and the live footer went
+// blank on every prompt. Every assertion above passed throughout, because they
+// assert on the ECHOED string, and the echo was always correct -- only the write
+// was wrong.
+//
+// These drive the mechanism directly rather than by running the installer.
+// Running it without -WhatIf is not an option: lines 93-94 call
+// SetEnvironmentVariable(..., "User"), which would mutate the real machine
+// environment of whoever ran the suite.
+const setStatusline = (file, command) => {
+  let code = 0, out = "";
+  try {
+    out = execFileSync(process.execPath, ["C:/Users/osami/.uw/menu/set-statusline.mjs", file],
+      { encoding: "utf8", stdio: "pipe", env: { ...process.env, UW_STATUSLINE_COMMAND: command } });
+  } catch (e) { code = e.status ?? -1; out = String(e.stdout ?? "") + String(e.stderr ?? ""); }
+  return { code, out };
+};
+
+test("the write preserves quotes in the command, byte for byte", () => {
+  const f = settings('"C:/node.exe" "C:/hud/omc-hud.mjs"');
+  const wrapped = 'node "C:/Users/osami/.uw/menu/hud-shim.mjs" -- "C:\nvm4w\nodejs\node.exe" "C:/hud/omc-hud.mjs"';
+  const { code } = setStatusline(f, wrapped);
+  assert.equal(code, 0);
+  // Read back the FILE, not the echo. The stripped value the defect produced
+  // differs from this one only in the quote characters, which is exactly what an
+  // assertion on the echoed text could not see.
+  assert.equal(JSON.parse(fs.readFileSync(f, "utf8")).statusLine.command, wrapped);
+});
+
+test("the written command survives unwrapCommand", () => {
+  // PREFIX_RE demands a literal `"` after `node `, so a quote-stripped write
+  // makes the wrapper unrecognisable and -HudUninstall's value edit writes back
+  // something that no longer round-trips. This is the end-to-end shape.
+  const original = '"C:\nvm4w\nodejs\node.exe" "C:/hud/omc-hud.mjs"';
+  const f = settings(original);
+  const wrapped = wrapCommand("C:\Users\osami\.uw\menu\hud-shim.mjs", original);
+  assert.equal(setStatusline(f, wrapped).code, 0);
+  const back = JSON.parse(fs.readFileSync(f, "utf8")).statusLine.command;
+  assert.equal(unwrapCommand(back), original);
+});
+
+test("the write touches only statusLine.command and keeps one-element arrays as arrays", () => {
+  const f = settings('"C:/node.exe" "x.mjs"');
+  assert.equal(setStatusline(f, 'node "s.mjs" -- "C:/node.exe" "x.mjs"').code, 0);
+  const doc = JSON.parse(fs.readFileSync(f, "utf8"));
+  assert.equal(doc.model, "opus");
+  assert.equal(doc.statusLine.type, "command");
+  // The reason the write goes through Node at all: PowerShell 5.1's JSON round
+  // trip collapses a single-element array into a scalar.
+  assert.deepEqual(doc.permissions.allow, ["Bash(git:*)"]);
+});
+
+test("the write refuses a file it cannot parse and leaves it alone", () => {
+  const f = path.join(tmpdir("uw-set3-"), "settings.json");
+  fs.writeFileSync(f, "{ not json");
+  const { code } = setStatusline(f, 'node "s.mjs" -- x');
+  assert.equal(code, 1);
+  assert.equal(fs.readFileSync(f, "utf8"), "{ not json");
+});
+
+test("the written file is BOM-free", () => {
+  // Q2.9: JSON.parse throws on a leading BOM, so every reader in this project
+  // would silently fall back to an empty object.
+  const f = settings('"C:/node.exe" "x.mjs"');
+  assert.equal(setStatusline(f, 'node "s.mjs" -- "C:/node.exe" "x.mjs"').code, 0);
+  assert.notEqual(fs.readFileSync(f)[0], 0xef);
 });

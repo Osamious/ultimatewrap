@@ -17,9 +17,24 @@
 import fs from "node:fs";
 import { writeAtomic, readJsonOr } from "./atomic.mjs";
 
-const [file, command] = process.argv.slice(2);
+// The command arrives in UW_STATUSLINE_COMMAND, not argv, and that is a fix
+// rather than a preference. PowerShell 5.1 strips embedded `"` from a string
+// passed as an argument to a NATIVE command, so `& node $nodeEdit $path $wrapped`
+// wrote
+//   node C:/.../hud-shim.mjs -- C:\nvm4w\nodejs\node.exe C:/.../omc-hud.mjs
+// for a $wrapped that had been correctly quoted one line earlier. Claude Code
+// runs the statusline through a POSIX-ish shell, which then ate the now-unguarded
+// backslashes: the node path collapsed to `C:nvm4wnodejsnode.exe`, the child
+// failed, and the footer was blank on every prompt. An environment variable
+// crosses the process boundary as bytes, with no quoting rules to get wrong.
+//
+// argv[1] is still honoured so a hand-run keeps working, and so the two forms
+// cannot drift apart.
+const [file, argvCommand] = process.argv.slice(2);
+const command = argvCommand ?? process.env.UW_STATUSLINE_COMMAND ?? null;
 if (!file || command == null) {
-  console.error("usage: set-statusline.mjs <settings.json> <command>");
+  console.error("usage: set-statusline.mjs <settings.json> [<command>]");
+  console.error("       (or set UW_STATUSLINE_COMMAND instead of passing it)");
   process.exit(2);
 }
 const doc = readJsonOr(file, null);

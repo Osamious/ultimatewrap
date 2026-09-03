@@ -58,8 +58,8 @@ export function checkHandoff(lines, { now = Date.now(), claudeRunSince = null } 
                     .filter(Boolean);
   if (!rows.length) {
     return { name: "handoff-contract", ok: false, verdict: "amber",
-      evidence: "the picker has never recorded an invocation — press ctrl+g and type " +
-                "`m` once, then re-run" };
+      evidence: "the picker has never recorded an invocation — type `m` in the chat " +
+                "input, THEN press ctrl+g, once; then re-run" };
   }
   const last = rows[rows.length - 1];
 
@@ -82,10 +82,10 @@ export function checkHandoff(lines, { now = Date.now(), claudeRunSince = null } 
       evidence: usedSince
         ? `the last recorded handoff is ${days} days old and Claude Code has been used ` +
           `since, so ctrl+g is no longer reaching the picker — this is what a changed ` +
-          `editor protocol looks like. Press ctrl+g and type \`m\`; if nothing happens, ` +
-          `re-verify CONTRACT.handoff against the running version`
+          `editor protocol looks like. Type \`m\` in the chat input, THEN press ctrl+g; ` +
+          `if nothing happens, re-verify CONTRACT.handoff against the running version`
         : `the last recorded handoff is ${days} days old — too old to be evidence. ` +
-          `Press ctrl+g and type \`m\` once, then re-run` };
+          `Type \`m\` in the chat input, THEN press ctrl+g, once; then re-run` };
   }
 
   if (!last.argv2 || !last.existed) {
@@ -134,9 +134,10 @@ export function checkFingerprint(current, pinned) {
     return { name: "cc-fingerprint", ok: false, verdict: "amber",
       evidence: `Claude Code moved from ${pinned.ccVersion} (${pinned.ccCommit}) to ` +
                 `${current.ccVersion} (${current.ccCommit}). Auto-update is enabled, so ` +
-                `the move is expected — the contract is not. Press ctrl+g, type \`m\`, ` +
-                `confirm the picker opens and the selection lands in the chat input, ` +
-                `then run \`uw doctor --accept-fingerprint\` to pin the new version` };
+                `the move is expected — the contract is not. Type \`m\` in the chat input, ` +
+                `THEN press ctrl+g; confirm the picker opens and the selection lands ` +
+                `in the chat input, then run \`uw doctor --accept-fingerprint\` to ` +
+                `pin the new version` };
   }
   return { name: "cc-fingerprint", ok: true, verdict: "green",
     evidence: `${current.ccVersion} (${current.ccCommit})` };
@@ -472,8 +473,8 @@ export async function main() {
                        acceptedBy: "uw doctor --accept-fingerprint" }, null, 2));
     console.log(`\npinned ${current.ccVersion} (${current.ccCommit ?? "no commit"}).`);
   } else if (r.checks.some((c) => c.name === "cc-fingerprint" && c.verdict === "amber")) {
-    console.log("\nrun `uw doctor --accept-fingerprint` once you have confirmed ctrl+g " +
-                "still reaches the picker.");
+    console.log("\nrun `uw doctor --accept-fingerprint` once you have confirmed that " +
+                "typing `m` and THEN pressing ctrl+g still reaches the picker.");
   }
   process.exit(r.verdict === "red" ? 1 : 0);
 }

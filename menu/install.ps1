@@ -186,7 +186,8 @@ if ($Hud) {
       # This is the CORRECT path whenever anyone else has touched settings.json
       # since the install, which for a file OMC and Claude Code both write is the
       # expected case rather than the exception.
-      & node $nodeEdit $settingsPath $prevHud.previousCommand
+      $env:UW_STATUSLINE_COMMAND = $prevHud.previousCommand
+      & node $nodeEdit $settingsPath
       if ($LASTEXITCODE -ne 0) { Write-Host "hud: restore FAILED; $bak still holds the original"; exit 1 }
       Write-Host "hud: restored the statusLine VALUE but not byte for byte -- other keys in"
       Write-Host "     settings.json have changed since the install, so the backup is not safe"
@@ -213,12 +214,23 @@ if ($Hud) {
   # this file without losing array-ness, and set-statusline.mjs writes it through
   # menu/atomic.mjs -- BOM-free and atomic (Q2.8, Q2.9), which Set-Content is
   # neither.
-  & node $nodeEdit $settingsPath $wrapped
+  #
+  # The command travels in an environment variable, NOT in argv. PowerShell 5.1
+  # strips embedded `"` from a string passed as an argument to a native command,
+  # so `& node $nodeEdit $settingsPath $wrapped` wrote an unquoted
+  #   node C:/.../hud-shim.mjs -- C:\nvm4w\nodejs\node.exe C:/.../omc-hud.mjs
+  # for the correctly quoted $wrapped echoed two lines above. Claude Code runs
+  # the statusline through a POSIX-ish shell, which ate the now-unguarded
+  # backslashes, and the footer was blank on every prompt. See set-statusline.mjs.
+  $env:UW_STATUSLINE_COMMAND = $wrapped
+  & node $nodeEdit $settingsPath
   if ($LASTEXITCODE -ne 0) { Write-Host "hud: FAILED to write settings.json; it is unchanged"; exit 1 }
   Write-Host "hud: installed. Previous command saved to $hudState"
 }
 
 Write-Host ""
 Write-Host "Done. Open a NEW terminal (User-scope variables do not reach running processes),"
-Write-Host "start Claude Code, press ctrl+g, type 'm', press enter."
+Write-Host "start Claude Code, type 'm' in the chat input, THEN press ctrl+g."
+Write-Host "(That order matters: uwpick.cmd dispatches on the buffer's first line, so"
+Write-Host " ctrl+g on an empty prompt correctly opens your real editor instead.)"
 exit 0
