@@ -1,187 +1,224 @@
 #!/usr/bin/env node
-// UW model picker — a terminal TUI that runs inside Claude Code's own external-editor
-// handoff (ctrl+g / chat:externalEditor).
+// UW model picker -- a terminal TUI that runs inside Claude Code's own
+// external-editor handoff (ctrl+g / chat:externalEditor).
 //
 // WHY THIS WORKS WHERE EVERYTHING ELSE FAILED:
-// CC's editor handoff calls enterAlternateScreen() — which PAUSES its renderer and
-// turns OFF raw mode — then spawnSync's the editor with stdio:"inherit" and BLOCKS.
-// So we get the real TTY, exclusively, with no repaint war and no keystroke war.
-// (A hook's child cannot do this: hooks are spawned stdio:["ignore","pipe","pipe"],
-// so they have no stdin at all, and CC keeps painting throughout.)
+// CC's editor handoff calls enterAlternateScreen() -- which PAUSES its renderer
+// and turns OFF raw mode -- then spawnSync's the editor with stdio:"inherit" and
+// BLOCKS. So we get the real TTY, exclusively, with no repaint war and no
+// keystroke war. (A hook's child cannot do this: hooks are spawned
+// stdio:["ignore","pipe","pipe"], so they have no stdin at all.)
 //
-// CONTRACT: argv[2] is a temp .md holding the current chat input. Whatever we leave
-// in that file becomes the new chat input. We write "/model <id>" and exit 0 —
-// a non-zero exit makes CC discard the content.
+// This file is three responsibilities and no more: read the console, sequence
+// frames, write the selection. Rows come from the snapshot, characters come from
+// style.mjs, decisions come from pick-state.mjs, and the two strings Claude Code
+// cares about come from cc-contract.mjs.
 
 import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
-import { build, routableSet } from "./catalog.mjs";
+import { openSync, readSync, closeSync } from "node:fs";
+import { loadSnapshot, SNAPSHOT_FILE } from "./snapshot.mjs";
+// NOTE: catalog.mjs is deliberately NOT imported here. It pulls in keysync and a
+// 19.7 MB catalogue parse, and the picker's whole input is the pre-built
+// snapshot (Q1.1). Routability arrives on the snapshot rows (Q1.3).
+import { initState, reduce, view, tokenize } from "./pick-state.mjs";
+import { handoffTarget, modelCommand, CONTRACT } from "./cc-contract.mjs";
+import { loadPickerState, recordRecent, toggleFavourite, recordHandoff,
+         recordStartup } from "./state.mjs";
+import { frame, confirmLine, detectCaps, glyphsFor, painter, motionEnabled,
+         slideFrames, revealFrames, flashFrames, sleepSync, FRAME_MS } from "./style.mjs";
 
-const FILE = process.argv[2];
-const STATE = path.join(os.homedir(), ".uw", "state");
-fs.mkdirSync(STATE, { recursive: true });
-const KEYLOG = path.join(STATE, "keys.log");
-const out = process.stdout;
-
-const { rows } = build();
-const routable = await routableSet();
-
-// ------------------------------------------------------------------ rendering
 const ESC = "\x1b";
-const hideCur = () => out.write(`${ESC}[?25l`);
-const showCur = () => out.write(`${ESC}[?25h`);
-const clear   = () => out.write(`${ESC}[2J${ESC}[H`);
-const dim = (s) => `${ESC}[2m${s}${ESC}[0m`;
-const inv = (s) => `${ESC}[7m${s}${ESC}[0m`;
-const grn = (s) => `${ESC}[32m${s}${ESC}[0m`;
-const red = (s) => `${ESC}[31m${s}${ESC}[0m`;
-const cya = (s) => `${ESC}[36m${s}${ESC}[0m`;
+const HOME = `${ESC}[H`;
+const EL = `${ESC}[K`;                 // erase to end of line
+const CLEAR = `${ESC}[2J${ESC}[H`;
+const HIDE = `${ESC}[?25l`, SHOW = `${ESC}[?25h`;
 
-const pad  = (s, n) => String(s ?? "").slice(0, n).padEnd(n);
-const rpad = (s, n) => String(s ?? "").slice(0, n).padStart(n);
-const ctxS = (c) => (c == null ? "" : c >= 1e6 ? `${c / 1e6}M` : `${Math.round(c / 1000)}k`);
-const money = (v) => (v == null ? "" : v === 0 ? "0" : v.toFixed(2));
+export function screen(v, meta, opts) { return frame(v, meta, opts).join("\n"); }
 
-// ---------------------------------------------------------------------- state
-let level = 0;            // 0 = providers, 1 = models
-let q = ["", ""];         // one filter per level, kept independently
-let cur = [0, 0];
-let top = [0, 0];
-let provider = null;
+// Q3.7: cursor-home plus per-line erase, never a full clear between frames. A
+// full clear is two writes the terminal renders separately, which is exactly what
+// flicker is; the screen is cleared once on entry and once on exit and never in
+// between.
+function paint(out, lines) {
+  out.write(HOME + lines.map((l) => l + EL).join("\n") + `${ESC}[J`);
+}
 
-// Level-1 match also searches MODEL names, so typing "opus" finds the provider that
-// serves it. Without this a two-level menu forces you to already know the answer.
-const provMatch = (r, s) =>
-  !s || r.keyId.toLowerCase().includes(s) || r.models.some((m) => m.id.toLowerCase().includes(s));
+export function firstFrame({ snap, recents, favourites, caps, termRows }) {
+  const rows = snap.rows;
+  const state = initState(rows, { recents, favourites, termRows });
+  const meta = {
+    providers: rows.length,
+    models: rows.reduce((n, r) => n + r.models.length, 0),
+    generatedAt: snap.generatedAt,
+    // Q1.3: carried straight through from the snapshot the refresher wrote. The
+    // picker asks nobody anything; it prints the stamp so the user can see how
+    // old the dim state is rather than assuming it is live.
+    routableAsOf: snap.routableAsOf ?? null,
+  };
+  return { state, meta, text: screen(view(state), meta, { caps }) };
+}
 
-const provRows  = () => rows.filter((r) => provMatch(r, q[0].toLowerCase()));
-const modelRows = () => {
-  if (!provider) return [];
-  const s = q[1].toLowerCase();
-  return provider.models.filter((m) => !s || m.id.toLowerCase().includes(s));
-};
-const list = () => (level === 0 ? provRows() : modelRows());
-const target = (m) => `${provider.provider}/${m.id}`;
+export function failMessage(res) {
+  const fix = "run: node C:/Users/osami/.uw/menu/snapshot.mjs --build";
+  if (res.reason === "missing") return `uwpick: no catalogue snapshot at ${res.detail} — ${fix}`;
+  if (res.reason === "schema") return `uwpick: snapshot is the wrong version (${res.detail}) — ${fix}`;
+  return `uwpick: snapshot unreadable (${res.detail}) — ${fix}`;
+}
 
-function draw() {
-  const rowsAvail = Math.max(5, (out.rows || 30) - 6);
-  const items = list();
-  if (cur[level] >= items.length) cur[level] = Math.max(0, items.length - 1);
-  if (cur[level] < top[level]) top[level] = cur[level];
-  if (cur[level] >= top[level] + rowsAvail) top[level] = cur[level] - rowsAvail + 1;
+export function framesFor(kind, lines, opts) {
+  if (!opts.motion) return [lines];
+  if (kind === "enter") return slideFrames(lines, 6, 3);
+  // `back` slides from the same side and then trims, so the step stays POSITIVE.
+  // Passing -6 here threw: slideFrames computes `" ".repeat(step * (f - 1))`, and
+  // String.repeat rejects a negative count with RangeError, so every `back`
+  // transition crashed the picker on the way out of a provider.
+  if (kind === "back") return slideFrames(lines, 6, 3).map((f) => f.map((l) => l.trimStart()));
+  if (kind === "open") return revealFrames(lines, 3);
+  return flashFrames(lines, opts.index ?? 0, opts.painter, 2);
+}
 
-  const L = [];
-  L.push(cya("  UW model picker") + dim(`   ${rows.length} providers · ${routable.size} routable`));
-  L.push("");
-  if (level === 0) {
-    L.push(`  ${cya("filter")} ${q[0]}${inv(" ")}`);
-    L.push(dim("  " + pad("key id", 30) + rpad("models", 7) + "  " + pad("free", 6) + "health"));
-  } else {
-    L.push(`  ${cya(provider.keyId)} ${dim("›")} ${q[1]}${inv(" ")}`);
-    L.push(dim("  " + pad("model", 34) + rpad("ctx", 6) + " " + rpad("$in", 7) + rpad("$out", 7)
-               + "  " + pad("badge", 6) + "caps"));
+// One place that decides what happens to the handoff buffer, so the two halves of
+// Q2.1 cannot drift apart. Both are needed: the exit code is what Claude Code
+// reads, and the truncation is what makes the outcome right even if some layer
+// swallows the code -- which is exactly what uwpick.cmd used to do.
+function abort(out, FILE, message) {
+  if (message) process.stderr.write(message + "\n");
+  if (FILE) { try { fs.writeFileSync(FILE, ""); } catch { /* nothing left to do */ } }
+  process.exit(CONTRACT.handoff.discardExit);
+}
+
+export function main() {
+  const t0 = process.hrtime.bigint();
+  const FILE = handoffTarget(process.argv);
+  const out = process.stdout;
+  const caps = detectCaps(process.env, out.columns ?? 80);
+  const g = glyphsFor(caps), p = painter(caps);
+  const motion = motionEnabled({ env: process.env, flags: process.argv.slice(2), caps });
+
+  const loaded = loadSnapshot();
+  if (!loaded.ok) {
+    // Q2.1. Truncate AND exit non-zero. The buffer at this moment still holds the
+    // `m` the user typed to get here, and exit 0 would submit it as a chat message.
+    abort(out, FILE, failMessage({ ...loaded, detail: loaded.detail ?? SNAPSHOT_FILE }));
   }
 
-  const slice = items.slice(top[level], top[level] + rowsAvail);
-  slice.forEach((it, i) => {
-    const idx = top[level] + i;
-    const sel = idx === cur[level];
-    let line;
-    if (level === 0) {
-      const free = it.free == null ? dim("—") : it.free ? grn(String(it.free)) : "0";
-      const h = it.health === "broken" ? red(it.health) : dim(it.health);
-      line = "  " + pad(it.keyId, 30) + rpad(it.models.length, 7) + "  "
-           + pad(it.free == null ? "—" : String(it.free), 6) + it.health;
-      line = sel ? inv(line) : "  " + pad(it.keyId, 30) + rpad(it.models.length, 7) + "  "
-                 + (it.free == null ? dim(pad("—", 6)) : pad(String(it.free), 6)) + h;
-    } else {
-      const ok = routable.has(target(it));
-      const badge = it.badge === "FREE?" ? grn(pad(it.badge, 6)) : dim(pad(it.badge, 6));
-      const caps = `${it.tools ? "T" : "-"}${it.vision ? "V" : "-"}${it.reason ? "R" : "-"}`;
-      const plain = (ok ? "  " : dim("· ")) + pad(it.id, 34) + rpad(ctxS(it.ctx), 6) + " "
-                  + rpad(money(it.pin), 7) + rpad(money(it.pout), 7) + "  ";
-      line = sel ? inv(plain.replace(/\x1b\[[0-9;]*m/g, "") + pad(it.badge, 6) + caps)
-                 : plain + badge + dim(caps);
-    }
-    L.push(line);
+  const { recents, favourites } = loadPickerState();
+  let { state, meta } = firstFrame({
+    snap: loaded.snap, recents, favourites, caps, termRows: out.rows || 30,
   });
 
-  const more = items.length - (top[level] + slice.length);
-  if (more > 0) L.push(dim(`  … ${more} more`));
-  L.push("");
-  L.push(true
-    ? dim(level === 0
-        ? "  type to filter · ↑↓ move · enter open · esc quit"
-        : "  type to filter · ↑↓ move · enter select · esc back · dim rows are not routable")
-    : dim("  LINE MODE (no raw tty): type a filter then Enter · a NUMBER then Enter to pick · "
-        + "'b' back · 'q' quit"));
-  clear();
-  out.write(L.join("\n"));
-}
-
-// ------------------------------------------------------------------- key loop
-function finish(text) {
-  showCur();
-  clear();
-  try { if (FILE && text != null) fs.writeFileSync(FILE, text); } catch {}
-  process.exit(0);                 // MUST be 0, or CC discards the content
-}
-
-// MEASURED, not assumed: under CC's ctrl+g handoff the child gets
-//   stdin.isTTY = undefined, setRawMode absent, 0 bytes ever delivered.
-// process.stdin is simply dead here. But the Windows console input device opens
-// fine as "//./CONIN$" (forward slashes — the backslash forms both ENOENT), and a
-// blocking readSync on it returns keystrokes. So read the console directly.
-//
-// Reads are blocking and synchronous, which is exactly right for a modal picker:
-// we own the terminal until we exit, and CC is blocked in spawnSync anyway.
-import { openSync, readSync, closeSync } from "node:fs";
-
-let CONIN = null;
-try { CONIN = openSync("//./CONIN$", "r"); } catch { CONIN = null; }
-
-if (CONIN === null) {
-  // No console: render once and leave the input untouched rather than hang.
-  draw();
-  out.write("\n\n  cannot open the console for input (//./CONIN$) — exiting.\n");
-  finish(null);
-}
-
-hideCur();
-draw();
-
-const buf = Buffer.alloc(64);
-for (;;) {
-  let n = 0;
-  try { n = readSync(CONIN, buf, 0, buf.length, null); }
-  catch { break; }
-  if (n <= 0) continue;
-  const key = buf.toString("utf8", 0, n);
-  // So a failed run still produces evidence instead of "nothing happened".
-  try { fs.appendFileSync(KEYLOG, JSON.stringify([...buf.slice(0, n)]) + "\n"); } catch {}
-  const c0 = key.charCodeAt(0);
-  const items = list();
-
-  if (c0 === 3) { closeSync(CONIN); finish(null); }              // ctrl+c
-  else if (key.length >= 3 && c0 === 27 && key[1] === "[") {      // arrows
-    const d = key[2];
-    if (d === "A") cur[level] = Math.max(0, cur[level] - 1);
-    if (d === "B") cur[level] = Math.min(items.length - 1, cur[level] + 1);
-    draw();
-  } else if (key.length === 1 && c0 === 27) {                     // esc
-    if (level === 1) { level = 0; draw(); } else { closeSync(CONIN); finish(null); }
-  } else if (c0 === 13 || c0 === 10) {                            // enter
-    const it = items[cur[level]];
-    if (it) {
-      if (level === 0) { provider = it; level = 1; q[1] = ""; cur[1] = 0; top[1] = 0; draw(); }
-      else { closeSync(CONIN); finish("/model " + target(it)); }
+  const lines = () => frame(view(state), meta, { caps });
+  const run = (kind, index) => {
+    for (const f of framesFor(kind, lines(), { motion, painter: p, caps, index })) {
+      paint(out, f);
+      if (motion) sleepSync(FRAME_MS);
     }
-  } else if (c0 === 127 || c0 === 8) {                            // backspace
-    q[level] = q[level].slice(0, -1); cur[level] = 0; top[level] = 0; draw();
-  } else if (key.length === 1 && c0 >= 32 && c0 <= 126) {         // live filter
-    q[level] += key; cur[level] = 0; top[level] = 0; draw();
+  };
+  const draw = () => {
+    state = reduce(state, { resize: out.rows || 30 }).state;
+    paint(out, lines());
+  };
+
+  out.write(HIDE + CLEAR);
+  run("open");                                     // startup reveal, inside the budget
+  recordStartup(Number(process.hrtime.bigint() - t0) / 1e6);
+
+  // NOTHING ASYNCHRONOUS HAPPENS BELOW THIS LINE, and nothing may be added.
+  // The loop is a blocking readSync with no yield in its body, so the JS stack
+  // never unwinds: the event loop is never re-entered, the microtask queue never
+  // drains, and `process.exit()` inside `finish()` is the only way out. A promise
+  // continuation or an `out.on("resize", ...)` here is unreachable code that a
+  // unit test -- which has an event loop -- will happily pass (Q1.3, Q7.2). The
+  // routability column is a field on the snapshot rows, put there by the
+  // refresher. A terminal resize is picked up on the next keystroke, because
+  // `draw()` reduces a `{resize}` event before painting; there is no way to
+  // observe one sooner without a worker thread, and Q7.2 forbids adding one.
+
+  let CONIN = null;
+  try { CONIN = openSync("//./CONIN$", "r"); } catch { CONIN = null; }
+
+  // Selection only. Every non-selection path goes through abort(), which
+  // truncates the buffer and exits non-zero (Q2.1, Q2.3a).
+  const finish = (target) => {
+    let wrote = false;
+    try {
+      fs.writeFileSync(FILE, modelCommand(...target.split(/\/(.*)/s)));
+      wrote = true;
+    } catch {
+      // The one string we exist to write did not get written. Exiting 0 here
+      // would leave the sentinel in the buffer and submit `m` as chat input, so
+      // this is an abort like any other -- and the user is told why.
+      out.write(CLEAR + SHOW);
+      abort(out, FILE, `uwpick: could not write the selection to ${FILE}`);
+    }
+    // Q3.3: the frame collapses to one line, which is what the user is left
+    // looking at for the instant before Claude Code repaints.
+    out.write(CLEAR + SHOW + confirmLine(target, g, p) + "\n");
+    recordHandoff({ argv2: FILE ?? null, existed: !!FILE && fs.existsSync(FILE), wrote });
+    process.exit(CONTRACT.handoff.acceptExit);      // 0: CC accepts the content
+  };
+
+  const quit = (why) => {
+    out.write(CLEAR + SHOW);
+    recordHandoff({ argv2: FILE ?? null, existed: !!FILE && fs.existsSync(FILE),
+                    wrote: false, why });
+    abort(out, FILE, null);
+  };
+
+  // The one escape hatch, and its only caller is test/bench-startup.mjs's
+  // wrapper-inclusive measurement (Q1.5), which needs the whole ctrl+g chain to
+  // run to completion without a console and without a human. It quits through the
+  // ordinary abort path, so it measures the real exit sequence rather than a
+  // shortcut past it.
+  if (process.env.UW_PICKER_QUIT_IMMEDIATELY === "1") quit("bench");
+
+  if (CONIN === null) {
+    // Q2.6. The console is unusable, so there is nothing to pick; leaving `m` in
+    // the buffer would turn an environment problem into a chat message.
+    out.write(`\n\n  uwpick: cannot open CONIN$ — the console is not available.\n`);
+    quit("no-conin");
   }
+
+  const buf = Buffer.alloc(1024);
+  for (;;) {
+    let n = 0;
+    try { n = readSync(CONIN, buf, 0, buf.length, null); }
+    catch { break; }
+    if (n <= 0) continue;
+
+    // Q3.8: readSync hands back the whole console buffer, so a held arrow arrives
+    // as several sequences in one chunk. Reduce each key in order, then draw once.
+    const before = state.level;
+    let exited = null, refav = null;
+    for (const key of tokenize(buf.toString("utf8", 0, n))) {
+      const r = reduce(state, key);
+      state = r.state;
+      if (r.favourite) refav = r.favourite;
+      if (r.exit) { exited = r.exit; break; }
+    }
+    if (refav) {
+      const next = toggleFavourite(refav);
+      state = initState(loaded.snap.rows, { ...next, termRows: out.rows || 30 });
+    }
+    if (exited) {
+      closeSync(CONIN);
+      if (exited.target) {
+        recordRecent(exited.target);
+        run("select", view(state).cursor - view(state).top + 4);
+        finish(exited.target);
+      }
+      quit("esc-or-ctrl-c");
+    }
+    if (state.level > before) run("enter");
+    else if (state.level < before) run("back");
+    else draw();
+  }
+  closeSync(CONIN);
+  quit("read-error");
 }
-closeSync(CONIN);
-finish(null);
+
+// Only run the loop when invoked as a program, never on import -- otherwise the
+// test that imports `screen` would block on a console read.
+if (process.argv[1] && process.argv[1].replace(/\\/g, "/").endsWith("/menu/uwpick.mjs")) {
+  main();
+}

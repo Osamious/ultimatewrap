@@ -9,14 +9,16 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { writeAtomic } from "./atomic.mjs";
+import { writeAtomic, readJsonOr } from "./atomic.mjs";
 
 const STATE_DIR = path.join(os.homedir(), ".uw", "state");
 export const PICKER_STATE = path.join(STATE_DIR, "picker.json");
 export const HANDOFF_LOG = path.join(STATE_DIR, "handoff.json");
+export const STARTUP_FILE = path.join(STATE_DIR, "startup.json");
 
 const MAX_RECENTS = 10;   // Q3.4
 const MAX_FAVOURITES = 20;
+const MAX_SAMPLES = 20;
 
 const strings = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
 
@@ -54,6 +56,21 @@ export function toggleFavourite(target, file = PICKER_STATE) {
     ? s.favourites.filter((t) => t !== target)
     : [target, ...s.favourites].slice(0, MAX_FAVOURITES);
   return save(file, { recents: s.recents, favourites });
+}
+
+// Q1.2's number, recorded on every real run rather than only under benchmark, so
+// a regression shows up in ordinary use instead of waiting for someone to measure.
+export function recordStartup(ms, file = STARTUP_FILE) {
+  const prev = readJsonOr(file, { samples: [] });
+  const samples = [...(prev.samples ?? []), { at: new Date().toISOString(), ms }].slice(-MAX_SAMPLES);
+  const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
+  const median = sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : null;
+  const next = { samples, median };
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeAtomic(file, JSON.stringify(next, null, 2));
+  } catch { /* a lost sample is not worth failing a launch over */ }
+  return next;
 }
 
 // One JSON line per picker invocation. This is the only evidence `uw doctor` has
