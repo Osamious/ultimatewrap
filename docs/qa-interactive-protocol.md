@@ -253,7 +253,17 @@ characters at the shell prompt.
 drawing itself top-down on open, the model list arriving from the right on enter,
 the same in reverse on esc, and the chosen row flashing twice before the frame
 collapses to `switched -> provider/model`. Then hold the down arrow for two
-seconds. Then close, run `set UW_PICKER_MOTION=0`, and reopen.
+seconds. Then close, set the kill switch, and reopen.
+
+The kill switch is an environment variable, and the syntax differs by shell.
+`set UW_PICKER_MOTION=0` is cmd.exe; in PowerShell `set` is an alias for
+`Set-Variable`, so that line sets a PowerShell variable the picker never reads
+and the step silently passes for the wrong reason. Use:
+
+```powershell
+$env:UW_PICKER_MOTION = "0"     # PowerShell
+set UW_PICKER_MOTION=0          # cmd.exe only
+```
 
 **Expected:** each transition completes in well under a fifth of a second, and the
 held arrow moves the cursor at full speed with no lag, because motion never delays
