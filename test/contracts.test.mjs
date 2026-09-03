@@ -174,6 +174,13 @@ const BOUNDARY_ALLOW = new Map([
   // uwpick.cmd names uwpick-run.ps1 relative to %~dp0 and nothing else; this
   // entry exists so a future absolute path is the thing that fails.
   ["uwpick.cmd", /(?!)/],            // matches nothing: no needle is allowed here
+  // doctor.mjs quotes CCR's npm package name in the one actionable remedy it
+  // prints -- "an `npm i -g @musistudio/claude-code-router` reverted the gateway
+  // patch" -- and names node_modules in the comment explaining where the install
+  // resolves. Neither is a path this file depends on; both are text a human
+  // reads. Keyed to those two needles only, so a NEW settings path, APPDATA
+  // reference or hard-coded loopback address in the doctor still trips the guard.
+  ["doctor.mjs", /claude-code-router|node_modules/],
 ]);
 
 test("no file outside the two contract modules names Claude Code or CCR", () => {
