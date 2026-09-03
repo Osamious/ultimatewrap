@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { checkEnv, checkHandoff, checkFingerprint, checkContracts, checkHud,
          checkBundled, checkCcrPatch, checkRpcSurface, diagnose,
          MAX_HANDOFF_AGE_MS } from "../menu/doctor.mjs";
@@ -294,4 +295,29 @@ test("checkHud is red when the command it wraps has gone, and names the undo", (
                            roundTrip: { ok: false, why: "context size not applied" } });
   assert.equal(stale.verdict, "amber");
   assert.match(stale.evidence, /footer still works/);
+});
+
+// --- the exit contract -------------------------------------------------------
+test("main() sets process.exitCode and never calls process.exit", () => {
+  // A source assertion, and deliberately so. The real guard would spawn
+  // doctor.mjs and assert its status, but that run takes ~9s, shells out to the
+  // `claude` binary and needs a live CCR gateway -- environment-dependent and
+  // slow enough to dominate the suite. This catches the thing that actually
+  // regresses: someone reaching for process.exit() again.
+  //
+  // What it is guarding, measured on Node v25.0.0/win32: process.exit() at the
+  // end of main() aborted with
+  //   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c:76
+  // and status 127 on EVERY run, amber and red alike, because
+  // probeRpcSurface()'s pending handles were still closing. The report printed
+  // correctly; only the status was wrong, and 127 is the shell's "command not
+  // found", so a CI gate could not tell a broken machine from a doctor that
+  // never ran.
+  const src = fs.readFileSync(new URL("../menu/doctor.mjs", import.meta.url), "utf8");
+  // Comments stripped first, or this fails on the block comment that explains
+  // why process.exit() is banned -- which is exactly what it did when written.
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const calls = code.match(/process\.exit\s*\(/g) ?? [];
+  assert.deepEqual(calls, [], "process.exit() discards pending work; assign process.exitCode instead");
+  assert.match(src, /process\.exitCode\s*=\s*r\.verdict === "red" \? 1 : 0/);
 });

@@ -142,10 +142,10 @@ twice, and a hand-maintained second copy would go stale the same way `testModel`
 
 ## 3. `uw doctor` exits 127 on every run, so no script can read its verdict
 
-**Status:** parked 2026-09-03, raised during the HUD statusline work.
-**Blocked on:** nothing technical. A one-line change with a proven fix; parked only
-because the HUD defect took priority.
-**Touches:** `menu/doctor.mjs:479`.
+**Status:** FIXED 2026-09-03, same day it was parked. Kept here as the record of the
+investigation. `main()` now assigns `process.exitCode` and returns; a source-level guard
+in `test/doctor.test.mjs` fails if anyone reaches for `process.exit()` again.
+**Touches:** `menu/doctor.mjs` (was `:479`).
 
 ### The symptom, measured rather than remembered
 
@@ -206,12 +206,26 @@ before assuming the underlying libuv behaviour is permanent — but the fix is c
 regardless, because `process.exit()` discarding pending work is a hazard independent of
 this particular assertion.
 
-### What a test for it looks like
+### The test that shipped, and the one that did not
 
-The suite cannot currently catch this: nothing runs `doctor.mjs` as a subprocess and
-asserts on its status. A test would spawn it and assert the code is 0 or 1 and never 127.
-That test needs a scratch environment rather than the live one, since the verdict depends
-on the real `EDITOR` and the real CCR gateway.
+`test/doctor.test.mjs` asserts on the SOURCE: `main()` must contain no `process.exit(`
+call and must assign `process.exitCode`. Comments are stripped before the scan, or it
+fails on the block comment explaining the ban -- which it did on first run.
+
+That is a proxy, not the real guard. The real guard spawns `doctor.mjs` and asserts the
+status is 0 or 1 and never 127. It was not written because that run takes ~9 s, shells out
+to the `claude` binary and needs a live CCR gateway, so it is slow enough to dominate the
+suite and environment-dependent enough to be flaky. The source assertion catches the thing
+that actually regresses -- someone reaching for `process.exit()` again -- and is verified
+to bite by mutation. Still worth building the subprocess test behind a gateway-reachable
+guard if the suite ever grows an integration tier.
+
+### Noticed while fixing, not pursued
+
+`probeRpcSurface()` takes **7.7 s**, which is nearly all of the doctor's ~9 s runtime. The
+drain after it is 0 ms, so `process.exit()` was not masking a slow teardown and this fix
+costs no wall clock -- but the probe itself is slower than three 400 ms-timeout RPCs
+should be. Not investigated.
 
 ---
 

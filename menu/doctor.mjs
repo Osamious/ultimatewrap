@@ -465,7 +465,9 @@ export async function main() {
   if (process.argv.includes("--accept-fingerprint")) {
     if (!current.ccVersion) {
       console.log("\nnothing to pin: the version could not be read.");
-      process.exit(1);
+      // `return`, not a bare exitCode assignment: the write below must not run.
+      process.exitCode = 1;
+      return;
     }
     fs.mkdirSync(path.dirname(CAPABILITIES), { recursive: true });
     writeAtomic(CAPABILITIES,
@@ -476,7 +478,21 @@ export async function main() {
     console.log("\nrun `uw doctor --accept-fingerprint` once you have confirmed that " +
                 "typing `m` and THEN pressing ctrl+g still reaches the picker.");
   }
-  process.exit(r.verdict === "red" ? 1 : 0);
+  // `process.exitCode`, never `process.exit()`. MEASURED on Node v25.0.0/win32:
+  // calling process.exit() here aborted the process with
+  //   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+  // and a status of 127 on EVERY run -- amber and red alike -- because
+  // probeRpcSurface()'s AbortSignal.timeout handles and undici's sockets are
+  // still closing when exit() forces libuv to tear them down. The report printed
+  // correctly throughout; only the status was wrong, which is the half a script
+  // reads, and 127 is the shell's "command not found" -- indistinguishable from
+  // this file being absent. Bisected: execFileSync alone, one rpc() alone, both
+  // in either order, and fetch-then-exit are all clean.
+  //
+  // Assigning the code and letting the loop drain is the idiomatic form and fixes
+  // it. It is also correct independently of that assertion, since process.exit()
+  // discarding pending work is a hazard on any platform.
+  process.exitCode = r.verdict === "red" ? 1 : 0;
 }
 
 if (process.argv[1] && process.argv[1].replace(/\\/g, "/").endsWith("/menu/doctor.mjs")) main();
