@@ -66,6 +66,58 @@ Five BLOCKERs that must be fixed before implementation:
 
 Synthesis: push all liveness (health, routability) into `refresh/cli.mjs`, fold the three `key-health*.mjs` scripts into tiers 2/3 as the health producer, add `testModelVerifiedAt`, and make the picker a pure synchronous renderer over one pre-computed snapshot.
 
+## Execution status (2026-09-03, later session)
+
+The plan was approved and execution began. Plan is now `6407899b99451da8456e3d9f2dd7bc8a645b8b06e45eceebab2c03df91352ed4`, 11,082 lines, 29 tasks — it grew because three user rules landed mid-execution (below).
+
+Committed, all green, suite at 74/74:
+
+| Task | Commit |
+|---|---|
+| A1 git init + .gitignore | `437f3e6` |
+| A2 spike into `menu/` | `c5d33ec` |
+| A3 `sanitize.mjs` | `23c8fc5` |
+| hygiene (untrack supervisor state) | `bf542ea` |
+| A4 contract modules | `ee10abc` |
+| A5 catalogue builder | `70ef3ef` |
+| A3 follow-up: `@`-scoped ids | `f172820` |
+
+**Task A5.1 is in progress and its four files are uncommitted.** A5.2 (relay bare-alias mapping) is written into the plan but **awaits the user's separate approval**, because it modifies `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs`, outside the repo, which keeps Claude reachable.
+
+### Three standing user rules that changed the design mid-flight
+
+1. **Never drop a provider** for CCR gaps, missing catalogue entries, or a stale `testModel`.
+2. **Resellers are first-class.** No provider is blocked for reselling another vendor's models. The defence moved from refusing a name to preventing silent misrouting.
+3. **Discovery must cover every provider call shape**, so no provider silently yields zero models.
+
+Rule 2 invalidated A5.1 as originally built. See `phase6-discovery-design.md` (558 lines) for the full architecture, and the `never-drop-a-provider-for-ccr-gaps` memory.
+
+### What triggered them
+
+`tabiai` and `gorouter` were being dropped by the reserved-name denylist. A keyed probe on 2026-09-03 showed **both are alive**: each serves `claude-opus-5` and `claude-opus-5-thinking`, and `claude-opus-5` answers 200. Their earlier 503s were stale `testModel` metadata naming `claude-opus-4-8`, which neither host carries. They are Claude resellers, so every model they sell is Claude-named.
+
+Cost note: their vault entries warn that completions are billed — tabiai injects a hidden system prompt that made a trivial test cost 6,554 prompt tokens. The team lead's probe ran a chat call against both before reading those notes. Discovery listings are free and always run; **chat verification stays gated behind tier 3's `--i-know-this-bills`** via `SKIP_CHAT_PROBE`.
+
+### CCR mechanisms verified directly in `dist/main/cli.js` (not from the research reports)
+
+- `providerModelMatches` (~offset 998924) iterates **raw** `Providers[].models[]` ids with only a provider-level enabled gate. `resolve()` binds on exactly one match and returns undefined on more than one. There is **no per-model bare-match opt-out**.
+- `Sd()` (~875300) is a flat map over the same array emitting namespaced `provider/model` ids — the availability enumerator, not the bare-match surface.
+- `exactAliases` are force-prefixed: `` `Fusion/${i}` `` unless already `fusion/`. `gatewayModels` is keyed from `Sd()`'s output and stage 3 looks up there, so an alias declared `uw/fast` routes **only** as `Fusion/uw/fast`. `UW_ALIAS`'s `/^uw\//i` therefore guards a namespace nothing currently routes on. Recorded, deliberately not resolved.
+- `anthropic-oauth-relay.mjs` performs **no model mapping**: `:246` forwards `GET /v1/models`, `:155` forwards the body unmodified. This is why A5.2 must land before or with the S2 alias append, enforced at runtime by `aliasesOk`.
+
+### Live-impact defects caught during execution
+
+- The plan's A5.1 step 3b would have replaced `ANTHROPIC_RELAY` — a complete CCR provider object — with a three-field summary, leaving `api_base_url` undefined so the relay never loads. It also silently changed the relay's advertised ids, dropping `claude-fable-5-1` (the model this session pins) and the dated `claude-haiku-4-5-20251001`. **Ruling: the relay keeps its exact current shape and ids**; changing what it advertises needs its own live verification.
+- `keysync/run.mjs` has no `main()`; 470 lines run at top level with `process.exit(0)` at `:192`, so importing it under `node --test` kills the runner. **Ruling: minimal-diff** — hoist `checkBareCollisions`, wrap the pipeline in an entry-point guard.
+- The vacuous accessor `p.models.map((m) => m.id)` over a `string[]` was corrected once and **reintroduced in three places** by a later revision, because the broken snippet lives in the plan's prose. Fix it at the source in the plan, not only at call sites.
+
+### Standing execution rules
+
+- Never author file content through a shell heredoc, `printf` or `echo` — and the editing tools are not fully safe either: they alter Unicode normalization and convert `\uXXXX` to literal characters. Generate byte-sensitive files from explicit code points and verify with `od -c` and `node --check`.
+- The test command is `node --test "C:/Users/osami/.uw/test/*.test.mjs"`. A directory argument fails with MODULE_NOT_FOUND on Node 25.
+- Three gates run from `plans/` before every commit: `check-blocks.mjs`, `check-control-chars.mjs`, `check-interfaces.mjs`.
+- Never leave a write-capable agent live beside an artifact under review. An idle *notification* means a turn ended, not that the agent stopped — check `ListAgents`, stop with `TaskStop`.
+
 ## Where to resume
 
 1. Follow the OPTIMAL PIPELINE memory and the ralplan consensus rule.

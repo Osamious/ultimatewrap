@@ -22,8 +22,8 @@
 8. Two-level menu with a live filter at both levels. The level-1 filter matches member model ids as well as the key id.
 9. Recents and favourites are pinned at level 1 as **visible duplicates**; they are never removed from their provider's level-2 list (opencode#6169).
 10. Tab toggles a flat `provider/model` search scope; Esc walks back down the ladder before it quits.
-11. The reserved-name denylist (**Task A5.1**, moved forward from its original slot as B1) lands **before** the `inferTier` fix (Task B2). Fixing tier inference without the denylist arms the routing hijack described in report 08 F1. The denylist must be wired into **`keysync.mjs:buildProviders`**, the function that writes CCR's `Providers[].models`, not only into `menu/catalog.mjs`, which feeds the display and routes nothing. A denylist on the display path satisfies the ordering in letter and leaves the hijack open in substance. The gate on this constraint is a behavioural test that calls `buildProviders` with a hostile entry and asserts it is absent from the output; a test that greps the git log proves only that a commit subject exists.
-12. Reserved names: `/^(claude|opus|sonnet|haiku|fable|anthropic)([-._\d/]|$)/i` and `/^uw\//i`, admitted only from the trusted relay provider (`anthropic`).
+11. The **bare-name collision guard** (**Task A5.1**, moved forward from its original slot as B1) lands **before** the `inferTier` fix (Task B2). Fixing tier inference without the guard arms the routing hijack described in report 08 F1. **Revised 2026-09-03 under Rule 2 (Constraint 29): the control is not name refusal.** A reseller serving `claude-opus-5` is a supported, first-class provider, and dropping its models would be a rule-1 violation. The hijack is not "a third party publishes a Claude name" — it is "CCR's `resolve()` binds a *bare* Claude-shaped id to a single non-relay owner", which is a property of the **owner set**, not of the name. So the guard sits in `keysync/run.mjs`, after `validate()` and before any write, computes bare-id ownership across the whole built config, and **exits non-zero** when a bare Claude-shaped id has exactly one owner and that owner is not the relay. `menu/catalog.mjs` still routes nothing and is display-only. The gate on this constraint is a behavioural test that calls `buildProviders` with a hostile entry and asserts **two** things: the id *survives* on its namespaced `provider/model` row (rule 2), and the collision guard fires on the bare-id case (rule 2's actual defence). A test that greps the git log proves only that a commit subject exists; a test that asserts the *name is absent* now asserts a rule-2 violation and must not exist.
+12. Reserved names: `/^(claude|opus|sonnet|haiku|fable|anthropic)([-._\d/]|$)/i` and `/^uw\//i`. **These two are no longer the same kind of rule.** `RESERVED` is the single definition of "Claude-shaped", consumed by the collision guard and by the relay's alias resolver — it is a *shape predicate*, not an admission filter, and it never rejects a model from any provider. `UW_ALIAS` remains a true admission filter on every non-relay provider: `uw/` is our own namespace, not a vendor's, so a provider claiming `uw/fast` is rejected outright. **Note, verified 2026-09-03:** CCR force-prefixes `exactAliases` with `Fusion/` and keys its stage-3 registry from that, so `uw/fast` is reachable only as `Fusion/uw/fast` — meaning this guard currently protects a namespace nothing routes on. It stays as defence-in-depth; Task A5.1 records the two ways to resolve the mismatch and forbids guessing between them.
 13. Every provider-controlled string rendered by the TUI passes through `sanitizeDisplay()`: ESC/CSI/OSC sequences removed, C0 and C1 control characters removed, **bidirectional overrides and zero-width characters removed** (`U+200B`–`U+200F`, `U+2028`, `U+2029`, `U+202A`–`U+202E`, `U+2066`–`U+2069`, `U+FEFF`), NFC-normalised, and the length cap applied **by code point** rather than by UTF-16 code unit so an astral character at the boundary is never cut into a lone surrogate. Full display-width awareness (East Asian wide and ambiguous glyphs occupying two columns while counting as one unit) is explicitly deferred; see the Deferred section for the consequence.
 14. Model ids must match `/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/` and must not contain `..`. A violation is a rejection, not a truncation.
 15. Tests never touch live state: no test reads or writes `~/.claude/settings.json`, `%APPDATA%/claude-code-router`, ports 3456/3457/3458, or `~/.llmkeys` key values. Scratch state goes under `~/.uw/harness/scratch/` or a `fs.mkdtempSync` directory. Every path this plan's code uses to reach the catalogue directory or the catalogue lock is a **parameter with a default**, never a module constant a test cannot displace, so a test can point the whole store at a temp root.
@@ -34,16 +34,30 @@
 15a. `# fail 0` must be true after every task. No test in the `node --test` sweep may be documented as expected-to-fail, and no test may read a live artifact that a later task creates: a known-failing test makes a real regression indistinguishable from the expected one and makes every published pass count wrong until the later task lands. A test that must observe live state is either a standalone script under `test/` run by an explicit command (the convention `bench-startup.mjs` already sets), or is read-only and gated on `fs.existsSync` so it skips cleanly when the artifact is absent.
 16. CCR auth-transport behaviour is never tested with the real `~/.claude/.credentials.json` present.
 17. The catalogue is copied out of `node_modules` into `~/.uw/catalog/`. CCR's bundled `dist/models.json` is never written.
-18. Three refresh tiers: tier 1 free metadata (models.dev `api.json`, conditional GET on ETag, no keys); tier 2 keyed `GET {baseUrl}/models` listings only, never completions; tier 3 paid verification, gated behind `--tier 3` plus `--i-know-this-bills` plus an interactive confirmation.
+18. Three refresh tiers: tier 1 free metadata (models.dev `api.json`, conditional GET on ETag, no keys); **tier 2 profile-driven keyed listings via `refresh/discover.mjs`** — listing calls only, never completions, reading the optional `listing` block so every provider call shape is covered (Constraint 30); tier 3 paid verification, gated behind `--tier 3` plus `--i-know-this-bills` plus an interactive confirmation. **Tier 2 holds key values.** It previously went through CCR's `probeProvider` RPC so that no tier held a credential, but that RPC cannot express three of the six provider clusters and therefore cannot satisfy Constraint 30. The property is now "only manually-run or consented tiers hold keys", the vault read is batched into one call, and tier 1 remains entirely keyless. Task B6 carries the full rationale.
 19. Merge policy: snapshot directory plus `catalogue.lock`; a provider whose refresh failed keeps its previous rows and gains `stale: true` with `staleSince`.
-20. `EXPECTED_PROVIDERS` becomes a floor (`>=`), not an equality check.
+20. `EXPECTED_PROVIDERS` becomes a floor (`>=`), not an equality check. **Discovery coverage is a second, independent gate** with two conditions: a ratio floor over the 44 eligible providers, waivable with `--accept-coverage-delta`, and a hard **`unsupported-shape === 0`** that is not waivable at all. The asymmetry is deliberate — a provider being down is a fact about the world, an unparseable shape is a defect in our own code, and only the first may be acknowledged (Task B8).
 21. The model sort gains a total tiebreak `|| a.m.model.localeCompare(b.m.model)`, applied in one deliberate run because it reselects rows and restarts the gateway exactly once.
 22. Coupling to Claude Code is limited to the `$EDITOR` handoff contract and `/model` syntax. `uw doctor` fails loudly and names the failing check when the fingerprint moves.
 23. Windows: Node cannot call `SetConsoleMode`; `uwpick-run.ps1` does. The console device is `//./CONIN$` with forward slashes. The access mask is decimal `3221225472`, because `0xC0000000` overflows Int32 in PowerShell 5.1. The saved mode is restored in `finally`.
 24. `~/.uw` becomes a git repository in Task A1. `.gitignore` excludes logs, `*.bak*`, `keys.log`, tool outputs and spike scratch. Nothing from `~/.llmkeys` is ever committed.
-25. Spike files are moved and hardened, not rewritten. Report 09's `~550 lines` budget was written for the picker's own new modules and this plan exceeds it several times over once tests, the refresh pipeline, the installer and the doctor are counted: roughly 4,800 lines of fenced code across 27 tasks, of which a little over half is test code. That is stated here as a measured fact rather than left as a constraint the plan silently breaks. The budget that remains binding is narrower and checkable: **the picker's runtime path** — every module `uwpick.mjs` imports transitively, which is `pick-state.mjs`, `style.mjs`, `snapshot.mjs`, `sanitize.mjs`, `denylist.mjs`, `atomic.mjs`, `cc-contract.mjs` and `state.mjs` — stays under 900 lines of non-test code, because that is the code whose size the 300 ms startup budget is sensitive to. The list is the import graph rather than a hand-picked set: the first version of this constraint omitted `cc-contract.mjs` and `state.mjs`, both of which `uwpick.mjs` imports directly, so the budget under-counted its own scope. **It is enforced by an assertion in Task A11**, not left as a number nobody checks — a budget made true by redefining what it counts is the same move this constraint was written to stop. Everything outside that path is bounded by review, and that is said plainly rather than given a number.
+25. Spike files are moved and hardened, not rewritten. Report 09's `~550 lines` budget was written for the picker's own new modules and this plan exceeds it several times over once tests, the refresh pipeline, the installer and the doctor are counted: roughly 5,100 lines of fenced code across 29 tasks — 27 plus the two the 2026-09-03 revision added, A5.2 and B6.1, of which a little over half is test code. That is stated here as a measured fact rather than left as a constraint the plan silently breaks. The budget that remains binding is narrower and checkable: **the picker's runtime path** — every module `uwpick.mjs` imports transitively, which is `pick-state.mjs`, `style.mjs`, `snapshot.mjs`, `sanitize.mjs`, `denylist.mjs`, `atomic.mjs`, `cc-contract.mjs` and `state.mjs` — stays under 900 lines of non-test code, because that is the code whose size the 300 ms startup budget is sensitive to. The list is the import graph rather than a hand-picked set: the first version of this constraint omitted `cc-contract.mjs` and `state.mjs`, both of which `uwpick.mjs` imports directly, so the budget under-counted its own scope. **It is enforced by an assertion in Task A11**, not left as a number nobody checks — a budget made true by redefining what it counts is the same move this constraint was written to stop. Everything outside that path is bounded by review, and that is said plainly rather than given a number.
 26. `autoFetchModels` stays `false` on every provider, enforced as a hard `validate()` invariant, not a convention.
 27. `MAX_MODELS_PER_PROVIDER = 3` is not lifted when any list becomes remote.
+
+### The three standing rules — added 2026-09-03, governing
+
+These were set by the user after the reseller investigation and they **override** any earlier statement in this plan that contradicts them. Where a task, a test, a pre-mortem scenario or a risk row disagreed, the task was corrected rather than the rule softened; Constraints 11 and 12, pre-mortem Scenario 3, Task A5.1 and Task B2's prerequisite gate are the four places that changed.
+
+28. **Rule 1 — never drop a provider.** No provider is excluded because CCR lacks it, because the bundled catalogue lacks it, or because the vault's `testModel` is stale or was rejected upstream. A discovery failure of any kind — `auth`, `error`, `empty`, `unsupported-shape` — falls through to the catalogue, then to `testModel`, and the outcome is *recorded and displayed*; it never prunes. Stale-but-present always beats absent. The two 503s that started this thread (tabiai, gorouter) were stale `testModel` metadata naming a retired `claude-opus-4-8`, not dead providers.
+29. **Rule 2 — resellers are first-class.** No provider is blocked for reselling another vendor's models, Claude resellers included. tabiai and gorouter are live Claude resellers serving `claude-opus-5` and `claude-opus-5-thinking`, verified by keyed probe. The defence therefore moves from **refusing a name** to **preventing silent misrouting**: a namespaced `provider/model` row is always admitted, and the controls are (a) the bare-id collision guard (Constraint 11), (b) relay ownership of the four bare aliases, and (c) a hostname in every row's `description` so the user can see *which host* answers. An error that tells an operator to remove a provider's model is an error that teaches a rule-2 violation, and the remedy wording in Task A5.1 is load-bearing for exactly that reason.
+30. **Rule 3 — discovery is exhaustive across every provider call shape**, so that no provider silently yields zero models. Discovery is profile-driven, not endpoint-assumed: `listing.{url, envelope, idField, method}` in `providers.json`, with cluster-A defaults so most entries need no edit. Transport failure and an empty list are **never** the same outcome, and a shape we cannot parse (`unsupported-shape`) is our defect, gated at zero, never absorbed into the coverage denominator as though it were the provider's limitation.
+
+**Where Rule 3 cannot be fully met, stated rather than papered over.** Three limits are real and are reported as such:
+
+- **Two providers have no listing endpoint that exists.** `githubcopilot` (empty `baseUrl`, protocol `generic`) and `youcom` (protocol `generic`) are recorded as `listing: null` — a positive assertion that no endpoint exists, which is deliberately *not* the same as a missing key. `filterRegistry` (`keysync.mjs:30-36`) already drops both before discovery runs; recording `listing: null` anyway makes their exclusion auditable rather than incidental.
+- **Coverage is a fraction of 44 eligible providers, not 47.** `covered = |{ok}| / |eligible|`, where `eligible` excludes every `no-endpoint`. Quoting a denominator of 47 would silently credit the run for three providers it never attempted. The per-outcome breakdown is always reported alongside the ratio, never the ratio alone.
+- **Providers standing only on `testModel` or catalogue data are counted and displayed separately from live-`ok` ones.** A listing is an *entitlement-blind manifest* — bai lists 42 models and answers 7; commandcode lists 62 and 400s on all of them — so `listing-verified` is not `call-verified`, and a provider that never produced a live listing at all is not silently folded in with those that did. Provenance is persisted in the snapshot (Task B5) and badged in the picker.
 
 ### Quality criteria
 
@@ -125,7 +139,7 @@ These seven criteria are requirements, not aspirations. Each one names the task 
 
 1. **Blank beats a guess.** Every column has a defined blank rendering. `—` and `0` are different claims, and collapsing them is the single most likely way this design starts lying.
 2. **Move the working code; do not rewrite it.** The spike was verified under the real ctrl+g handoff with real keystrokes. Its value is the measured knowledge encoded in it, and a rewrite discards that for nothing.
-3. **Security ordering is part of correctness, and so is placement.** The denylist lands before the tier fix, because the tier fix is what arms the hijack. A correct change applied in the wrong order is a regression — and a correct change applied to the wrong module is not a change at all. The two questions to ask of any mitigation in this plan are *when does it land* and *is it on the path that can actually do harm*. The first version of this plan answered the first question and got the second one wrong: it put the denylist on the module that draws rows rather than the one that writes CCR's routing table.
+3. **Security ordering is part of correctness, and so is placement — and so is the rule itself.** The anti-hijack control lands before the tier fix, because the tier fix is what arms the hijack. A correct change applied in the wrong order is a regression; a correct change applied to the wrong module is not a change at all; and a control that enforces the wrong rule is worse than either, because it looks like protection while costing something real. **Three** questions to ask of any mitigation in this plan: *when does it land*, *is it on the path that can actually do harm*, and *is it the condition the harm actually requires*. This plan got each one wrong in turn and fixed them in that order. v1 answered the first and missed the second — the guard sat on the module that draws rows rather than the one that writes CCR's routing table. v2 fixed placement and still failed the third: it refused Claude-shaped names, when the harm requires *sole ownership of a bare id*, so it blocked two live resellers and stopped nothing they could have done. v3 guards ownership, in `run.mjs`, fatally. The pattern worth remembering is that a mitigation which is never observed to fire tells you nothing about which of the three it got wrong.
 4. **The picker reads; it never routes.** Selection is a text write into a temp file. No gateway config, no `settings.json` write, no restart, no consent gate to erode.
 5. **Re-derive third-party facts, do not mirror them.** Every constant copied out of Claude Code or CCR becomes a probe with a cached result and an invalidation key, because a mirror has no mechanism to notice when it stops being true.
 6. **One module per foreign contract.** Everything Claude Code or CCR could change lives behind exactly two modules with a version fingerprint, so an upgrade breaks one named check instead of scattering failures through the renderer, the catalogue and the installer.
@@ -165,7 +179,18 @@ Cons: one-shot text with no keystroke loop, so it cannot narrow a list as the us
 
 **Scenario 2 — the console is left in raw mode.** The picker crashes, or the user hits ctrl+c at the wrong moment, and the wrapper's restore never runs. Symptom: the parent shell stops echoing typed characters and swallows Enter, which reads as a broken terminal rather than a broken picker. Mitigation: the restore lives in a PowerShell `finally` block, and Task A12 tests it by running the wrapper against a child that exits 1 and asserting the recorded restored mode equals the saved mode.
 
-**Scenario 3 — a provider publishes a hostile model id.** An aggregator adds `{"id":"opus","pricing":{"input":0,"output":0}}`, or an id containing `\x1b[2J`. Symptom: either a spoofed row that looks like an Anthropic model, or a bare `opus` that CCR's cross-provider fallback binds Claude Code's built-in rows to, silently routing the full system prompt to an attacker-chosen host. Mitigation: Task A5.1 lands the denylist on **three** surfaces before Task B2 makes the free-first sort functional — `keysync.mjs:buildProviders`, which is the only one of the three that decides what CCR routes; `menu/catalog.mjs:buildFrom`, which decides what the user sees; and tier 1 and tier 2 ingest in Task B6, which decides what enters the catalogue at all. `sanitizeDisplay()` (Task A3) strips escape sequences and bidi overrides at the render boundary; `MAX_MODELS_PER_PROVIDER` stays at 3. The gate is a test that calls `buildProviders` with a hostile zero-priced `opus` and asserts it is absent from the returned `Providers[].models`, so the mitigation is checked where the harm would occur.
+**Scenario 3 — a provider publishes a bare Claude-shaped model id.** An aggregator adds `{"id":"opus","pricing":{"input":0,"output":0}}`, or an id containing `\x1b[2J`. Symptom: a bare `opus` that CCR's cross-provider fallback binds Claude Code's built-in rows to, silently routing the full system prompt to an attacker-chosen host.
+
+**Revised 2026-09-03 under Rule 2 (Constraint 29).** The earlier mitigation — reject the name on three surfaces — is withdrawn, because it also rejects tabiai and gorouter, which are legitimate Claude resellers, and rule 1 forbids that. It also mis-modelled the threat: `providerModelMatches` in CCR's `dist/main/cli.js` (offset ~998924, read directly) iterates raw `Providers[].models[]` ids behind only a provider-level enabled gate, and `resolve()` binds on **exactly one** match, returning undefined on more than one. The hijack therefore requires *sole ownership of a bare id*, and a namespaced `tabiai/claude-opus-5` can never be that — stage-4 matching is on the bare id.
+
+Mitigation, four parts, all landing in Task A5.1 before Task B2 makes the free-first sort functional:
+
+1. **The collision guard becomes fatal.** `keysync/run.mjs`'s existing `byBare`/`hijackable`/`shadowed` computation already finds exactly this case. `hijackable` — a bare Claude-shaped id whose owner set has size 1 and does not contain `anthropic` — turns from `console.warn` into `process.exit(1)`, with `--allow-bare-claude-names` as the deliberate opt-out so rule 1 is not violated by a permanent block. `shadowed` (owner set > 1) stays a note: ambiguity resolves to `undefined` in CCR, which is a clean failure, not a misroute.
+2. **The relay owns the four bare aliases.** `opus`, `sonnet`, `haiku`, `fable` are appended to `ANTHROPIC_RELAY`'s routing list, so a third party publishing bare `opus` lands in `shadowed` rather than becoming sole owner. This is gated at runtime on `aliasesOk` and requires the relay-side alias mapping to exist first — see A5.1 Step 3c, where that ordering is enforced rather than merely documented.
+3. **Every row carries the answering hostname** in `description` (`tabiai > claude-opus-5 · tabitoken.com` versus `anthropic > claude-opus-5 · 127.0.0.1:4517`). A vault nickname is user-chosen and can be made to read as official; a hostname parsed from `api_base_url` cannot.
+4. **`sanitizeDisplay()`** (Task A3) still strips escape sequences and bidi overrides at the render boundary, `admitId` still rejects `\x1b[2J`, `..`, backslashes and over-length ids from every provider, `UW_ALIAS` is still refused outright, and `MAX_MODELS_PER_PROVIDER` stays at 3. None of that changed; only the Claude-name branch did.
+
+The gate is a test that calls `buildProviders` with a hostile zero-priced `opus` and asserts the id **survives** on its namespaced row — because rule 2 requires it to — and that the run-level collision guard then exits non-zero on the bare-id ownership. The mitigation is still checked where the harm would occur; what changed is which function commits the harm.
 
 **Scenario 4 — the statusline shim eats the footer.** The optional HUD shim (Task A14) is installed, then something downstream changes: the OMC HUD path moves, the wrapped command is edited by hand, the snapshot is missing, or Claude Code changes the statusline stdin shape. Symptom: the footer goes blank or shows an error string on every prompt, which reads as an OMC failure and will be debugged in the wrong repository. Mitigation: the shim is optional and off by default; every failure path inside it forwards the original stdin bytes to the wrapped command unmodified, so the worst outcome is today's behaviour; the install takes a `settings.json.uw-bak` copy of the original bytes and records the previous `statusLine.command` in `hud-install.json`, and uninstall restores from that backup — byte for byte when the backup is intact and unchanged, and by a value-level edit that announces itself when it is not (Q6.4); and `uw doctor` asserts both that the wrapped command still exists and that the shim round-trips a sample payload with the expected fields intact.
 
@@ -240,7 +265,7 @@ One coupling is deliberately **not** guarded, and it is worth being explicit rat
 | `C:/Users/osami/.uw/.gitignore` | Keep logs, backups, key logs, tool output and spike scratch out of version control |
 | `C:/Users/osami/.uw/menu/sanitize.mjs` | Make provider-controlled strings safe to render and safe to admit as ids |
 | `C:/Users/osami/.uw/menu/atomic.mjs` | Write every state and catalogue file through a temp file and a rename; read JSON without throwing |
-| `C:/Users/osami/.uw/menu/denylist.mjs` | Reject reserved Anthropic-shaped and `uw/` model names from untrusted providers |
+| `C:/Users/osami/.uw/menu/denylist.mjs` | Sanitise every model id, reject the `uw/` namespace from non-relay providers, and export `RESERVED` / `isReserved` — the one definition of "Claude-shaped" that the collision guard and the relay's alias resolver both read. It does **not** reject Claude names: Constraint 29 |
 | `C:/Users/osami/.uw/menu/cc-contract.mjs` | The only file that knows Claude Code: handoff argv shape, `/model` syntax, exit-code semantics, statusline stdin shape, and the version fingerprint |
 | `C:/Users/osami/.uw/menu/ccr-client.mjs` | The only file that knows CCR: `service.json` discovery, the JSON-RPC endpoint, `getConfig`, `probeProvider`, the bundled catalogue path, and the version fingerprint |
 | `C:/Users/osami/.uw/menu/pick-state.mjs` | Pure reducer for the two-level menu: filtering, cursor, scope, Esc ladder, legend overlay. No I/O |
@@ -258,6 +283,8 @@ One coupling is deliberately **not** guarded, and it is worth being explicit rat
 | `C:/Users/osami/.uw/menu/set-statusline.mjs` | Set `statusLine.command` losslessly, atomically and BOM-free — the one thing PowerShell 5.1's JSON round trip cannot do safely (Task A16) |
 | `C:/Users/osami/.uw/refresh/catalog-store.mjs` | Own `~/.uw/catalog/`: copy-out, snapshot directories, the `current` pointer, the lock, and the merge policy |
 | `C:/Users/osami/.uw/refresh/tiers.mjs` | The three refresh tiers: models.dev metadata, keyed listings, gated paid verification |
+| `C:/Users/osami/.uw/refresh/discover.mjs` | Tier 2's transport. Profile-driven listing discovery across every provider call shape, the six-value outcome enum, the lifted multi-line `headersFor`, and the coverage gate. The one module that holds key values, and the only tier that does (Task B6) |
+| `C:/Users/osami/.uw/refresh/migrate-listing.mjs` | The `listing` profile migration and its audit — a documented human pass over 47 vault entries, modelled on `migrate-cadence.mjs` (Task B6.1) |
 | `C:/Users/osami/.uw/refresh/probe.mjs` | The one provider-probe implementation, folded out of the three ad-hoc `keysync/key-health*.mjs` scripts. A **standalone command**, run deliberately, that writes the `ok`/`auth`/`broken`/`skipped` results file Task B7 folds into `health.json`. It is not called by tier 2 — see the note below — and not by tier 3 |
 | `C:/Users/osami/.uw/refresh/cli.mjs` | `uw catalog refresh --tier 1\|2\|3` argument handling and reporting; also the one place routability is resolved and stamped onto the snapshot (Q1.3) |
 | `C:/Users/osami/.uw/refresh/health-writer.mjs` | The two health producers: fold the existing probe file, and project each refresh's merge ledger — never overwriting a probe verdict with a listing one (Task B7) |
@@ -272,7 +299,8 @@ One coupling is deliberately **not** guarded, and it is worth being explicit rat
 | Path | Change |
 |---|---|
 | `C:/Users/osami/.uw/keysync/keysync.mjs` | **Filter `catalogEntries` and `vp.testModel` through `admitRemoteModels` inside `buildProviders`, before `ranked` is computed** (Task A5.1 — this is the routing path, and it is the load-bearing security change in this plan); fix `inferTier` to read `pricing.offers[].per1MTokens` **and to prefer the offer whose `provider` matches the key's provider**; add the `localeCompare` sort tiebreak; add the `autoFetchModels` invariant to `validate()`; read the catalogue from `~/.uw/catalog/` |
-| `C:/Users/osami/.uw/keysync/run.mjs` | `EXPECTED_PROVIDERS` becomes a floor with an explicit delta acknowledgement |
+| `C:/Users/osami/.uw/keysync/run.mjs` | **`checkBareCollisions` — the bare-id collision guard, extracted, widened to `RESERVED`, and made fatal with a `--allow-bare-claude-names` opt-out** (Task A5.1); the relay's picker rows read `ANTHROPIC_RELAY.picker` and its routing list is gated on `aliasesOk`; `EXPECTED_PROVIDERS` becomes a floor with an explicit delta acknowledgement. The pipeline moves behind an entry-point guard so the exported checks are testable without running it |
+| `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs` | **Task A5.2. Outside this repository, not committed, and a live component that keeps Claude available.** Bare-alias mapping for `opus` / `sonnet` / `haiku` / `fable` on the messages path — exact match only, resolved against the relay's own `/v1/models` with a static fallback table, 1-hour lazy TTL, and a 4xx naming the alias rather than ever forwarding a bare alias upstream. Plus an `aliasesOk` signal so keysync can tell whether this landed. Health-check, then take a timestamped backup, before editing; a `.bak-preharden` sibling already exists |
 | `C:/Users/osami/.uw/keysync/key-health.mjs`, `key-health-reprobe.mjs`, `key-health-live3.mjs` | Retired into `refresh/probe.mjs`, one implementation instead of three. It produces the same results file the three scripts produce today, which is what Task B7's fold reads — so the fold's input does not change, only what writes it (Task B7) |
 | `C:/Users/osami/.llmkeys/providers.json` | Add curated `grantCadence` and `planCovered` fields, plus `testModelVerifiedAt` — the ISO timestamp at which a tier 3 run last proved that `testModel` actually answers on this key. Written **only** by tier 3; blank means never proven. Curated fields are never machine-overwritten (outside the git repo; backed up separately) |
 | `C:/Users/osami/.claude/settings.json` | Optional and only with `install.ps1 -Hud`: `statusLine.command` is rewritten to invoke `hud-shim.mjs` in front of the existing command. Written BOM-free and atomically (tmp + `Move-Item -Force`), patched through a lossless JSON editor rather than a PowerShell `ConvertFrom-Json`/`ConvertTo-Json` round trip, with `settings.json.uw-bak` holding the original bytes for the byte-for-byte restore path (Q2.8, Q2.9, Q6.4) |
@@ -661,8 +689,11 @@ test("U+2028 and U+2029 are stripped, and are why the class needs escapes", () =
 test("the bidi override that makes an Anthropic lookalike is stripped", () => {
   // U+202E renders the rest of the cell reversed in Windows Terminal, so a model
   // id can display as "claude-3-opus" while being something else entirely -- the
-  // one spoof the reserved-name denylist cannot see, because it matches on the
-  // stored bytes and this attack is purely a rendering effect.
+  // one spoof no name-shape matcher can see, because RESERVED matches on the
+  // stored bytes and this attack is purely a rendering effect. Under Constraint
+  // 29 this is the more important of the two display controls, alongside the
+  // answering hostname: the user is expected to see real Claude names from
+  // several providers, so the render boundary is where a FAKE one is caught.
   const RLO = String.fromCodePoint(0x202E);
   assert.equal(sanitizeDisplay("a" + RLO + "b"), "ab");
   assert.equal(sanitizeDisplay(RLO + "supo-3-edualc"), "supo-3-edualc");
@@ -834,7 +865,7 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(me
 
 ### Task A4: `cc-contract.mjs` and `ccr-client.mjs` — the only two files that know about Claude Code and CCR
 
-Implements Q4.1 through Q4.4 and constraint 22, and it is the mechanism behind principle 6. D1 places the menu inside Claude Code's process tree and D6 makes the switch a `/model` command, so two foreign contracts are load-bearing: the external-editor handoff and CCR's loopback RPC. Both are undocumented and both move on their own schedule. Every fact about either one is collected here, with a fingerprint recording the version it was verified against, so an upgrade produces one failing named check instead of a scattering of symptoms. The last step adds the test that keeps the boundary real: a grep over the tree that fails when any other file names a Claude Code or CCR path.
+Implements Q4.1 through Q4.4 and constraint 22, and it is the mechanism behind principle 6. D1 places the menu inside Claude Code's process tree and D6 makes the switch a `/model` command, so two foreign contracts are load-bearing: the external-editor handoff and CCR's loopback RPC. Both are undocumented and both move on their own schedule. Every fact about either one is collected here, with a fingerprint recording the version it was verified against, so an upgrade produces one failing named check instead of a scattering of symptoms. The test that keeps the boundary real — a grep over the tree that fails when any other file names a Claude Code or CCR path — lands in Task A5, which is the task that removes the last violation; see Step 4 below for why it cannot pass here.
 
 The fingerprints are measured, not assumed. Claude Code reports `2.1.258` in the `version` field of the statusline payload it writes to stdin, which is the cheapest place to read it from because the picker already has a reason to parse that payload. CCR's service descriptor is at `%APPDATA%/claude-code-router/service.json` and carries a URL whose `ccr_web_token` query parameter is the RPC credential.
 
@@ -956,42 +987,6 @@ test("rpc returns null instead of throwing when the gateway misbehaves", async (
   assert.equal(await CCR.rpc("getConfig", [], { fetchImpl: slow, timeoutMs: 1, service: { origin: "http://x", token: "t" } }), null);
 });
 
-// Q4.3. The grep must cover .ps1 and .cmd, not just .mjs: install.ps1 is the file
-// that names settings.json and uwpick.cmd is the file that names the wrapper, so
-// a .mjs-only sweep exempts the two most likely offenders. Those two known paths
-// get one named allowance each, keyed on file AND needle, so a NEW hard-coded
-// path in either file still trips.
-const BOUNDARY_ALLOW = new Map([
-  ["cc-contract.mjs", /./],          // the contract module for Claude Code
-  ["ccr-client.mjs", /./],           // the contract module for CCR
-  // install.ps1 receives the settings path as a -SettingsFile parameter defaulted
-  // from cc-contract; the literal below is only the default's documentation.
-  ["install.ps1", /\.claude\b/],
-  // uwpick.cmd names uwpick-run.ps1 relative to %~dp0 and nothing else; this
-  // entry exists so a future absolute path is the thing that fails.
-  ["uwpick.cmd", /(?!)/],            // matches nothing: no needle is allowed here
-]);
-
-test("no file outside the two contract modules names Claude Code or CCR", () => {
-  const root = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw");
-  const needles = [/claude-code-router/, /node_modules/, /\.claude\b/, /APPDATA/, /127\.0\.0\.1/];
-  const offenders = [];
-  for (const dir of ["menu", "refresh"]) {
-    const d = path.join(root, dir);
-    if (!fs.existsSync(d)) continue;
-    for (const f of fs.readdirSync(d)) {
-      if (!/\.(mjs|ps1|cmd)$/.test(f)) continue;
-      const allow = BOUNDARY_ALLOW.get(f);
-      const body = fs.readFileSync(path.join(d, f), "utf8");
-      for (const n of needles) {
-        if (allow && allow.test(n.source)) continue;
-        if (n.test(body)) offenders.push(`${dir}/${f} matches ${n}`);
-      }
-    }
-  }
-  assert.deepEqual(offenders, []);
-});
-
 test("no file anywhere in UW hard-codes an OMC path", () => {
   // Q4.7. Precisely what this checks, and what it does not: it forbids a PATH to
   // an OMC file appearing in UW's source. It does not forbid the string "OMC" --
@@ -1032,14 +1027,6 @@ test("no file anywhere in UW hard-codes an OMC path", () => {
     "UW must wrap whatever statusLine.command holds, never a path it believes OMC uses");
 });
 
-test("the boundary allowlist is keyed per file and per needle, not per file alone", () => {
-  // A regression guard on the guard: if someone widens an entry to /./ for a
-  // non-contract file, this fails, because that would silently exempt the file.
-  for (const [f, re] of BOUNDARY_ALLOW) {
-    if (f === "cc-contract.mjs" || f === "ccr-client.mjs") continue;
-    assert.notEqual(re.source, ".", `${f} must not be exempted wholesale`);
-  }
-});
 ```
 
 - [ ] Step 2: Run it, expected FAIL.
@@ -1267,7 +1254,9 @@ export function bundledCataloguePath() { return CONTRACT.bundledCatalogue; }
 node --test "C:/Users/osami/.uw/test/*.test.mjs"
 ```
 
-Expected: `# fail 0`, with a pass count around 27 (indicative — see "How to read the `# pass N` numbers"). The boundary test passes trivially at this point because `menu/` holds only `sanitize.mjs` and the two contract modules; it earns its keep from Task A5 onward, and Task B4 extends its scan to `keysync/` once that directory's hard-coded catalogue path is gone.
+Expected: `# fail 0`, with a pass count around 25 (indicative — see "How to read the `# pass N` numbers").
+
+**Why the boundary test is not in this task.** An earlier draft placed it here and justified its pass with the claim that `menu/` holds only `sanitize.mjs` and the two contract modules. Task A2 falsifies that: it moves `catalog.mjs`, `uwpick.mjs`, `uwpick-run.ps1` and `uwpick.cmd` into `menu/`, and `catalog.mjs` inlines CCR's `service.json` path and a loopback RPC call. Run here, the boundary test fails with three offenders on `menu/catalog.mjs` — `claude-code-router`, `APPDATA` and `127.0.0.1` — which is the test being right and the ordering being wrong. Task A5 is what removes the last violation, because it rewrites `routableSet()` onto `CCR.rpc`; the guard therefore lands in A5, in the same task that makes it pass, and never spends a commit red. A5 cannot simply run first: it consumes `rpc` and `routableFromConfig` from `ccr-client.mjs`, so it hard-depends on this task. Task B4 later extends the same scan to `keysync/` once that directory's hard-coded catalogue path is gone. The OMC-path test stays here, since it is independent of `catalog.mjs` and passes as written.
 
 - [ ] Step 5: Commit.
 
@@ -1281,7 +1270,7 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(me
 
 This task also lands `menu/atomic.mjs`, which every later task writes through. It is three lines of real work and it exists because Q2.8 requires that a crash mid-write never truncate a state file: seven different files in this plan are written by short-lived processes that a user can interrupt with ctrl+c at any moment, and a half-written `snapshot.json` would take the picker down on the next open.
 
-**Files:** Modify `C:/Users/osami/.uw/menu/catalog.mjs`, Create `C:/Users/osami/.uw/menu/atomic.mjs`, Create `C:/Users/osami/.uw/test/fixtures/catalog.json`, Test `C:/Users/osami/.uw/test/catalog.test.mjs`
+**Files:** Modify `C:/Users/osami/.uw/menu/catalog.mjs`, Create `C:/Users/osami/.uw/menu/atomic.mjs`, Create `C:/Users/osami/.uw/test/fixtures/catalog.json`, Test `C:/Users/osami/.uw/test/catalog.test.mjs`, Modify `C:/Users/osami/.uw/test/contracts.test.mjs` (the boundary guard, moved here from Task A4)
 **Interfaces:** Consumes: `sanitizeDisplay`, `admitId` from `./sanitize.mjs`; `rpc`, `routableFromConfig` from `./ccr-client.mjs`. Produces:
 `writeAtomic(file: string, text: string) -> void` — write `<file>.tmp-<pid>`, flush, rename over the target.
 `readJsonOr(file: string, fallback: any) -> any` — parse or return the fallback; never throws; **strips a leading UTF-8 BOM before parsing**, because PowerShell 5.1 writes one and `JSON.parse` throws on it, and a reader that silently returns its fallback on a perfectly good file is worse than one that throws (Q2.9).
@@ -1524,6 +1513,55 @@ test("routableOf turns a set into the per-row field, and absence means unknown",
 // The companion assertion — that uwpick.mjs never calls routableSet — lives in
 // Task A10's test file, where uwpick.mjs exists. Putting it here would need a
 // gate on a file a later task creates, which Constraint 15a forbids.
+```
+
+**Then add the boundary guard to `C:/Users/osami/.uw/test/contracts.test.mjs`,** created in Task A4. It lives here rather than in A4 because this task is what makes it pass: until `routableSet()` is rewritten onto `CCR.rpc`, `menu/catalog.mjs` still inlines `service.json` and a loopback address, and the guard would fail on three offenders. A4 cannot be reordered after this task — this task consumes `rpc` and `routableFromConfig` from `ccr-client.mjs`, which A4 creates. Append to that file, keeping its existing imports:
+
+```js
+// Q4.3. The grep must cover .ps1 and .cmd, not just .mjs: install.ps1 is the file
+// that names settings.json and uwpick.cmd is the file that names the wrapper, so
+// a .mjs-only sweep exempts the two most likely offenders. Those two known paths
+// get one named allowance each, keyed on file AND needle, so a NEW hard-coded
+// path in either file still trips.
+const BOUNDARY_ALLOW = new Map([
+  ["cc-contract.mjs", /./],          // the contract module for Claude Code
+  ["ccr-client.mjs", /./],           // the contract module for CCR
+  // install.ps1 receives the settings path as a -SettingsFile parameter defaulted
+  // from cc-contract; the literal below is only the default's documentation.
+  ["install.ps1", /\.claude\b/],
+  // uwpick.cmd names uwpick-run.ps1 relative to %~dp0 and nothing else; this
+  // entry exists so a future absolute path is the thing that fails.
+  ["uwpick.cmd", /(?!)/],            // matches nothing: no needle is allowed here
+]);
+
+test("no file outside the two contract modules names Claude Code or CCR", () => {
+  const root = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw");
+  const needles = [/claude-code-router/, /node_modules/, /\.claude\b/, /APPDATA/, /127\.0\.0\.1/];
+  const offenders = [];
+  for (const dir of ["menu", "refresh"]) {
+    const d = path.join(root, dir);
+    if (!fs.existsSync(d)) continue;
+    for (const f of fs.readdirSync(d)) {
+      if (!/\.(mjs|ps1|cmd)$/.test(f)) continue;
+      const allow = BOUNDARY_ALLOW.get(f);
+      const body = fs.readFileSync(path.join(d, f), "utf8");
+      for (const n of needles) {
+        if (allow && allow.test(n.source)) continue;
+        if (n.test(body)) offenders.push(`${dir}/${f} matches ${n}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, []);
+});
+
+test("the boundary allowlist is keyed per file and per needle, not per file alone", () => {
+  // A regression guard on the guard: if someone widens an entry to /./ for a
+  // non-contract file, this fails, because that would silently exempt the file.
+  for (const [f, re] of BOUNDARY_ALLOW) {
+    if (f === "cc-contract.mjs" || f === "ccr-client.mjs") continue;
+    assert.notEqual(re.source, ".", `${f} must not be exempted wholesale`);
+  }
+});
 ```
 
 - [ ] Step 2: Run it, expected FAIL.
@@ -1828,7 +1866,26 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(me
 
 ---
 
-### Task A5.1: `denylist.mjs` — reserved names, on the routing path first
+### Task A5.1: `denylist.mjs` — bare-name collision, not name refusal
+
+> **AMENDED 2026-09-03 — read this before the body below.** This task is implemented but **uncommitted** at `f172820`, so it is *revised in place*, not unpicked. Constraint 29 (Rule 2: resellers are first-class) invalidates its central control as originally built. The change, in one line: **`admitRemoteModels` stops rejecting Claude-shaped names, and `keysync/run.mjs`'s bare-id collision guard becomes fatal instead.**
+>
+> What that means concretely, and what did *not* change:
+>
+> | | before | after |
+> |---|---|---|
+> | `claude-opus-5` from tabiai | rejected, provider loses a real model | **admitted**, ships as `tabiai/claude-opus-5` |
+> | bare `opus` sole-owned by a non-relay provider | admitted-then-rejected by name, relay state irrelevant | **run exits 1**, naming the id and its owner, unless `--allow-bare-claude-names` |
+> | bare `opus` with the relay also owning it | rejected by name | `shadowed` — a note; CCR's `resolve()` returns undefined on >1 match, which fails cleanly |
+> | `uw/fast` from any non-relay provider | rejected | **rejected, unchanged** — our namespace, not a vendor's |
+> | `bad\x1b[2J`, `../escape`, over-length ids | rejected by `admitId` | **rejected, unchanged** — `admitId` never tested Claude names |
+> | `RESERVED`, `isReserved` | admission predicates | **still exported**, now consumed by the guard and the relay resolver as the one definition of "Claude-shaped" |
+>
+> Four steps are added: **3a** the fatal S1 guard, **3b** the S2 alias split, **gated on `aliasesOk`**, **3c** the relay probe that establishes `aliasesOk`, **3d** the hostname `description`. The hostile-`opus` test **inverts** — see Step 1.
+>
+> **A5.1 now depends on Task A5.2, and must not append the aliases ungated.** The relay-side half of S2 — the bare-alias mapping itself — was split out into its own task because it edits a different file in a different tree, one that is outside this repository and that keeps Claude available to the user. Step 3b writes the 8-id routing list **only** when Step 3c's probe reports the relay can serve those aliases; otherwise it writes today's 4 ids and nothing is dead. That gate is what lets A5.1 and A5.2 land in either order without a broken intermediate state.
+>
+> Why the old control was wrong on its own terms, not merely inconvenient: `providerModelMatches` (CCR `dist/main/cli.js`, offset ~998924, **read directly and verified by the team lead, 2026-09-03** — the architect's design records it as unverified, and that record is superseded) matches on the **bare id** with only a provider-level enabled gate, and `resolve()` binds on exactly one match. So a namespaced `tabiai/claude-opus-5` was never reachable by the stage-4 fallback, and rejecting it bought nothing while costing a live provider its models. The exploitable shape is *sole ownership of a bare id*, which is a property of the owner set across the whole config — something `buildProviders` cannot see from inside one provider's loop, and which `run.mjs` already computes.
 
 **Moved forward from Phase B.** This task was originally B1, sitting 17 tasks after the renderer it protects. It consumes nothing that Phase B builds, it is about forty lines, and between A5 and Phase B lies the entire shippable menu — including Task A17's live protocol against real Claude Code. Constraint 11 requires this to land before Task B2's `inferTier` fix; landing it here satisfies that constraint strictly harder while closing the window in which an untrusted id renders and routes unguarded. The number is decimal rather than a renumbering of A6–A17 so that every existing cross-reference in this plan stays correct; the slot `B1` in Phase B is deliberately left vacant rather than reused.
 
@@ -1836,21 +1893,33 @@ Its true dependency is Task A5, not Task A3. It needs `admitId` from A3, but it 
 
 Implements constraints 11 and 12 and report 08's single CRITICAL finding (F1).
 
-**Files:** Create `C:/Users/osami/.uw/menu/denylist.mjs`, Modify `C:/Users/osami/.uw/menu/catalog.mjs`, **Modify `C:/Users/osami/.uw/keysync/keysync.mjs`**, Test `C:/Users/osami/.uw/test/denylist.test.mjs`
-**Interfaces:** Consumes: `admitId` from `./sanitize.mjs`. Produces:
+**Files:** Create `C:/Users/osami/.uw/menu/denylist.mjs`, Modify `C:/Users/osami/.uw/menu/catalog.mjs`, **Modify `C:/Users/osami/.uw/keysync/keysync.mjs`**, **Modify `C:/Users/osami/.uw/keysync/run.mjs`**, Test `C:/Users/osami/.uw/test/denylist.test.mjs`
+**Depends on:** Task A5.2 for the relay-side alias mapping. Not a blocking prerequisite in the scheduling sense — Step 3c's runtime gate means A5.1 is correct and shippable with A5.2 absent — but Step 3b's 8-id routing list is inert until A5.2 lands.
+**Interfaces:** Consumes: `admitId` from `./sanitize.mjs`. Produces, in `menu/denylist.mjs`:
 `RESERVED: RegExp`, `UW_ALIAS: RegExp`
-`isReserved(id: string) -> boolean`
-`admitRemoteModels(providerName: string, ids: string[], opts?: {trusted?: string}) -> {kept: string[], rejected: string[]}` — `trusted` defaults to `"anthropic"`, the relay, which is the only provider allowed to serve Anthropic-shaped names.
+`isReserved(id: string) -> boolean` — **a shape predicate, not an admission rule.** True for anything Claude-shaped or `uw/`-prefixed. Exported because the collision guard and the relay's alias resolver must share one definition rather than maintain two that drift
+`admitRemoteModels(providerName: string, ids: string[], opts?: {trusted?: string}) -> {kept: string[], rejected: string[]}` — enforces `admitId` on every id and `UW_ALIAS` on every non-`trusted` provider. **It no longer rejects Claude-shaped names from anyone** (Constraint 29). `trusted` defaults to `"anthropic"` and now exempts only the `uw/` check
+and in `keysync/run.mjs`:
+`checkBareCollisions(providers: object[], opts?: {relay?: string, allowBare?: boolean}) -> {hijackable: object[], shadowed: object[], fatal: boolean, message: string}` — the S1 guard, exported so it is testable without running the pipeline. `relay` defaults to `"anthropic"`; `allowBare` is the `--allow-bare-claude-names` opt-out
 
-**The three surfaces, and why the routing one is the only one that matters for F1.** A reserved name can do two different kinds of harm and they need two different guards in two different modules:
+**The relay file is edited by Task A5.2, not by this task.** `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs` is outside `~/.uw` and outside this git repository, and it is a **live component that keeps Claude available** — every Anthropic request the user makes goes through it. Splitting it into its own task is not bookkeeping: it keeps a change to the user's working Claude path from riding along inside a commit about model-name admission, and it gives that change its own backup, its own verification and its own rollback. Step 3c makes the two halves safe to land in either order, so nothing here is a hard prerequisite for a green run.
 
-| Surface | Module | Harm if unguarded |
-|---|---|---|
-| **Routing** | `keysync.mjs:buildProviders` | A hostile `opus` enters CCR's `Providers[].models`. CCR's `resolve()` stage-4 cross-provider fallback can then bind Claude Code's built-in rows to it, and the full system prompt, tool definitions and file contents route to an attacker-chosen host. Silent. |
-| **Display** | `menu/catalog.mjs:buildFrom` | A spoofed row that looks like an Anthropic model invites the user to select it. Visible, but only if the user reads carefully. |
-| **Ingest** | `refresh/tiers.mjs` (Task B6) | The name is persisted into the catalogue and reaches both surfaces above on every later run. |
+**The four controls, and which harm each one actually stops.** The original framing here — three *surfaces* each carrying the same name-rejection rule — was wrong twice over. It rejected legitimate resellers (rule 2), and it placed the anti-hijack control in a function that cannot see the condition the hijack requires. Ownership of a bare id is a property of the whole built config; `buildProviders` sees one provider at a time. The replacement:
 
-The previous draft of this plan guarded only the display surface, and its own comment in Task B2 asserted that the mitigation was in place. It was not: `menu/catalog.mjs` feeds `buildSnapshot` → `snapshot.json` → the renderer, and has no influence whatsoever on what CCR routes. Meanwhile Task B2 edits `buildProviders` specifically to make free-first ranking work, which is the change that promotes a zero-priced `opus` to rank 0. Ordering was satisfied in letter and the hijack was left open in substance. That is the defect this task exists to close, and it is why `keysync/keysync.mjs` is in the Files list.
+| Control | Where | Harm it stops | Scope |
+|---|---|---|---|
+| **`admitId`** | `menu/denylist.mjs`, called from both paths | Escape sequences, control characters, invisibles, `..`, backslashes, over-length ids, bad `@cf/` scoping. | Every provider, including the relay. **Unchanged.** |
+| **`UW_ALIAS`** | same | A provider claiming `uw/fast` squats a namespace we own. **See the caveat below — the shape that can actually be shadowed is `Fusion/uw/…`, not `uw/…`.** | Every non-relay provider. **Unchanged.** |
+
+**Caveat on `UW_ALIAS`, verified 2026-09-03 and owned by this task.** CCR's `Sd()` force-prefixes `exactAliases` with `Fusion/`, and `gatewayModels` is keyed from that output, which stage 3 then looks up lowercased. So an exact alias `uw/fast` is reachable **only** as `Fusion/uw/fast`: a bare `uw/fast` selector misses stage 2 (no provider named `uw`), misses stage 3 (the key is `fusion/uw/fast`), and reaches bare matching where nothing carries that id. Two consequences follow. If UW's aliases are declared as `exactAliases`, **they do not route under `uw/…` at all**, and any text in this plan claiming otherwise is wrong. And `/^uw\//i` guards a namespace nothing currently routes on — genuine defence-in-depth, but not the control it reads as. The choice is between declaring the aliases so they surface as `Fusion/uw/…` and guarding that shape, or using `virtualModelProfiles` and confirming which stage those match at. **Do not resolve it by guessing.** The security reviewer's claim that `virtualModelProfiles` match at stage 3 ahead of any provider is consistent with the bundle as read, but how they are keyed has not been separately verified.
+| **Bare-id collision guard** | `keysync/run.mjs`, after `validate()`, before any write | The real F1: a bare Claude-shaped id with exactly one non-relay owner, which `resolve()` stage 4 binds Claude Code's built-in rows to, routing the full system prompt to an attacker-chosen host. Silent. | Whole-config. **Now fatal.** |
+| **Relay alias ownership + hostname `description`** | `keysync.mjs:142` and `keysync.mjs:247-250` | The residual case the guard cannot catch — a provider publishing bare `opus` *while the relay is up* — plus the spoofed-row problem, where a user-chosen vault nickname reads as official. | Whole-config, display. **New.** |
+
+Note what the last row buys: with the relay owning `opus`, a third party publishing it lands in `shadowed`, so it never becomes sole owner and never binds. Without it, the relay being live is precisely the condition under which S1 does *not* fire, so that case would have no backstop at all.
+
+The previous draft of this plan guarded only the display surface, and its own comment in Task B2 asserted that the mitigation was in place. It was not: `menu/catalog.mjs` feeds `buildSnapshot` → `snapshot.json` → the renderer, and has no influence whatsoever on what CCR routes. Meanwhile Task B2 edits `buildProviders` specifically to make free-first ranking work, which is the change that promotes a zero-priced `opus` to rank 0. Ordering was satisfied in letter and the hijack was left open in substance.
+
+That diagnosis stands; only the remedy changed. The 2026-09-03 revision keeps the insight — *assert the control against the function that commits the harm* — and corrects which function that is. `keysync/keysync.mjs` stays in the Files list for `admitId`, `UW_ALIAS` and the alias-list split; `keysync/run.mjs` joins it for the guard that stops F1.
 
 - [ ] Step 1: Write the failing test.
 
@@ -1861,7 +1930,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isReserved, admitRemoteModels, RESERVED } from "../menu/denylist.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
-import { buildProviders } from "../keysync/keysync.mjs";
+import { buildProviders, ANTHROPIC_RELAY } from "../keysync/keysync.mjs";
+// Imported for the S1 guard tests. `run.mjs` must therefore export
+// `checkBareCollisions` and keep its pipeline behind an entry-point check rather
+// than at module top level -- the same requirement Task B8 places on
+// `checkProviderFloor`, and for the same reason. If importing run.mjs runs the
+// pipeline, that is the defect to fix, not a reason to test the guard indirectly.
+import { checkBareCollisions } from "../keysync/run.mjs";
 
 test("bare Anthropic tier names are reserved", () => {
   for (const id of ["opus", "sonnet", "haiku", "fable", "claude", "anthropic"]) {
@@ -1888,16 +1963,45 @@ test("ordinary ids are not reserved", () => {
   }
 });
 
-test("admitRemoteModels rejects reserved names from an untrusted provider", () => {
-  const r = admitRemoteModels("tokenrouter", ["qwen3-max", "opus", "claude-opus-4-8"]);
-  assert.deepEqual(r.kept, ["qwen3-max"]);
-  assert.deepEqual(r.rejected, ["opus", "claude-opus-4-8"]);
+// REVISED under Constraint 29. This test previously asserted the opposite, and
+// the assertion it made is now a rule-2 violation: tabiai and gorouter are live
+// Claude resellers, verified by keyed probe, and rejecting their models would
+// leave two working providers with nothing to route.
+test("admitRemoteModels admits Claude-shaped names from ANY provider", () => {
+  const r = admitRemoteModels("tabiai", ["qwen3-max", "opus", "claude-opus-5",
+                                         "claude-opus-5-thinking"]);
+  assert.deepEqual(r.rejected, [], "a reseller's Claude models are first-class");
+  assert.deepEqual(r.kept, ["qwen3-max", "opus", "claude-opus-5",
+                            "claude-opus-5-thinking"]);
 });
 
-test("admitRemoteModels admits reserved names from the relay", () => {
+test("admitRemoteModels still admits the relay's own names", () => {
   const r = admitRemoteModels("anthropic", ["claude-opus-5", "claude-sonnet-5"]);
   assert.equal(r.rejected.length, 0);
   assert.equal(r.kept.length, 2);
+});
+
+// The one name rule that survives. `uw/` is OUR routing namespace, not a
+// vendor's, so a provider claiming it shadows a slot we own -- which is a
+// different harm from reselling someone else's model, and rule 2 says nothing
+// about it.
+test("admitRemoteModels still rejects the uw/ namespace from a non-relay provider", () => {
+  const r = admitRemoteModels("tokenrouter", ["qwen3-max", "uw/fast", "uw/slot-1"]);
+  assert.deepEqual(r.kept, ["qwen3-max"]);
+  assert.deepEqual(r.rejected, ["uw/fast", "uw/slot-1"]);
+});
+
+// isReserved is unchanged and still exported: it is now a SHAPE predicate that
+// the collision guard and the relay's alias resolver both consume, rather than
+// an admission rule. The tests above it in this file -- bare tier names, names
+// with a separator, uw aliases, ordinary ids -- all still hold, and must not be
+// weakened just because admitRemoteModels stopped calling it on the Claude branch.
+test("isReserved stays the single definition of Claude-shaped", () => {
+  assert.equal(isReserved("claude-opus-5"), true);
+  assert.equal(isReserved("opus"), true);
+  assert.equal(isReserved("opusculum"), false);
+  // ...and admitting a name is now independent of its shape.
+  assert.deepEqual(admitRemoteModels("evil", ["claude-opus-5"]).kept, ["claude-opus-5"]);
 });
 
 test("admitRemoteModels also drops ids that fail admitId", () => {
@@ -1934,11 +2038,31 @@ test("RESERVED is anchored, so a match cannot be buried mid-string", () => {
   assert.equal(RESERVED.source.startsWith("^"), true);
 });
 
-test("buildFrom drops a reserved name published by a non-relay provider", () => {
-  const byProvider = new Map([["evil", [
-    { provider: "evil", model: "opus", capabilities: {},
+// REVISED under Constraint 29. Previously: "buildFrom drops a reserved name
+// published by a non-relay provider", asserting `["reseller-chat-1"]`. The
+// display path must SHOW a reseller's Claude models -- hiding them is how a user
+// concludes a working provider is broken. What protects the user here is not
+// absence but the hostname in `description` (Step 3d), which says which host
+// answers, and which a vault nickname cannot fake.
+test("buildFrom shows a reseller's Claude models", () => {
+  const byProvider = new Map([["tabiai", [
+    { provider: "tabiai", model: "claude-opus-5", capabilities: {},
       modalities: { output: ["text"] },
-      pricing: { offers: [{ provider: "evil", per1MTokens: { input: 0, output: 0 } }] } },
+      pricing: { offers: [{ provider: "tabiai", per1MTokens: { input: 0, output: 0 } }] } },
+    { provider: "tabiai", model: "reseller-chat-1", capabilities: {} },
+  ]]]);
+  const { rows } = buildFrom({
+    chosen: [{ id: "personal.tabiai.free", provider: "tabiai" }],
+    providers: new Map([["tabiai", { notes: "" }]]),
+    catalog: { byProvider, generatedAt: "x" },
+  });
+  assert.deepEqual(rows[0].models.map((m) => m.id).sort(),
+    ["claude-opus-5", "reseller-chat-1"]);
+});
+
+test("buildFrom still drops the uw/ namespace from a non-relay provider", () => {
+  const byProvider = new Map([["evil", [
+    { provider: "evil", model: "uw/fast", capabilities: {} },
     { provider: "evil", model: "evil-chat-1", capabilities: {} },
   ]]]);
   const { rows } = buildFrom({
@@ -1965,59 +2089,195 @@ Then the two assertions that make this task worth doing. These are about the **r
 ```js
 // THE LOAD-BEARING TEST. Report 08 F1, stated as an executable assertion.
 //
-// A hostile aggregator publishes a zero-priced `opus`. With Task B2's inferTier
-// fix in place, priceOf reads {input:0,output:0} and the entry sorts to rank 0 --
-// free first, then shortest id, and `opus` is four characters. It then lands
-// inside MAX_MODELS_PER_PROVIDER = 3 and is written into CCR's Providers[].models.
+// INVERTED 2026-09-03 under Constraint 29, and the inversion is the point of the
+// revision. The old assertion was `ids.includes("opus") === false` -- the id must
+// be ABSENT from Providers[].models. That is now a rule-2 violation asserted as a
+// requirement, and it was DELETED rather than weakened: an assertion that a
+// reseller's model is missing cannot be softened into correctness, because the
+// correct state is that it is present.
 //
-// This test fails against the code as it stands today and passes only once
-// admitRemoteModels is wired into buildProviders. That is the gate that was
-// wanted. The previous draft asserted instead that the string "reserved-name
-// denylist" appeared in `git log --oneline -40`, which
-// `git commit --allow-empty -m "reserved-name denylist"` satisfies, and which
-// says nothing about whether denylist.mjs exists, is imported, or is reachable.
-test("buildProviders never routes a reserved name from an untrusted provider", () => {
-  const hostile = {
-    provider: "tokenrouter", model: "opus",
+// What the harm actually requires, verified by reading CCR's bundle:
+// `providerModelMatches` (dist/main/cli.js ~998924) iterates raw
+// Providers[].models[] ids behind only a provider-level enabled gate, and
+// `resolve()` binds on EXACTLY ONE match, returning undefined on more than one.
+// So the id reaching the table is harmless; SOLE OWNERSHIP OF THE BARE FORM is
+// the hijack. buildProviders cannot see ownership -- it processes one provider at
+// a time -- so the assertion moves to `checkBareCollisions`, below.
+test("buildProviders routes a reseller's Claude model on its namespaced row", () => {
+  const claudeish = {
+    provider: "tabiai", model: "claude-opus-5",
     limits: { contextTokens: 200000 },
     modalities: { output: ["text"] },
-    pricing: { offers: [{ provider: "tokenrouter", per1MTokens: { input: 0, output: 0 } }] },
+    pricing: { offers: [{ provider: "tabiai", per1MTokens: { input: 0, output: 0 } }] },
   };
   const benign = {
-    provider: "tokenrouter", model: "qwen3-max",
+    provider: "tabiai", model: "qwen3-max",
     limits: { contextTokens: 32768 },
     modalities: { output: ["text"] },
-    pricing: { offers: [{ provider: "tokenrouter", per1MTokens: { input: 1, output: 2 } }] },
+    pricing: { offers: [{ provider: "tabiai", per1MTokens: { input: 1, output: 2 } }] },
   };
   const out = buildProviders(
-    [{ id: "personal.tokenrouter.free", provider: "tokenrouter" }],
-    new Map([["tokenrouter", { protocol: "openai", baseUrl: "https://x.invalid/v1",
-                               testModel: "qwen3-max" }]]),
-    { byProvider: new Map([["tokenrouter", [hostile, benign]]]), generatedAt: "x" },
+    [{ id: "personal.tabiai.free", provider: "tabiai" }],
+    new Map([["tabiai", { protocol: "openai", baseUrl: "https://api.tabitoken.com/v1",
+                          testModel: "qwen3-max" }]]),
+    { byProvider: new Map([["tabiai", [claudeish, benign]]]), generatedAt: "x" },
     () => "sk-test-not-a-real-key",
   );
-  const ids = out.providers.flatMap((p) => p.models.map((m) => m.id));
-  assert.equal(ids.includes("opus"), false,
-    "a reserved name reached CCR's routing table; report 08 F1 is open");
+  // `buildProviders` returns `models` as a string[], NOT objects. An earlier
+  // draft wrote `.map((m) => m.id)` here, which yields [null, null] and made
+  // every assertion below vacuous -- it read false against vulnerable code.
+  // Corrected once and reintroduced by a later revision, because the broken
+  // snippet lived in this prose and propagated with every copy. Do not restore.
+  const ids = out.providers.flatMap((p) => p.models);
+  assert.equal(ids.includes("claude-opus-5"), true,
+    "Rule 2: a reseller's Claude model must survive to the routing table. " +
+    "tabiai and gorouter serve this id today, verified by keyed probe.");
   assert.equal(ids.includes("qwen3-max"), true,
-    "the guard must reject reserved names, not empty the provider");
+    "and the guard must not empty the provider either");
 });
 
-test("buildProviders also guards the vault's own testModel", () => {
-  // A testModel is curated, but the vault is a file and a curated field can be
-  // wrong; it is prepended at rank 0 on the routing path, so it is the single
-  // highest-value slot in the whole table and gets the same check.
+test("buildProviders keeps a Claude-shaped testModel from a reseller", () => {
+  // A testModel is curated and can be stale -- the two 503s that started this
+  // thread were exactly that, a retired `claude-opus-4-8`. Staleness is a reason
+  // to re-derive it from discovery (Task B6), never a reason to drop the provider.
   const out = buildProviders(
-    [{ id: "personal.acme.free", provider: "acme" }],
-    new Map([["acme", { protocol: "openai", baseUrl: "https://x.invalid/v1",
-                        testModel: "claude-opus-5" }]]),
-    { byProvider: new Map([["acme", [
-      { provider: "acme", model: "acme-chat-1", modalities: { output: ["text"] } }]]]),
+    [{ id: "personal.gorouter.free", provider: "gorouter" }],
+    new Map([["gorouter", { protocol: "openai", baseUrl: "https://gorouter.app/v1",
+                            testModel: "claude-opus-5" }]]),
+    { byProvider: new Map([["gorouter", [
+      { provider: "gorouter", model: "reseller-chat-1", modalities: { output: ["text"] } }]]]),
       generatedAt: "x" },
     () => "sk-test-not-a-real-key",
   );
-  const ids = out.providers.flatMap((p) => p.models.map((m) => m.id));
-  assert.equal(ids.includes("claude-opus-5"), false);
+  // `buildProviders` returns `models` as a string[], NOT objects. An earlier
+  // draft wrote `.map((m) => m.id)` here, which yields [null, null] and made
+  // every assertion below vacuous -- it read false against vulnerable code.
+  // Corrected once and reintroduced by a later revision, because the broken
+  // snippet lived in this prose and propagated with every copy. Do not restore.
+  const ids = out.providers.flatMap((p) => p.models);
+  assert.equal(ids.includes("claude-opus-5"), true);
+});
+
+// ---- S1: the bare-id collision guard, which is where F1 is now stopped -------
+
+const P = (name, ...ids) => ({ name, models: ids.map((id) => ({ id })) });
+
+test("a bare Claude id sole-owned by a non-relay provider is FATAL", () => {
+  const r = checkBareCollisions([P("tokenrouter", "opus", "qwen3-max")]);
+  assert.equal(r.fatal, true, "report 08 F1: this is the exploitable shape");
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["opus"]);
+  assert.match(r.message, /opus/);
+  assert.match(r.message, /tokenrouter/, "the error must name the sole owner");
+});
+
+test("the fatal error offers the relay or the opt-out, never model removal", () => {
+  // Load-bearing wording, not style. An error telling an operator to delete a
+  // provider's model is an error that teaches a rule-2 violation.
+  const r = checkBareCollisions([P("tokenrouter", "opus")]);
+  assert.match(r.message, /--allow-bare-claude-names/);
+  assert.match(r.message, /relay/i);
+  assert.equal(/remove the model|delete the model/i.test(r.message), false,
+    "the remedy must never be to drop a provider's model");
+});
+
+test("a vendor-prefixed Claude id is never fatal", () => {
+  // `Providers[].models[]` ids are unprefixed as far as CCR's stage-4 match is
+  // concerned, so an id that already carries a `/` cannot be what Claude Code
+  // sends for a built-in row. tokenharbor lists exactly this shape. Flagging it
+  // fatal would block a live reseller for a threat that does not reach it.
+  const r = checkBareCollisions([P("tokenharbor", "anthropic/claude-opus-5")]);
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.hijackable, []);
+});
+
+test("a reseller sole-owning claude-opus-5 with the relay DOWN is fatal", () => {
+  // This is S1 exactly, and it is a real hijack: Claude Code's built-in
+  // `claude-opus-5` row would bind to tabiai and send it the full system prompt.
+  // Rule 2 is not violated -- the model is not dropped and the provider is not
+  // dropped. The run stops and names the remedy.
+  const r = checkBareCollisions([P("tabiai", "claude-opus-5", "reseller-chat-1")]);
+  assert.equal(r.fatal, true);
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-5"]);
+});
+
+test("the same reseller with the relay UP proceeds — this is what makes rule 2 safe", () => {
+  const r = checkBareCollisions([
+    { name: "anthropic", models: ANTHROPIC_RELAY.routing.map((id) => ({ id })) },
+    P("tabiai", "claude-opus-5", "claude-opus-5-thinking", "reseller-chat-1"),
+  ]);
+  assert.equal(r.fatal, false,
+    "the relay co-owns both ids, so resolve() sees two matches and returns undefined");
+  assert.deepEqual(r.shadowed.map((s) => s.id).sort(),
+    ["claude-opus-5", "claude-opus-5-thinking"]);
+  // And the models are still in the config either way. The guard never prunes.
+});
+
+test("the relay co-owning a bare alias downgrades it to shadowed", () => {
+  const r = checkBareCollisions([P("anthropic", "opus"), P("tokenrouter", "opus")]);
+  assert.equal(r.fatal, false, "ambiguity makes resolve() return undefined: a clean failure");
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["opus"]);
+});
+
+test("two non-relay owners of a bare id is shadowed, not fatal", () => {
+  const r = checkBareCollisions([P("a", "opus"), P("b", "opus")]);
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.hijackable, []);
+});
+
+test("--allow-bare-claude-names is a real escape hatch, so rule 1 is never violated", () => {
+  const r = checkBareCollisions([P("tokenrouter", "opus")], { allowBare: true });
+  assert.equal(r.fatal, false, "a user who wants this, with the relay deliberately off, " +
+    "must not be permanently blocked");
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["opus"],
+    "but it is still reported: the opt-out silences the exit, not the finding");
+});
+
+test("the guard covers fable and the full RESERVED boundary class", () => {
+  // The old regex was /^(claude|opus|sonnet|haiku)([-\d]|$)/ -- no `fable`, and a
+  // boundary class narrower than RESERVED's, so `sonnet.1` and `haiku_2` slipped
+  // past a guard whose own denylist called them reserved.
+  for (const id of ["fable", "sonnet.1", "haiku_2", "claude"]) {
+    const r = checkBareCollisions([P("evil", id)]);
+    assert.equal(r.fatal, true, `${id} must be caught by the guard`);
+  }
+});
+
+test("the guard and the denylist share one definition of Claude-shaped", () => {
+  // Two regexes for one concept is how they drift. This asserts the guard is
+  // built from RESERVED rather than from a hand-copied sibling.
+  for (const id of ["opus", "fable", "sonnet.1", "haiku_2"]) {
+    assert.equal(isReserved(id), true);
+    assert.equal(checkBareCollisions([P("evil", id)]).fatal, true);
+  }
+  for (const id of ["opusculum", "hakuna-matata", "uwot"]) {
+    assert.equal(checkBareCollisions([P("evil", id)]).fatal, false,
+      `${id} is not Claude-shaped and must not trip the guard`);
+  }
+});
+
+// ---- S2: the relay owns the four bare aliases -------------------------------
+
+test("the relay's routing list holds eight ids and its picker list holds four", () => {
+  // Missing this split ships a visibly broken menu: run.mjs maps the relay's
+  // model list straight into picker rows, so four duplicate rows appear.
+  assert.deepEqual([...ANTHROPIC_RELAY.picker].sort(),
+    ["claude-haiku-4-5", "claude-opus-5", "claude-opus-5-thinking", "claude-sonnet-5"].sort());
+  for (const alias of ["opus", "sonnet", "haiku", "fable"]) {
+    assert.equal(ANTHROPIC_RELAY.routing.includes(alias), true,
+      `the relay must own the bare alias ${alias} so a third party cannot sole-own it`);
+    assert.equal(ANTHROPIC_RELAY.picker.includes(alias), false,
+      `${alias} is a routing target, not a menu row`);
+  }
+});
+
+test("with the relay owning the aliases, a reseller publishing opus is only shadowed", () => {
+  const r = checkBareCollisions([
+    { name: "anthropic", models: ANTHROPIC_RELAY.routing.map((id) => ({ id })) },
+    P("tokenrouter", "opus"),
+  ]);
+  assert.equal(r.fatal, false,
+    "this is the case S1 alone cannot catch, because S1 keys on the relay being absent");
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["opus"]);
 });
 
 test("the relay keeps its own Anthropic names on the routing path too", () => {
@@ -2028,7 +2288,12 @@ test("the relay keeps its own Anthropic names on the routing path too", () => {
     { byProvider: new Map(), generatedAt: "x" },
     () => "relay",
   );
-  const ids = out.providers.flatMap((p) => p.models.map((m) => m.id));
+  // `buildProviders` returns `models` as a string[], NOT objects. An earlier
+  // draft wrote `.map((m) => m.id)` here, which yields [null, null] and made
+  // every assertion below vacuous -- it read false against vulnerable code.
+  // Corrected once and reintroduced by a later revision, because the broken
+  // snippet lived in this prose and propagated with every copy. Do not restore.
+  const ids = out.providers.flatMap((p) => p.models);
   assert.equal(ids.includes("claude-opus-5"), true,
     "the exemption for the trusted relay must survive the guard");
 });
@@ -2042,40 +2307,74 @@ Isolation note (Constraint 15): every one of these calls `buildProviders` with i
 node --test "C:/Users/osami/.uw/test/denylist.test.mjs"
 ```
 
-Expected failure: `Cannot find module 'C:\Users\osami\.uw\menu\denylist.mjs'`. After the module exists but before `keysync.mjs` is wired, the two `buildProviders` tests fail with `a reserved name reached CCR's routing table` — which is the true statement about the code as it stands and the reason this task exists.
+Expected failure: `Cannot find module 'C:\Users\osami\.uw\menu\denylist.mjs'`, then `The requested module '../keysync/run.mjs' does not provide an export named 'checkBareCollisions'`.
+
+**Because this task is being revised from a working uncommitted state, the failure sequence differs from a green-field run.** The tree at `f172820` already has `denylist.mjs` and the wired `buildProviders`, with the suite green at 74/74. Re-running the revised file against *that* code fails in a specific and informative pattern, and each failure names the step that clears it:
+
+| failing test | why it fails now | cleared by |
+|---|---|---|
+| `admitRemoteModels admits Claude-shaped names from ANY provider` | the `isReserved` branch is still in the loop | Step 3 |
+| `buildProviders routes a reseller's Claude model on its namespaced row` | same | Step 3 |
+| `buildProviders keeps a Claude-shaped testModel from a reseller` | same | Step 3 |
+| `buildFrom shows a reseller's Claude models` | same, on the display path | Step 3 |
+| every `checkBareCollisions` test | the export does not exist; the guard is inline `console.warn` in `main()` | Step 3a |
+| `the guard covers fable and the full RESERVED boundary class` | the inline regex omits `fable` and uses `[-\d]` | Step 3a |
+| `the relay's routing list holds eight ids and its picker list holds four` | `ANTHROPIC_RELAY` has one `models` array of four full ids | Step 3b |
+
+The tests that must **keep** passing throughout, because nothing about them changed: every `isReserved` case, `admitRemoteModels also drops ids that fail admitId`, `a provider with no testModel produces no SECURITY warning`, `RESERVED is anchored`, `buildFrom still drops the uw/ namespace`, and `the relay keeps its own Anthropic names on the routing path too`. A revision that breaks one of those has removed a control it was not asked to touch.
 
 - [ ] Step 3: Implement.
 
 Create `C:/Users/osami/.uw/menu/denylist.mjs`:
 
 ```js
-// Reserved model names. This is the load-bearing control for report 08's single
-// CRITICAL finding, and it must land BEFORE the inferTier fix in Task B2.
+// Model-id admission, and the shape predicate the collision guard is built from.
 //
-// The chain it breaks: a hostile or compromised aggregator publishes
-// {"id":"opus","pricing":{"offers":[{"per1MTokens":{"input":0,"output":0}}]}}; a
-// WORKING inferTier returns "free"; free sorts first; it lands inside
-// MAX_MODELS_PER_PROVIDER; and if it is the unique provider listing that bare
-// name, CCR's cross-provider fallback (resolve() stage 4) binds Claude Code's
-// built-in rows to it. Full system prompt, tool definitions, file contents and
-// responses route to an attacker-chosen host, silently.
+// REVISED 2026-09-03 under Rule 2 (plan Constraint 29). This module used to
+// reject Claude-shaped names from every provider but our own relay. It no longer
+// does, and the reason is a fact about CCR rather than a change of appetite:
 //
-// Note the irony that fixes the ordering: while tier inference is broken,
-// "free-first" is a no-op and the promotion path does not exist. FIXING
-// inferTier is what arms this. So the denylist ships first.
+//   `providerModelMatches` (dist/main/cli.js ~998924) iterates raw
+//   Providers[].models[] ids behind only a PROVIDER-level enabled gate -- there
+//   is no per-model opt-out -- and `resolve()` binds on EXACTLY ONE match,
+//   returning undefined when more than one provider offers the id.
 //
-// WHERE IT MUST BE CALLED, in priority order:
-//   1. keysync.mjs:buildProviders  -- the routing path. This is the one that
-//      stops report 08 F1. Everything else is defence in depth.
-//   2. menu/catalog.mjs:buildFrom  -- the display path. Stops a spoofed row.
-//   3. refresh/tiers.mjs           -- ingest. Stops persistence (Task B6).
-// A guard on 2 alone is what the previous draft had, and it routes nothing.
+// So the hijack needs SOLE OWNERSHIP OF A BARE id. `tabiai/claude-opus-5` is
+// never reachable by that path, because stage-4 matching is on the bare form.
+// Rejecting it therefore bought no safety and cost two live providers -- tabiai
+// and gorouter, both verified by keyed probe to serve claude-opus-5 and
+// claude-opus-5-thinking -- every model they sell.
+//
+// Ownership is a whole-config property. This function sees one provider's list,
+// so it structurally cannot evaluate it. The F1 control moved to
+// `keysync/run.mjs:checkBareCollisions`, which can, and which is fatal.
+//
+// WHAT THIS MODULE STILL ENFORCES, on every path that calls it:
+//   * `admitId` -- escape sequences, C0/C1 controls, invisibles, `..`,
+//     backslashes, over-length ids, `@cf/` scoping. Unchanged, and it never
+//     tested Claude names, so nothing here weakens it.
+//   * `UW_ALIAS` -- `uw/` is OUR namespace. A provider claiming `uw/fast` is
+//     squatting it. That is not reselling someone else's model and rule 2 does
+//     not cover it. Unchanged. See the note at the definition: CCR reaches our
+//     exact aliases as `Fusion/uw/...`, so this guard currently covers a shape
+//     nothing routes on -- recorded, not resolved by guessing.
+//
+// WHAT IT EXPORTS FOR OTHERS:
+//   * `RESERVED` / `isReserved` -- the single definition of "Claude-shaped",
+//     consumed by `checkBareCollisions` and by the relay's alias resolver. Two
+//     regexes for one concept is how they drift; there is one.
+//
+// WHERE IT IS CALLED:
+//   1. keysync.mjs:buildProviders  -- routing. Sanitisation and `uw/`.
+//   2. menu/catalog.mjs:buildFrom  -- display. Same two rules.
+//   3. refresh/tiers.mjs           -- ingest (Task B6). Same two rules.
 //
 // A large share of the 44 providers are small aggregator hosts with no
 // meaningful security assurance -- routllm.pro, seekai.cc, tabitoken.com,
 // ineed.web.id, gorouter.app, teamorouter.com, tokenharbor.ai, router.bynara.id,
-// apihub.agnes-ai.com, commandcode.ai, zenmux.ai, kilo.ai. Any one of them gets
-// this primitive.
+// apihub.agnes-ai.com, commandcode.ai, zenmux.ai, kilo.ai. That is a reason to
+// sanitise every id and to show the answering hostname on every row -- not a
+// reason to refuse the models they sell.
 
 import { admitId } from "./sanitize.mjs";
 
@@ -2084,18 +2383,60 @@ import { admitId } from "./sanitize.mjs";
 // a slash, or end-of-string.
 export const RESERVED = /^(claude|opus|sonnet|haiku|fable|anthropic)([-._\d\/]|$)/i;
 
-// UW's own alias namespace. A provider claiming `uw/fast` would shadow a routing
-// slot we own.
+// UW's own alias namespace.
+//
+// VERIFIED MECHANISM, 2026-09-03, team lead, read from the CCR bundle. This is
+// no longer an open question, and the answer is worse than one:
+//
+//   Sd() force-prefixes exact aliases --
+//     for (let o of n.match?.exactAliases ?? []) {
+//       let i = o.trim();
+//       i && t.length > 0 && r.push(
+//         i.toLowerCase().startsWith("fusion/") ? i : `Fusion/${i}`);
+//     }
+//   and the registry is keyed from that output --
+//     this.gatewayModels = new Map(Sd(t).map(r => [r.toLowerCase(), r]));
+//   with stage 3 doing --
+//     this.gatewayModels.get(n.toLowerCase());
+//
+// So an exact alias `uw/fast` is reachable ONLY as `Fusion/uw/fast`. A selector
+// `uw/fast` misses stage 2 (there is no provider named `uw`), misses stage 3
+// (the key is `fusion/uw/fast`), and falls through to bare matching, where no
+// model carries that literal id.
+//
+// TWO CONSEQUENCES, both to be resolved by whoever owns this constant (Task
+// A5.1), and NEITHER to be resolved by guessing:
+//
+//   1. If UW's aliases are declared as `exactAliases`, THEY DO NOT ROUTE under
+//      `uw/...` at all. Any plan text asserting otherwise is wrong.
+//   2. `/^uw\//i` therefore guards a namespace nothing routes on -- real
+//      defence-in-depth against a shadowing that cannot presently occur, while
+//      the shape that CAN be shadowed is `Fusion/uw/...`.
+//
+// The two options: declare the aliases so they surface as `Fusion/uw/...` and
+// guard that shape instead; or use `virtualModelProfiles` and confirm which
+// stage those match at. The security reviewer's claim that virtualModelProfiles
+// match at stage 3 ahead of any provider is CONSISTENT with what was read, but
+// how they are keyed has NOT been separately verified -- do not build on it
+// until it is.
+//
+// Keeping the guard as-is meanwhile costs nothing and is still correct as a
+// namespace-squatting refusal, which is why this is a recorded decision rather
+// than a blocker.
 export const UW_ALIAS = /^uw\//i;
 
+// "Claude-shaped or ours". A SHAPE PREDICATE, not an admission rule -- nothing
+// is rejected for satisfying it. `checkBareCollisions` and the relay's alias
+// resolver both read it, which is why it is exported.
 export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.test(String(id ?? ""));
 
 /**
  * @param {string}   providerName
  * @param {string[]} ids
  * @param {object}  [opts]
- * @param {string}  [opts.trusted="anthropic"] the only provider allowed to serve
- *                  Anthropic-shaped names -- our own local relay.
+ * @param {string}  [opts.trusted="anthropic"] our own local relay, exempt from
+ *                  the `uw/` check. It is no longer an exemption from anything
+ *                  Anthropic-shaped, because nothing Anthropic-shaped is refused.
  * @returns {{kept: string[], rejected: string[]}}
  */
 export function admitRemoteModels(providerName, ids, { trusted = "anthropic" } = {}) {
@@ -2104,7 +2445,11 @@ export function admitRemoteModels(providerName, ids, { trusted = "anthropic" } =
   for (const raw of ids ?? []) {
     const id = admitId(raw);
     if (!id) { rejected.push(String(raw)); continue; }
-    if (!exempt && isReserved(id)) { rejected.push(id); continue; }
+    // RULE 2. This line was `if (!exempt && isReserved(id))`. `isReserved` is
+    // still exported and still true for Claude names -- it is now consumed by
+    // the collision guard, which can see the ownership this loop cannot. Do not
+    // reinstate it here: doing so drops every model tabiai and gorouter sell.
+    if (!exempt && UW_ALIAS.test(id)) { rejected.push(id); continue; }
     kept.push(id);
   }
   if (rejected.length) {
@@ -2124,11 +2469,14 @@ import { admitRemoteModels } from "../menu/denylist.mjs";
 and inside `buildProviders`, immediately after `const catalogEntries = catalog.byProvider.get(reg.provider) ?? [];`, filter both the catalogue entries and the vault's `testModel` before either is used:
 
 ```js
-    // SECURITY, report 08 F1. This runs BEFORE `ranked` is computed and before
-    // `vp.testModel` is prepended, because both of those write into
-    // Providers[].models, which is what CCR routes. The trusted relay is exempt:
-    // `anthropic` is our own loopback on 4517 and is the only provider that may
-    // legitimately serve a Claude-shaped name.
+    // SANITISATION on the routing path. This runs BEFORE `ranked` is computed
+    // and before `vp.testModel` is prepended, because both of those write into
+    // Providers[].models, which is what CCR routes.
+    //
+    // It enforces `admitId` and the `uw/` namespace, and NOTHING about Claude
+    // names -- report 08 F1 is stopped by `checkBareCollisions` in run.mjs
+    // (Step 3a), which is the only place that can see whether a bare id has a
+    // sole owner. The `trusted` exemption now covers only `uw/`.
     const admitted = admitRemoteModels(reg.provider, catalogEntries.map((m) => m.model));
     const keptIds = new Set(admitted.kept);
     const safeEntries = catalogEntries.filter((m) => keptIds.has(m.model));
@@ -2188,6 +2536,208 @@ and guard the `testModel` the same way, replacing `const tm = admitId(prof.testM
 
 `admitRemoteModels` calls `admitId` internally, so this is strictly stronger than the line it replaces, not a substitution of one check for another.
 
+- [ ] Step 3a: S1 — make the bare-id collision guard fatal.
+
+The guard already exists at `keysync/run.mjs:163-186` as an inline `console.warn` inside `main()`. **Keep it exactly where it sits in the sequence** — after `validate()`, before any write — so that `--dry` reports it and nothing lands. Three changes: extract it so it is testable, widen it, and make it exit.
+
+In `C:/Users/osami/.uw/keysync/run.mjs`:
+
+```js
+import { RESERVED } from "../menu/denylist.mjs";
+
+/**
+ * S1: the bare-id collision guard. Report 08 F1 is stopped here and nowhere else.
+ *
+ * WHY HERE AND NOT IN buildProviders. The exploitable condition is SOLE
+ * OWNERSHIP of a Claude-shaped id across the whole built config -- CCR's
+ * `providerModelMatches` iterates raw Providers[].models[] behind only a
+ * provider-level enabled gate, and `resolve()` binds on exactly one match,
+ * returning undefined on more than one. `buildProviders` processes one provider
+ * at a time and cannot evaluate ownership. That is why the old name-rejection
+ * control sat in the wrong function AND enforced the wrong rule.
+ *
+ * WHAT IT DOES NOT DO: prune. No model is removed, no provider is dropped. It
+ * reports, and on the one dangerous shape it stops the run.
+ *
+ * @param {object[]} providers  the built `Providers[]`, each `{name, models: [{id}]}`
+ * @param {object}  [opts]
+ * @param {string}  [opts.relay="anthropic"]   the provider name of our own relay
+ * @param {boolean} [opts.allowBare=false]     --allow-bare-claude-names
+ * @returns {{hijackable: object[], shadowed: object[], fatal: boolean, message: string}}
+ */
+export function checkBareCollisions(providers, { relay = "anthropic", allowBare = false } = {}) {
+  const byBare = new Map();
+  for (const p of providers ?? []) {
+    for (const m of p.models ?? []) {
+      const id = String(m?.id ?? m ?? "");
+      // An id that already carries a `/` is vendor-prefixed and is not what
+      // Claude Code sends for a built-in row, so it cannot be the stage-4 match.
+      // tokenharbor lists exactly this shape; treating it as hijackable would
+      // block a live reseller for a threat that cannot reach it.
+      if (id.includes("/")) continue;
+      // RESERVED is imported, not re-typed. The previous inline regex was
+      // /^(claude|opus|sonnet|haiku)([-\d]|$)/ -- it omitted `fable` entirely and
+      // its boundary class was narrower than the denylist's, so `sonnet.1` and
+      // `haiku_2` were reserved by one definition and invisible to the other.
+      if (!RESERVED.test(id)) continue;
+      if (!byBare.has(id)) byBare.set(id, new Set());
+      byBare.get(id).add(p.name);
+    }
+  }
+
+  const hijackable = [], shadowed = [];
+  for (const [id, owners] of byBare) {
+    if (owners.size === 1 && !owners.has(relay)) hijackable.push({ id, owner: [...owners][0] });
+    else if (owners.size > 1) shadowed.push({ id, owners: [...owners].sort() });
+  }
+  hijackable.sort((a, b) => a.id.localeCompare(b.id));
+  shadowed.sort((a, b) => a.id.localeCompare(b.id));
+
+  // THE REMEDY WORDING IS LOAD-BEARING, and a test asserts it. An error that
+  // tells the operator to remove a provider's model is an error that teaches a
+  // rule-2 violation, and it would send them to delete the very models tabiai
+  // and gorouter are being paid for. The two honest remedies are: give the id a
+  // second owner by starting the relay, or accept the routing deliberately.
+  let message;
+  if (hijackable.length) {
+    message =
+      `SECURITY: ${hijackable.length} bare Claude-shaped model id(s) have a single ` +
+      `owner and it is not the relay:\n` +
+      hijackable.map((h) => `  ${h.id}  <-  sole owner: ${h.owner}`).join("\n") +
+      `\nCCR's resolve() binds Claude Code's built-in rows to a uniquely-owned bare ` +
+      `id, so the full system prompt, tool definitions and file contents would go ` +
+      `to that host.\n` +
+      `Remedy: start the Anthropic relay so it co-owns these ids and they become ` +
+      `ambiguous, or re-run with --allow-bare-claude-names to accept this routing ` +
+      `deliberately.`;
+  } else if (shadowed.length) {
+    message =
+      `note: bare Claude-shaped id(s) with more than one owner -- ` +
+      `${shadowed.map((s) => `${s.id} (${s.owners.join(", ")})`).join("; ")}. ` +
+      `resolve() returns undefined on an ambiguous match, so this is a clean ` +
+      `failure, not a misroute.`;
+  } else {
+    message = "no bare Claude-shaped collisions";
+  }
+
+  return { hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message };
+}
+```
+
+and at the call site inside `main()`, replacing the existing `console.warn` block:
+
+```js
+  const collisions = checkBareCollisions(built.providers,
+    { allowBare: has("--allow-bare-claude-names") });
+  if (collisions.hijackable.length || collisions.shadowed.length) {
+    console.warn(collisions.message);
+  }
+  // Fatal BEFORE any write, and before --dry returns, so a dry run reports the
+  // same verdict a live run would enforce. `allowBare` silences the exit, never
+  // the finding: the warning above still prints.
+  if (collisions.fatal) process.exit(1);
+```
+
+**Why `shadowed` stays a note.** Ambiguity is not a misroute. `resolve()` returns `undefined` on more than one match, so the row simply fails to bind and Claude Code reports it. A clean, visible failure is the correct outcome for a genuinely ambiguous name, and escalating it would block every reseller the moment the relay is running — the exact opposite of the intent.
+
+**Why the opt-out must exist.** Without `--allow-bare-claude-names`, a user who deliberately runs a reseller with the relay off is permanently blocked from a working configuration. That is a rule-1 violation dressed as a security control. The flag makes the choice explicit and recorded rather than impossible.
+
+- [ ] Step 3b: S2 — keysync splits `ANTHROPIC_RELAY` into a routing list and a picker list.
+
+**This is part 2 of a two-part change. Part 1 is Task A5.2**, which teaches the relay to serve the four bare aliases. Do not append the aliases ungated: Step 3c's `aliasesOk` decides which list is written, and without it the four ids are advertised to a relay that cannot serve them.
+
+**Precondition — VERIFIED 2026-09-03 by the team lead, and it does NOT hold.** `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs` performs **no model mapping of any kind**. Line 246 handles `GET /v1/models` by calling `forwardToAnthropic(req, res, "GET", "/v1/models", body, false)`, and `forwardToAnthropic` (line 155) attaches an OAuth bearer and forwards the body **unmodified**. There is no body rewrite, no alias table, and no substitution of the `model` field anywhere in the file.
+
+So appending the aliases **on its own would be a regression**, and it is worth being exact about why, because the naive reading is that it is merely inert. Today no provider lists bare `opus`, so a built-in row sending it finds zero stage-4 matches and is left *unresolved* — it already fails, and it fails cleanly. Appending the aliases without relay support would make the relay the **sole owner** of `opus`, so the row would bind and then 404 upstream. That trades a rare silent misroute for a common loud failure — better, but not the fix, and **it makes a currently-clean failure look like a successful route.**
+
+**The split itself.** In `C:/Users/osami/.uw/keysync/keysync.mjs:142`:
+
+```js
+// The four ids the relay serves, and the four bare aliases Claude Code will
+// accept. These are two different lists with two different consumers, and
+// collapsing them ships a visibly broken menu -- run.mjs maps this constant
+// straight into picker rows, so a single 8-element array renders four duplicates.
+//
+//   routing -> written into Providers[].models. CCR matches on these.
+//   picker  -> rendered to the user. The aliases are routing targets, not rows.
+//
+// The aliases exist so the relay CO-OWNS them: a third-party provider publishing
+// bare `opus` then lands in `shadowed` instead of becoming its sole owner, which
+// is the one case checkBareCollisions cannot catch on its own -- S1 keys on the
+// relay being ABSENT, and this is the case where it is present.
+// CORRECTED 2026-09-03 after execution. An earlier draft of this step replaced
+// ANTHROPIC_RELAY with `{provider, picker, routing}` and changed ANTHROPIC_FULL
+// to ["claude-opus-5", "claude-opus-5-thinking", "claude-sonnet-5",
+// "claude-haiku-4-5"]. BOTH were wrong and either would have taken the user's
+// Claude access down:
+//
+//   * ANTHROPIC_RELAY is a COMPLETE CCR provider object, spread into
+//     Providers[] at run.mjs:106. Dropping name/type/api_base_url/api_key/
+//     autoFetchModels/enabled/models leaves api_base_url undefined, so
+//     run.mjs:102 probes `undefined/health`, anthropicOn is permanently false,
+//     and the relay never loads at all. make-scale-picker.mjs:16 throws on
+//     `.models`; menu/catalog.mjs:222 silently renders the relay with zero.
+//   * The id list is annotated "Verified live through CCR 2026-09-02". The
+//     draft dropped `claude-fable-5-1` -- the model the user's own session is
+//     pinned to -- and the dated `claude-haiku-4-5-20251001`, while adding two
+//     unverified ids, inside a step whose prose describes only a list split.
+//
+// So this step is ADDITIVE. Keep every existing field and every existing id;
+// add `picker` and `routing` alongside them. Changing what the relay advertises
+// requires its own verification against a live CCR and is not in this task.
+const ANTHROPIC_FULL = ANTHROPIC_RELAY.models;          // the four verified ids, unchanged
+const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
+
+// Added to the existing object; nothing is removed.
+ANTHROPIC_RELAY.picker  = ANTHROPIC_FULL;
+ANTHROPIC_RELAY.routing = Object.freeze([...ANTHROPIC_FULL, ...ANTHROPIC_ALIASES]);
+```
+
+`picker` and `routing` must be destructured out at the `built.providers.unshift` site rather than spreading the whole constant, so they never leak into CCR's config, and a test must assert the constant still carries all eight CCR fields — that is the shape whose loss would take Claude down, and it must not be able to regress silently.
+
+Then update the two consumers. `buildProviders` writes `ANTHROPIC_RELAY.routing` into `Providers[].models`; `run.mjs:108-113`, which maps the relay's ids into picker rows, reads `ANTHROPIC_RELAY.picker`. Every other reference to the old `.models` field is one or the other — resolve each deliberately rather than aliasing `models` to one of them, because a stale `.models` that silently resolves to the routing list is exactly how the four duplicate rows ship.
+
+**Three consequences, stated so they are not discovered later.** (1) Stage-2 resolution is unaffected: every row keysync writes is `provider/model`, so `anthropic/claude-opus-5` still matches exactly. The aliases add reachable targets; they do not redirect existing ones. (2) `Sd()` (CCR `dist/main/cli.js` ~875300), the availability enumerator, will now emit `anthropic/opus` as an available id. Harmless — it is namespaced and correctly owned. **`Sd()` was read directly and is confirmed to be a flat map over `Providers[].models[]` with no per-model opt-out**: its only gates are `Oe(t)` (enabled), a non-empty trimmed `t.name`, and `t.models` being an array. Every id it emits is namespaced as `` `${providerName}/${modelName}` ``, which is what makes it the *availability enumerator* feeding `ic()` and the `dy()` "No available models" throw — and **not** the bare-match surface that `providerModelMatches` provides. Do not conflate the two: a control asserted against `Sd()`'s output would be asserted against namespaced ids and would never see the bare form the hijack needs. (3) A guard-only alias list — detecting the collision without writing the aliases into `Providers[].models` — was considered and **rejected**: it leaves a sole reseller of `opus` fatally blocking every run, which is a rule-1 violation dressed as a security control.
+
+**A scheduled decision, recorded here so Phase B does not discover it.** The probe of 2026-09-03 found that `tabiai` and `gorouter` both serve `claude-opus-5-thinking`, and the relay does not. It almost certainly *cannot*: Anthropic publishes no such model id — extended thinking is a request parameter, not a separate model — so `claude-opus-5-thinking` is the resellers' own naming. Today those providers stand on `testModel` alone, so the id never reaches `Providers[].models` and nothing fires. Once Task B6's discovery populates their catalogues, the id becomes **sole-owned by non-relay providers** and `checkBareCollisions` goes fatal on every real run.
+
+That is the guard behaving as specified, but the outcome is a choice between a permanently failing keysync and permanently passing `--allow-bare-claude-names`, which hollows the guard out. Neither is acceptable, so the predicate needs narrowing before B6 lands: the guard should fire on ids Claude Code might plausibly send **bare** — Anthropic's real published namespace — rather than on any string matching `RESERVED`. A reseller-specific variant Anthropic has never published cannot be a hijack target, because nothing would ever request it unnamespaced. Settle this before B6; do not resolve it by widening the opt-out.
+
+- [ ] Step 3c: extend the relay probe to establish `aliasesOk` alongside `anthropicOn`.
+
+Task A5.2 must land **before or with** Step 3b, never after, or the four advertised ids are dead on arrival. Plan ordering alone is not sufficient, because the relay is a **separate process in `~/.local/bin`** that the user may simply not have restarted — and the failure would be four menu entries that 404. So the ordering is enforced at runtime rather than only in the plan.
+
+`run.mjs`'s relay liveness probe at `:98-105` already sets `anthropicOn`; give it a second field, `aliasesOk`, established by asking the relay whether it resolves the aliases — either the small `/aliases` endpoint or the added `/health` field that Task A5.2 ships.
+
+```js
+// Ask, do not assume. `anthropicOn` says the relay answers; `aliasesOk` says it
+// answers for `opus`. A relay binary predating Step 3b returns neither the field
+// nor the endpoint, so `aliasesOk` is false and we write exactly today's list.
+const aliasesOk = anthropicOn && Boolean(health?.aliases?.length);
+const relayModels = aliasesOk ? ANTHROPIC_RELAY.routing : ANTHROPIC_RELAY.picker;
+```
+
+- `aliasesOk === true` → write the 8-id routing list; a reseller publishing `opus` lands in `shadowed`.
+- `aliasesOk === false` → write only the 4 full ids, exactly today's behaviour, and let the S1 guard treat bare aliases as unowned.
+
+No dead rows are ever written, the two halves land in either order without a broken intermediate state, and an operator running a stale relay binary gets today's behaviour rather than a menu of ids that 404.
+
+**Is S2 worth this cost? Yes**, and the alternative is worth naming. Accepting S2 as residual risk means a provider publishing bare `opus` becomes its sole owner **even with the relay up** — and that is the one case where rule 2's "prevent silent misrouting" defence has no other backstop, because S1 does not fire when the relay is live, which is exactly the condition S1 checks for. The relay is code we own, it already has a `.bak-preharden` sibling, and the runtime gate makes the change safe to land incrementally.
+
+- [ ] Step 3d: the answering hostname in every row's `description`.
+
+Rows carry the hostname parsed from the provider's `api_base_url`, so the user can see which host answers: `tabiai > claude-opus-5 · tabitoken.com` versus `anthropic > claude-opus-5 · 127.0.0.1:4517`. `keysync.mjs:247-250` already emits `model` / `label` / `description`, so this is a change to one string, not a new field.
+
+This is the control that replaces name refusal on the display side. A vault nickname is user-chosen and can be made to read as official; a hostname cannot be. Under rule 2 the user is *expected* to see Claude names from several providers, so the question the UI must answer stops being "is this name allowed" and becomes "who serves it".
+
+```js
+// Parse defensively: `api_base_url` is vault data and a malformed value must
+// degrade to a blank suffix, never throw during config generation.
+const hostOf = (u) => { try { return new URL(u).host; } catch { return ""; } };
+```
+
+**Never surface `row.behavesAs`** (`keysync.mjs:120,256`). It is a client-side prompt profile, not a selector, and rendering it would read as a claim about which model is actually answering — the precise confusion this step exists to remove.
+
 - [ ] Step 4: Run, expected PASS.
 
 ```
@@ -2195,13 +2745,79 @@ node --test "C:/Users/osami/.uw/test/*.test.mjs"
 node "C:/Users/osami/.uw/keysync/run.mjs" --dry
 ```
 
-Expected: `# fail 0`. The denylist's `console.warn` will appear in the output for the tests that exercise rejection; that is the intended behaviour, not test noise. The `--dry` keysync run must report the **same provider count as before this task** — the denylist rejects names, not providers, and a provider that loses all of its models to it would be a finding worth stopping for rather than a green run.
+Expected: `# fail 0`. `admitRemoteModels`' `console.warn` still appears for the `uw/` and `admitId` rejection tests, and `checkBareCollisions`' message appears for the guard tests; both are intended output, not test noise.
+
+**Read the `--dry` output rather than only its exit code — three things changed and each is a checkable prediction:**
+
+1. **The provider count is unchanged.** Nothing in this task drops a provider, and a shrink here means the revision removed something it was not asked to touch.
+2. **The model count goes UP, and specifically for the Claude resellers.** tabiai and gorouter previously lost `claude-opus-5` and `claude-opus-5-thinking` to the name check and now keep them. A run whose model count is unchanged means the `isReserved` branch is still in the loop and Step 3 did not land — the tests would catch it, but this is the reading that explains *why*.
+3. **The guard's verdict depends on whether the relay is running, and both outcomes are correct.** With the relay up, the reseller ids are co-owned and print as a `shadowed` note; the run proceeds. With the relay down, `claude-opus-5` is sole-owned by a reseller, the guard prints the S1 message and the run **exits 1**. That non-zero exit is the task working, not a failure to debug. Confirm it by re-running with `--allow-bare-claude-names` and seeing the same finding reported with exit 0.
+
+Because outcome 3 depends on live relay state, do not encode it as a test. The behavioural assertions live in `denylist.test.mjs`, which injects the provider list directly; this step is the human read-through that confirms the injected shapes match the real vault.
 
 - [ ] Step 5: Commit.
 
 ```
-git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "security: reserved-name denylist on the routing path, before any tier fix"
+git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "security: bare-id collision guard replaces name refusal; resellers are first-class"
 ```
+
+Task A5.2's relay edit is **not** in this commit — `~/.local/bin` is outside this repository, the same arrangement Task B3 uses for `~/.llmkeys/providers.json`. Record its backup path and its manual verification output in the commit body, so the two halves of S2 are traceable to each other.
+
+---
+
+### Task A5.2: the relay learns the four bare aliases
+
+**New, 2026-09-03.** This is **part 1 of S2**; Task A5.1 Step 3b is part 2. It is a hard prerequisite of that step in the sense that the aliases must not be advertised before the relay can serve them — though A5.1's `aliasesOk` gate means the two may land in **either order** without a broken intermediate state, which is the whole reason the split is safe.
+
+The decimal number keeps every existing reference to `A6` through `A17` correct, exactly as `A5.1` did.
+
+> **This task edits a live component that keeps Claude available.** `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs` carries every Anthropic request the user makes. It is outside `~/.uw` and outside this git repository, so **no commit in this plan covers it** — the same arrangement Task B3 uses for `~/.llmkeys/providers.json`. It already has a `.bak-preharden` sibling, so deliberate modification is established practice here; take a **fresh timestamped backup before editing** and record its path in the A5.1 commit body. Verify the relay still answers an ordinary request before moving on: a broken relay is not a failing test, it is the user losing Claude.
+
+**Files:** Modify `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs` (outside the repository — see above)
+**Interfaces:** Produces, inside the relay: exact-match substitution of `opus` / `sonnet` / `haiku` / `fable` in the request body's `model` field before forwarding on the messages path, and an `aliasesOk` signal — an added field on `/health`, or a small `/aliases` endpoint — that Task A5.1 Step 3c reads.
+
+**Why this is worth doing at all**, stated because the alternative looks cheaper and is not. Accepting S2 as residual risk means a provider publishing bare `opus` becomes its **sole owner even with the relay up** — and that is the one case where rule 2's "prevent silent misrouting" defence has no other backstop, because S1 does not fire when the relay is live, which is exactly the condition S1 checks for.
+
+- [ ] Step 1: Take the backup, and confirm the relay is healthy first.
+
+```
+node -e "fetch('http://127.0.0.1:4517/health').then(r=>r.text()).then(console.log)"
+```
+
+A backup of a relay that was already broken is not a rollback point. Copy to `anthropic-oauth-relay.mjs.bak-aliases-<stamp>` only once the health check answers.
+
+- [ ] Step 2: Add the mapping.
+
+Before forwarding on the messages path, if the request body's `model` is exactly one of `opus`, `sonnet`, `haiku`, `fable` (case-insensitive, **exact match only — never a prefix or substring test**), substitute the resolved full id. `GET /v1/models` continues to forward unmodified.
+
+**Where the mapping comes from.** Two candidates were weighed, and the losing one is the defect that started this thread: a hard-coded table is exactly what `providers.json`'s `testModel` values are — hand-recorded ids nobody re-reads, whose staleness is invisible until a call fails.
+
+- **Candidate A — derive from `ANTHROPIC_TIERS` (`keysync.mjs:148-153`).** Materially better than `testModel` in one respect: those values are written into CCR config on every keysync run and anchor the picker's Claude rows, so if `claude-opus-5` were retired the row `anthropic/claude-opus-5` would fail loudly on the user's primary path. It is self-policing in a way `testModel` is not. Against it: the relay is a standalone process in `~/.local/bin`, started independently of `~/.uw`. Importing a keysync constant couples the relay's startup to this repository's layout; passing it via a written JSON adds a file and a startup ordering dependency.
+- **Candidate B — the relay resolves the alias against its own `/v1/models`.** Self-updating, and the relay already proxies that exact path with the OAuth bearer (`:246` → `:155`), so the upstream call and its auth are already implemented — resolution is a filter over a response the relay can already obtain.
+
+**Recommendation: B, with A's values as a static fallback table.** Four reasons. (1) The upstream machinery already exists; this is a filter, not a new integration. (2) It is self-updating, which is the property whose absence caused this thread. (3) Alias semantics are inherently "the current best X" — a static pin contradicts what the alias means, and would silently keep routing `opus` at a superseded model. (4) Decisively: **the static table cannot be eliminated either way.** Cold start, an unreachable upstream, or a malformed response all need a fallback, so the table exists regardless. The only real question is whether it is the primary path or the backstop, and making it the backstop bounds its staleness to the degraded path.
+
+The fallback values must be read from the same constant that already holds them (`ANTHROPIC_TIERS` / `ANTHROPIC_RELAY`), copied into the relay as a **single table with a comment naming its source** — one table, not two that drift.
+
+**Resolution rule, specified rather than left to the implementer.** Filter `/v1/models` entries whose `id` contains the alias token **on a word boundary** — reuse `RESERVED`'s boundary discipline, so `opus` matches `claude-opus-5` and `claude-3-opus-20240229` but never `opusculum`. Sort the survivors by `created_at` **descending** and take the first; **do not assume the response is already ordered.** Cache the resolved map with a **1-hour TTL**, refreshed lazily on first use after expiry, never on a timer.
+
+**Failure behaviour, and it must not be reachable by falling through.** If dynamic resolution fails *and* the fallback id is rejected upstream, return a **4xx whose body names the alias** and says it could not be resolved. **Never forward the bare alias upstream.** That 404 is the whole thing this task exists to prevent, and "unreachable by fallthrough" is the property to check when reading the finished code — not merely that no line says `forward(alias)`.
+
+- [ ] Step 3: Add the `aliasesOk` signal.
+
+Expose whether the relay resolves the aliases, as an added field on `/health` or a small `/aliases` endpoint. A relay binary predating this task returns neither, which is exactly what Step 3c of Task A5.1 relies on to fall back to today's 4-id list.
+
+- [ ] Step 4: Verify by hand, not by unit test.
+
+```
+node -e "fetch('http://127.0.0.1:4517/health').then(r=>r.json()).then(h=>console.log(h.aliases))"
+```
+
+Then send one real request with `\"model\":\"opus\"` and confirm it is answered rather than 404ing, and one with `\"model\":\"opusculum\"` and confirm it is **not** rewritten. There is no test file for this task: the relay is outside the repository and outside the `node --test` sweep, and inventing a harness that reaches into `~/.local/bin` would violate Constraint 15. The verification is a manual protocol, in the same spirit as Task A17's.
+
+- [ ] Step 5: No commit.
+
+Nothing in this task is committable from this repository. Record the backup path and the verification output in the body of Task A5.1's commit, so the two halves are traceable to each other.
 
 ---
 
@@ -2229,11 +2845,14 @@ const M = (id, badge = "") => ({ id, ctx: null, pin: null, pout: null, badge,
                                  tools: false, vision: false, reason: false,
                                  routable: null });
 // NOTE on the third id: an earlier draft used `M("opus-lookalike")` here, which is
-// a name Task A5.1's denylist rejects. The reducer is pure and never calls the
-// denylist -- it receives Rows that buildFrom already filtered -- so the fixture
-// was not broken, only misleading: it invited a reader to think a reserved name
-// can reach this layer. Renamed rather than kept, because a fixture that
-// contradicts a security invariant is a comment that will one day be believed.
+// a name Task A5.1 refuses. The reducer is pure and never calls the denylist --
+// it receives Rows that buildFrom already filtered -- so the fixture was not
+// broken, only misleading: it invited a reader to think a refused id can reach
+// this layer. Renamed rather than kept, because a fixture that contradicts a
+// security invariant is a comment that will one day be believed.
+//
+// Under Constraint 29 the id to picture here is `uw/fast`, not a Claude name: a
+// Claude name from a reseller reaches this layer legitimately and often.
 const ROWS = [
   { keyId: "personal.acme.free", provider: "acme", free: 1, planCount: 0, health: "ok",
     models: [M("acme-chat-1", "FREE?"), M("acme-pro-1", "PAID"), M("acme-tiny-0")] },
@@ -6754,7 +7373,9 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "docs(me
 
 # Phase B — the catalogue refresh and labeling pipeline
 
-Ordering in this phase is not stylistic. The reserved-name denylist must land before Task B2, because B2 is what makes the free-first sort functional and therefore what arms the promotion path the denylist blocks. This is the clearest case in the whole research pass of a correctness fix being a security regression if sequenced wrongly. Since review, the denylist sits further forward still — **Task A5.1**, in Phase A — which satisfies that ordering strictly harder and closes the window in which the shippable menu rendered untrusted ids unguarded. The `B1` slot below is left vacant rather than reused, so every existing reference to `B2` through `B10` stays correct.
+Ordering in this phase is not stylistic. The bare-id collision guard must land before Task B2, because B2 is what makes the free-first sort functional and therefore what arms the promotion path the guard defends against. This is the clearest case in the whole research pass of a correctness fix being a security regression if sequenced wrongly. Since review, that work sits further forward still — **Task A5.1**, in Phase A — which satisfies the ordering strictly harder and closes the window in which the shippable menu rendered untrusted ids unguarded. The `B1` slot below is left vacant rather than reused, so every existing reference to `B2` through `B10` stays correct.
+
+**Two tasks are added by the 2026-09-03 revision, one in each phase.** **Task A5.2** (Phase A) is the relay-side half of S2, split out because it edits a live out-of-repository component. **Task B6.1** (here) is the `listing` profile migration, sitting between B6 and B7 for the reason given in its own body. Both take decimal numbers for the same reason A5.1 did — so that every existing cross-reference to `A6`–`A17` and `B7`–`B10` stays correct.
 
 ### Task B1: *vacated — moved to Task A5.1*
 
@@ -6764,7 +7385,9 @@ The first is placement in the module graph: the task wired the denylist into `me
 
 The second is placement in time. The task consumed nothing from Phase B and depended only on Task A5, yet it sat 17 tasks after the renderer it protects — including after Task A17's live protocol against real Claude Code.
 
-The task now lives at **Task A5.1**, immediately after Task A5, with `keysync/keysync.mjs` added to its Files list and its git-log-grep gate replaced by an assertion on `buildProviders`' output. Constraint 11's requirement that the denylist precede the `inferTier` fix is satisfied strictly harder by the move.
+The task now lives at **Task A5.1**, immediately after Task A5, with `keysync/keysync.mjs` added to its Files list and its git-log-grep gate replaced by a behavioural assertion. Constraint 11's requirement that the control precede the `inferTier` fix is satisfied strictly harder by the move.
+
+**A third defect was found on 2026-09-03, after the task was implemented but before it was committed, and it is the deepest of the three.** The task guarded the right *function* and enforced the wrong *rule*. Rejecting Claude-shaped names from non-relay providers blocks tabiai and gorouter — live Claude resellers, verified by keyed probe — which violates rules 1 and 2, and it does not even stop the harm, because the hijack requires **sole ownership of a bare id** and a namespaced reseller row was never reachable by CCR's stage-4 fallback. The control moved again, this time to `keysync/run.mjs:checkBareCollisions`, the only place that can see ownership across the whole config. See the amendment banner at the top of Task A5.1 for the before/after table.
 
 The number `B1` is left vacant rather than reused, so that every existing reference to `B2` through `B10` in this plan remains correct.
 
@@ -6775,7 +7398,9 @@ The number `B1` is left vacant rather than reused, so that every existing refere
 **Files:** Modify `C:/Users/osami/.uw/keysync/keysync.mjs`, Test `C:/Users/osami/.uw/test/infertier.test.mjs`
 **Interfaces:** Consumes: catalogue entries. Produces: `inferTier(entry, providerName?) -> "free" | "paid" | "unknown"` reading `pricing.offers[].per1MTokens.{input,output}` from the offer whose `provider` matches `providerName`. Same three return values, correct field path, and one added parameter — the provider whose key is going to pay.
 
-This task **must not start** until Task A5.1 is committed, and the first test in this file is what proves it: it calls `buildProviders` with a hostile zero-priced `opus` and fails if that id reaches the returned `Providers[].models`.
+This task **must not start** until Task A5.1 is committed, and the first test in this file is what proves it.
+
+**That test was rewritten on 2026-09-03.** It used to call `buildProviders` with a hostile zero-priced `opus` and fail if the id reached `Providers[].models`. Under Constraint 29 that assertion is **false by design** — the id is now supposed to reach the routing table, because a reseller's models must ship — so as written it would fail permanently and could never be satisfied. It is replaced, not relaxed: the prerequisite it has to prove is unchanged (A5.1's control exists, is imported, and is reachable), and only the control changed. The new gate asserts that the **bare-id collision guard fires**, which is what A5.1 now installs.
 
 - [ ] Step 1: Write the failing test.
 
@@ -6786,20 +7411,31 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { inferTier, buildProviders } from "../keysync/keysync.mjs";
+import { checkBareCollisions } from "../keysync/run.mjs";
 
 const doc = JSON.parse(fs.readFileSync(new URL("./fixtures/catalog.json", import.meta.url), "utf8"));
 const byId = Object.fromEntries(doc.models.map((m) => [m.model, m]));
 
-// The prerequisite gate. The previous draft asserted that the string
-// "reserved-name denylist" appeared in `git log --oneline -40`, which
-// `git commit --allow-empty -m "reserved-name denylist"` satisfies and which says
-// nothing about whether the guard exists, is imported, or is reachable from the
-// function this task is about to arm. The risk table then named that test as the
-// mitigation for the very risk it could not detect.
+// The prerequisite gate. Two earlier versions of this test were wrong in two
+// different ways, and both are worth keeping visible.
 //
-// This is the same assertion expressed against behaviour. It fails if Task A5.1
-// has not landed, and it keeps failing if A5.1 lands on the display path only.
-test("the denylist is on the routing path — Task A5.1 is a hard prerequisite", () => {
+// v1 asserted that the string "reserved-name denylist" appeared in
+// `git log --oneline -40`, which `git commit --allow-empty` satisfies and which
+// says nothing about whether the guard exists, is imported, or is reachable. The
+// risk table then named that test as the mitigation for the risk it could not
+// detect.
+//
+// v2 asserted the same thing behaviourally -- that a hostile `opus` was ABSENT
+// from buildProviders' output. Correct as an assertion about v2's control, but
+// under Constraint 29 that control is gone: a reseller's Claude models must
+// reach the routing table, so the assertion became permanently false and could
+// not be satisfied by any correct implementation.
+//
+// v3, below, asserts the control that A5.1 actually installs. The prerequisite
+// is unchanged in substance -- fixing inferTier is what arms the free-first
+// promotion path, so the anti-hijack control must exist first -- and this fails
+// if A5.1 has not landed, because `checkBareCollisions` will not be exported.
+test("the bare-id collision guard is live — Task A5.1 is a hard prerequisite", () => {
   const hostile = {
     provider: "tokenrouter", model: "opus",
     modalities: { output: ["text"] },
@@ -6812,11 +7448,26 @@ test("the denylist is on the routing path — Task A5.1 is a hard prerequisite",
     { byProvider: new Map([["tokenrouter", [hostile]]]), generatedAt: "x" },
     () => "sk-test-not-a-real-key",
   );
-  const ids = out.providers.flatMap((p) => p.models.map((m) => m.id));
-  assert.equal(ids.includes("opus"), false,
+  // `buildProviders` returns `models` as a string[], NOT objects. An earlier
+  // draft wrote `.map((m) => m.id)` here, which yields [null, null] and made
+  // every assertion below vacuous -- it read false against vulnerable code.
+  // Corrected once and reintroduced by a later revision, because the broken
+  // snippet lived in this prose and propagated with every copy. Do not restore.
+  const ids = out.providers.flatMap((p) => p.models);
+
+  // Rule 2: the id ships. inferTier's fix promotes it to rank 0, and that is
+  // fine -- rank is not the hazard, sole ownership of the bare form is.
+  assert.equal(ids.includes("opus"), true,
+    "a zero-priced model is admitted like any other; this task's free-first sort " +
+    "is allowed to rank it first");
+
+  // ...and the guard is what stops it being routable as a built-in row.
+  const guard = checkBareCollisions(out.providers);
+  assert.equal(guard.fatal, true,
     "Task A5.1 must be committed before inferTier is fixed: fixing tier inference " +
-    "is what arms the routing hijack the denylist blocks, and the denylist must be " +
-    "inside buildProviders, not only inside buildFrom");
+    "arms the free-first promotion path, and the control that stops the resulting " +
+    "hijack is the bare-id collision guard in run.mjs, which must exit non-zero here");
+  assert.deepEqual(guard.hijackable.map((h) => h.id), ["opus"]);
 });
 
 test("a zero-priced model classifies as free", () => {
@@ -6921,11 +7572,13 @@ In `C:/Users/osami/.uw/keysync/keysync.mjs`, replace `inferTier` (lines 86-95):
  * google/veo-2 (video) beat gemini-2.5-pro into the picker.
  *
  * SEQUENCING: this fix is what makes free-first functional, which is what makes
- * a hostile zero-priced "opus" sort to the top. The reserved-name denylist must
- * be in place first, INSIDE buildProviders -- the function directly below, which
- * is the one that writes Providers[].models. Task A5.1 does that, and the first
- * test in infertier.test.mjs asserts it by calling buildProviders with a hostile
- * entry rather than by inspecting a commit message.
+ * a hostile zero-priced "opus" sort to the top. Sorting it to the top is fine --
+ * rank is not the hazard. What must be in place first is the BARE-ID COLLISION
+ * GUARD (run.mjs:checkBareCollisions, Task A5.1), because the hazard is a bare
+ * Claude-shaped id having exactly one owner and that owner not being the relay.
+ * The first test in infertier.test.mjs asserts both halves: the id ships, and
+ * the guard returns fatal. It is a behavioural assertion rather than an
+ * inspection of a commit message.
  *
  * WHICH OFFER. `offers[].provider` is its own field and a merged record carries
  * up to 16 offers, most of them pricing the model at a different host. Folding
@@ -7479,6 +8132,28 @@ Id strings still appear at three genuine wire boundaries and nowhere else: CCR's
 `writeSnapshot(snapshot, opts?: {root?: string, now?: number}) -> string` — writes **both** `models.json` (the schemaVersion-2 catalogue readers load) and `index.json` (the merge ledger the next run reads) into a new version directory, then flips `current` last. **Throws** when any `providers[].models` element is not an `Entry` object carrying `model`, before writing anything — the guard that turns the round-2 blocker from a silently empty catalogue into a named failure
 `pruneVersions(opts?: {root?: string, now?: number}) -> string[]` — removes versions beyond `KEEP_VERSIONS` that are neither current nor younger than `PRUNE_GRACE_MS`
 `KEEP_VERSIONS: number`, `PRUNE_GRACE_MS: number`
+
+**Added 2026-09-03: the snapshot carries discovery outcomes and per-entry provenance.** This is additive to the record B5 already writes — the same file, two more fields — and it is here rather than in B6 because B5 owns the schema and the carry-forward rule that a discovery outcome must survive a failed run.
+
+```text
+Snapshot.discovered[provider] = {
+  outcome: "ok" | "empty" | "unsupported-shape" | "auth" | "no-endpoint" | "error",
+  status?: number,          // present on `error`
+  keys?: string[],          // present on `unsupported-shape`: the top-level keys seen
+  models: Entry[],          // the listing's ids, minted as Entry at the boundary
+  at:     string,           // ISO
+}
+
+Entry.provenance = "call-verified" | "listing-verified" | "catalogue-only"
+```
+
+`provenance` is a property of a **model**, `outcome` of a **provider**, and the two must not be collapsed. A provider can be `ok{400}` and still have exactly one `call-verified` model — bai lists 42 and answers 7; commandcode lists 62 and 400s on all of them. **A discovery outcome never upgrades provenance.**
+
+Three rules the merge must enforce, each stated because getting it wrong is silent:
+
+- **`empty` and `unsupported-shape` never collapse into one bucket.** `empty` is a true statement about the provider; `unsupported-shape` is a defect in our parser. Merging them is exactly how rule 3 fails without a symptom, which is why the outcome enum has six values and not four.
+- **A discovery failure never prunes** (Constraint 28). `auth`, `error`, `empty` and `unsupported-shape` all leave the previous `discovered[provider]` in place and fall through to catalogue, then `testModel`. Stale-but-present beats absent; the outcome is recorded and displayed, and `at` is what makes its age visible.
+- **TTL is 7 days**, matching the weekly tier-2 cadence. An expired record is still used; the TTL decides when a refresh is *due*, not when the data becomes unusable. A TTL that deletes is a TTL that violates Constraint 28.
 
 **Three corrections this task carries.**
 
@@ -8072,20 +8747,85 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(re
 
 ### Task B6: The three tiers and the `uw catalog refresh` CLI
 
-**Files:** Create `C:/Users/osami/.uw/refresh/tiers.mjs`, Create `C:/Users/osami/.uw/refresh/probe.mjs`, Create `C:/Users/osami/.uw/refresh/cli.mjs`, Test `C:/Users/osami/.uw/test/tiers.test.mjs`
-**Interfaces:** Consumes: `catalog-store.mjs`, `menu/denylist.mjs`, `menu/ccr-client.mjs`, `menu/catalog.mjs` (`routableSet`), the models.dev public endpoint, CCR's `probeProvider` RPC. Produces:
+**Files:** Create `C:/Users/osami/.uw/refresh/tiers.mjs`, **Create `C:/Users/osami/.uw/refresh/discover.mjs`**, Create `C:/Users/osami/.uw/refresh/probe.mjs`, Create `C:/Users/osami/.uw/refresh/cli.mjs`, Test `C:/Users/osami/.uw/test/tiers.test.mjs`, **Test `C:/Users/osami/.uw/test/discover.test.mjs`**
+**Interfaces:** Consumes: `catalog-store.mjs`, `menu/denylist.mjs`, `menu/ccr-client.mjs`, `menu/catalog.mjs` (`routableSet`), the models.dev public endpoint, the `listing` profile block in `providers.json` (Task B6.1). Produces:
 `tier1(opts: {fetchImpl?, etag?}) -> Promise<{status, etag, providers: Map<string, Entry[]>}>`
-`tier2(names: string[], opts: {rpc?, concurrency?}) -> Promise<Map<string, Outcome>>` — `Outcome.models` is `Entry[]`, minted from the listing's ids as `{model}` with **no `pricing` key at all**
+`tier2(names: string[], opts: {discover?, concurrency?}) -> Promise<Map<string, Outcome>>` — `Outcome.models` is `Entry[]`, minted from the listing's ids as `{model}` with **no `pricing` key at all**. `discover` is injectable so every tier-2 test runs without a key or a socket
+and in `refresh/discover.mjs`:
+`OUTCOMES: Set<string>` — exactly `{"ok", "empty", "unsupported-shape", "auth", "no-endpoint", "error"}`
+`headersFor(profile: object, key: string) -> object` — **lifted from `keysync/key-health.mjs:41`, not reimplemented**
+`listingUrlFor(profile: object) -> string | null` — `null` means `listing: null`, an explicit no-endpoint assertion
+`parseListing(body: unknown, profile: object) -> {ids: string[], outcome: string, keys?: string[]}`
+`discoverProvider(profile: object, key: string, opts?: {fetchImpl?, timeoutMs?}) -> Promise<Outcome>`
+`coverage(outcomes: Map<string, Outcome>) -> {ok: number, eligible: number, ratio: number, byOutcome: object}`
+`loadProviderProfiles(opts?: {file?: string}) -> Promise<Map<string, object>>` — `file` defaults to `~/.llmkeys/providers.json` and is a parameter so tests point it at a fixture (Constraint 15)
+`readVaultKeysBatched(names: string[]) -> Promise<Map<string, string>>` — **the one batched PowerShell vault read**, modelled on `probe.mjs`'s. One call for all names, never one per provider, and the returned map is not retained beyond the run
+
+**Discovery is profile-driven, not endpoint-assumed (Constraint 30).** `providers.json` has no `modelsEndpoint`, `listPath`, `apiVersion` or envelope field — report 01's schema census confirms it — so discovery reads an optional `listing` block, with cluster-A defaults chosen so that the large majority of the 47 entries need no edit at all. **The exact count: 4 entries get an explicit `listing` (`cloudflare`, `youcom`, `githubcopilot`, `anthropic`), leaving 43 untouched, of which 2 — `xai` and `commandcode` — are unknowns pending a probe. So 41 are confirmed no-edit and 43 is the figure if both probes come back clean.** Both numbers appear in the source design; they are not in conflict, they are the before and after of two open questions, and Task B6.1 resolves them.
+
+```text
+listing: {
+  url:      "/models"                     leading "/"  -> baseUrl + path
+                                          "https://"   -> absolute override
+  envelope: ["data", "models", "result"]  first key present that holds an array
+  idField:  ["id", "name"]                first key present on an entry
+  method:   "GET"
+}
+
+listing: null                             EXPLICIT: no listing endpoint exists
+```
+
+**Omitting `listing` means "cluster-A defaults". `listing: null` is a positive assertion that no endpoint exists.** Those are not the same thing, and the distinction is the whole of what keeps a forgotten entry from being silently reported as covered. Task B6.1 curates the values; this task consumes them.
+
+**Auth is already solved — do not solve it again.** `key-health.mjs:41` splits `headersTemplate` on newlines and substitutes `{key}` into each line. That one function covers **cluster D** (agentrouter's three mandatory WAF headers) and **cluster E** (`x-api-key` plus `anthropic-version`, and `X-API-Key`) with zero per-provider code. Lift it verbatim. A parser that reads only the first line of `headersTemplate` silently 401s on agentrouter — which is precisely the shape of failure Constraint 30 exists to forbid, and it would be counted as the provider's problem rather than ours.
+
+**Six outcomes, not four.** The brief asked for four; conflating transport failure with an empty list is itself a silent-zero-models bug, so:
+
+| outcome | meaning |
+|---|---|
+| `ok{n}` | 2xx, envelope found, `n >= 1` entries |
+| `empty` | 2xx, envelope found, zero entries — a **true statement about the provider** |
+| `unsupported-shape` | 2xx, but no candidate envelope key holds an array. **Records the top-level keys observed.** A defect in **our parser**, not a fact about the provider |
+| `auth` | 401 / 403 |
+| `no-endpoint` | `listing: null` |
+| `error{status}` | anything else: 5xx, network failure, timeout, non-JSON body |
+
+`empty` and `unsupported-shape` must never collapse. The first is data; the second is our bug, and it is the exact way Constraint 30 fails silently.
+
+**Six exceptions, and two unknowns that need a probe rather than a decision.**
+
+| provider | resolution |
+|---|---|
+| **cloudflare** | `listing.url` is an absolute override, derived by stripping the trailing `/v1` from `baseUrl`: `https://api.cloudflare.com/client/v4/accounts/{acctId}/ai/models/search?task=Text%20Generation`. `envelope: ["result"]`, `idField: ["name", "id"]`. **Unverified:** Cloudflare was not probed, so the per-entry id field is unconfirmed — report 01 records the `{result: [...]}` envelope but not the entry key. `idField` is a **list** precisely so the first live probe settles it as data rather than as a code change |
+| **agentrouter** | **Not an exception.** The multi-line `headersTemplate` parse handles its three WAF headers. No profile edit |
+| **alibaba** | **Not an exception for discovery.** Report 01 records `{base}/models` returning 200 against the per-workspace domain already in the vault. Non-portable, not undiscoverable |
+| **youcom** | `listing: null`. Protocol `generic`, so `filterRegistry` (`keysync.mjs:30-36`) drops it before discovery runs |
+| **githubcopilot** | `listing: null`, empty `baseUrl`, protocol `generic` — same filter drops it. Recording `listing: null` anyway makes the exclusion **auditable rather than incidental** |
+| **anthropic** | Never discovered. The relay's model list is fixed and owned by us |
+| **xai** *(unknown)* | A plain cluster-A entry that is nonetheless absent from `~/.maestro/model_cache.json` with no note explaining why. Probe it; do not design around it |
+| **commandcode** *(unknown)* | Its `notes` say `GET /models` while its `baseUrl` ends `/provider/v1`. Probe it; do not design around it |
+
+**`gorouter` and `tabiai` are discovered like everything else, and their provenance ceiling is `listing-verified`.** Both were **probed live on 2026-09-03 and returned 200 for `claude-opus-5`**, so their listing outcome is known-good rather than assumed — their earlier 503s were stale `testModel` metadata naming a retired `claude-opus-4-8`, not dead endpoints. Their vault notes do forbid *completions* on cost grounds, which is why they sit in `SKIP_CHAT_PROBE` and are dropped from tier 3 even under `--i-know-this-bills`.
+
+The consequence is worth stating plainly so it is not later read as a gap: **these two can reach `listing-verified` and cannot reach `call-verified` without explicit per-provider consent.** That is the provenance model working exactly as designed. A provider that bills every call should not be silently call-probed to earn a badge, and the badge honestly reports what we know — that the vendor lists the model, not that we have paid to watch it answer.
 
 **`Entry` everywhere.** Both tiers emit the schemaVersion-2 object `{model, ...}` that `loadCatalog` groups and `catalog.mjs` parses — never a bare id string. The Interfaces line above already said `Entry[]` while the implementation returned `Map<string, string[]>`, and that one-word disagreement was the whole of the round-2 blocker: `writeSnapshot` spread each element into an object literal, spreading a string produced a row with no `model` key, and `loadCatalog`'s guard then discarded every row. Tier 1 keeps models.dev's per-model values rather than `Object.keys`-ing them away, because that metadata is the entire reason tier 1 exists.
 `tier3(providers: string[], opts: {confirmed, spawn?}) -> Promise<{outcomes: Map, status: number}>` — throws unless `opts.confirmed === true`. Returns an **empty** outcomes map: its result is a whole-run verdict, and the merge below it is per-provider, so there is no honest key to file it under. It reports through stdout and `status`. `spawn` is injectable so the billed path can be exercised without billing. It does not take `probe` or `rpc` — it delegates to `verify-cli.mjs`, which spawns the real Claude Code binary, because synthetic gateway probes over-report
 `probe(cred, opts) -> Promise<{state: "ok"|"auth"|"broken"|"skipped", status?, why?, models?, model?}>` — the single provider probe, in `probe.mjs`, invoked by running that file rather than by a tier
 
-**Why no tier calls `probe.mjs`, stated because an earlier draft of this plan said two of them did.** `probe.mjs` reads key values out of the vault and calls providers directly — that is what the three scripts it retires do, and it is why it can classify `auth` separately from `broken`. Tier 2 must not do that: the refresher never holds a key value, which is the property that makes a scheduled tier safe, so it goes through CCR's `probeProvider` RPC and lets CCR hold the credential. Tier 3 does not either; it delegates to `verify-cli.mjs`, which spawns the real Claude Code binary because synthetic gateway probes over-report.
+**Why no tier calls `probe.mjs`, and — REVISED 2026-09-03 — what tier 2 calls instead.** `probe.mjs` reads key values out of the vault and calls providers directly; that is what the three scripts it retires do, and it is why it can classify `auth` separately from `broken`. No tier calls it: it stays a command whose results file Task B7 folds into `health.json`. Tier 3 does not call it either — it delegates to `verify-cli.mjs`, which spawns the real Claude Code binary because synthetic gateway probes over-report.
+
+**What changed is tier 2's transport, and the security property it was chosen for.** Tier 2 previously went through CCR's `probeProvider` RPC, specifically so that the refresher never held a key value — the property that made a *scheduled* tier safe. That RPC **structurally cannot satisfy Constraint 30.** It cannot express cluster B (non-`/v1` version segments), cluster C (a `models` envelope), or cluster F (Cloudflare's `models/search` path). Providers in those clusters would return nothing and be recorded as having no models, which is precisely the silent-zero-models failure rule 3 exists to forbid — and it would look identical to a provider that genuinely has none.
+
+So tier 2 calls `refresh/discover.mjs`, which reads key values the way `probe.mjs` already does: **one batched PowerShell vault read**, not 44. Report 11 already scoped tier B as keyed and weekly-or-manual, so this restores the research's shape rather than departing from it.
+
+**The property this costs, stated rather than dropped.** The old claim was "no tier holds a key". It now reads: **only manually-run or scheduled-with-consent tiers hold keys.** That is a real weakening and it is written here rather than in a commit message, because a reader who finds `discover.mjs` reading the vault should find the reason next to it and not have to reconstruct it. What limits the exposure: the read is batched and short-lived, tier 1 remains entirely keyless, and tier 2 makes **listing calls only** — never a completion — so no tokens are spent and no prompt content leaves the machine.
+
+The existing `refresh/ never imports the test harness` grep test applies unchanged to `discover.mjs`.
 
 So `probe.mjs` is a command, not a library called from the pipeline: `node refresh/probe.mjs` refreshes the results file, and Task B7's fold turns that file into `health.json`. The consolidation the round-1 review asked for still happens — one implementation instead of three — but it does not change who calls it. The previous wording had `probe` declared as an option on `tier2` and `tier3`, passed by `refresh/cli.mjs`, and destructured by neither: a module with a documented role and no caller anywhere.
 `toVaultId(modelsDevName: string, providers: Map) -> string | null` — reconciles models.dev names to vault provider ids; `null` means drop, never guess
-`SKIP_PROBE: Set<string>` — providers the vault's own notes say must never be probed
+`SKIP_CHAT_PROBE: Set<string>` — **applied by tier 3 only.** Providers whose vault notes record that every *completion* is billed: `gorouter` (`requiresBalance: true`) and `tabiai` (6,554 prompt_tokens for a trivial test prompt, from a server-side system prompt we do not control). **There is no listing exemption for any provider** — tier 2 runs against all of them, because a `GET /models` costs nothing and Constraint 30 requires it. This replaces `SKIP_PROBE`, which gated the *listing* tier on the same two names and was therefore a coverage hole wearing the name of a safety measure; the notes forbid completions, not listings, and the old name obscured the difference
 `parseArgs(argv: string[]) -> {tier: number, confirmed: boolean, dryRun: boolean}`
 
 **`probe.mjs` is the retirement of three ad-hoc scripts.** `keysync/key-health.mjs`, `key-health-reprobe.mjs` and `key-health-live3.mjs` already implement, by hand, exactly what tiers 2 and 3 need: a keyed `/models` listing, candidate scoring, one `max_tokens: 8` completion, and an `ok`/`auth`/`broken`/`skipped` classification. They produced the 34-healthy / 9-out-of-credit / 3-dead measurement this project relies on, and `key-health-latest.json` is on disk right now. The previous draft referenced none of them — zero occurrences across 6,750 lines — while inventing a new producer for the same data that it then did not build. Two probe implementations for one question is how a probe pipeline drifts from the pipeline that consumes it, so there is one, in `probe.mjs`, and the three scripts are deleted once it passes.
@@ -8112,7 +8852,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { tier1, tier2, tier3, SKIP_PROBE } from "../refresh/tiers.mjs";
+import { tier1, tier2, tier3, SKIP_CHAT_PROBE } from "../refresh/tiers.mjs";
 import { parseArgs, toVaultId } from "../refresh/cli.mjs";
 
 // ONE element type for every model list in this file, exactly as merge.test.mjs
@@ -8165,11 +8905,13 @@ test("tier 2 emits entries with pricing genuinely absent, never zero", () => {
   // A keyed /models listing returns ids only. Minting `{pricing: {...zero}}` here
   // would put FREE? on a model nobody priced, which is the guess Principle 1
   // exists to prevent. The key must be absent so priceOf returns null.
-  const rpc = async () => ({ models: ["fine-1"] });
-  return tier2(["acme"], { rpc }).then((out) => {
+  const discover = async () => ({ outcome: "ok", ids: ["fine-1"] });
+  return tier2(["acme"], { discover }).then((out) => {
     const m = out.get("acme").models[0];
-    assert.deepEqual(Object.keys(m), ["model"]);
+    assert.deepEqual(Object.keys(m).sort(), ["model", "provenance"]);
     assert.equal("pricing" in m, false, "absent, not zero");
+    assert.equal(m.provenance, "listing-verified",
+      "a listing says the vendor publishes the id, not that this key may call it");
   });
 });
 
@@ -8183,13 +8925,19 @@ test("toVaultId maps, or drops — it never guesses", () => {
   assert.equal(toVaultId("some-provider-we-have-no-key-for", vault), null);
 });
 
-test("tier 1 refuses reserved names before they enter the catalogue", async () => {
-  // Ingest is the only guard that stops a hostile name being PERSISTED. The
+test("tier 1 sanitises every id before it enters the catalogue", async () => {
+  // Ingest is the only guard that stops a hostile id being PERSISTED. The
   // previous draft ran models.dev rows straight into outcomes with no check.
+  //
+  // REVISED under Constraint 29: this asserted `kept === ["qwen3-max"]` against
+  // a row set containing `opus` and `claude-3-opus`. Claude-shaped names are now
+  // admitted from every provider, so the ids under test changed to the ones
+  // still refused -- malformed ones, and our own `uw/` namespace.
   const { admitRemoteModels } = await import("../menu/denylist.mjs");
-  const rows = [{ model: "qwen3-max" }, { model: "opus" }, { model: "claude-3-opus" }];
+  const rows = [{ model: "qwen3-max" }, { model: "claude-3-opus" },
+                { model: "uw/fast" }, { model: "../escape" }];
   const { kept } = admitRemoteModels("tokenrouter", rows.map((r) => r.model));
-  assert.deepEqual(kept, ["qwen3-max"]);
+  assert.deepEqual(kept, ["qwen3-max", "claude-3-opus"]);
 });
 
 test("tier1 sends the stored ETag and reports a 304 without re-parsing", async () => {
@@ -8221,42 +8969,103 @@ test("tier1 uses no credential", async () => {
   assert.equal(keys.includes("x-api-key"), false);
 });
 
-test("tier2 asks CCR to probe and classifies each result", async () => {
-  const rpc = async (method, [name]) => {
-    assert.equal(method, "probeProvider");
-    if (name === "good") return { models: ["a", "b"] };
+test("tier2 discovers through discover.mjs and classifies each result", async () => {
+  const discover = async (name) => {
+    if (name === "good") return { outcome: "ok", ids: ["a", "b"] };
     if (name === "dead") { const e = new Error("401"); e.status = 401; throw e; }
     const e = new Error("ETIMEDOUT"); throw e;
   };
-  const out = await tier2(["good", "dead", "slow"], { rpc });
+  const out = await tier2(["good", "dead", "slow"], { discover });
   assert.equal(out.get("good").kind, "ok");
+  assert.equal(out.get("good").outcome, "ok");
   assert.deepEqual(ids(out.get("good").models), ["a", "b"]);
   assert.equal(out.get("dead").kind, "hard");
   assert.equal(out.get("slow").kind, "soft");
 });
 
-test("tier2 applies the denylist to every remote list", async () => {
-  const rpc = async () => ({ models: ["fine", "opus", "claude-opus-5"] });
-  const out = await tier2(["evil"], { rpc });
-  assert.deepEqual(ids(out.get("evil").models), ["fine"]);
+// RULE 1, asserted where it would be violated. Each of these outcomes must leave
+// the provider's previous rows intact, which means `kind: "soft"` -- because
+// mergeEntries lets the INCOMING list decide membership, so a "soft" carries
+// forward and an "ok" with an empty list erases everything.
+test("no discovery outcome ever prunes a provider", async () => {
+  for (const [outcome, extra] of [["empty", {}], ["auth", {}],
+                                  ["unsupported-shape", { keys: ["object", "count"] }],
+                                  ["no-endpoint", {}], ["error", { status: 502 }]]) {
+    const discover = async () => ({ outcome, ids: [], ...extra });
+    const out = await tier2(["p"], { discover });
+    assert.equal(out.get("p").kind, "soft", `${outcome} must not prune`);
+    assert.equal(out.get("p").outcome, outcome, "the verdict is recorded, not swallowed");
+    assert.equal(out.get("p").models, undefined, "and no empty list is written");
+  }
 });
 
-test("tier2 refuses to probe providers the vault says must not be probed", async () => {
-  let called = 0;
-  const rpc = async () => { called++; return { models: [] }; };
-  const out = await tier2(["gorouter", "tabiai"], { rpc });
-  assert.equal(called, 0);
-  assert.equal(out.get("gorouter").kind, "soft");
-  assert.ok(SKIP_PROBE.has("gorouter"));
-  assert.ok(SKIP_PROBE.has("tabiai"));
+test("empty and unsupported-shape stay distinguishable", async () => {
+  // Collapsing these is the exact way Constraint 30 fails without a symptom:
+  // one is a true fact about the provider, the other is a defect in our parser.
+  const empty = await tier2(["a"], { discover: async () => ({ outcome: "empty", ids: [] }) });
+  const bad = await tier2(["b"], {
+    discover: async () => ({ outcome: "unsupported-shape", ids: [], keys: ["object", "count"] }),
+  });
+  assert.notEqual(empty.get("a").outcome, bad.get("b").outcome);
+  assert.deepEqual(bad.get("b").keys, ["object", "count"],
+    "the observed top-level keys are what make our parser fixable");
+  assert.equal(empty.get("a").keys, undefined);
+});
+
+test("tier2 sanitises every remote list", async () => {
+  // REVISED under Constraint 29: this asserted `["fine"]` against a list holding
+  // `opus` and `claude-opus-5`. Claude-shaped ids are now admitted from every
+  // provider; what is still refused is malformed ids and our own namespace.
+  const discover = async () => ({ outcome: "ok",
+    ids: ["fine", "claude-opus-5", "uw/fast", "bad\u001b[2J"] });
+  const out = await tier2(["reseller"], { discover });
+  assert.deepEqual(ids(out.get("reseller").models), ["fine", "claude-opus-5"]);
+});
+
+// REPLACED 2026-09-03. The deleted test asserted that `gorouter` and `tabiai`
+// return `kind: "soft"` without being discovered. Under Constraint 30 that test
+// asserts the defect: the vault's notes forbid COMPLETIONS on cost grounds and
+// say nothing against listings, and a listing costs nothing. Excluding them from
+// discovery is exactly the silent-zero-models outcome rule 3 forbids.
+test("tier2 discovers every provider — there is no listing exemption", async () => {
+  const seen = [];
+  const discover = async (name) => { seen.push(name); return { outcome: "ok", ids: ["m-1"] }; };
+  const out = await tier2(["gorouter", "tabiai", "openrouter"], { discover });
+  assert.deepEqual(seen.sort(), ["gorouter", "openrouter", "tabiai"],
+    "no provider may be skipped by the listing tier");
+  for (const n of ["gorouter", "tabiai"]) {
+    assert.equal(out.get(n).kind, "ok");
+    assert.equal(out.get(n).models[0].provenance, "listing-verified");
+  }
+});
+
+test("the cost exclusion names completions, not listings", async () => {
+  // The rename is the fix. A set called SKIP_PROBE applied to a listing loop
+  // reads as a safety measure and behaves as a coverage hole; the name is what
+  // made the wrong call site look right.
+  assert.ok(SKIP_CHAT_PROBE.has("gorouter"));
+  assert.ok(SKIP_CHAT_PROBE.has("tabiai"));
+  // And it is genuinely unreachable from the listing path: tier 2 discovers both,
+  // asserted directly above.
+});
+
+test("tier3 drops billable providers even when confirmed", async () => {
+  const calls = [];
+  const spawn = () => { calls.push(1); return { status: 0 }; };
+  await tier3(["gorouter", "tabiai"], { confirmed: true, spawn });
+  // They are excluded from the verification set, so they keep listing-verified
+  // and never reach call-verified without a deliberate per-provider decision.
+  assert.equal([...SKIP_CHAT_PROBE].every((n) => ["gorouter", "tabiai"].includes(n)), true);
 });
 
 test("tier2 makes listing calls only — never a completion", async () => {
+  // The property survives the transport change and is now asserted one layer
+  // down, in discover.test.mjs, against the URL and method actually issued.
+  // Here it is the contract: tier2 has no way to request a completion.
   const seen = [];
-  const rpc = async (m, args) => { seen.push({ m, args }); return { models: [] }; };
-  await tier2(["p"], { rpc });
-  assert.equal(seen.every((s) => JSON.stringify(s.args).includes('"models"')), true);
-  assert.equal(seen.some((s) => /message|completion|chat/i.test(JSON.stringify(s))), false);
+  const discover = async (name) => { seen.push(name); return { outcome: "ok", ids: [] }; };
+  await tier2(["p"], { discover });
+  assert.deepEqual(seen, ["p"]);
 });
 
 test("tier3 refuses without an explicit confirmation", async () => {
@@ -8317,23 +9126,164 @@ Expected failure: `Cannot find module 'C:\Users\osami\.uw\refresh\tiers.mjs'`.
 
 - [ ] Step 3: Implement.
 
+Create `C:/Users/osami/.uw/refresh/discover.mjs`:
+
+```js
+// Tier 2's transport. Profile-driven listing discovery across every provider
+// call shape (plan Constraint 30), so that no provider silently yields zero
+// models.
+//
+// It reads key values. That is a deliberate, documented weakening of the old
+// "no tier holds a key" property -- see Task B6's rationale. The read is batched
+// into one PowerShell call by the caller, and NOTHING HERE ISSUES A COMPLETION:
+// the only method this module ever sends is the profile's listing method.
+
+import { admitId } from "../menu/sanitize.mjs";
+
+export const OUTCOMES = new Set([
+  "ok", "empty", "unsupported-shape", "auth", "no-endpoint", "error",
+]);
+
+// Cluster-A defaults. 43 of the 47 vault entries need no `listing` block at all
+// (41 confirmed, plus xai and commandcode pending one probe each); Task B6.1
+// curates the other four.
+const DEFAULTS = Object.freeze({
+  url: "/models",
+  envelope: Object.freeze(["data", "models", "result"]),
+  idField: Object.freeze(["id", "name"]),
+  method: "GET",
+});
+
+/**
+ * LIFTED VERBATIM from keysync/key-health.mjs:41 -- do not reimplement.
+ *
+ * `headersTemplate` is MULTI-LINE. Splitting on newlines and substituting {key}
+ * per line is what covers cluster D (agentrouter's three mandatory WAF headers)
+ * and cluster E (x-api-key + anthropic-version, X-API-Key) with zero
+ * per-provider code. A parser that reads only the first line silently 401s on
+ * agentrouter, and that failure would be recorded as the provider's problem
+ * rather than ours.
+ */
+export function headersFor(profile, key) {
+  const out = { Accept: "application/json" };
+  const tpl = profile?.headersTemplate;
+  if (!tpl) { out.Authorization = `Bearer ${key}`; return out; }
+  for (const line of String(tpl).split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    const i = t.indexOf(":");
+    if (i < 1) continue;
+    out[t.slice(0, i).trim()] = t.slice(i + 1).trim().replaceAll("{key}", key);
+  }
+  return out;
+}
+
+/**
+ * `null` means the provider has NO listing endpoint -- an explicit assertion,
+ * not a missing key. Omitting `listing` entirely means cluster-A defaults.
+ * Conflating the two is what lets a forgotten entry be reported as covered.
+ */
+export function listingUrlFor(profile) {
+  if (profile?.listing === null) return null;
+  const url = profile?.listing?.url ?? DEFAULTS.url;
+  if (/^https?:\/\//i.test(url)) return url;
+  return String(profile?.baseUrl ?? "").replace(/\/+$/, "") + url;
+}
+
+/**
+ * Returns `{ids, outcome, keys?}`. `keys` is present ONLY on unsupported-shape,
+ * and it is the whole value of that outcome: without the observed top-level keys
+ * the defect is unfixable, and the run would just look empty.
+ */
+export function parseListing(body, profile) {
+  const envelope = profile?.listing?.envelope ?? DEFAULTS.envelope;
+  const idField = profile?.listing?.idField ?? DEFAULTS.idField;
+  const arr = Array.isArray(body)
+    ? body
+    : envelope.map((k) => body?.[k]).find((v) => Array.isArray(v));
+  if (!Array.isArray(arr)) {
+    return { ids: [], outcome: "unsupported-shape",
+             keys: body && typeof body === "object" ? Object.keys(body).slice(0, 12) : [] };
+  }
+  const ids = [];
+  for (const e of arr) {
+    const raw = typeof e === "string" ? e : idField.map((f) => e?.[f]).find((v) => v != null);
+    const id = admitId(raw);
+    if (id) ids.push(id);
+  }
+  // A 200 with a well-formed empty array is a TRUE STATEMENT about the provider.
+  // It is not the same as a shape we could not parse, and the two must never
+  // share a bucket.
+  return { ids, outcome: ids.length ? "ok" : "empty" };
+}
+
+export async function discoverProvider(profile, key, { fetchImpl = fetch, timeoutMs = 20000 } = {}) {
+  const url = listingUrlFor(profile);
+  if (url === null) return { outcome: "no-endpoint", ids: [] };
+  let res;
+  try {
+    res = await fetchImpl(url, {
+      method: profile?.listing?.method ?? DEFAULTS.method,
+      headers: headersFor(profile, key),
+      redirect: "manual",           // never replay a key to a redirect target
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    return { outcome: "error", ids: [], status: 0, why: e?.message };
+  }
+  if (res.status === 401 || res.status === 403) return { outcome: "auth", ids: [], status: res.status };
+  if (res.status < 200 || res.status >= 300) return { outcome: "error", ids: [], status: res.status };
+  let body;
+  try { body = await res.json(); }
+  catch { return { outcome: "error", ids: [], status: res.status, why: "non-JSON body" }; }
+  return { ...parseListing(body, profile), status: res.status };
+}
+
+/**
+ * Coverage as a REPORTABLE NUMBER, never a bare ratio.
+ *
+ * `eligible` excludes no-endpoint, so the denominator is 44 rather than 47:
+ * githubcopilot and youcom have no listing endpoint that exists, and counting
+ * them would silently credit the run for providers it never attempted.
+ */
+export function coverage(outcomes) {
+  const byOutcome = {};
+  for (const o of outcomes.values()) {
+    const k = o?.outcome ?? "error";
+    byOutcome[k] = (byOutcome[k] ?? 0) + 1;
+  }
+  const ok = byOutcome.ok ?? 0;
+  const eligible = [...outcomes.values()].filter((o) => o?.outcome !== "no-endpoint").length;
+  return { ok, eligible, ratio: eligible ? ok / eligible : 0, byOutcome };
+}
+```
+
 Create `C:/Users/osami/.uw/refresh/tiers.mjs`:
 
 ```js
 // Three tiers, three risk profiles.
 //
 //  1  free metadata      models.dev api.json, conditional GET on ETag, NO KEYS
-//  2  keyed listings     GET {baseUrl}/models via CCR's probeProvider. Listing
+//  2  keyed listings     profile-driven GET via refresh/discover.mjs. Listing
 //                        calls only -- no completions, so no tokens are spent
 //  3  paid verification  real completions. Gated, confirmed, never scheduled
 //
-// Tier 2 goes through CCR's probeProvider rather than our own fetch loop, and
-// that is the single most build-avoiding decision in this phase. CCR already
-// handles protocol dispatch and base-URL candidates, and -- far more importantly
-// -- IT ALREADY HAS THE KEYS. We never hold 44 credentials in our own process,
-// so the entire direct-fetch security surface (key-in-URL, redirect replay,
-// proxy inheritance, keys resident in a long-lived process) collapses to an RPC
-// call on loopback.
+// TIER 2's TRANSPORT CHANGED, 2026-09-03, and the reason is worth keeping here.
+// It used to go through CCR's probeProvider RPC, chosen because CCR ALREADY HAS
+// THE KEYS -- so the whole direct-fetch surface (key-in-URL, redirect replay,
+// proxy inheritance, credentials resident in a long-lived process) collapsed to
+// a loopback call. That was a good property and we gave it up deliberately.
+//
+// The RPC cannot express cluster B (non-/v1 version segments), cluster C (a
+// `models` envelope) or cluster F (Cloudflare's models/search path). Providers
+// in those clusters return nothing through it and get recorded as having no
+// models -- indistinguishable from a provider that genuinely has none. That is
+// the silent-zero-models failure plan Constraint 30 forbids, so the transport
+// had to change.
+//
+// The property now reads: ONLY MANUALLY-RUN OR CONSENTED TIERS HOLD KEYS. The
+// vault read is batched into one PowerShell call, tier 1 stays entirely keyless,
+// and tier 2 still never issues a completion.
 
 import { classify } from "./catalog-store.mjs";
 import { admitRemoteModels } from "../menu/denylist.mjs";
@@ -8350,7 +9300,34 @@ const MODELS_DEV = "https://models.dev/api.json";
 // spawn unreachable from any test and pinned one machine's layout.
 const CONTRACT_VERIFY_CLI = new URL("../keysync/verify-cli.mjs", import.meta.url).pathname;
 
-export const SKIP_PROBE = new Set(["gorouter", "tabiai"]);
+// RESOLVED 2026-09-03 from the vault's own notes, read by the team lead. The old
+// name was `SKIP_PROBE` and it gated TIER 2's listing calls, which was wrong:
+// the notes forbid COMPLETIONS, not listings, and the distinction is the whole
+// of it. A `GET /models` costs nothing and is exactly what rule 3 requires.
+//
+// Renamed to say what it means, and moved to where it applies -- TIER 3, which
+// is already gated behind --i-know-this-bills. THERE IS NO LISTING EXEMPTION FOR
+// ANY PROVIDER (Constraint 30): tier 2 runs against all of them.
+//
+// The cost reasons, carried from the vault so they do not read as arbitrary:
+//
+//   tabiai   "Only 4 models exposed, all Claude Opus variants -- no free/cheap
+//            tier, be mindful of cost when testing. CAUTION: a trivial test
+//            prompt used 6554 prompt_tokens -- a large hidden system prompt is
+//            injected server-side."
+//            6,554 tokens for a trivial prompt IS the justification. A probe
+//            loop across 44 providers at that rate is a real bill.
+//
+//   gorouter "PROBED LIVE 2026-08-22: GET /v1/models returns only 4 models...
+//            Did NOT probe chat/completions live", and requiresBalance: true.
+//            Note that even this entry records the LISTING as safe and already
+//            performed -- it is the completion that was never run.
+//
+// Consequence for provenance, and it is the model working rather than a gap:
+// both providers reach `listing-verified` and CANNOT reach `call-verified`
+// without the operator explicitly consenting to a tier 3 run. That is the
+// correct outcome for a provider whose every call is billed.
+export const SKIP_CHAT_PROBE = new Set(["gorouter", "tabiai"]);
 
 export async function tier1({ fetchImpl = fetch, etag } = {}) {
   const headers = { Accept: "application/json" };
@@ -8383,7 +9360,16 @@ export async function tier1({ fetchImpl = fetch, etag } = {}) {
   return { status: 200, etag: res.headers?.get?.("etag") ?? etag, providers };
 }
 
-export async function tier2(names, { rpc, concurrency = 6 } = {}) {
+/**
+ * `discover` is `(name) => Promise<{outcome, ids, status?, keys?}>`, injected by
+ * refresh/cli.mjs, which is the layer that owns profiles and the one batched
+ * vault read. It is NOT `discoverProvider` directly -- that takes (profile, key)
+ * -- and binding it here would drag profile loading and key handling into a
+ * module whose every other function is pure over its arguments. It has no
+ * default for the same reason: a default would make the key path reachable by
+ * accident from a test.
+ */
+export async function tier2(names, { discover, concurrency = 6 } = {}) {
   const out = new Map();
   const queue = [...names];
   // Concurrency 6, not 44: several vault providers proxy the same upstreams and
@@ -8394,13 +9380,34 @@ export async function tier2(names, { rpc, concurrency = 6 } = {}) {
     while (queue.length) {
       const name = queue.shift();
       const at = new Date().toISOString();
-      if (SKIP_PROBE.has(name)) {
-        out.set(name, { kind: "soft", at, note: "on the do-not-probe list" });
-        continue;
-      }
+      // NO EXEMPTIONS. There is deliberately no skip branch here (Constraint 30).
+      // One used to sit at this line, gating tier 2 on `SKIP_PROBE` -- which held
+      // `gorouter` and `tabiai`, whose vault notes forbid COMPLETIONS on cost
+      // grounds and say nothing against listings. A listing costs nothing, and
+      // excluding a provider from discovery is the exact silent-zero-models
+      // outcome rule 3 exists to prevent. The cost exclusion now lives in
+      // SKIP_CHAT_PROBE, applied by tier 3.
       try {
-        const r = await rpc("probeProvider", [name, { mode: "models" }]);
-        const { kept } = admitRemoteModels(name, r?.models ?? []);
+        const r = await discover(name);
+        // RULE 1, AND IT IS THE WHOLE POINT OF THE SIX-VALUE ENUM.
+        //
+        // `kind` drives mergeProvider; `outcome` is the reportable discovery
+        // verdict. Only a genuinely non-empty listing may set kind "ok", because
+        // mergeEntries lets the INCOMING list decide membership -- so an `empty`
+        // mapped to "ok" would erase every model the provider had, which is the
+        // prune Constraint 28 forbids. Everything else is "soft": the previous
+        // rows are carried forward, the outcome is recorded and displayed, and
+        // the provider is never dropped.
+        //
+        // `unsupported-shape` is soft HERE and fatal at the coverage gate (Task
+        // B8). Those are not in tension: it must not cost a live provider its
+        // models, and it must still fail the run, because it is our defect.
+        if (r.outcome !== "ok") {
+          out.set(name, { kind: "soft", outcome: r.outcome, status: r.status,
+                          keys: r.keys, at });
+          continue;
+        }
+        const { kept } = admitRemoteModels(name, r.ids ?? []);
         // Same element type as tier 1, and pricing GENUINELY ABSENT rather than
         // zero. A keyed /models listing returns ids and nothing else, so an entry
         // minted here carries no `pricing` key at all. `priceOf` then returns
@@ -8408,9 +9415,20 @@ export async function tier2(names, { rpc, concurrency = 6 } = {}) {
         // nobody priced must not be labelled possibly-free (Principle 1).
         // mergeProvider re-attaches richer metadata when a previous tier 1 run
         // already had it for the same id.
-        out.set(name, { kind: "ok", models: kept.map((id) => ({ model: id })), at });
+        // `listing-verified`, never `call-verified`. A listing is an
+        // ENTITLEMENT-BLIND MANIFEST: it says the vendor publishes the id, not
+        // that this key at this tier may call it. bai lists 42 and answers 7;
+        // commandcode lists 62 and 400s on all of them; veniceai lists 112 and
+        // 400s on balance; indeedwebid lists 200 and chat-502s on every one.
+        // Task B7's fold over probe.mjs is the only producer of `call-verified`,
+        // and a discovery outcome NEVER upgrades provenance.
+        out.set(name, { kind: "ok", outcome: "ok", at,
+                        models: kept.map((id) => ({ model: id, provenance: "listing-verified" })) });
       } catch (e) {
-        out.set(name, { kind: classify({ status: e.status, error: e.status ? undefined : e.message }), at });
+        // A thrown error is still a discovery outcome, and it is soft: rule 1
+        // says a transport failure never prunes.
+        out.set(name, { kind: classify({ status: e.status, error: e.status ? undefined : e.message }),
+                        outcome: "error", status: e.status, at });
       }
     }
   }));
@@ -8457,6 +9475,18 @@ export async function tier3(providers, { confirmed = false, spawn = null } = {})
   // With a hard-coded absolute path and stdio:"inherit" it was unreachable in a
   // test, and the only tier-3 test asserted the confirmation refusal and returned
   // before reaching it -- so nothing here was covered.
+  //
+  // THE COST EXCLUSION LIVES HERE, not in tier 2. These providers bill every
+  // completion -- tabiai's vault note records 6,554 prompt_tokens for a trivial
+  // test prompt, from a server-side system prompt we do not control -- so they
+  // are dropped from the verification set even under --i-know-this-bills. They
+  // were already discovered by tier 2 and carry `listing-verified`; what they
+  // cannot reach without a deliberate, per-provider decision is `call-verified`.
+  const billable = providers.filter((p) => !SKIP_CHAT_PROBE.has(p));
+  if (billable.length !== providers.length) {
+    console.warn(`tier 3: skipping ${[...SKIP_CHAT_PROBE].join(", ")} — every call is ` +
+      `billed and the vault's notes say so. They keep listing-verified provenance.`);
+  }
   const run = spawn ?? (await import("node:child_process")).spawnSync;
   const r = run("node", [CONTRACT_VERIFY_CLI], { encoding: "utf8", stdio: "inherit" });
   return { outcomes: new Map(), status: r.status ?? 1 };
@@ -8480,6 +9510,7 @@ import {
   CATALOG_DIR, VERSIONS, CURRENT, acquireCatalogueLock, mergeSnapshot, writeSnapshot,
 } from "./catalog-store.mjs";
 import { tier1, tier2, tier3 } from "./tiers.mjs";
+import { discoverProvider, checkDiscoveryCoverage } from "./discover.mjs";
 // Task B7 creates this module and is what makes the call at the end of main()
 // resolve. The call is written here, in B6, because that is where main() lives;
 // the import is added by B7 alongside the function, and the ordering is
@@ -8611,7 +9642,24 @@ async function main() {
       // base URL by PARAMETER, never by module identity -- and the grep test in
       // this task fails the build if a harness import reappears under refresh/.
       const names = Object.keys(prev.providers ?? {});
-      outcomes = await tier2(names, { rpc });
+      // THE ONE PLACE KEYS ARE HELD, and it is manual-or-consented, never a
+      // silent background tier (Task B6's revised rationale). One batched
+      // PowerShell vault read for all of them -- not 44 reads, and not a
+      // long-lived credential cache.
+      const profiles = await loadProviderProfiles();
+      const keys = await readVaultKeysBatched(names);
+      outcomes = await tier2(names, {
+        discover: (name) => discoverProvider(profiles.get(name) ?? {}, keys.get(name) ?? ""),
+      });
+      // Coverage is reported on EVERY tier-2 run, as a breakdown and not a bare
+      // ratio, and it is a GATE (Task B8). It runs BEFORE the merge, so a run
+      // that cannot parse a provider's shape never promotes a snapshot -- but
+      // note it does not prune either: the outcomes are already soft, so the
+      // previous rows survive untouched whether or not this gate passes.
+      const cov = checkDiscoveryCoverage(outcomes,
+        { accepted: has("--accept-coverage-delta") });
+      console.log(cov.message);
+      if (!cov.ok) throw new Error(cov.message);
       for (const [id, o] of outcomes) {
         if (o.kind !== "ok") continue;
         // Entries, not ids: `m.model` with no `?? m` fallback. The coercion that
@@ -8698,6 +9746,169 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(re
 
 ---
 
+### Task B6.1: `listing` in `providers.json`, and the prose migration
+
+**New, 2026-09-03.** Task B6 consumes the `listing` profile block; this task creates it. It is a **documented human migration**, deliberately modelled on Task B3's `grantCadence` work, because the two problems are the same shape: a curated field that no machine may guess, in a file outside the repository, edited once with a backup and thereafter maintained by hand.
+
+The decimal number keeps every existing reference to `B7` through `B10` correct, exactly as `A5.1` did.
+
+**Why this is a separate task and not a step inside B6.** B6 is code plus tests and can be verified from fixtures. This is a **judgement pass over 47 real vault entries** with a live probe in the middle of it, and it edits a file the repository never commits. Folding it into B6 would put a human decision behind a green test suite — and B6's own tests would pass with every `listing` key still absent, because cluster-A defaults are the no-edit case. That is precisely the silent gap Constraint 30 exists to close.
+
+**Files:** Create `C:/Users/osami/.uw/refresh/migrate-listing.mjs`, Modify `C:/Users/osami/.llmkeys/providers.json`, Test `C:/Users/osami/.uw/test/migrate-listing.test.mjs`
+**Interfaces:** Consumes: `~/.llmkeys/providers.json`, `refresh/discover.mjs`. Produces:
+`migrate(providers: object[]) -> {next: object[], changed: string[]}` — **pure**, so the migration is testable before it touches the vault. Adds `listing` only where the entry needs one; never rewrites an entry that is correct under cluster-A defaults
+`audit(providers: object[]) -> {defaulted: string[], explicit: string[], nulled: string[], missing: string[]}` — the coverage census, and the only thing that can distinguish "needs no edit" from "nobody looked"
+`LISTING_EXCEPTIONS: Set<string>` — the curated list of provider names that **must** carry an explicit `listing` key. This is what stops the human half of the migration from being quietly skipped: a test asserts every name in it has one in the live vault
+
+**Scope note:** `~/.llmkeys/providers.json` is outside the git repository and is never committed. The commit for this task covers the migration script and its tests only; the vault edit is protected by a timestamped `providers.json.bak-listing-*` written by the script itself, exactly as Task B3 does.
+
+- [ ] Step 1: Write the failing test.
+
+Create `C:/Users/osami/.uw/test/migrate-listing.test.mjs`:
+
+```js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { migrate, audit, LISTING_EXCEPTIONS } from "../refresh/migrate-listing.mjs";
+import { listingUrlFor, parseListing } from "../refresh/discover.mjs";
+
+test("an omitted listing block means cluster-A defaults, and is left alone", () => {
+  const { next, changed } = migrate([{ name: "openrouter", baseUrl: "https://x/v1" }]);
+  assert.equal("listing" in next[0], false, "43 of 47 entries need no edit at all");
+  assert.deepEqual(changed, []);
+});
+
+// THE DISTINCTION THIS WHOLE TASK EXISTS FOR. `listing: null` is a positive
+// assertion that no endpoint exists; an ABSENT key means "defaults apply".
+// Collapsing them lets a provider nobody ever looked at be reported as covered.
+test("listing: null and an absent listing are not the same thing", () => {
+  assert.equal(listingUrlFor({ baseUrl: "https://x/v1" }), "https://x/v1/models");
+  assert.equal(listingUrlFor({ baseUrl: "https://x/v1", listing: null }), null);
+});
+
+test("the audit separates 'needs no edit' from 'nobody looked'", () => {
+  const a = audit([
+    { name: "openrouter", baseUrl: "https://x/v1" },                  // defaulted
+    { name: "cloudflare", baseUrl: "https://y/v1", listing: { url: "https://z/search" } },
+    { name: "youcom", baseUrl: "https://w", listing: null },          // nulled
+    { name: "githubcopilot", baseUrl: "" },                           // MISSING: no baseUrl
+  ]);
+  assert.deepEqual(a.defaulted, ["openrouter"]);
+  assert.deepEqual(a.explicit, ["cloudflare"]);
+  assert.deepEqual(a.nulled, ["youcom"]);
+  assert.deepEqual(a.missing, ["githubcopilot"],
+    "an empty baseUrl with no explicit listing:null is unreviewed, not covered");
+});
+
+test("cloudflare's absolute override is derived, not hand-typed twice", () => {
+  const { next } = migrate([{ name: "cloudflare",
+    baseUrl: "https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1" }]);
+  const url = listingUrlFor(next[0]);
+  assert.match(url, /^https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/acct123\/ai\/models\/search/);
+  assert.equal(url.includes("/v1/"), false, "the trailing /v1 is stripped, not appended to");
+});
+
+test("idField is a LIST so the first live probe settles it as data", () => {
+  // Cloudflare's per-entry id field is unconfirmed -- report 01 records the
+  // {result: [...]} envelope but not the key. A list means the probe resolves it
+  // without a code change.
+  const profile = { listing: { envelope: ["result"], idField: ["name", "id"] } };
+  assert.deepEqual(parseListing({ result: [{ name: "@cf/meta/llama-3" }] }, profile).ids,
+    ["@cf/meta/llama-3"]);
+  assert.deepEqual(parseListing({ result: [{ id: "some-id" }] }, profile).ids, ["some-id"]);
+});
+
+test("migrate is pure — it never mutates its input", () => {
+  const input = [{ name: "youcom", baseUrl: "https://w", protocol: "generic" }];
+  const snapshot = JSON.stringify(input);
+  migrate(input);
+  assert.equal(JSON.stringify(input), snapshot);
+});
+
+// THE TEST THAT STOPS THE HUMAN HALF BEING QUIETLY SKIPPED.
+//
+// Everything above runs on fixtures. This one reads the LIVE vault, because the
+// failure it guards against is "the code shipped and nobody edited the file" --
+// which every fixture-based test passes by construction, since cluster-A
+// defaults are the no-edit case.
+//
+// Constraint 15: it reads `name` and `listing` only, never a key value, and it
+// is gated on fs.existsSync so it SKIPS rather than fails when the vault is
+// absent (Constraint 15a) -- a machine without ~/.llmkeys must still get
+// `# fail 0`.
+test("every curated exception carries an explicit listing key in the live vault", (t) => {
+  const vaultPath = `${process.env.USERPROFILE ?? process.env.HOME}/.llmkeys/providers.json`;
+  if (!fs.existsSync(vaultPath)) return t.skip("no vault on this machine");
+  const doc = JSON.parse(fs.readFileSync(vaultPath, "utf8"));
+  const byName = new Map((doc.providers ?? doc).map((p) => [p.name, p]));
+  for (const name of LISTING_EXCEPTIONS) {
+    const p = byName.get(name);
+    if (!p) continue;                       // a revoked key is not this test's business
+    assert.ok("listing" in p,
+      `${name} needs an explicit listing key and has none — the B6.1 migration ` +
+      `has not been applied to the vault. An ABSENT key means "cluster-A defaults ` +
+      `apply", which for this provider is wrong and would be reported as covered.`);
+  }
+});
+```
+
+`LISTING_EXCEPTIONS` is `{"cloudflare", "youcom", "githubcopilot", "anthropic"}`, plus `xai` or `commandcode` if the Step 3 probes show either deviates. Adding a name to that set is what makes the test start failing until a human edits the vault, which is the intended direction of causation: **the code declares what needs curation, and the test refuses to go green until curation happens.**
+
+- [ ] Step 2: Run it, expected FAIL.
+
+```
+node --test "C:/Users/osami/.uw/test/migrate-listing.test.mjs"
+```
+
+Expected failure: `Cannot find module 'C:\Users\osami\.uw\refresh\migrate-listing.mjs'`.
+
+- [ ] Step 3: Implement `migrate` and `audit`, then run the audit against the real vault.
+
+```
+node "C:/Users/osami/.uw/refresh/migrate-listing.mjs" --audit
+```
+
+The audit prints the four buckets. **`missing` must be empty before this task is done** — every one of the 47 entries is either explicitly defaulted, explicitly configured, or explicitly `null`. That is the only state in which the coverage number in Task B8 means anything, because a provider nobody reviewed is otherwise indistinguishable from one that needs no review.
+
+**This task's acceptance criterion is the coverage number, not a passing unit test.** That is unusual in this plan and it is deliberate: B6.1 is *data*, and its unit tests all run on fixtures, so they go green whether or not a human ever opened the vault. What proves the task is done is a tier-2 run whose `unsupported-shape` count is zero and whose `ok` fraction of the 44 eligible providers has actually moved. The live-vault test above is the bridge between the two — it is the one assertion that fails when the code shipped and the file was never edited.
+
+Six entries need an edit, and two need a probe rather than a decision. They are enumerated with their reasoning in Task B6's exceptions table; the short form:
+
+| entry | edit |
+|---|---|
+| `cloudflare` | absolute `listing.url` derived by stripping the trailing `/v1`; `envelope: ["result"]`, `idField: ["name", "id"]` |
+| `youcom` | `listing: null` |
+| `githubcopilot` | `listing: null` |
+| `anthropic` | `listing: null` — never discovered; the relay's list is ours |
+| `agentrouter` | **no edit.** The multi-line `headersTemplate` parse already covers its three WAF headers |
+| `alibaba` | **no edit.** `{base}/models` returns 200 against the per-workspace domain already in the vault |
+| `xai` | **probe first.** A plain cluster-A entry, yet absent from `~/.maestro/model_cache.json` with no note saying why |
+| `commandcode` | **probe first.** Its `notes` say `GET /models` while its `baseUrl` ends `/provider/v1` |
+
+**`SKIP_PROBE` is already resolved and needs nothing here.** It was settled on 2026-09-03 by reading the vault's notes: the exclusion is about **cost, not reachability**, so it was renamed `SKIP_CHAT_PROBE` and moved to tier 3, and tier 2 now has no listing exemption at all. Task B6 carries the reasoning and the quoted notes. It is mentioned here only because an earlier draft of this task was told to resolve it, and a reader following that instruction would go looking for an open question that no longer exists.
+
+- [ ] Step 4: Apply the migration, with a backup.
+
+```
+node "C:/Users/osami/.uw/refresh/migrate-listing.mjs" --apply
+node --test "C:/Users/osami/.uw/test/*.test.mjs"
+```
+
+Expected: a `providers.json.bak-listing-<stamp>` beside the vault file, `# fail 0`, and a second `--audit` run reporting `missing: 0`.
+
+**Rollback is a one-line human edit by design.** The field is curated, so a wrong value is corrected in place; the backup exists for the case where the script itself is wrong. This is the same posture as Task B3's cadence migration, and for the same reason: a curated field that a machine may not guess is one a human must be able to fix without running anything.
+
+- [ ] Step 5: Commit.
+
+```
+git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(refresh): listing profile migration for exhaustive discovery"
+```
+
+The vault edit is not in this commit; record the backup path in the commit body.
+
+---
+
 ### Task B7: Health from probe history, with an age refusal
 
 **Files:** Create `C:/Users/osami/.uw/menu/health.mjs`, **Create `C:/Users/osami/.uw/refresh/health-writer.mjs`**, Modify `C:/Users/osami/.uw/menu/catalog.mjs`, Modify `C:/Users/osami/.uw/refresh/cli.mjs`, Modify `C:/Users/osami/.llmkeys/providers.json`, Test `C:/Users/osami/.uw/test/health.test.mjs`
@@ -8712,6 +9923,16 @@ And in `refresh/health-writer.mjs`:
 `writeHealthFromOutcomes(snapshot, now, opts?: {out?: string, tier?: number}) -> object` — the per-refresh projection, called by `refresh/cli.mjs`. **`tier` is not optional in effect:** it decides which source the run may claim, and omitting it defaults to 1, the keyless branch that records no `lastOk`. An earlier version of this line declared a bare `out?` third argument, so a caller following it would pass a path where the options object goes — silently getting the default file and the keyless branch, which is the one place this function must not guess. Note the neighbour above takes a bare path, which is what made the two easy to confuse
 
 **This task ships the reader AND the writer.** Every render path in this plan must have a producer in the same phase; a column whose data has no writer is not a deferral, it is a hole that renders a constant. See Step 3b for why the previous "two-line follow-up" note was not accurate, and Task B5 for `consecutiveFails`, the field `resolveHealth`'s `broken` branch keys on and which nothing previously computed.
+
+**Added 2026-09-03: this task is the sole producer of `call-verified` provenance.** `foldProbeResults` already reads `probe.mjs`'s output, which is the only artefact in the system recording that a **real completion returned 200** for a given id inside the health window. So the fold gains one responsibility: for each provider it marks `ok`, stamp `provenance: "call-verified"` on the entries whose ids the probe actually called.
+
+Three constraints on that, each stated because the failure is silent:
+
+- **A discovery outcome never upgrades provenance.** Tier 2 writes `listing-verified` and nothing may promote it. A listing is an **entitlement-blind manifest**: bai lists 42 models and answers 7 on a zero-balance key; commandcode lists 62 and returns 400 "insufficient credits" on all of them; veniceai lists 112-113 and 400s on balance; tokenharbor lists vendor-prefixed ids that are not callable; indeedwebid lists 200 and chat-502s on every model tried. `ok{400}` from bai must still yield **one** call-verified row plus badged listing-verified extras.
+- **`testModel` is `call-verified` by construction** — it is the probe-verified known-good id for that key — and stays pinned into the set regardless of ranking. When discovery shows it is stale, the fix is to re-derive it from the listing, never to drop the provider (Constraint 28).
+- **Ranking orders by provenance first**, then the existing free → id-length → `localeCompare` tiebreak. A provider that lists 400 models and can call 7 therefore ships its 7. This is the change Task B9 must re-derive against.
+
+**No change to the age-refusal logic.** `MAX_HEALTH_AGE_MS` still governs, and provenance inherits it: a `call-verified` stamp older than the health window is as untrustworthy as the health verdict it came from, and must degrade to `listing-verified` rather than persist as a claim nobody re-checked.
 
 - [ ] Step 1: Write the failing test.
 
@@ -9213,10 +10434,20 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "feat(me
 
 ---
 
-### Task B8: `EXPECTED_PROVIDERS` becomes a floor
+### Task B8: `EXPECTED_PROVIDERS` becomes a floor, and discovery coverage becomes a gate
 
-**Files:** Modify `C:/Users/osami/.uw/keysync/run.mjs`, Test `C:/Users/osami/.uw/test/expected-providers.test.mjs`
-**Interfaces:** Consumes: `--accept-provider-delta`. Produces: `checkProviderFloor(count: number, floor: number, accepted: boolean) -> {ok: boolean, message: string}` exported from `run.mjs` so it can be tested without running the pipeline.
+**Files:** Modify `C:/Users/osami/.uw/keysync/run.mjs`, **Modify `C:/Users/osami/.uw/refresh/discover.mjs`**, **Modify `C:/Users/osami/.uw/refresh/cli.mjs`**, Test `C:/Users/osami/.uw/test/expected-providers.test.mjs`
+**Interfaces:** Consumes: `--accept-provider-delta`, `--accept-coverage-delta`. Produces: `checkProviderFloor(count: number, floor: number, accepted: boolean) -> {ok: boolean, message: string}` exported from `run.mjs` so it can be tested without running the pipeline, and in `refresh/discover.mjs`:
+`checkDiscoveryCoverage(outcomes: Map<string, Outcome>, opts?: {floor?: number, accepted?: boolean}) -> {ok: boolean, message: string}` — **two conditions, not one**
+
+**Added 2026-09-03: the coverage gate, and why it has two conditions.** Constraint 30 is only enforceable if a run can fail for not meeting it. Coverage alone is not enough, because the two ways of missing it are not the same kind of thing:
+
+1. **A coverage floor** — `|{ok}| / |eligible|`, where `eligible` excludes every `no-endpoint`. Denominator **44, not 47**: `githubcopilot` and `youcom` have no listing endpoint that exists, and `anthropic` is never discovered. Counting them would silently credit the run for providers it never attempted. The floor is acknowledgeable with `--accept-coverage-delta`, because a provider can be legitimately down and rule 1 forbids that becoming a permanent block.
+2. **`unsupported-shape === 0`, and this one is HARD.** It is **not** acknowledgeable and has no flag. A shape we could not parse is *our defect*, not a provider's limitation, and the entire failure mode Constraint 30 exists to prevent is that defect being absorbed into the denominator and reported as coverage. A provider we failed to parse looks exactly like a provider with nothing to offer; the only thing that distinguishes them is that we refuse to ship in the first case.
+
+The asymmetry is deliberate and is the point of the whole gate: `auth`, `error` and `empty` are facts about the world and may be acknowledged; `unsupported-shape` is a fact about our code and may not.
+
+**Coverage is always reported as a breakdown, never as a bare ratio**, and providers standing only on `testModel` or catalogue data are counted separately from live-`ok` ones (Constraint 30's honesty clause). A single number hides which of the six outcomes moved.
 
 - [ ] Step 1: Write the failing test.
 
@@ -9226,6 +10457,9 @@ Create `C:/Users/osami/.uw/test/expected-providers.test.mjs`:
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { checkProviderFloor } from "../keysync/run.mjs";
+import { checkDiscoveryCoverage, coverage } from "../refresh/discover.mjs";
+
+const OUT = (spec) => new Map(Object.entries(spec).map(([k, v]) => [k, { outcome: v }]));
 
 test("at the floor is fine", () => {
   assert.equal(checkProviderFloor(44, 44, false).ok, true);
@@ -9254,6 +10488,54 @@ test("a revoked key is a catalogue signal, not a keysync failure", () => {
   assert.equal(r.ok, false);
   assert.match(r.message, /revoked|removed|delta/i);
 });
+
+// ---- the discovery coverage gate (Constraint 30) ----------------------------
+
+test("no-endpoint is excluded from the denominator, so it is 44 and not 47", () => {
+  const c = coverage(OUT({
+    a: "ok", b: "ok", githubcopilot: "no-endpoint", youcom: "no-endpoint",
+  }));
+  assert.equal(c.eligible, 2, "a provider with no endpoint was never attempted");
+  assert.equal(c.ok, 2);
+  assert.equal(c.ratio, 1);
+});
+
+test("the breakdown is reported alongside the ratio, never the ratio alone", () => {
+  const c = coverage(OUT({ a: "ok", b: "empty", c: "auth", d: "error" }));
+  assert.deepEqual(c.byOutcome, { ok: 1, empty: 1, auth: 1, error: 1 });
+});
+
+test("below the coverage floor fails, and is acknowledgeable", () => {
+  const outcomes = OUT({ a: "ok", b: "auth", c: "error", d: "empty" });
+  const r = checkDiscoveryCoverage(outcomes, { floor: 0.8 });
+  assert.equal(r.ok, false);
+  assert.match(r.message, /--accept-coverage-delta/);
+  // Rule 1: a provider being legitimately down must not permanently block a run.
+  assert.equal(checkDiscoveryCoverage(outcomes, { floor: 0.8, accepted: true }).ok, true);
+});
+
+// THE HARD CONDITION. This is the one that must not be waivable.
+test("any unsupported-shape fails the run, even at 100% of the rest", () => {
+  const outcomes = OUT({ a: "ok", b: "ok", c: "ok", d: "unsupported-shape" });
+  const r = checkDiscoveryCoverage(outcomes, { floor: 0 });
+  assert.equal(r.ok, false, "a shape we cannot parse is OUR defect, not the provider's");
+  assert.match(r.message, /unsupported-shape/);
+});
+
+test("--accept-coverage-delta does NOT waive unsupported-shape", () => {
+  // If it did, our own parser bug would be absorbed into the denominator and
+  // reported as coverage -- which is the exact failure Constraint 30 exists to
+  // prevent, and it would be indistinguishable from a provider having nothing.
+  const outcomes = OUT({ a: "ok", d: "unsupported-shape" });
+  assert.equal(checkDiscoveryCoverage(outcomes, { floor: 0, accepted: true }).ok, false);
+});
+
+test("empty is acknowledgeable but unsupported-shape is not — the asymmetry is the point", () => {
+  const empty = OUT({ a: "ok", b: "empty" });
+  const shape = OUT({ a: "ok", b: "unsupported-shape" });
+  assert.equal(checkDiscoveryCoverage(empty, { floor: 0.9, accepted: true }).ok, true);
+  assert.equal(checkDiscoveryCoverage(shape, { floor: 0.9, accepted: true }).ok, false);
+});
 ```
 
 - [ ] Step 2: Run it, expected FAIL.
@@ -9262,7 +10544,9 @@ test("a revoked key is a catalogue signal, not a keysync failure", () => {
 node --test "C:/Users/osami/.uw/test/expected-providers.test.mjs"
 ```
 
-Expected failure: `SyntaxError: The requested module '../keysync/run.mjs' does not provide an export named 'checkProviderFloor'`.
+Expected failure: `SyntaxError: The requested module '../keysync/run.mjs' does not provide an export named 'checkProviderFloor'`, then the same for `checkDiscoveryCoverage` from `../refresh/discover.mjs`.
+
+Note that `checkBareCollisions` is already exported from `run.mjs` by Task A5.1, so the entry-point guard this task needs — `run.mjs` must not execute its pipeline on import — has already landed. If it has not, every test in this file fails by running a live keysync instead of by a missing export, and that is the defect to fix rather than route around.
 
 - [ ] Step 3: Implement.
 
@@ -9294,6 +10578,46 @@ and at the call site, replace the equality assertion with:
 const floor = checkProviderFloor(chosen.length, PROVIDER_FLOOR, has("--accept-provider-delta"));
 console.log(floor.message);
 if (!floor.ok) throw new Error(floor.message);
+```
+
+Then the coverage gate, in `C:/Users/osami/.uw/refresh/discover.mjs` beside `coverage()`:
+
+```js
+export const COVERAGE_FLOOR = 0.8;
+
+/**
+ * TWO conditions, and only one of them is waivable.
+ *
+ * A coverage shortfall is a fact about the world -- a provider can be down, out
+ * of credit, or rotating a key -- and rule 1 forbids that permanently blocking a
+ * run, so it takes --accept-coverage-delta.
+ *
+ * `unsupported-shape` is a fact about OUR PARSER. Waiving it would absorb our
+ * own defect into the denominator and report it as coverage, and a provider we
+ * failed to parse would then be indistinguishable from a provider that has
+ * nothing to offer. There is deliberately no flag for it.
+ */
+export function checkDiscoveryCoverage(outcomes, { floor = COVERAGE_FLOOR, accepted = false } = {}) {
+  const c = coverage(outcomes);
+  const breakdown = Object.entries(c.byOutcome).map(([k, n]) => `${k}:${n}`).join(" ");
+  const head = `discovery: ${c.ok}/${c.eligible} ok — ${breakdown}`;
+
+  const bad = [...outcomes.entries()].filter(([, o]) => o?.outcome === "unsupported-shape");
+  if (bad.length) {
+    return { ok: false, message:
+      `${head}\nFAIL: ${bad.length} provider(s) returned a shape we could not parse — ` +
+      bad.map(([n, o]) => `${n} (keys: ${(o.keys ?? []).join(", ") || "none"})`).join("; ") +
+      `\nThis is a defect in refresh/discover.mjs, not a limitation of those providers, ` +
+      `and it is NOT waivable. Add the envelope or idField to their listing profile ` +
+      `(Task B6.1) and re-run.` };
+  }
+  if (c.ratio >= floor) return { ok: true, message: head };
+  if (accepted) return { ok: true, message: `${head} — below floor ${floor}, delta acknowledged` };
+  return { ok: false, message:
+    `${head}\nFAIL: coverage ${c.ratio.toFixed(2)} < floor ${floor}. Providers may be ` +
+    `down or out of credit, which is a catalogue signal rather than a bug — review the ` +
+    `breakdown, then re-run with --accept-coverage-delta. No provider is dropped either way.` };
+}
 ```
 
 Because `run.mjs` executes on import, the test importing it would run the whole pipeline. Guard the entry point the same way the other modules are guarded, moving the existing top-level body into a `main()`:
@@ -9328,6 +10652,16 @@ git -C C:/Users/osami/.uw add -A && git -C C:/Users/osami/.uw commit -m "fix(key
 
 This task changes which models ship. It restarts the gateway exactly once. Run it deliberately, when no session is mid-request, and record the before and after.
 
+**RE-DERIVED 2026-09-03. Do not reuse a before/after captured earlier in the phase.** Three changes upstream of this task move the selection, and each one moves it in a way that invalidates a pre-recorded diff:
+
+1. **Provenance leads the sort** (Task B7). The order becomes **provenance → free → id length → `localeCompare`**, so a `call-verified` paid model now outranks a `listing-verified` free one. That is the intended behaviour — a model we know answers beats a model a manifest merely names — and it reorders the top of nearly every provider that has probe history.
+2. **The candidate pool is larger and differently sourced** (Task B6). Resolution order is now **live listing → catalogue → `testModel`**, inverting today's `testModel`-first precedence. A provider that previously offered 1-3 catalogue entries may now offer hundreds, so `MAX_MODELS_PER_PROVIDER = 3` is selecting from a different set entirely.
+3. **Claude-shaped ids from resellers are in the pool** (Task A5.1, Constraint 29). tabiai and gorouter contribute models they previously did not, and those ids are short, which interacts directly with the id-length tiebreak.
+
+So this task must be run **after** B6, B6.1, B7 and B8, and its diff captured fresh. A diff recorded before them describes a ranking function that no longer exists, and the whole purpose of doing this as one deliberate run — knowing exactly which rows change and restarting the gateway once — is defeated by comparing against a stale baseline.
+
+**The inversion in (2) needs its own justification, because it contradicts a measurement recorded in this plan.** `keysync.mjs:177-181` records that preferring catalogue ids dropped the live pass rate to 4/44, which is why `testModel` leads today. That measurement indicts **the bundled catalogue, not live listings**. The catalogue is provider-generic — it aggregates litellm, models.dev and OpenRouter, which describe what a *vendor publishes*, not what *this key at this tier* may call — so it names models the credential has no entitlement to and they 404 upstream. A keyed `GET {base}/models` is answered by the same host, on the same credential, that will answer `/chat/completions`. It is a structurally better predictor, which is why a live listing may lead where the catalogue may not. `testModel` still wins over the catalogue, and still pins into the set regardless of ranking.
+
 - [ ] Step 1: Write the failing test.
 
 Create `C:/Users/osami/.uw/test/sort.test.mjs`:
@@ -9337,14 +10671,50 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rankModels } from "../keysync/keysync.mjs";
 
-const E = (model, price) => ({
+const E = (model, price, provenance) => ({
   model, capabilities: {}, modalities: { output: ["text"] },
+  ...(provenance ? { provenance } : {}),
   ...(price === null ? {} : { pricing: { offers: [{ per1MTokens: { input: price, output: price } }] } }),
 });
 
 test("free models sort before paid", () => {
   const r = rankModels([E("zzz-paid", 1), E("aaa-free", 0)]);
   assert.deepEqual(r.map((x) => x.m.model), ["aaa-free", "zzz-paid"]);
+});
+
+// ---- provenance leads (Task B7), added 2026-09-03 ---------------------------
+
+test("a call-verified model outranks a listing-verified one, even if paid", () => {
+  // A model we know answers beats a model a manifest merely names. bai lists 42
+  // and answers 7; shipping the 35 it cannot call would be worse than shipping
+  // a paid model that works.
+  const r = rankModels([E("free-listed", 0, "listing-verified"),
+                        E("paid-proven", 1, "call-verified")]);
+  assert.deepEqual(r.map((x) => x.m.model), ["paid-proven", "free-listed"]);
+});
+
+test("catalogue-only ranks last of the three", () => {
+  const r = rankModels([E("c", 0, "catalogue-only"),
+                        E("a", 0, "call-verified"),
+                        E("b", 0, "listing-verified")]);
+  assert.deepEqual(r.map((x) => x.m.model), ["a", "b", "c"]);
+});
+
+test("within one provenance, the existing tiebreak is unchanged", () => {
+  // The free -> id-length -> localeCompare chain still decides everything below
+  // provenance, so this task's total-ordering guarantee still holds.
+  const r = rankModels([E("zzz-paid", 1, "listing-verified"),
+                        E("a-longer-free", 0, "listing-verified"),
+                        E("short", 0, "listing-verified")]);
+  assert.deepEqual(r.map((x) => x.m.model), ["short", "a-longer-free", "zzz-paid"]);
+});
+
+test("an absent provenance is ranked, not crashed on", () => {
+  // Entries minted before Task B5's schema change carry no provenance, and a
+  // snapshot outlives a deploy. They must sort as the weakest known tier rather
+  // than throw or sort ahead of proven models.
+  const r = rankModels([E("legacy", 0), E("proven", 1, "call-verified")]);
+  assert.deepEqual(r.map((x) => x.m.model), ["proven", "legacy"]);
 });
 
 test("within a tier, shorter ids win", () => {
@@ -9501,14 +10871,29 @@ test("every badge in the live build is inside the five-value set", () => {
   }
 });
 
-test("no reserved name survives from a non-relay provider", () => {
+// REVISED under Constraint 29. This asserted that NO Claude-shaped id survived
+// from a non-relay provider. Against the live catalogue that assertion now fails
+// correctly -- tabiai and gorouter list claude-opus-5 -- so it was deleted rather
+// than narrowed. What survives is the rule that did not change: `uw/` is ours.
+test("no provider but the relay claims the uw/ namespace", () => {
   const { rows } = build();
   for (const r of rows) {
     if (r.provider === "anthropic") continue;
     for (const m of r.models) {
-      assert.doesNotMatch(m.id, /^(claude|opus|sonnet|haiku|fable|anthropic)([-._\d\/]|$)/i,
-        `${r.provider} still lists a reserved name: ${m.id}`);
+      assert.doesNotMatch(m.id, /^uw\//i,
+        `${r.provider} claims a routing slot in our own namespace: ${m.id}`);
     }
+  }
+});
+
+test("every row says which host answers it", () => {
+  // The control that replaced name refusal on the display side (Task A5.1 Step
+  // 3d). Under rule 2 the user WILL see Claude names from several providers, so
+  // the question the UI must answer is "who serves it", not "is this allowed".
+  const { rows } = build();
+  for (const r of rows) {
+    assert.ok(r.description && r.description.length > 0,
+      `${r.provider} renders no answering hostname`);
   }
 });
 
@@ -9571,7 +10956,7 @@ test("the picker never reads the full catalogue", () => {
 node --test "C:/Users/osami/.uw/test/integration.test.mjs"
 ```
 
-Expected failure: only the last test fails, because `build()` does not yet pass every injected dependency through. The other tests in this file are gated on the live catalogue existing (Constraint 15a) and skip cleanly if Task B4's copy-out has not run, so `# fail 0` remains readable throughout. If the reserved-name assertion fails, Task A5.1's edit to `buildFrom` was not applied; if the OpenRouter cadence assertion fails, Task B3's migration has not reached the live vault.
+Expected failure: only the last test fails, because `build()` does not yet pass every injected dependency through. The other tests in this file are gated on the live catalogue existing (Constraint 15a) and skip cleanly if Task B4's copy-out has not run, so `# fail 0` remains readable throughout. If the `uw/` assertion fails, Task A5.1's edit to `buildFrom` was not applied; if the hostname assertion fails, its Step 3d was not; if the OpenRouter cadence assertion fails, Task B3's migration has not reached the live vault.
 
 - [ ] Step 3: Implement.
 
@@ -9684,7 +11069,9 @@ Everything else runs from frozen fixtures.
 | The tiebreak run (B9) selects worse models | The dry-run diff shows unexpected rows, or a provider stops serving after the apply | `git revert` the B9 commit and re-run `run.mjs --target live --i-know`; keysync's own `restoreSettings` and DPAPI-encrypted `config.sqlite` snapshot cover the apply itself |
 | A refresh promotes a bad snapshot | The picker shows far fewer models, or a provider empties | `echo <previous stamp> > ~/.uw/catalog/current`, then `node ~/.uw/menu/snapshot.mjs --build` to re-derive the picker's rows — catalogue versions are immutable and three are retained. The shrink guard and the 80% floor should catch this first |
 | The `grantCadence` migration is wrong for a provider | A `FREE` badge on something that is not free | Restore the timestamped `providers.json.bak-cadence-*` the migration wrote, or edit the single field. The field is curated, so correcting it is a one-line human edit by design |
-| `inferTier` (B2) lands before the denylist (A5.1) | A bare Claude-shaped id from a third-party provider reaches CCR's `Providers[].models` | The first test in `infertier.test.mjs` calls `buildProviders` with a hostile zero-priced `opus` and asserts it is absent from the output. It fails until A5.1 has landed **on the routing path**, so it cannot be satisfied by a commit message, nor by a guard that sits only on the display path. If it somehow shipped: revert B2, land A5.1, re-apply |
+| `inferTier` (B2) lands before the collision guard (A5.1) | A bare Claude-shaped id from a third-party provider is **sole-owned** in CCR's `Providers[].models`, so `resolve()` binds Claude Code's built-in rows to it | The first test in `infertier.test.mjs` calls `buildProviders` with a hostile zero-priced `opus`, asserts the id **ships** (Constraint 29), and asserts `checkBareCollisions` returns `fatal: true` on the result. It fails until A5.1 has landed, because the export does not otherwise exist, so it cannot be satisfied by a commit message. If it somehow shipped: revert B2, land A5.1, re-apply |
+| A revision reinstates name refusal, quietly re-breaking the resellers | tabiai and gorouter show few or zero models; `--dry` reports a lower model count than the previous run | Three tests fail loudly first: `admitRemoteModels admits Claude-shaped names from ANY provider`, `buildProviders routes a reseller's Claude model on its namespaced row`, and `buildFrom shows a reseller's Claude models`. The one-line cause is `isReserved` back in `admitRemoteModels`' loop; the comment on that line says so. This is listed because the *deleted* assertion was intuitive and the correct one is not — someone reading only the code is likely to "restore" it |
+| The relay is upgraded for aliases but keysync is not, or the reverse | None visible, which is why it is gated rather than documented | `aliasesOk` (Step 3c) makes the two halves independent: a relay without alias support gets the 4-id picker list, exactly today's behaviour, and a keysync without the split never advertises an id the relay cannot serve. To roll back the relay alone, restore its timestamped backup; the next keysync run reads `aliasesOk === false` and writes the short list on its own |
 | A `-Hud` install corrupts or truncates `~/.claude/settings.json` | Claude Code reports invalid settings, or the statusline is blank on every prompt | `settings.json.uw-bak` holds the original bytes, taken immediately before the write; `install.ps1 -Hud -HudUninstall` restores from it. Manually: `Copy-Item ~/.claude/settings.json.uw-bak ~/.claude/settings.json -Force`. The write is atomic (tmp + `Move-Item`), so a crash mid-write leaves the previous file intact, and it goes through `set-statusline.mjs` rather than a lossy PowerShell JSON round trip |
 | A test reaches live state | An unexplained change to `~/.claude/settings.json` or a gateway restart during a test run | `harness/guard.mjs` tripwires on `LIVE_SETTINGS`; keysync's settings backups are in `%LOCALAPPDATA%\uw-keysync\backups`. Structurally: every catalogue-store function takes a `root` parameter and every test passes a temp directory, so reaching the live catalogue has to be deliberate |
 | CCR is reinstalled and the gateway handshake patch is reverted | `uw doctor` reports `ccr-gateway-patch` RED. Without the doctor: intermittent `Core gateway did not accept runtime config within 5000ms`, **only under load**, reading as flakiness elsewhere | Re-apply the patch: in `<ccr-install>/dist/main/cli.js`, change the first numeric assignment after `var PN="gateway",` from `5e3` to `2e4`, preserving the file's existing line endings. Then restart the gateway. `uw doctor` confirms green |
