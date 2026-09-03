@@ -151,3 +151,52 @@ though browsers forbid it. Spinning on `Date.now()` would pin a core.
 
 Motion is off when `UW_PICKER_MOTION=0`, when `--no-motion` is passed, on a
 non-VT terminal, or below 60 columns.
+
+## Measured costs
+
+Every number below was measured on this machine, not estimated. Three runs each,
+reported as the typical value. They exist so the next person to wonder why ctrl+g
+is not instantaneous has numbers rather than a suspicion.
+
+| leg | cost | ours to fix? |
+|---|---|---|
+| `cmd` dispatch in `uwpick.cmd` | negligible | — |
+| PowerShell start, `-NoProfile` | ~190 ms | no |
+| `Add-Type` compiling the P/Invoke signature, plus the `CONIN$` open, mode set and restore | ~240 ms | no, in practice |
+| node start, module graph, snapshot read, first frame, reveal burst | ~115 ms | **yes** |
+| **whole ctrl+g chain to exit** | **~545 ms** | soft budget 700 ms |
+
+Bare `node -e 0` is ~83 ms of that last row, and 90 ms of it is the three
+deliberate `sleepSync(30)` pauses in the reveal, so the picker's own work is
+roughly 25 ms. That last row is the only one the hard 300 ms budget gates, and
+`test/bench-startup.mjs` is what gates it: median 115 ms across five separate
+processes.
+
+**One correction to the estimate this replaces.** The plan expected PowerShell's
+own start to be the dominant fixed term at roughly 200 ms. It is not: bare
+PowerShell start is ~190 ms, but the wrapper costs ~430 ms before node runs, so
+the larger half is `Add-Type` compiling the C# P/Invoke signature at runtime.
+That matters if the wrapper ever needs to get faster — the lever is caching or
+avoiding the compile, not shaving PowerShell startup.
+
+The whole chain is measured with the picker given `UW_PICKER_QUIT_IMMEDIATELY=1`,
+which exits through the ordinary abort path, so it includes the real exit
+sequence rather than a shortcut past it. Observed exit code 1, which is the
+discard path propagating correctly through the wrapper.
+
+### Console mode, measured
+
+`uwpick-run.ps1 -Diagnose` writes `~/.uw/state/conmode.json`. Observed after a
+child that exits 1:
+
+```
+saved 0x1f7   set 0x280   restored 0x1f7   childExit 1
+```
+
+`0x280` is `ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT`, with
+`ENABLE_LINE_INPUT`, `ENABLE_ECHO_INPUT` and `ENABLE_PROCESSED_INPUT` all
+deliberately unset — the last so ctrl+c arrives as byte 3 rather than being eaten
+by the console. `restored === saved` after a failing child is the property that
+matters: the restore lives in a `finally`, because a console left in raw mode
+makes the parent shell unusable and reads as a broken terminal rather than a
+broken picker.

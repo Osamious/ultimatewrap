@@ -1,4 +1,8 @@
-param([string]$File)
+param(
+  [string]$File,
+  [string]$ChildScript = "uwpick.mjs",
+  [switch]$Diagnose
+)
 
 # Node cannot call SetConsoleMode, and that is the whole problem.
 #
@@ -13,7 +17,8 @@ param([string]$File)
 # So: flip the console to raw VT input for the duration of the picker, then put
 # it back exactly as we found it. The restore runs in `finally` so it also
 # happens on ctrl+c or a crash -- leaving a console in raw mode would make the
-# parent shell unusable.
+# parent shell unusable, and that failure reads as a broken terminal rather than
+# a broken picker.
 
 $sig = @'
 using System;
@@ -30,12 +35,13 @@ public static class ConMode {
   public static extern bool CloseHandle(IntPtr h);
 }
 '@
-Add-Type -TypeDefinition $sig -ErrorAction Stop
+Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
 
-# Decimal, not hex, and this is not a style choice: PowerShell 5.1 parses
-# 0xC0000000 as an Int32, which overflows to -1073741824, and the [uint32] cast
-# then throws before the P/Invoke is ever reached.
-$ACCESS_RW     = [uint32]3221225472   # GENERIC_READ (0x80000000) | GENERIC_WRITE (0x40000000)
+# Decimal, not hex, and this is not a style choice: PowerShell 5.1 parses the
+# hex form of GENERIC_READ|GENERIC_WRITE as an Int32, which overflows to
+# -1073741824, and the [uint32] cast then throws before the P/Invoke is ever
+# reached. The literal is deliberately not written in hex anywhere in this file.
+$ACCESS_RW     = [uint32]3221225472   # GENERIC_READ | GENERIC_WRITE
 $SHARE_RW      = [uint32]3
 $OPEN_EXISTING = [uint32]3
 
@@ -54,16 +60,36 @@ $haveSaved = [ConMode]::GetConsoleMode($h, [ref]$saved)
 
 # ENABLE_VIRTUAL_TERMINAL_INPUT (0x200) makes the console emit arrows as the VT
 # sequences the picker already parses (ESC [ A/B). Deliberately NOT set:
-#   ENABLE_LINE_INPUT (0x02)  -- would buffer until Enter
-#   ENABLE_ECHO_INPUT (0x04)  -- would echo filter text over our own rendering
+#   ENABLE_LINE_INPUT (0x02)     -- would buffer until Enter
+#   ENABLE_ECHO_INPUT (0x04)     -- would echo filter text over our own rendering
 #   ENABLE_PROCESSED_INPUT(0x01) -- would eat ctrl+c instead of delivering byte 3
 $RAW_VT = [uint32](0x0080 -bor 0x0200)   # ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
 [void][ConMode]::SetConsoleMode($h, $RAW_VT)
 
+$childExit = 0
 try {
-  & node "$PSScriptRoot/uwpick.mjs" $File
-  exit $LASTEXITCODE
+  & node (Join-Path $PSScriptRoot $ChildScript) $File
+  $childExit = $LASTEXITCODE
 } finally {
   if ($haveSaved) { [void][ConMode]::SetConsoleMode($h, $saved) }
+  if ($Diagnose) {
+    $after = 0
+    [void][ConMode]::GetConsoleMode($h, [ref]$after)
+    $dir = Join-Path $env:USERPROFILE ".uw\state"
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $report = @{ saved = [int]$saved; set = [int]$RAW_VT; restored = [int]$after
+                 childExit = [int]$childExit } | ConvertTo-Json -Compress
+    # Q2.9: NOT Set-Content -Encoding UTF8. In PowerShell 5.1 that writes a UTF-8
+    # BOM, JSON.parse throws on a leading U+FEFF, and menu/atomic.mjs:readJsonOr
+    # would return its fallback -- so the console-mode test below would read an
+    # empty object and conclude the restore never happened, or that it did,
+    # depending on which way the assertion was written. Neither would be a
+    # measurement. UTF8Encoding($false) is the BOM-free constructor.
+    # Q2.8: temp + Move-Item, so a ctrl+c here cannot leave a half-written report.
+    $tmp = (Join-Path $dir "conmode.json.uw-tmp")
+    [IO.File]::WriteAllText($tmp, $report, (New-Object Text.UTF8Encoding $false))
+    Move-Item -LiteralPath $tmp -Destination (Join-Path $dir "conmode.json") -Force
+  }
   [void][ConMode]::CloseHandle($h)
 }
+exit $childExit
