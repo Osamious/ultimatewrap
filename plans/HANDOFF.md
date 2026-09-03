@@ -82,7 +82,46 @@ Committed, all green, suite at 74/74:
 | A5 catalogue builder | `70ef3ef` |
 | A3 follow-up: `@`-scoped ids | `f172820` |
 
-**Task A5.1 is in progress and its four files are uncommitted.** A5.2 (relay bare-alias mapping) is written into the plan but **awaits the user's separate approval**, because it modifies `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs`, outside the repo, which keeps Claude reachable.
+**Phase A is complete through A16** (2026-09-03). Suite **265/265**, 0 skipped, three gates clean.
+Later commits: A5.1 `c10e6ee`, A6 `d80a8cc`, A7 `eb3a813`, A8 `e849319`, A9 `e36a411`,
+A10 `e2fe0f0`, review fixes `2e72e2d`/`3705d2d`/`c57841b`, A11 `e27f076`, slot param
+`9506ff5`, A12 `721b94a`, A13 `4ba145c`, A16 `a1ac0ae`, A14 `e6a3ed0`, A15 `8aabc2b`,
+docs `4f9f2d5`/`73e27e1`.
+
+**Measured, not estimated:** first frame 115 ms against a 300 ms budget (90 ms of it
+deliberate animation pauses); the whole ctrl+g chain ~545 ms against a 700 ms soft budget,
+where `Add-Type` compiling the P/Invoke signature — not PowerShell start — is the dominant
+fixed cost, correcting the plan's estimate. The real snapshot is 192 KB, 45 providers,
+1,588 models.
+
+**A14's Step 0 was satisfied by live capture**, not inference. A CCR-routed non-Anthropic
+payload reads `model.id = "google/gemini-3.5-flash-lite"` — bare `provider/model`, **no
+suffix**; `[1m]` is an Anthropic 1M-context marker only. The snapshot index holds that
+exact key with `ctx: 1048576` while the HUD reported `200000`, so the shim's correction is
+verified end to end (a displayed 50% resolves to a true 10%). There are zero `anthropic/*`
+keys in the index because relay rows carry `ctx: null`, so a miss on the Anthropic path is
+correct behaviour rather than a defect.
+
+**Three open user decisions, none blocking each other:**
+
+1. **`EDITOR` points at `C:/Users/osami/.uw/spike/uwpick.cmd`, which no longer exists** —
+   A2 moved it to `menu/`, so ctrl+g has reached nothing since commit `c5d33ec`. Fix by
+   repointing the variable, or by running A16's installer, which also writes
+   `~/.claude/settings.json`.
+2. **Claude Code is 2.1.259; `cc-contract.mjs` pins 2.1.258.** The doctor reports the drift
+   amber rather than re-pinning, by design. Re-pinning should mean re-verifying the handoff
+   contract, not bumping a number.
+3. **Task A17** drives the user's live Claude Code session through a fifteen-step protocol.
+   It cannot meaningfully run until decision 1 is made.
+
+**Correction on record:** A15's `checkRpcSurface` reported the CCR gateway as down. Verified
+otherwise — ports 3456/3457/3458 are all open, `service.json` is current, and
+`POST /api/ccr/rpc` returns 401 without an `x-ccr-web-auth` header and **200 with it**. The
+probe is not authenticating; the gateway is healthy. A fix distinguishing connection-refused
+(amber, gateway down) from 401 (red, our bug) from partial failure (red, real drift) was
+requested before A17.
+
+**Task A5.1's original four files were superseded** by the reseller rules before commit; A5.2 (relay bare-alias mapping) is written into the plan but **awaits the user's separate approval**, because it modifies `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs`, outside the repo, which keeps Claude reachable.
 
 ### Three standing user rules that changed the design mid-flight
 
