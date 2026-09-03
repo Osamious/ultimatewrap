@@ -32,6 +32,8 @@ public static class ConMode {
   [DllImport("kernel32.dll", SetLastError=true)]
   public static extern bool SetConsoleMode(IntPtr h, uint mode);
   [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool FlushConsoleInputBuffer(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)]
   public static extern bool CloseHandle(IntPtr h);
 }
 '@
@@ -65,6 +67,22 @@ $haveSaved = [ConMode]::GetConsoleMode($h, [ref]$saved)
 #   ENABLE_PROCESSED_INPUT(0x01) -- would eat ctrl+c instead of delivering byte 3
 $RAW_VT = [uint32](0x0080 -bor 0x0200)   # ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
 [void][ConMode]::SetConsoleMode($h, $RAW_VT)
+
+# Discard whatever the handoff left behind, or the picker's first readSync eats
+# it instead of the user's first keypress.
+#
+# MEASURED: launched through Claude Code's ctrl+g, the picker drew correctly but
+# ignored the first key -- arrows did nothing until some key had been pressed
+# once. Launched DIRECTLY against the same buffer file, arrows worked
+# immediately. That difference is the whole diagnosis: the console input buffer
+# is shared, and the key records left over from the ctrl+g press itself are still
+# queued when we open it. The picker consumed them as its first read, found
+# nothing it recognised, and redrew unchanged.
+#
+# Nothing legitimate is lost. The only input that can be pending at this instant
+# is what was typed before the picker existed, which the user cannot have aimed
+# at a menu that was not on screen yet.
+[void][ConMode]::FlushConsoleInputBuffer($h)
 
 $childExit = 0
 try {

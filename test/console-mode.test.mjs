@@ -82,3 +82,24 @@ test("the restore is in a finally block, not on the success path", () => {
   assert.ok(src.indexOf("SetConsoleMode($h, $saved)") > fin,
     "the restore must run after a crash, not only after a clean exit");
 });
+
+test("the wrapper flushes the console input buffer before the child reads", () => {
+  // Launched through Claude Code's ctrl+g, the picker ignored the FIRST keypress:
+  // arrows did nothing until some key had been pressed once. Launched directly
+  // against the same buffer file it responded immediately. The console input
+  // buffer is shared, so the key records from the ctrl+g press itself were still
+  // queued; the picker's first readSync consumed those instead of the user's key.
+  //
+  // Order matters as much as presence -- flushing before the mode flip would
+  // drain the buffer and then leave a window in which more records could arrive
+  // under the old mode, so this asserts the flush comes after SetConsoleMode and
+  // before the child is spawned.
+  const src = fs.readFileSync(PS1, "utf8");
+  assert.match(src, /FlushConsoleInputBuffer/, "no flush: the first keypress is eaten");
+  const set = src.indexOf("SetConsoleMode($h, $RAW_VT)");
+  const flush = src.indexOf("[ConMode]::FlushConsoleInputBuffer($h)");
+  const spawn = src.indexOf("& node (Join-Path $PSScriptRoot $ChildScript)");
+  assert.ok(set > 0 && flush > 0 && spawn > 0, "expected all three landmarks");
+  assert.ok(set < flush, "flush must come after the mode is set");
+  assert.ok(flush < spawn, "flush must come before the child is spawned");
+});
