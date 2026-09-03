@@ -70,7 +70,17 @@ export function sanitizeDisplay(s, max = 80) {
 // `/` is legitimate and common -- `groq/openai/gpt-oss-20b` is a real two-slash
 // id -- so it cannot be banned. `\` and `..` can and must be: an id must never
 // be able to reach a filesystem path.
-export const MODEL_ID_OK = /^[A-Za-z0-9][A-Za-z0-9._:@\/-]{0,127}$/;
+//
+// The leading `@` is a SCOPE, and it is admitted only when an alphanumeric
+// follows it. Cloudflare Workers AI ids are scoped -- `@cf/openai/gpt-oss-120b`
+// is the vault's cloudflare.testModel, and that key probes healthy on it -- but
+// the original anchor demanded an alphanumeric first character while allowing
+// `@` in every later position, so it refused a working provider on punctuation
+// rather than on any property worth defending. The alternation widens the
+// accepted set by exactly one shape: a bare `@`, `@/foo` and `@-x` stay
+// rejected, so no leading separator slips in behind the scope, and the `..`
+// check below still applies to scoped ids.
+export const MODEL_ID_OK = /^(?:@[A-Za-z0-9]|[A-Za-z0-9])[A-Za-z0-9._:@\/-]{0,127}$/;
 
 export function admitId(id) {
   const s = String(id ?? "");

@@ -133,3 +133,39 @@ test("MODEL_ID_OK is anchored at both ends", () => {
   assert.equal(MODEL_ID_OK.source.startsWith("^"), true);
   assert.equal(MODEL_ID_OK.source.endsWith("$"), true);
 });
+
+test("admitId accepts a scoped id whose leading @ is followed by an alphanumeric", () => {
+  // Measured, not hypothetical: `@cf/openai/gpt-oss-120b` is the vault's
+  // cloudflare.testModel, and the recorded health for personal.cloudflare.free
+  // is `ok` on that exact id. The original anchor required the first character
+  // to be alphanumeric while allowing `@` everywhere after it, so a working,
+  // probe-verified provider was being refused by punctuation rather than by any
+  // security property.
+  assert.equal(admitId("@cf/openai/gpt-oss-120b"), "@cf/openai/gpt-oss-120b");
+  assert.equal(admitId("@a"), "@a");
+});
+
+test("admitId rejects an @ that does not begin a scope", () => {
+  // Exactly one shape is added: @ followed by an alphanumeric. A bare @, or an @
+  // followed by punctuation, stays rejected -- otherwise the widening would admit
+  // a leading-separator id through the back door.
+  assert.equal(admitId("@"), null);
+  assert.equal(admitId("@/foo"), null);
+  assert.equal(admitId("@-x"), null);
+  assert.equal(admitId("@."), null);
+  assert.equal(admitId("@@a"), null);
+});
+
+test("widening the anchor for @ refuses everything it refused before", () => {
+  // The regression half of the widening. Each of these was rejected by the
+  // original anchor and must still be rejected by the new one.
+  assert.equal(admitId("a\x1b[2Jb"), null);          // escape sequence
+  assert.equal(admitId("-leading-dash"), null);      // leading separator
+  assert.equal(admitId("/leading-slash"), null);     // leading separator
+  assert.equal(admitId("../../etc/passwd"), null);   // traversal
+  assert.equal(admitId("@cf/../../etc/passwd"), null); // traversal behind a scope
+  assert.equal(admitId("back\\slash"), null);        // path separator
+  assert.equal(admitId("x".repeat(129)), null);      // over length
+  assert.equal(admitId(""), null);
+  assert.equal(admitId(null), null);
+});
