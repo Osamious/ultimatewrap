@@ -1,0 +1,24 @@
+{
+  "generatedAt": "2026-08-24T12:22:28.162Z",
+  "models": [
+    { "provider": "acme", "model": "acme-chat-1",
+      "limits": { "contextTokens": 163840 },
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "capabilities": { "toolCalling": true, "imageInput": false, "reasoning": true },
+      "pricing": { "offers": [ { "provider": "acme", "per1MTokens": { "input": 0, "output": 0 } } ] } },
+    { "provider": "acme", "model": "acme-pro-1",
+      "limits": { "contextTokens": 1000000 },
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "capabilities": { "toolCalling": true, "imageInput": true, "reasoning": false },
+      "pricing": { "offers": [ { "provider": "acme", "per1MTokens": { "input": 0.3, "output": 1.2 } } ] } },
+    { "provider": "acme", "model": "acme-image-1",
+      "modalities": { "input": ["text"], "output": ["image"] },
+      "capabilities": {},
+      "pricing": { "offers": [ { "provider": "acme", "per1MTokens": { "input": 0, "output": 0 } } ] } },
+    { "provider": "acme", "model": "acme-legacy-1",
+      "capabilities": {},
+      "pricing": { "inputPerMillion": 0, "outputPerMillion": 0 } },
+    { "provider": "blank", "model": "blank-a", "capabilities": {} },
+    { "provider": "blank", "model": "blank-b", "capabilities": {} }
+  ]
+}

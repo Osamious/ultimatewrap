@@ -133,3 +133,48 @@ test("no file anywhere in UW hard-codes an OMC path", () => {
   assert.deepEqual(offenders, [],
     "UW must wrap whatever statusLine.command holds, never a path it believes OMC uses");
 });
+
+// Q4.3. The grep must cover .ps1 and .cmd, not just .mjs: install.ps1 is the file
+// that names settings.json and uwpick.cmd is the file that names the wrapper, so
+// a .mjs-only sweep exempts the two most likely offenders. Those two known paths
+// get one named allowance each, keyed on file AND needle, so a NEW hard-coded
+// path in either file still trips.
+const BOUNDARY_ALLOW = new Map([
+  ["cc-contract.mjs", /./],          // the contract module for Claude Code
+  ["ccr-client.mjs", /./],           // the contract module for CCR
+  // install.ps1 receives the settings path as a -SettingsFile parameter defaulted
+  // from cc-contract; the literal below is only the default's documentation.
+  ["install.ps1", /\.claude\b/],
+  // uwpick.cmd names uwpick-run.ps1 relative to %~dp0 and nothing else; this
+  // entry exists so a future absolute path is the thing that fails.
+  ["uwpick.cmd", /(?!)/],            // matches nothing: no needle is allowed here
+]);
+
+test("no file outside the two contract modules names Claude Code or CCR", () => {
+  const root = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw");
+  const needles = [/claude-code-router/, /node_modules/, /\.claude\b/, /APPDATA/, /127\.0\.0\.1/];
+  const offenders = [];
+  for (const dir of ["menu", "refresh"]) {
+    const d = path.join(root, dir);
+    if (!fs.existsSync(d)) continue;
+    for (const f of fs.readdirSync(d)) {
+      if (!/\.(mjs|ps1|cmd)$/.test(f)) continue;
+      const allow = BOUNDARY_ALLOW.get(f);
+      const body = fs.readFileSync(path.join(d, f), "utf8");
+      for (const n of needles) {
+        if (allow && allow.test(n.source)) continue;
+        if (n.test(body)) offenders.push(`${dir}/${f} matches ${n}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, []);
+});
+
+test("the boundary allowlist is keyed per file and per needle, not per file alone", () => {
+  // A regression guard on the guard: if someone widens an entry to /./ for a
+  // non-contract file, this fails, because that would silently exempt the file.
+  for (const [f, re] of BOUNDARY_ALLOW) {
+    if (f === "cc-contract.mjs" || f === "ccr-client.mjs") continue;
+    assert.notEqual(re.source, ".", `${f} must not be exempted wholesale`);
+  }
+});
