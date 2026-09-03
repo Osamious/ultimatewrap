@@ -179,17 +179,57 @@ test("checkRpcSurface names the method that moved", () => {
   assert.match(gone.evidence, /getConfig/);
 });
 
-test("a gateway that answers nothing is amber, not a renamed API", () => {
-  // Found by running the doctor against this machine: service.json was readable
-  // while nothing was listening on its port, so every probe returned "no answer"
-  // and the check reported RED "the method names moved in an upgrade" -- about
-  // the wrong thing entirely. probeRpcSurface only returns null when service.json
-  // itself is unreadable, and a stale descriptor from a stopped gateway is the
-  // common case. A partial failure is the shape drift actually has, and stays red.
-  const down = checkRpcSurface({ methods: { getAppInfo: false, getConfig: false, probeProvider: false } });
-  assert.equal(down.verdict, "amber");
-  assert.match(down.evidence, /not running|stale/i);
-  assert.doesNotMatch(down.evidence, /the method names moved in an upgrade/);
+// "The method did not answer" has four causes with three different owners. The
+// check reported RED "the method names moved in an upgrade" for all of them.
+// Every state below was measured against the live gateway before being encoded.
+const ALL = ["getAppInfo", "getConfig", "probeProvider"];
+const surface = (states) => ({
+  methods: Object.fromEntries(ALL.map((m) => [m, states[m] === "ok" || states[m] === "error"])),
+  states,
+});
+
+test("a 401 is RED and blames UW, because the gateway is alive and we are not authenticating", () => {
+  // Measured: POST /api/ccr/rpc with no header -> 401 in 4 ms; with
+  // x-ccr-web-auth carrying service.json's ccr_web_token -> 200. So this state
+  // means our client stopped sending the header, which is our defect to fix.
+  const c = checkRpcSurface(surface({ getAppInfo: "auth", getConfig: "auth", probeProvider: "auth" }));
+  assert.equal(c.verdict, "red");
+  assert.match(c.evidence, /x-ccr-web-auth/);
+  assert.match(c.evidence, /UW defect/);
+  assert.doesNotMatch(c.evidence, /the method names moved in an upgrade/);
+});
+
+test("a refused connection is amber: the gateway is down, service.json is just stale", () => {
+  const c = checkRpcSurface(surface({ getAppInfo: "refused", getConfig: "refused", probeProvider: "refused" }));
+  assert.equal(c.verdict, "amber");
+  assert.match(c.evidence, /not running|stale/i);
+  assert.doesNotMatch(c.evidence, /the method names moved in an upgrade/);
+});
+
+test("a timeout is amber and says slow, not absent", () => {
+  // The live cause. getAppInfo takes ~7.2 s repeatably while getConfig answers in
+  // 6 ms, and an aborted call keeps the gateway busy so the calls queued behind it
+  // time out too -- which is why the whole surface read as missing under the old
+  // 2000 ms budget.
+  const c = checkRpcSurface(surface({ getAppInfo: "timeout", getConfig: "timeout", probeProvider: "timeout" }));
+  assert.equal(c.verdict, "amber");
+  assert.match(c.evidence, /slow, not absent/);
+  assert.doesNotMatch(c.evidence, /the method names moved in an upgrade/);
+});
+
+test("a method that ran and returned ok:false is PRESENT — the name resolved", () => {
+  // probeProvider does exactly this on a null argument: HTTP 500, ok:false, 2 ms.
+  // The surface probe asks whether the NAME resolves, and it did.
+  const c = checkRpcSurface(surface({ getAppInfo: "ok", getConfig: "ok", probeProvider: "error" }));
+  assert.equal(c.verdict, "green");
+});
+
+test("a genuinely renamed method is still red, and named", () => {
+  const c = checkRpcSurface({ methods: { getAppInfo: true, getConfig: false, probeProvider: true },
+                              states: { getAppInfo: "ok", getConfig: "bad-body", probeProvider: "ok" } });
+  assert.equal(c.verdict, "red");
+  assert.match(c.evidence, /getConfig/);
+  assert.match(c.evidence, /moved in an upgrade/);
 });
 
 test("an installed/running version split is reported before it bites", () => {

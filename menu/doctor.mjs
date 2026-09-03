@@ -278,27 +278,47 @@ export function checkCcrPatch({ file, read = null }) {
  * while the running process still holds it, so everything works until the next
  * restart and then stops. That is worth naming before it happens.
  */
-export function checkRpcSurface({ methods, installedVersion, runningVersion }) {
+export function checkRpcSurface({ methods, states, installedVersion, runningVersion }) {
   const names = Object.keys(methods ?? {});
   const missing = Object.entries(methods ?? {}).filter(([, ok]) => !ok).map(([m]) => m);
-  // ALL of them failing is a gateway that is not answering, not a renamed API.
-  //
-  // Found by running this against the live machine: service.json existed and was
-  // readable while nothing was listening on its port, so every probe returned "no
-  // answer" and this check reported RED "the method names moved in an upgrade" --
-  // confidently, and about the wrong thing. probeRpcSurface only returns null when
-  // service.json itself is unreadable, and a stale descriptor from a stopped
-  // gateway is the common case rather than the rare one.
-  //
-  // A method genuinely disappearing in an upgrade takes the others with it only if
-  // the whole surface was renamed at once; a partial failure is the shape drift
-  // actually has, and that stays red.
-  if (names.length && missing.length === names.length) {
+
+  // "The method did not answer" has four causes with three different owners, and
+  // collapsing them was this check's original defect: it reported RED "the method
+  // names moved in an upgrade" for every one of them. All four were measured
+  // against the live gateway before this was written.
+  const kinds = Object.entries(states ?? {});
+  const withState = (s) => kinds.filter(([, v]) => v === s).map(([m]) => m);
+  const authFailed = withState("auth");
+  const timedOut = withState("timeout");
+  const refused = [...withState("refused"), ...withState("no-service")];
+
+  // UW's own bug, and the only one of the four that is. The RPC returns 401
+  // without `x-ccr-web-auth` and 200 with it, so if this fires the client is not
+  // sending service.json's ccr_web_token. Red, and the remedy points at us.
+  if (authFailed.length) {
+    return { name: "ccr-rpc", ok: false, verdict: "red",
+      evidence: `CCR rejected the credential on ${authFailed.join(", ")} (HTTP 401/403). The ` +
+                `gateway is alive and UW is not authenticating: rpc() must send the ` +
+                `${CCR.CONTRACT.authHeader} header carrying the ${CCR.CONTRACT.tokenParam} from ` +
+                `service.json's url. This is a UW defect, not a CCR one` };
+  }
+  // Nothing listening. This is the stale-descriptor case: service.json survives a
+  // stopped gateway, so it is readable while the port is dead.
+  if (names.length && refused.length === names.length) {
     return { name: "ccr-rpc", ok: false, verdict: "amber",
-      evidence: `CCR answered none of ${names.join(", ")} — the gateway is not running, or ` +
-                `service.json is stale and points at a port nothing is listening on. Start ` +
-                `CCR and re-run; if it IS running, then the method names have moved and this ` +
-                `is red rather than amber` };
+      evidence: `nothing is listening on CCR's RPC port — the gateway is not running, or ` +
+                `service.json is stale. Start CCR and re-run` };
+  }
+  // Alive but slower than the budget. MEASURED on this machine: getAppInfo takes
+  // ~7.2 s repeatably while getConfig answers in 6 ms, and an aborted request
+  // keeps the gateway busy, so the calls queued behind it time out too and the
+  // whole surface reads as missing. The probe budget is now 15 s for exactly this.
+  if (timedOut.length) {
+    return { name: "ccr-rpc", ok: false, verdict: "amber",
+      evidence: `CCR did not answer ${timedOut.join(", ")} inside the probe budget. The gateway ` +
+                `is reachable — it is slow, not absent. getAppInfo has been measured at ~7.2 s ` +
+                `on this machine while getConfig answers in 6 ms; an aborted call keeps the ` +
+                `gateway busy, so anything queued behind it times out as well` };
   }
   if (missing.length) {
     return { name: "ccr-rpc", ok: false, verdict: "red",

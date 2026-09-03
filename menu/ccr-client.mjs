@@ -77,19 +77,70 @@ export const CONTRACT = Object.freeze({
  * Never throws, and returns `null` when CCR is simply not running, because "the
  * gateway is down" is an ordinary condition and not a drift report.
  */
-export async function probeRpcSurface({ timeoutMs = 2000 } = {}) {
+export async function probeRpcSurface({ timeoutMs = 15000 } = {}) {
   const service = readService();
   if (!service) return null;
-  const methods = {};
+  const methods = {}, states = {};
   let runningVersion = null;
   for (const m of CONTRACT.rpcMethods) {
     // probeProvider needs an argument to do anything, but an unknown METHOD and a
     // bad argument fail differently: this asks only whether the name resolves.
-    const r = await rpc(m, m === "probeProvider" ? [null] : [], { timeoutMs, service });
-    methods[m] = r !== undefined;
-    if (m === "getAppInfo" && r && typeof r === "object") runningVersion = r.version ?? null;
+    const r = await rpcProbe(m, m === "probeProvider" ? [null] : [], { timeoutMs, service });
+    states[m] = r.state;
+    // "The name resolved" is the question. `error` means the gateway ran the
+    // method and it returned ok:false -- present. Only a transport or auth
+    // failure leaves the question unanswered, and those are reported as states
+    // rather than folded into a bare false, which would read as "renamed".
+    methods[m] = r.state === "ok" || r.state === "error";
+    if (m === "getAppInfo" && r.ok && r.value && typeof r.value === "object") {
+      runningVersion = r.value.version ?? null;
+    }
   }
-  return { methods, runningVersion, installedVersion: ccrVersion() };
+  return { methods, states, runningVersion, installedVersion: ccrVersion() };
+}
+
+/**
+ * One RPC call, with the FAILURE KIND preserved.
+ *
+ * `rpc()` collapses everything into undefined, which is right for callers that
+ * only need an answer and wrong for the doctor, whose whole job is to say WHY.
+ * Measured against the live gateway, the four outcomes are genuinely different
+ * problems with different owners:
+ *
+ *   auth     401 without the header, 200 with it. If this ever fires, UW is
+ *            failing to send `x-ccr-web-auth` from service.json's ccr_web_token
+ *            -- our defect, not the user's.
+ *   timeout  the gateway is alive but slower than the budget. getAppInfo takes
+ *            ~7.2 s on this machine, repeatably, while getConfig answers in 6 ms.
+ *   refused  nothing listening: the gateway is actually down.
+ *   error    HTTP reached, the method ran and returned ok:false -- probeProvider
+ *            does exactly this on a null argument. The NAME resolved, which is
+ *            all the surface probe is asking, so this counts as present.
+ */
+export async function rpcProbe(method, args = [], opts = {}) {
+  const { timeoutMs = 400, fetchImpl = fetch, service = readService() } = opts;
+  if (!service) return { ok: false, state: "no-service" };
+  let res;
+  try {
+    res = await fetchImpl(`${service.origin}${CONTRACT.rpcPath}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", [CONTRACT.authHeader]: service.token },
+      body: JSON.stringify({ method, args }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    const name = String(e?.name ?? "");
+    const timedOut = name === "TimeoutError" || name === "AbortError";
+    return { ok: false, state: timedOut ? "timeout" : "refused",
+             detail: String(e?.message ?? e).slice(0, 80) };
+  }
+  if (res.status === 401 || res.status === 403) {
+    return { ok: false, state: "auth", status: res.status };
+  }
+  let body = null;
+  try { body = await res.json(); } catch { return { ok: false, state: "bad-body", status: res.status }; }
+  if (body && body.ok === false) return { ok: false, state: "error", status: res.status };
+  return { ok: true, state: "ok", status: res.status, value: body?.value ?? null };
 }
 
 export function readService(file = CONTRACT.servicePath) {
