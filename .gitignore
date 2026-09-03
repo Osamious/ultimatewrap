@@ -36,6 +36,12 @@ state/
 catalog/
 research/phase6/_tmp/
 
+# The supervisor's own runtime state. Written by the scheduled task that keeps
+# the CCR gateway and OAuth relay alive, so it churns on its own schedule and
+# would otherwise be swept into every task commit by `git add -A`. Discovered at
+# Task A4 execution; the supervise/*.ps1 scripts themselves stay tracked.
+supervise/supervise-state.json
+
 # Rust build output from the rescued prior-art crate. The crate is kept for its
 # working model_tier.rs; its compiled artifacts are 3,225 files of regenerable
 # object code, .pdb and .rlib. Discovered at Task A1 execution: `git add -A`
