@@ -214,6 +214,26 @@ Not a defect in A8 as specified, so it was not changed during execution. Resolve
 B10 by extending both the field list and that test together, and confirm the picker
 actually reads the field it is given.
 
+## Phase 7 — subagent model selection across providers
+
+Raised 2026-09-03. Written up in full in `phase7-subagent-models.md`: full support for
+spawning subagents on non-Anthropic models, or on a different provider than the main agent.
+
+Not planned, not scheduled. That file records the verified mechanism, five unknowns that
+must be settled before designing, and the open design questions — default inheritance,
+explicit versus automatic selection, how much control to expose, which surface expresses
+it, how the user sees what actually ran, and what happens when a foreign model cannot hold
+up its end.
+
+Two connections to the items above. **Unknown 2 in that file is the same `Fusion/` prefix
+question already recorded against `UW_ALIAS`** in the Phase 6 plan, so settling it serves
+both. And the cost argument is the strongest case for the phase: in a multi-agent workflow
+subagents dominate token spend, and the machinery to route them elsewhere already exists.
+
+Works today without new code, as a stopgap: repoint `fableModel` at `<provider>/<model>`
+and spawn with `model: "fable"`. Limited to four addressable tier slots, global rather than
+per-spawn, and semantically a pun.
+
 ## Related open question, already recorded in the plan
 
 `UW_ALIAS` guards `/^uw\//i`, but CCR force-prefixes exact aliases as `Fusion/<alias>`
