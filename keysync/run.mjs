@@ -57,6 +57,12 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
 export function checkBareCollisions(providers, { relay = "anthropic", allowBare = false } = {}) {
   const byBare = new Map();
   for (const p of providers ?? []) {
+    // CCR's own gate. `providerModelMatches` checks the provider is enabled before
+    // it looks at any id, so a disabled co-owner does not count towards ownership
+    // there -- and counting it here would read two owners as ambiguous while CCR
+    // sees exactly one match and binds. Always true in today's generated config,
+    // so this is a latent divergence rather than a live one.
+    if (p.enabled === false) continue;
     for (const m of p.models ?? []) {
       // Accepts both shapes deliberately: the built config carries `models` as a
       // string[], while the guard's own tests inject `{id}` objects.
@@ -91,6 +97,19 @@ export function checkBareCollisions(providers, { relay = "anthropic", allowBare 
   // second owner by starting the relay, or accept the routing deliberately.
   let message;
   if (hijackable.length) {
+    // OFFER THE RELAY ONLY WHERE IT CAN ACTUALLY HELP. Co-ownership works only for
+    // ids the relay itself serves, and the id most likely to fire this guard is
+    // `claude-opus-4-8` -- a retired name two resellers still list and the relay
+    // has never served. Telling the operator to start the relay for that id sends
+    // them to do something that cannot work, and the only real remedy is the flag.
+    const relayHelps = hijackable.filter((h) => ANTHROPIC_RELAY.routing.includes(h.id));
+    const remedy = relayHelps.length === hijackable.length
+      ? `start the Anthropic relay so it co-owns these ids and they become ambiguous, or `
+      : relayHelps.length
+        ? `start the Anthropic relay, which co-owns ${relayHelps.map((h) => h.id).join(", ")} ` +
+          `but not the rest, and/or `
+        : `the relay does not serve ${hijackable.length === 1 ? "this id" : "these ids"}, ` +
+          `so co-ownership cannot resolve ${hijackable.length === 1 ? "it" : "them"}; `;
     message =
       `SECURITY: ${hijackable.length} bare Claude-shaped model id(s) have a single ` +
       `owner and it is not the relay:\n` +
@@ -98,8 +117,7 @@ export function checkBareCollisions(providers, { relay = "anthropic", allowBare 
       `\nCCR's resolve() binds Claude Code's built-in rows to a uniquely-owned bare ` +
       `id, so the full system prompt, tool definitions and file contents would go ` +
       `to that host.\n` +
-      `Remedy: start the Anthropic relay so it co-owns these ids and they become ` +
-      `ambiguous, or re-run with --allow-bare-claude-names to accept this routing ` +
+      `Remedy: ${remedy}re-run with --allow-bare-claude-names to accept this routing ` +
       `deliberately.`;
   } else if (shadowed.length) {
     message =

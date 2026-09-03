@@ -254,6 +254,45 @@ test("the fatal error offers the relay or the opt-out, never model removal", () 
     "the remedy must never be to drop a provider's model");
 });
 
+test("the guard reads the production model shape, not only the test shape", () => {
+  // Every other case here builds `{id}` objects through P(). Production does not:
+  // buildProviders emits `models: models.map((m) => m.id)` and the relay unshift
+  // spreads a constant whose `models` is a string[]. Narrowing the accessor to
+  // `m.id` yields ["", ""] on real data -- the guard silently stops guarding, F1
+  // is unprotected, and the whole suite stays green. This is the case that fails.
+  const r = checkBareCollisions([{ name: "tabiai", models: ["claude-opus-5", "reseller-1"] }]);
+  assert.equal(r.fatal, true);
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-5"]);
+  assert.equal(r.hijackable[0].owner, "tabiai");
+});
+
+test("a disabled provider does not count as a co-owner", () => {
+  // CCR checks the provider is enabled before it looks at any id, so a disabled
+  // co-owner is invisible to resolve() and the id has exactly one real owner.
+  // Counting it here would report a safe ambiguity that CCR does not see.
+  const r = checkBareCollisions([
+    { name: "off", enabled: false, models: ["opus"] },
+    { name: "tokenrouter", models: ["opus"] },
+  ]);
+  assert.equal(r.fatal, true, "the disabled provider must not launder sole ownership");
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["opus"]);
+  assert.deepEqual(r.shadowed, []);
+});
+
+test("the fatal message only offers the relay for an id the relay can serve", () => {
+  // claude-opus-4-8 is the id most likely to fire this guard -- two resellers list
+  // it, the relay never has. "Start the relay" is unachievable advice for it, and
+  // the flag is the only real remedy.
+  const cannot = checkBareCollisions([P("tabiai", "claude-opus-4-8")]);
+  assert.equal(cannot.fatal, true);
+  assert.doesNotMatch(cannot.message, /start the Anthropic relay/,
+    "an unachievable remedy is worse than none");
+  assert.match(cannot.message, /--allow-bare-claude-names/);
+  // ...and it is still offered where it works: `opus` is in the relay's routing list.
+  const can = checkBareCollisions([P("tokenrouter", "opus")]);
+  assert.match(can.message, /start the Anthropic relay/);
+});
+
 test("a vendor-prefixed Claude id is never fatal", () => {
   // `Providers[].models[]` ids are unprefixed as far as CCR's stage-4 match is
   // concerned, so an id that already carries a `/` cannot be what Claude Code
