@@ -95,6 +95,28 @@ id becomes sole-owned by non-relay providers and the guard goes fatal on every r
 The user's only options at that point would be a permanently failing keysync or
 permanently passing `--allow-bare-claude-names`, which switches the guard off entirely.
 
+### Measured evidence for the deadline (code review, 2026-09-03)
+
+A code review of the committed A-i work verified the following against the live vault:
+
+- `tabiai` and `gorouter` are **absent from the bundled catalogue entirely**. Their built
+  models today are therefore one stale `testModel` each, and that is the **only** reason
+  `claude-opus-4-8` currently has exactly two owners and lands in `shadowed` rather than
+  `hijackable`.
+- Consequently the guard is non-fatal today by accident of missing data, not by design.
+  Losing either provider — key expiry, a `testModel` edit, `--verified-only` — makes the
+  id sole-owned and fatal immediately. Confirmed by simulation.
+- When B6 populates their catalogues, **every Claude id served by only one of them becomes
+  sole-owned**, and `checkBareCollisions` exits 1 on the main write path. `claude-opus-5-thinking`
+  is the likely first instance.
+
+A second, related defect must be fixed in the same pass: the fatal message's primary
+remedy is unachievable for the very id that will fire it. It says to start the Anthropic
+relay so it co-owns the id, but the relay serves `claude-opus-5`, `claude-sonnet-5`,
+`claude-haiku-4-5-20251001` and `claude-fable-5-1` — never `claude-opus-4-8`. Only
+`--allow-bare-claude-names` would work. Gate the relay remedy on
+`ANTHROPIC_RELAY.routing.includes(h.id)` so the message only offers it when it is achievable.
+
 ### Why narrowing is correct, not a workaround
 
 The guard exists because Claude Code sends **bare** names that CCR might bind to the wrong
@@ -117,6 +139,80 @@ the predicate this guard wants. Doing them in the other order means building the
 twice, and a hand-maintained second copy would go stale the same way `testModel` did.
 
 ---
+
+## Pending fix pass — code review of commits `437f3e6`..`c10e6ee`
+
+Queued to run after Tasks A6–A10 land, so the writes are sequenced rather than raced.
+Every finding below was verified by executing a mutant or checking live data, not by
+reading. None is live breakage today; all are latent or coverage gaps.
+
+**High**
+
+1. `menu/ccr-client.mjs:89` — the RPC drift check cannot report a missing method.
+   `methods[m] = r !== undefined`, but `rpc()` returns `null` on every failure path
+   (`:99` no service, `:116` catch, `:105` `body?.value ?? null`). A throwing `fetchImpl`
+   and an unknown-method error both yield `null`, so the check reads `true` either way and
+   `uw doctor` reports all three methods present with CCR dead. Fix: return `undefined`
+   from the failure paths, keeping `?? null` only for a genuine null result — or return
+   `{ok, value}`.
+2. `keysync/run.mjs:63` — the guard's production input shape is untested. Every S1 test
+   builds `{id}` objects via `P()`; `buildProviders` and the relay unshift both emit
+   `models` as `string[]`. Narrowing `String(m?.id ?? m ?? "")` to `String(m.id ?? "")`
+   yields `["",""]` on production data — the guard becomes a silent no-op with F1
+   unguarded — and all 91 tests still pass. Fix: one case with
+   `[{name:"tabiai", models:["claude-opus-5"]}]`.
+3. `keysync/run.mjs:101` — the fatal message's primary remedy is unachievable for the id
+   that will fire it. See the deadline evidence above.
+
+**Medium**
+
+4. `menu/catalog.mjs:56-58` — provider-matched pricing is untested for the case it exists
+   to handle. `test/fixtures/catalog.json` has no entry with more than one offer and none
+   whose `offers[].provider` differs from the row's. The live catalogue has 973 entries
+   with ≥2 offers, **792** where `offers[0].provider !== row.provider` (e.g.
+   `alibaba/qwen-3-14b`, whose first offer is Vercel's and whose correct answer is `null`).
+   Reverting `priceOf` to `offers[0]` — the exact defect the comment at `:36` records —
+   passes 91/91 and badges those rows with another host's price. Fix: a fixture entry with
+   two foreign offers, asserting `priceOf(e, "acme") === null`.
+5. `menu/catalog.mjs:16` — `writeAtomic` is imported and never used; `writeSlot` (`:228`)
+   uses plain `fs.writeFileSync`, so ctrl+c mid-write truncates `slot.json` and `readSlot`
+   swallows it to `""`. Fix: `writeSlot` → `writeAtomic`.
+
+**Low**
+
+6. `menu/atomic.mjs:13-18` — on a write or fsync throw the previous file is correctly
+   intact, but `${file}.tmp-${pid}` is left behind. Add `catch { fs.rmSync(tmp, {force:true}); throw; }`.
+7. `keysync/run.mjs:59` — owner counting ignores `enabled`, which is CCR's own gate, so a
+   disabled co-owner reads as safe while CCR sees one match. Latent (always `true` today).
+   `if (p.enabled === false) continue;`.
+8. `test/denylist.test.mjs:340` — title claims the routing list holds eight ids; the body
+   checks neither the length nor that `FULL` is a subset of `routing`.
+9. `menu/catalog.mjs:164` — `admitRemoteModels`' `console.warn` fires inside the picker's
+   build path, into the alternate screen mid-frame. Zero rejections across all 4,298 live
+   ids today, so latent — but **goes live with B6**, since discovery returns raw provider
+   strings rather than today's uniformly clean bundle.
+10. `test/menu-layout.test.mjs:21` — the spike-reference guard omits `catalog.mjs`, the one
+    file whose contents A2 changed. Clean today, so a coverage gap rather than a bug. Fix:
+    add `"catalog.mjs"` to the loop.
+
+**Noted, not asserted:** `spike/` still holds 10 tracked files plus a 45 MB untracked
+`cc_strings.txt`. Task A2 only claimed the picker spike, so this may be deliberate.
+
+**Assessed sound, explicitly:** `menu/sanitize.mjs` and `menu/denylist.mjs` — no findings
+at any severity. `admitId` accepts 4,298 of 4,298 live catalogue ids, so it drops no
+provider and the `@`-scope widening closed the last rule-1 exposure.
+
+## Forward note for whoever writes Task B10
+
+Task A5's text says the refresher bakes `routable` into snapshot rows, but A8's
+`buildSnapshot` enumerates eight model fields and `routable` is **not** among them — and
+A8 ships a test asserting exactly those eight. If B10 writes routability through
+`buildSnapshot` as it stands, the field is silently dropped and the routability column
+renders empty, which is the round-2 defect returning by a different route.
+
+Not a defect in A8 as specified, so it was not changed during execution. Resolve it in
+B10 by extending both the field list and that test together, and confirm the picker
+actually reads the field it is given.
 
 ## Related open question, already recorded in the plan
 
