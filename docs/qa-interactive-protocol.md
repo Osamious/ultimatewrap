@@ -37,9 +37,19 @@ a near miss, not just by an error — `0` where `—` is expected is a failure.
 **Do:** in Claude Code, type `m` into the chat input, then press ctrl+g.
 
 **Expected:** the chat pane is replaced by a rounded frame whose title bar reads
-`UW > providers` and whose second line ends with `44 providers · 1584 models ·
+`UW > providers` and whose second line ends with `<N> providers · <M> models ·
 routable <stamp>` (or `routable —` before any refresh has resolved routability).
 The frame draws top-down over about a tenth of a second.
+
+`N` and `M` are whatever the current snapshot holds, not fixed values — the plan
+pinned `44` and `1584`, and the snapshot on this machine already reads 45 and
+1588, so a pinned number fails this step against working software the first time
+a refresh lands. Check them against the snapshot rather than against this
+document:
+
+```
+node -e "import('./menu/snapshot.mjs').then(m=>{const{snap}=m.loadSnapshot();console.log(snap.rows.length,'providers',snap.rows.reduce((a,r)=>a+(r.models??[]).length,0),'models')})"
+```
 
 **Fail means:** the dispatcher did not match the sentinel, or `EDITOR` is not
 wired — run `node C:\Users\osami\.uw\menu\doctor.mjs`. If your real editor opened
