@@ -107,9 +107,18 @@ export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.te
  * @param {string}  [opts.trusted="anthropic"] our own local relay, exempt from
  *                  the `uw/` check. It is no longer an exemption from anything
  *                  Anthropic-shaped, because nothing Anthropic-shaped is refused.
+ * @param {boolean} [opts.warn=true] emit the SECURITY line. The DISPLAY path
+ *                  passes false: buildFrom runs inside the picker, which draws a
+ *                  full-screen frame into the alternate screen, and a console
+ *                  write mid-frame corrupts the frame it lands in. The same
+ *                  rejections are reported by the routing path, which is the one
+ *                  that matters and which runs with an ordinary stdout. Zero
+ *                  rejections across all 4,298 bundled ids today, so this is
+ *                  latent -- but it goes live with Task B6, where discovery
+ *                  returns raw provider strings instead of a curated bundle.
  * @returns {{kept: string[], rejected: string[]}}
  */
-export function admitRemoteModels(providerName, ids, { trusted = "anthropic" } = {}) {
+export function admitRemoteModels(providerName, ids, { trusted = "anthropic", warn = true } = {}) {
   const kept = [], rejected = [];
   const exempt = providerName === trusted;
   for (const raw of ids ?? []) {
@@ -122,7 +131,7 @@ export function admitRemoteModels(providerName, ids, { trusted = "anthropic" } =
     if (!exempt && UW_ALIAS.test(id)) { rejected.push(id); continue; }
     kept.push(id);
   }
-  if (rejected.length) {
+  if (warn && rejected.length) {
     console.warn(`SECURITY: provider "${providerName}" advertised ${rejected.length} ` +
       `rejected model name(s): ${rejected.slice(0, 10).join(", ")}`);
   }

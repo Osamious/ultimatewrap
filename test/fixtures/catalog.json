@@ -19,6 +19,17 @@
       "capabilities": {},
       "pricing": { "inputPerMillion": 0, "outputPerMillion": 0 } },
     { "provider": "blank", "model": "blank-a", "capabilities": {} },
-    { "provider": "blank", "model": "blank-b", "capabilities": {} }
+    { "provider": "blank", "model": "blank-b", "capabilities": {} },
+
+    { "provider": "multi", "model": "multi-foreign-only",
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "capabilities": {},
+      "pricing": { "offers": [ { "provider": "vercel", "per1MTokens": { "input": 0, "output": 0 } },
+                               { "provider": "bedrock", "per1MTokens": { "input": 2, "output": 8 } } ] } },
+    { "provider": "multi", "model": "multi-mine-second",
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "capabilities": {},
+      "pricing": { "offers": [ { "provider": "vercel", "per1MTokens": { "input": 9, "output": 9 } },
+                               { "provider": "multi", "per1MTokens": { "input": 1, "output": 2 } } ] } }
   ]
 }

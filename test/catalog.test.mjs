@@ -22,6 +22,25 @@ test("priceOf reads pricing.offers[].per1MTokens", () => {
   assert.deepEqual(priceOf(byId["acme-pro-1"]), { in: 0.3, out: 1.2 });
 });
 
+test("priceOf answers about MY key, not about the first offer in the array", () => {
+  // The case provider-matching exists for, and it was previously untested: the
+  // fixture had no entry with more than one offer and none whose offers[].provider
+  // differed from the row's. The live catalogue has 973 entries with two or more
+  // offers and 792 where offers[0] belongs to another host, so reverting to
+  // offers[0] -- the exact defect the comment at priceOf records -- passed the
+  // whole suite while badging rows with a different vendor's price.
+  //
+  // Foreign offers only: the honest answer is null, never the first offer's zero.
+  assert.equal(priceOf(byId["multi-foreign-only"], "multi"), null);
+  assert.equal(priceOf(byId["multi-foreign-only"]), null, "two usable offers, none identifiable");
+  assert.equal(badgeOf(byId["multi-foreign-only"], { providerName: "multi" }), "",
+    "a free-looking foreign offer must not badge the row FREE");
+
+  // Mine present but not first: the matching offer wins, so a reversion to
+  // offers[0] returns 9.00/9.00 here and this fails.
+  assert.deepEqual(priceOf(byId["multi-mine-second"], "multi"), { in: 1, out: 2 });
+});
+
 test("priceOf returns null for the legacy shape keysync's inferTier reads", () => {
   assert.equal(priceOf(byId["acme-legacy-1"]), null);
   assert.equal(priceOf(byId["blank-a"]), null);
@@ -156,6 +175,47 @@ test("writeAtomic leaves no partial file and replaces the previous contents", ()
   writeAtomic(f, '{"v":2}');
   assert.equal(fs.readFileSync(f, "utf8"), '{"v":2}');
   assert.equal(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")).length, 0);
+});
+
+test("a failed writeAtomic leaves the target intact and no debris behind", () => {
+  // The target was already safe -- it keeps its previous contents, which is the
+  // guarantee. What was not safe is the leftover `<file>.tmp-<pid>`: a full disk
+  // or a revoked permission left one on every attempt, and the picker's own state
+  // tests assert no such file survives a write.
+  //
+  // Forced by renaming onto a non-empty directory, which fails after the temp file
+  // has been created and written.
+  const dir = path.join(process.env.HOME ?? process.env.USERPROFILE,
+                        ".uw", "harness", "scratch", "atomic-fail");
+  const target = path.join(dir, "occupied");
+  fs.mkdirSync(target, { recursive: true });
+  fs.writeFileSync(path.join(target, "child"), "keep me");
+
+  assert.throws(() => writeAtomic(target, '{"v":1}'), "a real failure must still fail");
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes(".tmp-")), [],
+    "the temp file must not survive the failure");
+  assert.equal(fs.readFileSync(path.join(target, "child"), "utf8"), "keep me");
+});
+
+test("buildFrom stays silent: the display path must not write to the console", () => {
+  // buildFrom runs inside the picker, which owns a full-screen frame in the
+  // alternate screen. admitRemoteModels' SECURITY line landed in the middle of
+  // one. Zero rejections across the 4,298 bundled ids today, so it was latent --
+  // and it goes live with Task B6, where discovery returns raw provider strings
+  // instead of a curated bundle. The routing path still reports the same
+  // rejections, with an ordinary stdout.
+  const c = catalog();
+  c.byProvider.set("evil", [{ provider: "evil", model: "uw/fast", capabilities: {} },
+                            { provider: "evil", model: "ok-1", capabilities: {} }]);
+  const said = [];
+  const realWarn = console.warn;
+  console.warn = (m) => said.push(String(m));
+  try {
+    buildFrom({ chosen: [{ id: "personal.evil.free", provider: "evil" }],
+                providers: new Map([["evil", { testModel: "uw/slot-1", notes: "" }]]),
+                catalog: c });
+  } finally { console.warn = realWarn; }
+  assert.deepEqual(said, [], "the picker's build path must print nothing");
 });
 
 test("readJsonOr never throws", () => {

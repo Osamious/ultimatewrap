@@ -9,14 +9,24 @@ import fs from "node:fs";
 
 export function writeAtomic(file, text) {
   const tmp = `${file}.tmp-${process.pid}`;
-  const fd = fs.openSync(tmp, "w");
   try {
-    fs.writeFileSync(fd, text);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    const fd = fs.openSync(tmp, "w");
+    try {
+      fs.writeFileSync(fd, text);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // The target is already safe -- it still holds the previous contents, which is
+    // the guarantee this function exists for. What is not safe is the debris: a
+    // full disk or a revoked permission leaves `<file>.tmp-<pid>` behind, and the
+    // picker's own tests assert that no such file survives a write. Clean up and
+    // rethrow, so a real failure is still a failure.
+    fs.rmSync(tmp, { force: true });
+    throw e;
   }
-  fs.renameSync(tmp, file);
 }
 
 // The BOM strip is not defensive padding. PowerShell 5.1's `Set-Content -Encoding

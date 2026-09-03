@@ -388,6 +388,15 @@ test("the relay's routing list holds eight ids and its picker list holds four", 
   assert.deepEqual([...ANTHROPIC_RELAY.picker].sort(),
     ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001",
      "claude-fable-5-1"].sort());
+  // The title says eight and four, so check eight and four -- the body previously
+  // checked neither length nor that the picker ids survive into routing, so a
+  // routing list that had LOST the four full ids would still have passed.
+  assert.equal(ANTHROPIC_RELAY.routing.length, 8);
+  assert.equal(ANTHROPIC_RELAY.picker.length, 4);
+  for (const id of ANTHROPIC_RELAY.picker) {
+    assert.ok(ANTHROPIC_RELAY.routing.includes(id),
+      `routing must be a superset of picker; ${id} is missing`);
+  }
   for (const alias of ["opus", "sonnet", "haiku", "fable"]) {
     assert.equal(ANTHROPIC_RELAY.routing.includes(alias), true,
       `the relay must own the bare alias ${alias} so a third party cannot sole-own it`);

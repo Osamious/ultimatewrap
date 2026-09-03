@@ -161,7 +161,12 @@ export function buildFrom({ chosen, providers, catalog, relay,
     const prof = providers.get(cred.provider) ?? {};
     const opts = { ...(cadenceOf(cred.provider) ?? {}), providerName: cred.provider };
     const entries = catalog.byProvider.get(cred.provider) ?? [];
-    const { kept } = admitRemoteModels(cred.provider, entries.map((e) => e.model));
+    // warn:false -- this is the DISPLAY path. buildFrom runs inside the picker,
+    // which owns a full-screen frame in the alternate screen, and a console write
+    // lands in the middle of one. The routing path reports the same rejections
+    // with an ordinary stdout, and that is the copy that matters.
+    const { kept } = admitRemoteModels(cred.provider, entries.map((e) => e.model),
+                                       { warn: false });
     const keptSet = new Set(kept);
     const models = [];
     for (const e of entries) {
@@ -179,7 +184,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
     // Guarded for the same reason as the routing path: an absent testModel is
     // ordinary configuration, not a rejected advertisement.
     const tm = prof.testModel
-      ? (admitRemoteModels(cred.provider, [prof.testModel]).kept[0] ?? null)
+      ? (admitRemoteModels(cred.provider, [prof.testModel], { warn: false }).kept[0] ?? null)
       : null;
     if (tm && !models.some((m) => m.id === tm)) {
       models.unshift({ id: tm, ctx: null, pin: null, pout: null,
@@ -225,7 +230,11 @@ export function build() {
 
 export function writeSlot(target) {
   fs.mkdirSync(path.dirname(SLOT), { recursive: true });
-  fs.writeFileSync(SLOT, JSON.stringify({ model: target }, null, 2));
+  // Through writeAtomic like every other state file. writeAtomic was imported here
+  // and never called: a plain write truncates slot.json in place, so ctrl+c during
+  // it leaves a prefix, and readSlot's catch turns that into "" -- a silently
+  // forgotten model pin rather than a visible error.
+  writeAtomic(SLOT, JSON.stringify({ model: target }, null, 2));
 }
 
 export function readSlot() {

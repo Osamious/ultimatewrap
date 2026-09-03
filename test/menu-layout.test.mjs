@@ -18,7 +18,11 @@ test("catalog.mjs exports the builder surface", async () => {
 });
 
 test("no menu file still points at the spike directory", () => {
-  for (const f of ["uwpick.mjs", "uwpick-run.ps1", "uwpick.cmd"]) {
+  // catalog.mjs included: it is the one file whose CONTENTS Task A2 changed, its
+  // slot path having pointed into spike/, and it was the only moved file this
+  // guard did not read. Clean today, so this closes a coverage gap rather than a
+  // bug -- but the gap was over exactly the file most likely to regress.
+  for (const f of ["catalog.mjs", "uwpick.mjs", "uwpick-run.ps1", "uwpick.cmd"]) {
     const src = fs.readFileSync(`${MENU}/${f}`, "utf8");
     assert.ok(!/[\\/]spike[\\/]/.test(src), `${f} still references the spike directory`);
   }
