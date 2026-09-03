@@ -323,3 +323,36 @@ test("sleepSync blocks for about the requested time and returns nothing", () => 
   const spent = Date.now() - t;
   assert.ok(spent >= 30 && spent < 400, `slept ${spent}ms`);
 });
+
+test("slide frames measure VISIBLE width, so colour does not truncate a line", () => {
+  // The transition test above builds its frame with PLAIN caps, where raw length
+  // and visible length are equal -- which is exactly why it never caught this.
+  // slideFrames clipped with String.slice on the RAW string, so every SGR escape
+  // in a line consumed a column of the budget and the line was cut before its
+  // visible end, dropping the right-hand frame character and whatever trailed it.
+  //
+  // The title was the worst case by an order of magnitude, because `title` paints
+  // it through `p.ramp` -- one escape PER CHARACTER. Measured before the fix: 453
+  // raw characters for 69 visible, clipped to 8. On screen that is a title bar
+  // reading `╭─ UW ▸` and nothing else, on every descend and every esc back,
+  // repaired by the next keypress because an ordinary redraw does not come
+  // through here.
+  const vis = (s) => [...strip(String(s))].length;
+  const settled = frame(V1, META, { caps: VT });
+
+  // The frame is only worth measuring if it actually carries colour, or this
+  // test degrades into the PLAIN one above without saying so.
+  assert.ok(settled.some((l) => strip(l).length !== l.length),
+            "fixture carries no SGR escapes; this test would prove nothing");
+
+  const frames = slideFrames(settled);
+  for (const [n, f] of frames.entries()) {
+    for (const [i, l] of f.entries()) {
+      assert.ok(vis(l) <= FRAME_W,
+                `frame ${n} line ${i} is ${vis(l)} visible columns, over FRAME_W`);
+    }
+  }
+  // At rest the slide must be a no-op: the settled frame the user is left looking
+  // at has to be bit-for-bit the ordinary render, not a clipped approximation.
+  assert.deepEqual(frames[frames.length - 1], settled);
+});

@@ -332,7 +332,25 @@ export function slideFrames(lines, step = 6, frames = 3) {
   const out = [];
   for (let f = frames; f >= 1; f--) {
     const shift = " ".repeat(step * (f - 1));
-    out.push(lines.map((l) => (shift + l).slice(0, FRAME_W + shift.length)));
+    // clipVisible, not String.slice. `.slice(0, FRAME_W + shift.length)` counted
+    // RAW characters, so every SGR escape in a line ate a column of the budget
+    // and the line was cut before its visible end -- losing the right-hand frame
+    // character and whatever trailed it.
+    //
+    // MEASURED: a row of 68 visible columns carrying two colour spans came out
+    // at 60 and lost its border. The title was worse by an order of magnitude,
+    // because `title` paints it through `p.ramp`, which emits one escape PER
+    // CHARACTER: 453 raw characters for 69 visible, clipped to 8. The user saw
+    // exactly that -- a title bar reading `╭─ UW ▸` and nothing else, on every
+    // descend and every esc back, corrected by the next keypress because a
+    // normal redraw does not go through here.
+    //
+    // FRAME_W, not FRAME_W + shift.length: the shifted line is that much wider
+    // than the frame, and letting it through wraps in a terminal sized to the
+    // frame. Clipping to the frame's own width is what makes this a slide rather
+    // than an overflow, and at the last frame (shift 0) it is a no-op, so the
+    // settled frame is bit-for-bit the normal render.
+    out.push(lines.map((l) => clipVisible(shift + l, FRAME_W)));
   }
   return out;
 }
