@@ -12,7 +12,7 @@ import os from "node:os";
 const KEYSYNC = path.join(os.homedir(), ".uw", "keysync", "keysync.mjs");
 const K = await import("file://" + KEYSYNC.replace(/\\/g, "/"));
 
-export const SLOT = path.join(os.homedir(), ".uw", "spike", "slot.json");
+export const SLOT = path.join(os.homedir(), ".uw", "state", "slot.json");
 
 // The catalogue's real pricing path. keysync's own inferTier reads
 // `pricing.inputPerMillion`, which does not exist in this schema — it returns

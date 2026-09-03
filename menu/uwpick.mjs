@@ -14,10 +14,14 @@
 // a non-zero exit makes CC discard the content.
 
 import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { build, routableSet } from "./catalog.mjs";
 
 const FILE = process.argv[2];
-const KEYLOG = "C:/Users/osami/.uw/spike/keys.log";
+const STATE = path.join(os.homedir(), ".uw", "state");
+fs.mkdirSync(STATE, { recursive: true });
+const KEYLOG = path.join(STATE, "keys.log");
 const out = process.stdout;
 
 const { rows } = build();

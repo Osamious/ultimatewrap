@@ -8,9 +8,6 @@ set "BUF=%~1"
 set "SENTINEL="
 if exist "%BUF%" for /f "usebackq delims=" %%L in ("%BUF%") do if not defined SENTINEL set "SENTINEL=%%L"
 
-REM trigger on: m | model | >>m   (leading "# ---" response header lines are skipped
-REM because we only read the first non-empty line)
-if /i "%SENTINEL%"=="diag"   goto diag
 if /i "%SENTINEL%"=="m"      goto pick
 if /i "%SENTINEL%"=="model"  goto pick
 if /i "%SENTINEL%"==">>m"    goto pick
@@ -25,8 +22,4 @@ REM via PowerShell: it sets the console to raw VT input mode first, which node
 REM cannot do. Without that the console stays line-buffered and arrows/typing
 REM never reach the picker -- the exact failure seen in testing.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0uwpick-run.ps1" -File "%BUF%"
-exit /b 0
-
-:diag
-node "%~dp0uwdiag.mjs" "%BUF%"
 exit /b 0
