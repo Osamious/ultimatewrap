@@ -224,8 +224,26 @@ different code path from Esc, so one can pass while the other fails.
 **Do:** rename `C:\Users\osami\.uw\catalog\snapshot.json` aside, type `m` into the
 chat input, press ctrl+g, then restore the file.
 
-**Expected:** one line naming the file and the `uw catalog refresh` command, and an
-**empty** chat input.
+```powershell
+Rename-Item C:\Users\osami\.uw\catalog\snapshot.json snapshot.json.uwtest
+#   ... type m, press ctrl+g, read the line, then:
+Rename-Item C:\Users\osami\.uw\catalog\snapshot.json.uwtest snapshot.json
+```
+
+**Expected:** one line naming the missing file and the command that rebuilds it,
+and an **empty** chat input. Verbatim, with the real path:
+
+```
+uwpick: no catalogue snapshot at C:\Users\osami\.uw\catalog\snapshot.json — run: node C:/Users/osami/.uw/menu/snapshot.mjs --build
+```
+
+This step needs no keystrokes: the picker fails and exits on its own, so it is
+unaffected by anything to do with console input.
+
+An earlier version of this step expected the line to name `uw catalog refresh`.
+It does not, and no such command exists here -- that name came from the plan
+rather than from the code, and an operator looking for it would have failed a
+step that passes.
 
 **Fail means:** a stack trace, a hung picker, or the literal `m` left in the chat
 input. This is Q2.1's stated behaviour and the failure most likely to be met by a
