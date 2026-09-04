@@ -152,7 +152,29 @@ const vis  = (s) => [...strip(String(s ?? ""))].length;
 const fill = (n) => " ".repeat(Math.max(0, n));
 const pad  = (s, n) => { const t = sanitizeDisplay(String(s ?? ""), n); return t + fill(n - vis(t)); };
 const rpad = (s, n) => { const t = sanitizeDisplay(String(s ?? ""), n); return fill(n - vis(t)) + t; };
-const ctxS = (c) => (c == null ? "" : c >= 1e6 ? `${c / 1e6}M` : `${Math.round(c / 1000)}k`);
+// Context window, formatted to FIT ITS COLUMN. The previous form was
+//   c >= 1e6 ? `${c / 1e6}M` : `${Math.round(c / 1000)}k`
+// which emits the raw quotient: 1048576 becomes "1.048576M", nine characters in a
+// six-wide column. `bar` then clips from the right and the M is what falls off,
+// so a 1,048,576-token window rendered as `1.0485` -- indistinguishable from a
+// number in the thousands, and wrong in the direction that matters, since the
+// whole point of the column is telling a big window from a small one. Every
+// power-of-two window was affected: 2^20 and 2^21 are the common ones, and the
+// operator hit it reading a real model's window off the screen.
+//
+// Trailing zeros go, so 1000000 stays "1M" rather than becoming "1.00M", and the
+// precision steps down until the result fits rather than being clipped.
+const trimZeros = (s) => (s.includes(".") ? s.replace(/0+$/, "").replace(/\.$/, "") : s);
+const ctxS = (c) => {
+  if (c == null) return "";
+  if (c < 1e6) return `${Math.round(c / 1000)}k`;
+  const v = c / 1e6;
+  for (const places of [2, 1, 0]) {
+    const s = `${trimZeros(v.toFixed(places))}M`;
+    if (s.length <= W.ctx) return s;
+  }
+  return `${Math.round(v)}M`;
+};
 const money = (v) => (v == null ? "" : Number(v).toFixed(2));
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 

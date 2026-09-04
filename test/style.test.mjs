@@ -405,3 +405,34 @@ test("both footers point at the legend as the complete list", () => {
   // scope but not enter, so the key that descends was undocumented on screen.
   assert.match(strip(frame(V0, META, { caps: PLAIN }).at(-1)), /open/);
 });
+
+test("the context column never overflows, so the unit is never the thing clipped", () => {
+  // ctxS used to emit the raw quotient: 1048576 -> "1.048576M", nine characters
+  // in a six-wide column. bar() clips from the right, so the M fell off and a
+  // 1,048,576-token window rendered as `1.0485` -- indistinguishable from a
+  // number in the thousands, and wrong in the direction that matters, since the
+  // column exists to tell a big window from a small one. Every power-of-two
+  // window was affected; the operator hit it reading a real model's window off
+  // the screen during P15.
+  const mk = (ctx) => ({ kind: "model", target: "p/m",
+    model: { id: "m", ctx, pin: 0, pout: 0, badge: "", tools: 0, vision: 0, reason: 0 },
+    row: {} });
+  const V = { level: 1, scope: "tree", filter: "", legend: false, cursor: 0, top: 0,
+              empty: false, more: 0, provider: { keyId: "p", provider: "p", models: [1] },
+              items: [] };
+  const cell = (ctx) => {
+    V.items = [mk(ctx)];
+    return strip(frame(V, META, { caps: PLAIN })[4]).slice(38, 38 + W.ctx).trim();
+  };
+  assert.equal(cell(1048576), "1.05M", "2^20 must keep its unit");
+  assert.equal(cell(2097152), "2.1M");
+  assert.equal(cell(1000000), "1M", "a round million must not gain decimals");
+  assert.equal(cell(262144), "262k");
+  assert.equal(cell(8192), "8k");
+  assert.equal(cell(null), "");
+  assert.equal(cell(100e6), "100M", "precision steps down rather than being clipped");
+  for (const c of [1048576, 2097152, 1048700, 999999, 1e6, 1e9]) {
+    assert.ok(cell(c).length <= W.ctx, `${c} rendered ${cell(c).length} columns`);
+    if (c >= 1e6) assert.match(cell(c), /M$/, `${c} lost its unit`);
+  }
+});
