@@ -299,6 +299,17 @@ it is just not the position `install.ps1` currently takes.
 
 ## Pending fix pass — code review of commits `437f3e6`..`c10e6ee`
 
+**Status: ALL NINE FIXED, verified 2026-09-04.** Re-checked every finding against current
+HEAD (`45ceed7`) before touching anything, since substantial work landed between this list
+being written and now. Each of the three High, two Medium and four Low findings below was
+already corrected -- `ccr-client.mjs` now discriminates RPC failure kinds instead of
+collapsing to `null`; `run.mjs`'s guard accepts both id shapes and respects `enabled`; the
+fatal message gates its remedy on `ANTHROPIC_RELAY.routing`; `catalog.mjs`'s fixture has a
+multi-foreign-offer entry; `writeSlot` goes through `writeAtomic`; `atomic.mjs` cleans up its
+temp file on throw; the routing-list test checks length; the mid-frame `console.warn` is
+gone. Kept below as the record -- not one required a new fix, all nine were verified by
+reading the current source, not by re-running a mutant.
+
 Queued to run after Tasks A6–A10 land, so the writes are sequenced rather than raced.
 Every finding below was verified by executing a mutant or checking live data, not by
 reading. None is live breakage today; all are latent or coverage gaps.
