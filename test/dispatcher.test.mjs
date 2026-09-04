@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 const CMD = "C:\\Users\\osami\\.uw\\menu\\uwpick.cmd";
 const FAKE = "C:\\Users\\osami\\.uw\\test\\fixtures\\fake-editor.cmd";
@@ -151,4 +151,44 @@ test("abort keeps the discarding exit when it could not empty the buffer", () =>
       { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1" }, stdio: "pipe" });
   } catch (e) { code = e.status ?? -1; }
   assert.notEqual(code, 0, "an un-emptied buffer must still be discarded");
+});
+
+test("a fatal message is printed once, and a piped run does not pay the screen hold", () => {
+  // Under ctrl+g the user saw NOTHING for a missing snapshot: Claude Code runs
+  // the editor inside the alternate screen buffer and restores it the instant the
+  // child exits, wiping anything written there. The only path carrying a message
+  // is the one a user who has never built a snapshot hits -- the person with the
+  // least context to work out what happened. The fix holds the screen; this pins
+  // the two parts of it that can regress silently.
+  //
+  // USERPROFILE is repointed rather than the real snapshot being moved: the
+  // picker resolves it under os.homedir(), so a scratch home makes it genuinely
+  // absent without touching the live catalogue, and every other file the picker
+  // reads or writes lands in the scratch tree too.
+  const home = scratchDir();
+  const buf = path.join(home, "b.md");
+  fs.writeFileSync(buf, "m\r\n");
+
+  // spawnSync, not execFileSync. On a zero exit execFileSync RETURNS stdout and
+  // discards stderr -- and stdout here is a pipe, not a TTY, so the message goes
+  // to stderr by design. The first version of this test captured nothing and
+  // failed against working code.
+  const started = Date.now();
+  const r = spawnSync(process.execPath, ["C:/Users/osami/.uw/menu/uwpick.mjs", buf],
+    { env: { ...process.env, USERPROFILE: home, HOME: home },
+      encoding: "utf8", timeout: 20000 });
+  const spent = Date.now() - started;
+  const code = r.status ?? -1;
+
+  const both = String(r.stdout ?? "") + String(r.stderr ?? "");
+  assert.match(both, /uwpick: no catalogue snapshot/, "the reason must be stated");
+  assert.match(both, /snapshot\.mjs --build/, "and the command that fixes it");
+  // ONE copy. Writing to stdout AND stderr printed it twice whenever they share a
+  // terminal, which is the normal case and which the first version of this did.
+  assert.equal(both.split("uwpick: ").length - 1, 1, "the message must appear once");
+  // Piped output is not a TTY, so the hold is skipped -- otherwise every scripted
+  // or CI invocation pays it on every abort.
+  assert.ok(spent < 2000, `piped run took ${spent}ms; the hold must not apply here`);
+  assert.equal(fs.readFileSync(buf, "utf8"), "", "the buffer is still emptied");
+  assert.equal(code, 0, "and the emptied buffer is still accepted");
 });

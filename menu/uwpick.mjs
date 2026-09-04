@@ -81,8 +81,32 @@ export function framesFor(kind, lines, opts) {
 // Q2.1 cannot drift apart. Both are needed: the exit code is what Claude Code
 // reads, and the truncation is what makes the outcome right even if some layer
 // swallows the code -- which is exactly what uwpick.cmd used to do.
+// How long a fatal message stays on screen before we exit. MEASURED: under
+// ctrl+g the user saw NOTHING at all. Claude Code runs the editor inside the
+// alternate screen buffer and restores it the instant the child exits, so
+// anything written here is wiped before it can be read -- and the only path that
+// carries a message is the one a user who has never built a snapshot will hit,
+// who has the least context to work out what happened. Holding the screen is the
+// one way to make it readable while still leaving the chat input empty, which is
+// what Q2.1 promises.
+//
+// Overridable so tests do not pay it, and so it can be turned off entirely.
+const ERROR_HOLD_MS = Number(process.env.UW_PICKER_ERROR_HOLD_MS ?? 2500);
+
 function abort(out, FILE, message) {
-  if (message) process.stderr.write(message + "\n");
+  if (message) {
+    // ONE copy, on whichever stream the user can actually see. Writing to both
+    // prints it twice whenever they share a terminal, which is the normal case
+    // and which the first version of this did. stdout is the screen the picker
+    // has been drawing on; stderr is the right place only when stdout is not a
+    // terminal, i.e. when nothing was ever shown and the line is going to a log.
+    if (out.isTTY) {
+      try { out.write("\n" + message + "\n"); } catch { process.stderr.write(message + "\n"); }
+      if (ERROR_HOLD_MS > 0) sleepSync(ERROR_HOLD_MS);
+    } else {
+      process.stderr.write(message + "\n");
+    }
+  }
   let emptied = false;
   if (FILE) { try { fs.writeFileSync(FILE, ""); emptied = true; } catch { /* see below */ } }
   // MEASURED on Claude Code 2.1.259, and it contradicts what this function used
