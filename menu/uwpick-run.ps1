@@ -110,6 +110,21 @@ try {
   & node (Join-Path $PSScriptRoot $ChildScript) $File
   $childExit = $LASTEXITCODE
 } finally {
+  # Sample the mode BEFORE restoring it. The mode logged above is what we set
+  # before spawning the child; this is what it actually was when the child
+  # finished. If they differ, something re-asserted a console mode while the
+  # picker was reading -- which is the only remaining explanation for a reader
+  # that behaves line-buffered while the flags say it is not.
+  if ($env:UW_PICK_TRACE) {
+    $end = 0
+    $okEnd = [ConMode]::GetConsoleMode($h, [ref]$end)
+    $l2 = @{ ev = "conmode-exit"; atExit = [int]$end; getOk = [bool]$okEnd
+             lineInput = [bool]([int]$end -band 0x0002)
+             vtInput   = [bool]([int]$end -band 0x0200)
+             changedDuringRun = ([int]$end -ne [int]$RAW_VT) } | ConvertTo-Json -Compress
+    try { [IO.File]::AppendAllText($env:UW_PICK_TRACE, $l2 + "`n",
+          (New-Object Text.UTF8Encoding $false)) } catch { }
+  }
   if ($haveSaved) { [void][ConMode]::SetConsoleMode($h, $saved) }
   if ($Diagnose) {
     $after = 0
