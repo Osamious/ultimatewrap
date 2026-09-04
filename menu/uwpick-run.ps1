@@ -84,6 +84,27 @@ $RAW_VT = [uint32](0x0080 -bor 0x0200)   # ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUA
 # at a menu that was not on screen yet.
 [void][ConMode]::FlushConsoleInputBuffer($h)
 
+# Read the mode BACK, and record it when tracing. SetConsoleMode returning true is
+# not evidence that the console is in the mode we asked for: the handle can be one
+# thing and the active input buffer another, and a parent that reasserts its own
+# mode after spawning us would leave no trace at all in the flags we set.
+#
+# This exists because two traces disagreed. Keys pressed seconds after the picker
+# opened arrived as clean ESC[B sequences; keys pressed immediately did not arrive
+# at all, and esc was not delivered until Enter was pressed after it -- which is
+# what a console still carrying ENABLE_LINE_INPUT does, not what a swallowed
+# keystroke does.
+if ($env:UW_PICK_TRACE) {
+  $back = 0
+  $okBack = [ConMode]::GetConsoleMode($h, [ref]$back)
+  $line = @{ ev = "conmode"; saved = [int]$saved; asked = [int]$RAW_VT
+             readBack = [int]$back; getOk = [bool]$okBack
+             lineInput = [bool]([int]$back -band 0x0002)
+             vtInput   = [bool]([int]$back -band 0x0200) } | ConvertTo-Json -Compress
+  try { [IO.File]::AppendAllText($env:UW_PICK_TRACE, $line + "`n",
+        (New-Object Text.UTF8Encoding $false)) } catch { }
+}
+
 $childExit = 0
 try {
   & node (Join-Path $PSScriptRoot $ChildScript) $File
