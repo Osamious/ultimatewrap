@@ -199,11 +199,30 @@ export function main() {
     quit("no-conin");
   }
 
+  // Set UW_PICK_TRACE to a path to record every read. This surface cannot be
+  // driven by a test -- tmux gives a pty rather than a Windows console input
+  // buffer, and synthetic WriteConsoleInput records were not observed to reach a
+  // readSync on CONIN$ -- so when it misbehaves under Claude Code's ctrl+g the
+  // only way to see what arrived is to write it down as it arrives. Off unless
+  // the variable is set, and it never affects what the picker does with a key.
+  const TRACE = process.env.UW_PICK_TRACE || null;
+  const t = (ev, extra) => {
+    if (!TRACE) return;
+    try {
+      fs.appendFileSync(TRACE, JSON.stringify({
+        ms: Number(process.hrtime.bigint() - t0) / 1e6, ev, ...extra }) + "\n");
+    } catch { /* tracing must never break the picker */ }
+  };
+  t("loop-start", { level: state.level, scope: state.scope });
+
   const buf = Buffer.alloc(1024);
   for (;;) {
     let n = 0;
     try { n = readSync(CONIN, buf, 0, buf.length, null); }
-    catch { break; }
+    catch (e) { t("read-threw", { message: String(e.message).slice(0, 120) }); break; }
+    t("read", { n, hex: buf.toString("hex", 0, Math.max(0, Math.min(n, 64))),
+                text: JSON.stringify(buf.toString("utf8", 0, Math.max(0, Math.min(n, 64)))),
+                tokens: n > 0 ? tokenize(buf.toString("utf8", 0, n)).length : 0 });
     if (n <= 0) continue;
 
     // Q3.8: readSync hands back the whole console buffer, so a held arrow arrives
