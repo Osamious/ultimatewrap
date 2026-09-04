@@ -150,9 +150,21 @@ export function reduce(state, ev) {
   }
 
   if (key.length >= 3 && c0 === 27 && key[1] === "[") {                        // arrows
+    // Wrap at both ends. With 45 providers and lists running to hundreds of
+    // models, the last row is the one furthest from the cursor's start, and
+    // holding up to reach it is the difference between one key and a hundred.
+    //
+    // The wrap is HERE and not in clamp() deliberately. clamp also runs when the
+    // filter changes, when a favourite is toggled and on resize, and there the
+    // right behaviour is to pin the cursor inside the new list -- a filter that
+    // shortens the list must not teleport the cursor to the far end. Only an
+    // explicit arrow press means "move", so only an arrow press may wrap.
     const cur = [...state.cur];
-    if (key[2] === "A") cur[i] = cur[i] - 1;
-    if (key[2] === "B") cur[i] = cur[i] + 1;
+    const n = list.length;
+    if (n > 0) {
+      if (key[2] === "A") cur[i] = (cur[i] - 1 + n) % n;
+      if (key[2] === "B") cur[i] = (cur[i] + 1) % n;
+    }
     return { ...NONE, state: clamp({ ...state, cur }) };
   }
 

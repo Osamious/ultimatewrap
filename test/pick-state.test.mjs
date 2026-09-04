@@ -112,11 +112,18 @@ test("enter on a model exits with the /model line", () => {
   assert.deepEqual(exit, { target: "acme/acme-pro-1" });
 });
 
-test("arrows clamp at both ends without wrapping", () => {
-  const a = drive(initState(ROWS), [UP, UP]);
-  assert.equal(view(a.state).cursor, 0);
-  const b = drive(initState(ROWS), [DOWN, DOWN, DOWN]);
-  assert.equal(view(b.state).cursor, 1);
+test("arrows wrap at both ends", () => {
+  // Was "arrows clamp at both ends without wrapping", asserting the opposite.
+  // It kept passing after the behaviour changed, for a reason worth recording:
+  // ROWS has two entries, so [UP, UP] wraps 0 -> 1 -> 0 and [DOWN, DOWN, DOWN]
+  // wraps 0 -> 1 -> 0 -> 1, landing on exactly the values it asserted. A
+  // two-element fixture cannot tell clamping from wrapping at all -- every
+  // sequence of length two or three returns to a value both behaviours produce.
+  // The assertions below use single steps from a known end, which can.
+  const a = drive(initState(ROWS), [UP]);
+  assert.equal(view(a.state).cursor, ROWS.length - 1, "up from the top wraps to the end");
+  const b = drive(initState(ROWS), [DOWN, DOWN]);
+  assert.equal(view(b.state).cursor, 0, "down past the end wraps to the top");
 });
 
 test("backspace pops the filter and resets the cursor", () => {
@@ -261,4 +268,52 @@ test("the window keeps the cursor visible after a refilter", () => {
   s = reduce(s, "m").state;
   const v = view(s);
   assert.ok(v.cursor >= v.top && v.cursor < v.top + v.items.length + 1);
+});
+
+// --- cursor wraparound -----------------------------------------------------
+
+test("up from the first row wraps to the last, and down from the last wraps to the first", () => {
+  // With 45 providers and model lists running to hundreds, the last row is the
+  // one furthest from where the cursor starts. Without a wrap, reaching it means
+  // holding a key rather than pressing one.
+  let s = initState(ROWS);
+  assert.equal(view(s).cursor, 0);
+  s = reduce(s, UP).state;
+  assert.equal(view(s).cursor, ROWS.length - 1, "up from the top must land on the last row");
+  s = reduce(s, DOWN).state;
+  assert.equal(view(s).cursor, 0, "down from the bottom must land on the first row");
+});
+
+test("wraparound holds at the model level too", () => {
+  let s = initState(ROWS);
+  s = reduce(s, "\r").state;                       // descend into acme
+  assert.equal(view(s).items.length, 3);
+  s = reduce(s, UP).state;
+  assert.equal(view(s).cursor, 2);
+  s = reduce(s, DOWN).state;
+  assert.equal(view(s).cursor, 0);
+});
+
+test("an empty list does not wrap, and does not divide by zero", () => {
+  let s = initState(ROWS);
+  for (const ch of "zzzz") s = reduce(s, ch).state;
+  assert.equal(view(s).items.length, 0);
+  s = reduce(s, UP).state;
+  assert.equal(view(s).cursor, 0);
+  s = reduce(s, DOWN).state;
+  assert.equal(view(s).cursor, 0);
+});
+
+test("a filter that shortens the list pins the cursor rather than wrapping it", () => {
+  // Why the wrap lives in the arrow branch and not in clamp(). clamp also runs on
+  // a filter change, a favourite toggle and a resize; there the correct move is to
+  // pin the cursor inside the new list. If clamp wrapped, typing a character that
+  // shortened the list under the cursor would teleport the selection to the far
+  // end -- a filter would move the thing the user is aiming at.
+  let s = initState(ROWS);
+  s = reduce(s, DOWN).state;                       // cursor on zeta, index 1
+  assert.equal(view(s).cursor, 1);
+  for (const ch of "acme") s = reduce(s, ch).state; // one match, index 0 only
+  assert.equal(view(s).items.length, 1);
+  assert.equal(view(s).cursor, 0, "clamped to the new end, not wrapped past it");
 });

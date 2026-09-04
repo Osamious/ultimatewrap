@@ -378,3 +378,30 @@ test("flat scope gets its own chrome, not the provider chrome with model rows", 
   // selects, so it must offer select rather than scope.
   assert.match(lines[lines.length - 1], /select/);
 });
+
+test("the legend lists every key, including the ones with no visible affordance", () => {
+  // The footer is one line inside a 78-column frame and cannot hold them all, so
+  // the legend is the only complete list -- which is why the footer now reads
+  // "all keys" rather than "keys".
+  //
+  // Typing and backspace were both missing. They are the two a user reaches for
+  // first, and the filter has no visible affordance saying it accepts text, so a
+  // user who opened the legend to find out how to search found every key EXCEPT
+  // the one that searches.
+  const lines = frame({ ...V0, legend: true }, META, { caps: PLAIN }).map(strip).join("\n");
+  for (const k of ["up / down", "type to filter", "backspace", "enter", "tab",
+                   "ctrl+f", "esc", "ctrl+c", "?"]) {
+    assert.ok(lines.includes(k), `legend does not mention ${k}`);
+  }
+  assert.match(lines, /wraps/, "the legend must say the cursor wraps");
+});
+
+test("both footers point at the legend as the complete list", () => {
+  for (const v of [V0, V1]) {
+    const last = strip(frame(v, META, { caps: PLAIN }).at(-1));
+    assert.match(last, /all keys/, "the footer must not imply it lists them all itself");
+  }
+  // The provider level offers enter, which opens a provider. It used to show
+  // scope but not enter, so the key that descends was undocumented on screen.
+  assert.match(strip(frame(V0, META, { caps: PLAIN }).at(-1)), /open/);
+});

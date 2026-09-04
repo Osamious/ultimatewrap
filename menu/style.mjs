@@ -192,18 +192,28 @@ const title = (g, p, text) => {
   return p.ramp(head) + g.frame.h.repeat(Math.max(0, FRAME_W - vis(head) - 1)) + g.frame.tr;
 };
 
-export const HELP0 = "[↑↓] move  [⇥] scope  [^f] fav  [?] keys  [esc] back";
-export const HELP1 = "[↑↓] move  [↵] select  [^f] fav  [?] keys  [esc] back";
-const HELP0_A = "[up/dn] move  [tab] scope  [^f] fav  [?] keys  [esc] back";
-const HELP1_A = "[up/dn] move  [enter] select  [^f] fav  [?] keys  [esc] back";
+export const HELP0 = "[↑↓] move  [↵] open  [⇥] scope  [^f] fav  [?] all keys  [esc] back";
+export const HELP1 = "[↑↓] move  [↵] select  [^f] fav  [?] all keys  [esc] back";
+const HELP0_A = "[up/dn] move [enter] open [tab] scope [^f] fav [?] all keys [esc] back";
+const HELP1_A = "[up/dn] move  [enter] select  [^f] fav  [?] all keys  [esc] back";
 
 const footer = (g, p, text) => {
   const head = `${g.frame.bl} ${text} `;
   return p.dim(head) + g.frame.h.repeat(Math.max(0, FRAME_W - vis(head) - 1)) + g.frame.br;
 };
 
+// The legend is the ONLY complete list of keys. The footer is one line inside a
+// 78-column frame and cannot hold them all, so it carries the common ones and
+// points here -- which is why it reads "all keys" rather than "keys".
+//
+// Typing and backspace were missing, and they are the two the user reaches for
+// first: the filter has no visible affordance saying it accepts text, so a user
+// who opens the legend to find out how to search found every key EXCEPT the one
+// that searches.
 const LEGEND = [
-  "up / down      move the cursor",
+  "up / down      move the cursor (wraps at either end)",
+  "a-z 0-9 etc    type to filter; the filter is per level",
+  "backspace      delete one character from the filter",
   "enter          open a provider, or select a model",
   "tab            toggle flat provider/model search",
   "ctrl+f         add or remove a favourite",
