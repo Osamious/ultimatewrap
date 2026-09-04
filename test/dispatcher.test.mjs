@@ -114,3 +114,41 @@ test("the passthrough branch returns 0 even when the editor fails", () => {
     UW_TEST_MARKER: path.join(dir, "m.txt"), UW_REAL_EDITOR: exiter(dir, 7) });
   assert.equal(code, 0, "a failing editor must never make CC discard the user's prose");
 });
+
+// --- what abort() leaves behind -------------------------------------------
+// MEASURED on Claude Code 2.1.259: a non-zero exit makes CC discard the file and
+// restore the input exactly as it was before ctrl+g. On every path that reaches
+// abort() that input is the sentinel the user typed to open the picker, so
+// exiting non-zero left a literal `m` in the chat input after every esc and every
+// ctrl+c -- and discarded the truncation, which was the only thing that could
+// have cleared it. Protocol steps P11a and P11b both failed on exactly this.
+//
+// These drive uwpick.mjs directly through UW_PICKER_QUIT_IMMEDIATELY, which exits
+// through the ordinary abort path, so they measure the real sequence.
+test("abort empties the buffer and exits 0, so the sentinel does not survive", () => {
+  const dir = scratchDir();
+  const buf = path.join(dir, "b.md");
+  fs.writeFileSync(buf, "m\r\n");
+  let code = 0;
+  try {
+    execFileSync(process.execPath, ["C:/Users/osami/.uw/menu/uwpick.mjs", buf],
+      { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1" }, stdio: "pipe" });
+  } catch (e) { code = e.status ?? -1; }
+  assert.equal(fs.readFileSync(buf, "utf8"), "", "the buffer must be emptied");
+  assert.equal(code, 0, "exit 0 is what makes CC ACCEPT the emptied file");
+});
+
+test("abort keeps the discarding exit when it could not empty the buffer", () => {
+  // The one case where accepting is worse than discarding: the file still holds
+  // the sentinel, so exit 0 would submit `m` as a chat message. A directory makes
+  // writeFileSync throw without needing permissions the test cannot rely on.
+  const dir = scratchDir();
+  const notAFile = path.join(dir, "sub");
+  fs.mkdirSync(notAFile);
+  let code = 0;
+  try {
+    execFileSync(process.execPath, ["C:/Users/osami/.uw/menu/uwpick.mjs", notAFile],
+      { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1" }, stdio: "pipe" });
+  } catch (e) { code = e.status ?? -1; }
+  assert.notEqual(code, 0, "an un-emptied buffer must still be discarded");
+});

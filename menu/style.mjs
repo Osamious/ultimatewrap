@@ -216,9 +216,18 @@ export function frame(v, meta, { caps }) {
   const g = glyphsFor(caps), p = painter(caps);
   const L = [];
 
-  const crumb = v.level === 0
-    ? "UW " + g.sep + " providers"
-    : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
+  // `flat` is a THIRD chrome, not a variant of level 0. Every branch below used
+  // to key on v.level alone, and tab leaves level at 0 -- so pressing it swapped
+  // the rows to models while the title still said "providers", the header still
+  // read `key id / models / free / health` over model data, and the stamp still
+  // counted providers. view() has always passed scope; frame() simply never read
+  // it.
+  const flat = v.scope === "flat";
+  const crumb = flat
+    ? "UW " + g.sep + " all models"
+    : v.level === 0
+      ? "UW " + g.sep + " providers"
+      : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
   L.push(title(g, p, crumb));
 
   // Q1.3: the routability stamp is printed, not implied. An undimmed row means
@@ -228,9 +237,11 @@ export function frame(v, meta, { caps }) {
   const routableStamp = meta.routableAsOf
     ? `routable ${String(meta.routableAsOf).slice(5, 16).replace("T", " ")}`
     : `routable ${g.dash}`;
-  const right = v.level === 0
-    ? `${meta.providers} providers ${g.sep} ${meta.models} models ${g.sep} ${routableStamp}`
-    : `${v.items.length} of ${v.provider.models.length}`;
+  const right = flat
+    ? `${v.items.length + v.more} of ${meta.models} models`
+    : v.level === 0
+      ? `${meta.providers} providers ${g.sep} ${meta.models} models ${g.sep} ${routableStamp}`
+      : `${v.items.length} of ${v.provider.models.length}`;
   const left = `  filter: ${sanitizeDisplay(v.filter, 40)}${p.inv(g.caret)}`;
   const gap = Math.max(1, INNER - vis(left) - vis(right));
   L.push(bar(g, left + " ".repeat(gap) + p.dim(right)));
@@ -251,10 +262,10 @@ export function frame(v, meta, { caps }) {
   // 3-wide T/V/R cell. Both are now derived from the same W constants as the row,
   // and the derived-offset test below asserts they agree rather than trusting it.
   // The two-space gap before "health" is the dot gutter (see W).
-  L.push(bar(g, p.dim(v.level === 0
+  L.push(bar(g, p.dim(!flat && v.level === 0
     ? "  " + pad("key id", W.keyId) + rpad("models", W.count) + "   " +
       pad("free", W.bar + W.free) + "  " + pad("health", W.health)
-    : "  " + pad("model", W.id) + rpad("ctx", W.ctx) + " " +
+    : "  " + pad(flat ? "provider/model" : "model", W.id) + rpad("ctx", W.ctx) + " " +
       rpad("$in", W.price) + rpad("$out", W.price) + "  " +
       pad("badge", W.badge) + pad("TVR", W.caps))));
 
@@ -299,7 +310,11 @@ export function frame(v, meta, { caps }) {
       // PAID) is 8 and p.ramp's 256-colour form is 11 or more per character.
       const badgeCell = pad(m.badge, W.badge);
       const badgeOut = badgeColour(m.badge) ? p[badgeColour(m.badge)](badgeCell) : badgeCell;
-      body = `${mark} ` + highlight(pad(m.id, W.id), v.filter, p) +
+      // In flat scope the id must be the TARGET. A bare `qwen3-max` in a list
+      // drawn from every provider at once names no row the user can act on --
+      // and the filter they typed was matched against the target, so the
+      // highlight would land on text that is not shown.
+      body = `${mark} ` + highlight(pad(flat ? it.target : m.id, W.id), v.filter, p) +
              rpad(ctxS(m.ctx), W.ctx) + " " +
              rpad(money(m.pin), W.price) + rpad(money(m.pout), W.price) + "  " +
              badgeOut +
@@ -314,8 +329,9 @@ export function frame(v, meta, { caps }) {
   });
 
   if (v.more > 0) L.push(bar(g, p.dim(`  ${g.ell} ${v.more} more`)));
-  L.push(footer(g, p, caps.unicode ? (v.level === 0 ? HELP0 : HELP1)
-                                   : (v.level === 0 ? HELP0_A : HELP1_A)));
+  const atProviders = !flat && v.level === 0;
+  L.push(footer(g, p, caps.unicode ? (atProviders ? HELP0 : HELP1)
+                                   : (atProviders ? HELP0_A : HELP1_A)));
   return L;
 }
 

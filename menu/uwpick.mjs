@@ -83,8 +83,28 @@ export function framesFor(kind, lines, opts) {
 // swallows the code -- which is exactly what uwpick.cmd used to do.
 function abort(out, FILE, message) {
   if (message) process.stderr.write(message + "\n");
-  if (FILE) { try { fs.writeFileSync(FILE, ""); } catch { /* nothing left to do */ } }
-  process.exit(CONTRACT.handoff.discardExit);
+  let emptied = false;
+  if (FILE) { try { fs.writeFileSync(FILE, ""); emptied = true; } catch { /* see below */ } }
+  // MEASURED on Claude Code 2.1.259, and it contradicts what this function used
+  // to assume. A non-zero exit makes CC DISCARD the file and restore the input
+  // exactly as it was before ctrl+g -- and what it was, on every path that
+  // reaches here, is the sentinel the user typed to open the picker. So exiting
+  // non-zero left a literal `m` sitting in the chat input after every esc and
+  // every ctrl+c, and threw away the truncation above, which is the only thing
+  // that could have cleared it. It also surfaced
+  //   Uwpick.cmd quit unexpectedly (exit code 1)
+  // to the user on an ordinary, deliberate cancel.
+  //
+  // Exiting 0 means CC accepts the file, and the file is now empty, so the input
+  // is cleared. The truncation is what makes 0 safe: the reasoning this replaces
+  // -- "exit 0 would submit `m` as a chat message" -- is only true of a file that
+  // still HOLDS `m`, and by this line it does not.
+  //
+  // If the write failed there is nothing to accept, and accepting a file that
+  // still contains the sentinel is the one outcome worse than the old
+  // behaviour, so that path keeps the discarding exit.
+  process.exit(emptied || !FILE ? CONTRACT.handoff.acceptExit
+                                : CONTRACT.handoff.discardExit);
 }
 
 export function main() {

@@ -356,3 +356,25 @@ test("slide frames measure VISIBLE width, so colour does not truncate a line", (
   // at has to be bit-for-bit the ordinary render, not a clipped approximation.
   assert.deepEqual(frames[frames.length - 1], settled);
 });
+
+test("flat scope gets its own chrome, not the provider chrome with model rows", () => {
+  // frame() keyed every branch on v.level, and tab leaves level at 0. So pressing
+  // it swapped the rows to models while the title still read "providers", the
+  // header still read `key id / models / free / health` over model data, the
+  // stamp still counted providers, and each row showed a bare model id naming no
+  // row the user could act on. view() has always passed scope; frame() never read
+  // it. Protocol step P9 failed on exactly this.
+  const flat = { ...V0, scope: "flat", filter: "gemini",
+                 items: [{ kind: "model", target: "google/gemini-3.5-flash-lite",
+                           model: ROWS[0].models[0], row: ROWS[0] }] };
+  const lines = frame(flat, META, { caps: PLAIN }).map(strip);
+  const title = lines[0], head = lines[3], row = lines[4];
+
+  assert.doesNotMatch(title, /providers/, "the title must not claim to list providers");
+  assert.match(head, /provider\/model/, "the id column must be labelled provider/model");
+  assert.doesNotMatch(head, /key id/, "provider columns must not head model rows");
+  assert.match(row, /google\/gemini-3\.5-flash-lite/, "the row must show the full target");
+  // The footer belongs to the level whose keys are live: in flat scope enter
+  // selects, so it must offer select rather than scope.
+  assert.match(lines[lines.length - 1], /select/);
+});
