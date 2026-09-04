@@ -203,3 +203,30 @@ test("the written file is BOM-free", () => {
   assert.equal(setStatusline(f, 'node "s.mjs" -- "C:/node.exe" "x.mjs"').code, 0);
   assert.notEqual(fs.readFileSync(f)[0], 0xef);
 });
+
+test("a mistyped switch is an error, not silence", () => {
+  // `-HudUinstall`, one `n` short, was accepted without complaint: the statusline
+  // section never ran, the script printed its ordinary success message and exited
+  // 0, and the operator believed the shim had been removed when it was still
+  // installed. Every measurement taken afterwards was of the wrong configuration.
+  const { code, out } = plan(["-HudUinstall"], null, "");
+  assert.equal(code, 2);
+  assert.match(out, /unrecognised argument/i);
+  assert.match(out, /-HudUinstall/);
+});
+
+test("-HudUninstall on its own reaches the uninstall branch", () => {
+  // The branch lives inside `if ($Hud)`, so the documented flag alone did nothing
+  // at all -- no statusline output, exit 0, the ordinary "Done." message. A user
+  // following the documented uninstall and omitting -Hud was told it had worked.
+  const original = '"C:/node.exe" "C:/hud/omc-hud.mjs"';
+  const f = settings(`node "hud-shim.mjs" -- ${original}`);
+  const scratch = tmpdir("uw-hud3-");
+  const state = path.join(scratch, "install.json");
+  fs.writeFileSync(path.join(scratch, "hud-install.json"),
+                   JSON.stringify({ previousCommand: original, settings: f }));
+  const { code, out } = plan(["-HudUninstall", "-SettingsFile", f], state, "");
+  assert.equal(code, 0);
+  assert.match(out, /restore/i, "-HudUninstall alone must reach the uninstall branch");
+  assert.ok(out.includes(original));
+});

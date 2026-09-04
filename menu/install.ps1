@@ -10,8 +10,29 @@ param(
   [string]$StateFile = (Join-Path $env:USERPROFILE ".uw\state\install.json"),
   # Injected only by tests. In normal use the current value is read from the
   # User environment, which is the thing we are about to change.
-  [string]$CurrentEditor = $null
+  [string]$CurrentEditor = $null,
+  # Anything not matched above lands here so a MISTYPED switch is an error rather
+  # than silence. `-HudUinstall` (one `n` short) was accepted without complaint,
+  # the statusline section never ran, and the script printed its ordinary success
+  # message -- so the operator believed the shim had been removed when it was
+  # still installed, and every reading taken afterwards was of the wrong thing.
+  [Parameter(ValueFromRemainingArguments = $true)]
+  [string[]]$Unrecognised
 )
+
+if ($Unrecognised) {
+  Write-Host "install: unrecognised argument(s): $($Unrecognised -join ', ')"
+  Write-Host "  valid: -Force -WhatIf -Hud -HudUninstall"
+  exit 2
+}
+
+# -HudUninstall implies -Hud. The uninstall branch lives inside `if ($Hud)`, so
+# on its own the flag did nothing at all -- no output about the statusline, exit
+# 0, and the ordinary "Done." message. A user following the documented uninstall
+# and omitting -Hud was told it had worked. Making it imply the section is the
+# fix rather than adding a second thing to remember, since -HudUninstall is
+# meaningless without it.
+if ($HudUninstall) { $Hud = $true }
 
 # Wire ctrl+g to the UW picker without destroying whatever the user already had.
 #
