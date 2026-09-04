@@ -15,6 +15,8 @@
 // that is empty on every prompt is a bug report in the wrong repository.
 
 import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { parseStatusline, usedTokens } from "./cc-contract.mjs";
 import { loadSnapshot, contextIndex, SNAPSHOT_FILE } from "./snapshot.mjs";
@@ -94,11 +96,34 @@ function cachedIndex() {
   return CACHE.ix;
 }
 
+// Capture the raw payload when a marker FILE exists. Not an environment
+// variable: Claude Code spawns the statusline itself, so there is no shell in
+// which to set one, and a marker on disk is the only switch reachable from
+// outside. Used to answer questions the documented shape cannot -- such as
+// whether the payload carries Claude Code's own auto-compaction budget, which
+// governs when it compacts regardless of what this shim reports.
+//
+// Bounded and self-disarming: it writes at most a handful of lines and then
+// removes its own marker, so forgetting to turn it off cannot grow a file
+// without limit on a surface that repaints on every keystroke.
+const TRACE_ON  = path.join(os.homedir(), ".uw", "state", "hud-trace-on");
+const TRACE_OUT = path.join(os.homedir(), ".uw", "state", "hud-payload.jsonl");
+function capture(raw) {
+  try {
+    if (!fs.existsSync(TRACE_ON)) return;
+    const n = Number(fs.readFileSync(TRACE_ON, "utf8").trim() || "3");
+    fs.appendFileSync(TRACE_OUT, raw.replace(/\s+$/, "") + "\n");
+    if (n <= 1) fs.rmSync(TRACE_ON, { force: true });
+    else fs.writeFileSync(TRACE_ON, String(n - 1));
+  } catch { /* capture must never affect the footer */ }
+}
+
 export function main(argv = process.argv.slice(2)) {
   const i = argv.indexOf("--");
   const command = i >= 0 ? argv.slice(i + 1).join(" ") : "";
   let raw = "";
   try { raw = fs.readFileSync(0, "utf8"); } catch { raw = ""; }
+  capture(raw);
   if (!command) { process.stdout.write(""); return 0; }
 
   let payload = raw;
