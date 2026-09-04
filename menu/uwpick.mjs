@@ -251,6 +251,13 @@ export function main() {
     if (state.level > before) run("enter");
     else if (state.level < before) run("back");
     else draw();
+    // AFTER the draw, so a trace line is evidence the repaint was reached and not
+    // merely that the key was read. Without this the trace can prove input
+    // arrives and still not say whether anything moved on screen, which is the
+    // difference between an input bug and a rendering one.
+    t("after", { level: state.level, scope: state.scope,
+                 cursor: view(state).cursor, filter: view(state).filter,
+                 items: view(state).items.length });
   }
   closeSync(CONIN);
   quit("read-error");
