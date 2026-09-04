@@ -270,8 +270,17 @@ characters at the shell prompt.
 **Do:** reopen the picker and watch the four transitions in order: the frame
 drawing itself top-down on open, the model list arriving from the right on enter,
 the same in reverse on esc, and the chosen row flashing twice before the frame
-collapses to `switched -> provider/model`. Then hold the down arrow for two
-seconds. Then close, set the kill switch, and reopen.
+collapses to a single confirmation line. That line is, with the real glyphs:
+
+```
+✔ switched → openrouter/auto
+```
+
+(`OK switched -> openrouter/auto` on a terminal without unicode.) Then hold the
+down arrow for two seconds. Then close, set the kill switch, and reopen.
+
+Each transition is three frames at `FRAME_MS` = 30 ms, so 90 ms per transition is
+the design budget -- "well under a fifth of a second" below is that, measured.
 
 The kill switch is an environment variable, and the syntax differs by shell.
 `set UW_PICKER_MOTION=0` is cmd.exe; in PowerShell `set` is an alias for
@@ -304,8 +313,19 @@ test harness to sample that is not our own mock.
 **Expected:** the legend replaces the rows and lists the keys including ctrl+f and
 esc; the key that closes it does nothing else, so pressing esc to close does not
 exit the picker; the filter still reads what it read before. With `zzzz` typed,
-one line reads `no match for "zzzz" — backspace to widen, esc to clear` and the
-help line is still visible at the bottom.
+one line reads, in this order:
+
+```
+  backspace to widen, esc to clear — no match for "zzzz"
+```
+
+and the help line is still visible at the bottom.
+
+The instruction comes BEFORE the echoed query, and that is not cosmetic. The line
+grows with the filter and `bar` clips from the right, so with the query first a
+long filter pushes "backspace to widen, esc to clear" off the end -- the user
+loses the stated way out at the moment they are most stuck. Earlier drafts of
+this step quoted the reversed order, which fails a passing step.
 
 **Fail means:** an empty pane with no explanation, or esc closing the legend and
 quitting in one press.
