@@ -1,7 +1,7 @@
 # Phase 6 research — index
 
 Twelve parallel research agents, 2026-09-02, on the UltimateWrap model-catalogue and menu
-design. These files are the **reconstructed agent reports**, written from the returned
+design; reports 14-16 were added later, 16 on 2026-09-04. These files are the **reconstructed agent reports**, written from the returned
 results — the raw `.output` transcripts in `%TEMP%` were **0 bytes for every agent but one**,
 so this directory is the record.
 
@@ -23,6 +23,9 @@ The working distillation, with running conclusions, is
 | 11 | `11-refresh-architecture.md` | Three-tier refresh (free metadata / keyed lists / paid verification), partial-failure merge policy, snapshot cache design, locking |
 | 12 | `12-uw-pipeline-audit.md` | Inventory of the current keysync pipeline, the dead `inferTier` proven empirically, and 14 gaps |
 | 13 | `13-tui-toolchain.md` | fzf on Windows: the `$SHELL` fork, `--with-shell`, dual renderers, `--listen`; Ink's Windows repaint landmine; what is dead |
+| 14 | `14-quota-billing-and-display.md` | 47 providers x 20 candidate paths with a control probe and an invalid-key pass: which quota/billing endpoints exist and which credential each accepts |
+| 15 | `15-zero-token-switching.md` | Zero-token, user-driven switching inside CC. Why MCP elicitation, slash commands and the conversational design are all disqualified |
+| 16 | `16-harness-context-management.md` | **Ten harnesses read at source** on context windows and compaction. The unknown-model split (guess vs refuse), absolute buffers over percentages, the confirmed negative that **nobody parses the limit out of the error text**, and Roo's per-endpoint fix for the aggregator problem. Measures UW's own catalogue: 98.5% text-model coverage against live models.dev, a live 4x over-declaration in the picker, and **probe P6 answered** |
 
 Also preserved: `~/.uw/prior-art/uw-rust-tui/` — the complete Rust crate rescued from a
 `%TEMP%` scratchpad that would have been swept, including the **working** `model_tier.rs`
