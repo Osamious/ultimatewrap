@@ -164,6 +164,33 @@ const ANTHROPIC_FULL = Object.freeze([
 ]);
 const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
 
+// `[1m]`, on the PICKER list only -- never on `models`/`routing`.
+//
+// Claude Code resolves its believed context window from the literal model
+// string, and without this marker a picker row for a real 1M-context model
+// reads as 200k once selected: MEASURED live 2026-09-05, selecting the
+// UW-injected row for `anthropic/claude-opus-5` (bare) left the session on
+// 200k, while typing `/model anthropic/claude-opus-5[1m]` directly resolved
+// to "Claude Opus 5 (1M context)" correctly. `ANTHROPIC_DEFAULT_OPUS_MODEL`
+// and `ANTHROPIC_DEFAULT_SONNET_MODEL` already carry the suffix for exactly
+// this reason -- the picker rows were simply never given the same treatment.
+//
+// `claude-haiku-4-5-20251001` is deliberately bare: Haiku 4.5's real ceiling
+// is 200,000 tokens (no 1M variant exists), so tagging it would be a false
+// claim, not a bigger window.
+//
+// `models`/`routing` stay on the bare ids. Those feed `Providers[].models`,
+// which CCR routes on and the relay forwards toward Anthropic -- and
+// Anthropic's real API rejects a suffixed model id outright: MEASURED,
+// `POST /v1/messages {"model":"claude-opus-5[1m]"}` -> `404 not_found_error`.
+// The relay now strips `[1m]` at its own last hop before forwarding (see
+// anthropic-oauth-relay.mjs's `resolveModelId`), which is what makes it safe
+// for `validate()` to require the picker's suffixed id to also appear
+// verbatim in `models[]` -- see the picker-row construction below.
+const ANTHROPIC_PICKER = Object.freeze([
+  "claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-4-5-20251001", "claude-fable-5-1[1m]"
+]);
+
 export const ANTHROPIC_RELAY = {
   name: "anthropic",
   provider: "anthropic",
@@ -174,7 +201,7 @@ export const ANTHROPIC_RELAY = {
   enabled: true,
   // Verified live through CCR 2026-09-02.
   models: ANTHROPIC_FULL,
-  picker: ANTHROPIC_FULL,
+  picker: ANTHROPIC_PICKER,
   routing: Object.freeze([...ANTHROPIC_FULL, ...ANTHROPIC_ALIASES])
 };
 
@@ -339,10 +366,23 @@ export function validate({ providers, picker }, expectedCount) {
     }
   }
 
-  // Every picker row must exist verbatim in that provider's models[].
+  // Every picker row must exist in that provider's models[], modulo a trailing
+  // `[1m]`. That suffix is Claude Code's own local context-window marker, never
+  // sent to a real API (the relay strips it at its last hop, see
+  // anthropic-oauth-relay.mjs), and CCR's own resolve() already tolerates it
+  // when matching a request against Providers[].models -- MEASURED: this
+  // session ran for hours on `anthropic/claude-sonnet-5[1m]` via
+  // ANTHROPIC_DEFAULT_SONNET_MODEL despite `models[]` never containing a
+  // suffixed entry. This check enforces the same tolerance CCR already has,
+  // rather than forcing `models[]` to carry redundant suffixed duplicates that
+  // the collision guard's real-id predicate (checkBareCollisions' `realIds`)
+  // would then have to know about too.
+  const stripOneMHere = (s) => s.replace(/\[1m\]$/i, "");
   const configured = new Set(providers.flatMap((p) => p.models.map((m) => `${p.name}/${m}`)));
   for (const row of picker) {
-    if (!configured.has(row.model)) problems.push(`picker row "${row.model}" not in Providers[].models`);
+    if (!configured.has(row.model) && !configured.has(stripOneMHere(row.model))) {
+      problems.push(`picker row "${row.model}" not in Providers[].models`);
+    }
   }
 
   // No credential may be empty.

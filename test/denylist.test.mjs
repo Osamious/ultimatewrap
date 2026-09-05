@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isReserved, admitRemoteModels, RESERVED } from "../menu/denylist.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
-import { buildProviders, ANTHROPIC_RELAY } from "../keysync/keysync.mjs";
+import { buildProviders, validate, ANTHROPIC_RELAY } from "../keysync/keysync.mjs";
 // Imported for the S1 guard tests. `run.mjs` must therefore export
 // `checkBareCollisions` and keep its pipeline behind an entry-point check rather
 // than at module top level -- the same requirement Task B8 places on
@@ -385,17 +385,28 @@ test("the relay's routing list holds eight ids and its picker list holds four", 
   // and added claude-opus-5-thinking, none of it verified against a live CCR --
   // inside a step whose prose describes only a split. Changing what the relay
   // advertises is out of scope here and needs its own verification.
+  // 2026-09-05: picker carries `[1m]` on the three ids with a real 1M window
+  // (see ANTHROPIC_PICKER's comment in keysync.mjs) -- so this now asserts the
+  // suffixed set, and checks the underlying ids separately from the marker.
   assert.deepEqual([...ANTHROPIC_RELAY.picker].sort(),
-    ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001",
-     "claude-fable-5-1"].sort());
+    ["claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-4-5-20251001",
+     "claude-fable-5-1[1m]"].sort());
   // The title says eight and four, so check eight and four -- the body previously
   // checked neither length nor that the picker ids survive into routing, so a
   // routing list that had LOST the four full ids would still have passed.
   assert.equal(ANTHROPIC_RELAY.routing.length, 8);
   assert.equal(ANTHROPIC_RELAY.picker.length, 4);
   for (const id of ANTHROPIC_RELAY.picker) {
-    assert.ok(ANTHROPIC_RELAY.routing.includes(id),
-      `routing must be a superset of picker; ${id} is missing`);
+    // Stripped, not verbatim: `[1m]` is Claude Code's own local marker, never
+    // sent upstream (the relay strips it at its last hop) and already
+    // tolerated by CCR's own resolve() when matching a request against
+    // Providers[].models -- MEASURED, this session ran for hours on
+    // `claude-sonnet-5[1m]` via an env default with no suffixed entry ever in
+    // routing. Requiring routing to carry suffixed duplicates would be asking
+    // for a property CCR does not need and does not have today.
+    const bare = id.replace(/\[1m\]$/i, "");
+    assert.ok(ANTHROPIC_RELAY.routing.includes(bare),
+      `routing must be a superset of picker's underlying ids; ${bare} is missing`);
   }
   for (const alias of ["opus", "sonnet", "haiku", "fable"]) {
     assert.equal(ANTHROPIC_RELAY.routing.includes(alias), true,
@@ -415,8 +426,14 @@ test("the relay constant keeps every field CCR needs, so it can still be spread"
     assert.ok(k in ANTHROPIC_RELAY, `ANTHROPIC_RELAY must keep ${k}`);
   }
   assert.match(ANTHROPIC_RELAY.api_base_url, /^http/);
-  assert.deepEqual([...ANTHROPIC_RELAY.models], [...ANTHROPIC_RELAY.picker],
-    "models stays the four full ids so existing consumers are unaffected");
+  // 2026-09-05: models and picker deliberately DIVERGE now -- models stays
+  // bare for CCR routing / the real API, picker carries [1m] so Claude Code
+  // believes the right context window once a row is selected (see
+  // ANTHROPIC_PICKER's comment in keysync.mjs). What must still hold is that
+  // stripping the marker recovers the same four ids in the same order.
+  assert.deepEqual([...ANTHROPIC_RELAY.models],
+    [...ANTHROPIC_RELAY.picker].map((id) => id.replace(/\[1m\]$/i, "")),
+    "picker's underlying ids, marker stripped, must match models exactly");
 });
 
 test("with the relay owning the aliases, a reseller publishing opus is only shadowed", () => {
@@ -492,4 +509,37 @@ test("an empty realIds set narrows everything away, rather than matching everyth
   const r = checkBareCollisions([P("tabiai", "claude-opus-5")], { realIds: new Set() });
   assert.equal(r.fatal, false);
   assert.deepEqual(r.hijackable, []);
+});
+
+// ---- validate() must tolerate [1m] on a picker row, end to end ------------
+// The mutation this guards against left every other test in this file green:
+// they check ANTHROPIC_RELAY's own shape, never validate() actually consuming
+// it. Without this, removing the [1m]-stripping tolerance in validate() (the
+// fix that makes ANTHROPIC_PICKER's suffix safe to ship) breaks nothing here.
+
+test("validate() accepts a [1m]-suffixed picker row against a bare models[] entry", () => {
+  const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       models: ["claude-opus-5"] }];
+  const picker = [{ model: "anthropic/claude-opus-5[1m]", label: "x" }];
+  assert.deepEqual(validate({ providers, picker }, 1), []);
+});
+
+test("validate() still rejects a picker row with no corresponding models[] entry", () => {
+  // The tolerance must be narrow: stripping [1m] must not become "any string
+  // is close enough". A genuinely absent id is still a real problem.
+  const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       models: ["claude-opus-5"] }];
+  const picker = [{ model: "anthropic/claude-sonnet-5[1m]", label: "x" }];
+  const problems = validate({ providers, picker }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /claude-sonnet-5\[1m\]/);
+});
+
+test("validate() accepts the real ANTHROPIC_RELAY picker against its own models", () => {
+  // The actual shapes this fix exists for, exercised together rather than each
+  // asserted on in isolation.
+  const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       models: [...ANTHROPIC_RELAY.models] }];
+  const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
+  assert.deepEqual(validate({ providers, picker }, 1), []);
 });

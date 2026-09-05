@@ -8,7 +8,26 @@ execution up to Task B6, with one exception: item 2 must be settled before B6 la
 
 ## 1. Task A5.2 — teach the OAuth relay the four bare aliases
 
-**Status: DONE 2026-09-05.** Backup `anthropic-oauth-relay.mjs.bak-aliases-20260904T225927`.
+**Status: DONE 2026-09-05, extended same day.** Backup `anthropic-oauth-relay.mjs.bak-aliases-20260904T225927`.
+
+**Extension, 2026-09-05:** `resolveModelId` now strips a trailing `[1m]` suffix before the
+alias lookup and on any id it returns. `[1m]` is a Claude-Code-side marker, never a real
+Anthropic model id -- measured against the live API: `POST /v1/messages
+{"model":"claude-opus-5[1m]"}` returns `404 not_found_error`. This was hit while fixing
+the modelPicker rows (below): keysync needs `[1m]` on the picker's `model` field so Claude
+Code believes the right context window once a row is selected, and that same string is
+what `validate()` requires to also appear verbatim in `Providers[].models` -- which CCR
+routes on and the relay forwards toward Anthropic. Stripping at the relay's last hop before
+the API makes the rest of the pipeline's behaviour (does CCR strip on match only or on
+forward too) irrelevant; either way Anthropic never sees the suffix. Backup
+`anthropic-oauth-relay.mjs.bak-1m-20260905T082516`. Verified live:
+
+```
+POST /v1/messages claude-opus-5[1m]  -> 200 (was 404 before this fix)
+POST /v1/messages opus[1m]           -> 200 (alias + suffix together)
+POST /v1/messages opus               -> 200 (A5.2's original behaviour, unaffected)
+POST /v1/messages opusculum          -> 404 (still correctly not rewritten)
+```
 Dynamic resolution against the relay's own `/v1/models`, word-boundary matched, sorted by
 `created_at` descending, 1-hour lazy cache; `ALIAS_FALLBACK` copied from `ANTHROPIC_TIERS`
 as the backstop; `aliases: true` added to `/health`; a fallback-and-upstream-rejects path
@@ -307,6 +326,46 @@ Whichever is chosen, `wrapCommand` and the recogniser must stay symmetric: `wrap
 always emits quotes, so a recogniser that requires them is correct for everything UW
 writes and wrong only for values someone else has touched. That is a defensible position;
 it is just not the position `install.ps1` currently takes.
+
+---
+
+## 5. `run.mjs` likely carries the same exit-code bug fixed in `doctor.mjs`
+
+**Status:** parked 2026-09-05, noticed while verifying item 1's [1m] extension.
+**Blocked on:** nothing. Same fix as `8e41471` (`process.exitCode`, not `process.exit()`),
+likely at the same shape of call site.
+
+`node keysync/run.mjs --dry` prints its full, correct output -- vault summary, validation,
+picker rows -- then crashes on exit:
+
+```
+Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\winsync.c, line 76
+```
+
+Same signature as the doctor.mjs bug fixed earlier today: `process.exit()` called while an
+async handle from a fetch-based probe is still closing. run.mjs has ten `process.exit()`
+call sites (`run.mjs:211,226,292,338,344,365,387,399,405,643`) and now also awaits
+`fetchAnthropicIds()` (Task item 4) and the relay `/health` probe, both of which use
+`AbortSignal.timeout`. Not yet isolated to a specific call site the way doctor.mjs's was.
+
+This was already present before today's [1m] work -- it was hidden in earlier verification
+runs only because their output was piped through `grep`, which filtered the crash line
+along with everything else, and a piped grep does not surface a background process's exit
+status. Not introduced by this session's changes; only noticed because a later check ran
+unpiped.
+
+**Consequence, same as doctor.mjs's:** exit code is corrupted on every run, dry or live.
+Anything scripting `keysync/run.mjs` and checking `$?`/exit status cannot trust it. `--dry`
+in particular is meant to be side-effect-free and CI-safe; the wrong exit code from a
+crash undermines that.
+
+### The fix
+
+Same as `8e41471`: replace `process.exit(n)` with `process.exitCode = n` and let the event
+loop drain naturally, at whichever call sites actually race the AbortSignal-timeout-backed
+fetches. Needs the same bisection `8e41471` used (isolate which fetch is still pending at
+the crashing exit) before touching all ten sites -- most are probably fine as-is and only
+the ones after an unresolved `AbortSignal.timeout` handle are suspect.
 
 ---
 
