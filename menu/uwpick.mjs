@@ -65,6 +65,12 @@ export function failMessage(res) {
   return `uwpick: snapshot unreadable (${res.detail}) — ${fix}`;
 }
 
+// NO keysync state file is read here, and that is the design rather than an
+// omission. An earlier revision of the Anthropic-catalog work added a banner fed
+// by `~/.uw/state/new-anthropic-models.json`; the native picker now shows every
+// live Anthropic id, so "new id detected, not added" no longer describes
+// anything, and the coupling was removed with it. uwpick's whole input remains
+// the pre-built catalogue snapshot.
 export function framesFor(kind, lines, opts) {
   if (!opts.motion) return [lines];
   if (kind === "enter") return slideFrames(lines, 6, 3);
