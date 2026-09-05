@@ -441,3 +441,55 @@ test("the relay keeps its own Anthropic names on the routing path too", () => {
   assert.equal(ids.includes("claude-opus-5"), true,
     "the exemption for the trusted relay must survive the guard");
 });
+
+// ---- narrowing the predicate (BACKLOG item 2) ------------------------------
+// checkBareCollisions used to flag any RESERVED-shaped id regardless of whether
+// Anthropic has ever published it. `realIds` narrows that: a Claude-shaped id
+// is only a hijack candidate if it is a REAL Anthropic id, because Claude Code
+// can never emit a bare name Anthropic has not published.
+
+test("realIds omitted (default null) keeps the old broad RESERVED-only behaviour", () => {
+  // Backward compatible on purpose: every test above this section calls
+  // checkBareCollisions without realIds and must keep passing unmodified.
+  const r = checkBareCollisions([P("tabiai", "claude-opus-5-thinking")]);
+  assert.equal(r.fatal, true, "with no realIds, a RESERVED match alone is still fatal");
+});
+
+test("a reseller-invented id is not hijackable once realIds says it is not real", () => {
+  // claude-opus-5-thinking: RESERVED-shaped, sole-owned by a non-relay provider,
+  // and Anthropic has never published it -- extended thinking is a request
+  // parameter, not a separate model. This is the exact false positive item 2
+  // exists to remove.
+  const realIds = new Set(["claude-opus-5", "claude-sonnet-5"]);
+  const r = checkBareCollisions([P("tabiai", "claude-opus-5-thinking")], { realIds });
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.hijackable, []);
+});
+
+test("a real Anthropic id is still hijackable when realIds confirms it", () => {
+  // Narrowing must not become a blanket exemption. The genuinely dangerous
+  // shape -- a real id, sole-owned by a non-relay provider -- must still fire.
+  const realIds = new Set(["claude-opus-5", "claude-sonnet-5"]);
+  const r = checkBareCollisions([P("tokenrouter", "claude-opus-5")], { realIds });
+  assert.equal(r.fatal, true);
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-5"]);
+});
+
+test("realIds narrows both hijackable AND shadowed classification", () => {
+  // A fake id shared by two resellers should not even reach `shadowed` -- it
+  // was never a candidate, not a candidate that resolved safely.
+  const realIds = new Set(["claude-opus-5"]);
+  const r = checkBareCollisions([P("a", "claude-opus-9-ultra"), P("b", "claude-opus-9-ultra")],
+    { realIds });
+  assert.deepEqual(r.hijackable, []);
+  assert.deepEqual(r.shadowed, []);
+});
+
+test("an empty realIds set narrows everything away, rather than matching everything", () => {
+  // Distinguishes null ("unknown, use the old behaviour") from an empty Set
+  // ("checked, and nothing is real") -- a relay that answered with zero models
+  // must not be treated the same as a relay that never answered.
+  const r = checkBareCollisions([P("tabiai", "claude-opus-5")], { realIds: new Set() });
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.hijackable, []);
+});

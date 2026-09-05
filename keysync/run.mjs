@@ -13,6 +13,7 @@ import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import { RESERVED } from "../menu/denylist.mjs";
+import { fetchAnthropicIds } from "./anthropic-catalog.mjs";
 import {
   loadVault, filterRegistry, chooseKeys, loadCatalog, buildProviders,
   validate, stripOneMSuffix, reconcileUserModelPin, KEY_CHOICES, ANCHOR_PREFERENCE,
@@ -52,9 +53,13 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  * @param {object}  [opts]
  * @param {string}  [opts.relay="anthropic"]   the provider name of our own relay
  * @param {boolean} [opts.allowBare=false]     --allow-bare-claude-names
+ * @param {Set<string>|null} [opts.realIds=null]  ids Anthropic actually publishes
+ *   (from anthropic-catalog.mjs's live /v1/models, unioned with ANTHROPIC_FULL by
+ *   the caller). null means "could not be determined" and the guard falls back
+ *   to the old, broader RESERVED-only match -- see the narrowing comment below.
  * @returns {{hijackable: object[], shadowed: object[], fatal: boolean, message: string}}
  */
-export function checkBareCollisions(providers, { relay = "anthropic", allowBare = false } = {}) {
+export function checkBareCollisions(providers, { relay = "anthropic", allowBare = false, realIds = null } = {}) {
   const byBare = new Map();
   for (const p of providers ?? []) {
     // CCR's own gate. `providerModelMatches` checks the provider is enabled before
@@ -77,6 +82,21 @@ export function checkBareCollisions(providers, { relay = "anthropic", allowBare 
       // its boundary class was narrower than the denylist's, so `sonnet.1` and
       // `haiku_2` were reserved by one definition and invisible to the other.
       if (!RESERVED.test(id)) continue;
+      // NARROWING (BACKLOG item 2). RESERVED asks "is this Claude-SHAPED"; the
+      // guard's actual concern is "could Claude Code send this bare and bind it
+      // to the wrong host", which only a REAL Anthropic id can ever trigger --
+      // Claude Code never emits a name Anthropic has not published. Without
+      // this, `claude-opus-5-thinking` (a reseller invention; extended thinking
+      // is a request parameter, not a model) reads as hijackable at tabiai and
+      // gorouter for a threat that cannot reach it.
+      //
+      // realIds === null means "could not be determined" (relay unreachable,
+      // no cache) -- fall back to the OLD broad behaviour rather than either
+      // extreme. Silently trusting every RESERVED id when uncertain would
+      // under-flag; silently rejecting all of them would refuse the escape
+      // hatch this guard exists to preserve. RESERVED alone, unchanged, is what
+      // shipped before this task and is the safe default when unverifiable.
+      if (realIds !== null && !realIds.has(id)) continue;
       if (!byBare.has(id)) byBare.set(id, new Set());
       byBare.get(id).add(p.name);
     }
@@ -301,8 +321,14 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
   // stops report 08 F1. A warning that a run proceeds past is not a control when
   // it is the last one. `--allow-bare-claude-names` keeps the deliberate case
   // reachable, so no working configuration is permanently blocked.
+  // Anthropic's real ids, unioned with our own verified four regardless of
+  // what the live fetch returns -- ANTHROPIC_RELAY.models is already the
+  // known-real backstop A5.2 uses for the same reason, so this costs nothing
+  // and guards against a live response that anomalously omits one of them.
+  const liveIds = await fetchAnthropicIds();
+  const realIds = liveIds ? new Set([...liveIds, ...ANTHROPIC_RELAY.models]) : null;
   const collisions = checkBareCollisions(built.providers,
-    { allowBare: has("--allow-bare-claude-names") });
+    { allowBare: has("--allow-bare-claude-names"), realIds });
   if (collisions.hijackable.length || collisions.shadowed.length) {
     console.warn(collisions.message);
   }
