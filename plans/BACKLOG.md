@@ -8,8 +8,21 @@ execution up to Task B6, with one exception: item 2 must be settled before B6 la
 
 ## 1. Task A5.2 — teach the OAuth relay the four bare aliases
 
-**Status:** parked. Written into the plan as Task A5.2 and fully specified there.
-**Blocked on:** the user being ready for a relay restart. Not a technical blocker.
+**Status: DONE 2026-09-05.** Backup `anthropic-oauth-relay.mjs.bak-aliases-20260904T225927`.
+Dynamic resolution against the relay's own `/v1/models`, word-boundary matched, sorted by
+`created_at` descending, 1-hour lazy cache; `ALIAS_FALLBACK` copied from `ANTHROPIC_TIERS`
+as the backstop; `aliases: true` added to `/health`; a fallback-and-upstream-rejects path
+returns a 4xx naming the alias rather than a raw upstream error about a substituted id the
+caller never typed. Verified by hand, live, against the real relay after a restart:
+
+```
+GET  /health           -> {"aliases": true, ...}
+POST /v1/messages opus       -> 200 (resolved and forwarded)
+POST /v1/messages opusculum  -> 404 (NOT rewritten -- real Anthropic rejection, untouched)
+```
+
+No commit in this repository covers the relay edit itself -- it lives outside `~/.uw`, per
+the file's own governing note. This entry is the record.
 **Touches:** `C:/Users/osami/.local/bin/anthropic-oauth-relay.mjs` — outside the repository.
 
 ### What it does
