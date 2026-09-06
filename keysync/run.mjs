@@ -879,8 +879,14 @@ if (!noProfileDone) {
   // capability declaration rather than a menu slot.
   const anthropicRows = built.picker.filter((r) => r.model.startsWith(`${ANTHROPIC_RELAY.name}/`));
   const optionRows = orderNativePickerOptions(built.picker);
+  // STRIPPED IN THE SAME COMMIT THAT ADDS THEM. `contextTokens` and `kind` are
+  // UW-side fields -- one feeds the [1m] decision, the other the bucket
+  // classifier and validate()'s V5 -- and Claude Code's row schema is exactly
+  // {model, label?, description?, behavesAs?}. A commit that added `kind` to the
+  // row without extending this strip would be a legitimate stopping point that
+  // writes a fifth key into a four-key schema.
   settings.modelPicker = {
-    options: optionRows.map(({ contextTokens, ...row }) => row),
+    options: optionRows.map(({ contextTokens, kind, ...row }) => row),
     replaceBuiltInOptions: true
   };
   console.log(`modelPicker: ${optionRows.length} row(s) written` +

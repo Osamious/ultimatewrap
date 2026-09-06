@@ -149,10 +149,106 @@ export function resolveProtocol(vaultProvider) {
 // --------------------------------------------------------------- build plan
 const MAX_MODELS_PER_PROVIDER = Number(process.env.UW_MAX_MODELS ?? 3);
 
-// A model Claude Code knows, whose client-side handling every keysync row
-// borrows. Mid-tier on purpose: it must not imply capabilities (or a context
-// window) that a small third-party model cannot honour.
-const BEHAVES_AS = process.env.UW_BEHAVES_AS ?? "claude-sonnet-4-6";
+// --------------------------------------------------- capability buckets (D4)
+//
+// `behavesAs` names a model Claude Code already knows, whose client-side
+// handling (prompt profile, effort tiers, thinking policy, believed context
+// window) every third-party row borrows. One constant for all 83 rows was an
+// OVER-declaration: it told Claude Code that a 4,096-token non-reasoning model
+// handles what a frontier reasoning model handles. Under-declare instead --
+// report 18 §10.6 measured that of the eight gated predicates, five are free to
+// under-declare and four are dangerous to over-declare.
+//
+// A TABLE, VALIDATED BY AN ALLOWLIST, NOT A DENYLIST. A denylist passes a typo
+// (`claude-sonnet-4-51`) silently, and silently is the failure mode this exists
+// to prevent. V1/V2/V6 in validate() check the table itself, so a wrong entry
+// stops the run rather than shipping 83 wrong declarations.
+//
+// FOUR CLASSIFICATIONS, TWO TARGETS. The extras are not decoration: keeping
+// "we measured it small" and "we know nothing" separately countable is what
+// makes the no-signal population (38 of 83) auditable, and it is the only
+// reason bucketFor's `> 0` guard is observable at all -- with `unknown` folded
+// into `weak`, both branches return the same string and the guard is untestable.
+export const BUCKET_TARGETS = Object.freeze({
+  // Unchanged from the single constant this replaces, deliberately: 27 of 83
+  // rows stay byte-identical, which is the control group proving the classifier
+  // RAN rather than replaced everything it touched.
+  capable: "claude-sonnet-4-6",
+  weak:    "claude-sonnet-4-5",
+  unknown: "claude-sonnet-4-5",   // D3 — same target, distinct classification
+  nonchat: "claude-sonnet-4-5"    // D6 — inert, but never absent
+});
+
+// The weak target is `claude-sonnet-4-5`, NOT the capability-identical
+// `claude-haiku-4-5`. Report 18 §10.2 fn 1: haiku's `interleaved_thinking` flips
+// false on bedrock / vertex / gateway / any custom base URL -- which is exactly
+// every provider shape UW routes through. `haiku-4-5` is absent from the
+// allowlist below for the same reason, so a later edit cannot reach for it.
+export const ALLOWED_BEHAVES_AS = Object.freeze([
+  "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-opus-4-6", "claude-opus-4-1"
+]);
+
+// Models whose client-side handling carries a MODEL-SPECIFIC prompt bundle,
+// which a third-party model must never inherit: `opus_5_prompt_bundle`,
+// `fable_5_mitigations`, `refusal_fallback`, `thinking_disabled_effort_cap` and
+// `rejects_disabled_thinking` (report 18 §10.3) -- plus these models omit
+// `temperature` entirely (§10.2), so a borrowed profile silently drops a
+// parameter the third-party provider expects.
+export const PROMPT_BUNDLE_MODELS = /^claude-(opus-5|fable-5|mythos-5)/;
+
+// INCLUSIVE, and the catalogue has a natural gap that makes `>=` vs `>` a
+// visible one-character mutation rather than a taste call. Measured over the 83
+// rows: mistral/mistral 8192, ollama/llama2 4096, ollama/llama3 8192,
+// cohere/command 4096 | cerebras/llama3.1-8b EXACTLY 128000,
+// cloudflare/granite-4.0-h-micro 131000, sambanova/gemma-4-31b-it 131072.
+// Nothing sits between 8,192 and 128,000, and a real row sits on the boundary.
+export const CTX_CAPABLE_MIN = 128000;
+
+/**
+ * The normalized keysync model -> its capability classification.
+ *
+ * ORDER IS LOAD-BEARING AND `kind` GOES FIRST. `contextTokens` is not
+ * trustworthy for a non-text row: google/veo-2 carries 480 (video SECONDS) and
+ * google/lyria carries 0. Both are numbers, so a proxy that ran first would read
+ * them as tiny models. Both also carry `reasoning: false`, so moving `reason`
+ * above `kind` sends them to weak instead of nonchat -- and every count in the
+ * audit still sums to 83, which is why the test for this asserts on a row that
+ * is `kind: "nontext"` and `reason: true` at once.
+ *
+ * `contextTokens > 0`, not `!= null`: google/lyria really reports 0, and a zero
+ * is the absence of a window rather than a very small one.
+ *
+ * Reads `contextTokens`. See normalizeModel for why that name is asserted.
+ *
+ * @param {{kind: ?string, reason: ?boolean, contextTokens: ?number}} model
+ * @returns {"nonchat"|"capable"|"weak"|"unknown"}
+ */
+export function bucketFor(model) {
+  if (model?.kind === "nontext") return "nonchat";
+  if (model?.reason === true) return "capable";
+  if (model?.reason === false) return "weak";
+  const ctx = model?.contextTokens;
+  if (typeof ctx !== "number" || !(ctx > 0)) return "unknown";
+  return ctx >= CTX_CAPABLE_MIN ? "capable" : "weak";
+}
+
+/**
+ * The declaration a row carries. NEVER null, "" or undefined.
+ *
+ * Omitting `behavesAs` is not the honest option, it is the MAXIMAL one: an id
+ * with no declaration resolves through the binary's `lH()` to every effort tier,
+ * adaptive thinking on and thinking un-disableable, plus an unknown-model launch
+ * warning. Report 18 §3 measures that as strictly worse than any bucket target,
+ * which is why even the four non-chat rows declare the weak target (D6) -- the
+ * declaration is inert on a model that cannot answer a chat request, and inert
+ * beats maximal.
+ *
+ * The lookup goes through BUCKET_TARGETS so the table cannot be bypassed by a
+ * caller that "knows" the answer.
+ */
+export function behavesAsFor(model) {
+  return BUCKET_TARGETS[bucketFor(model)];
+}
 
 /**
  * Anthropic via the local OAuth relay, added as a first-class provider.
@@ -494,7 +590,19 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // provider-format id, warns on every launch, and assumes a 200k context
       // window regardless of the model's real one. behavesAs names a model it
       // DOES know whose client-side handling (prompt profile) to reuse.
-      row.behavesAs = BEHAVES_AS;
+      //
+      // Per row now, not one constant for all 83: see BUCKET_TARGETS. Never
+      // absent -- behavesAsFor always returns a table value, because an absent
+      // declaration resolves to the MAXIMAL assumption set, not to none.
+      row.behavesAs = behavesAsFor(m);
+      // UW-SIDE FIELDS, BOTH STRIPPED BEFORE THE WRITE (run.mjs). Claude Code's
+      // own zod schema for a row is exactly {model, label?, description?,
+      // behavesAs?}, so either of these reaching settings.json is a fifth key in
+      // a four-key schema. `kind` is carried unconditionally, including its null,
+      // so validate() sees the same field on every row -- V5 asks whether a row
+      // is non-chat, and a key that exists only on some rows makes "absent" and
+      // "text" indistinguishable there.
+      row.kind = m.kind;
       if (m.contextTokens) row.contextTokens = m.contextTokens;
       picker.push(row);
     }

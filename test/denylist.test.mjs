@@ -1,10 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { isReserved, admitRemoteModels, RESERVED } from "../menu/denylist.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
 import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
          ANTHROPIC_FALLBACK_TAGS, ONE_M_TOKENS, buildAnthropicPickerRows,
-         normalizeModel } from "../keysync/keysync.mjs";
+         normalizeModel, bucketFor, behavesAsFor, BUCKET_TARGETS,
+         ALLOWED_BEHAVES_AS, PROMPT_BUNDLE_MODELS, CTX_CAPABLE_MIN
+       } from "../keysync/keysync.mjs";
 // Imported for the S1 guard tests. `run.mjs` must therefore export
 // `checkBareCollisions` and keep its pipeline behind an entry-point check rather
 // than at module top level -- the same requirement Task B8 places on
@@ -1130,4 +1133,285 @@ test("buildProviders plumbs reason and kind onto every model it builds", () => {
   // contextTokens is the one signal already visible on the row, so it is the one
   // that proves the normalizer's output really is what the builder consumed.
   assert.deepEqual(built.picker.map((r) => r.contextTokens), [200000, 8192, 4096]);
+});
+
+// ---- T7: the bucket table and the classifier ---------------------------------
+
+const M = (o) => ({ kind: null, reason: null, contextTokens: undefined, ...o });
+
+test("bucketFor matches the decision table, in the order the table states", () => {
+  // The whole rule, one row per branch. Written as a table so a reordering shows
+  // up as a changed cell rather than as a rewritten test.
+  const cases = [
+    [M({ kind: "nontext" }),                            "nonchat"],
+    [M({ kind: "text", reason: true }),                 "capable"],
+    [M({ kind: "text", reason: false }),                "weak"],
+    [M({ kind: "text", contextTokens: 131072 }),        "capable"],
+    [M({ kind: "text", contextTokens: 8192 }),          "weak"],
+    [M({ kind: "text" }),                               "unknown"],
+    [M({}),                                             "unknown"],
+  ];
+  for (const [model, want] of cases) {
+    assert.equal(bucketFor(model), want, JSON.stringify(model));
+  }
+});
+
+test("the context cutoff is INCLUSIVE at exactly 128,000", () => {
+  // Mutation boundary 1, the same shape as the ONE_M_TOKENS boundary above.
+  // cerebras/llama3.1-8b sits on 128000 exactly and the catalogue has nothing
+  // between 8,192 and 128,000, so `>=` -> `>` moves a real row and only that row.
+  assert.equal(CTX_CAPABLE_MIN, 128000);
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: 127999 })), "weak");
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: 128000 })), "capable");
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: 128001 })), "capable");
+});
+
+test("a context of 0 is no signal, not a very small window", () => {
+  // Mutation boundary 3. google/lyria really reports contextTokens 0. `> 0` ->
+  // `!= null` reads that as a valid tiny context and returns "weak". Both answers
+  // resolve to the SAME target, so the only thing that can tell them apart is the
+  // distinct `unknown` classification -- which is why D3 keeps it distinct. The
+  // `kind` shadow is bypassed here on purpose: lyria is also nontext, and testing
+  // this through a nontext row would assert nothing about the guard.
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: 0 })), "unknown");
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: undefined })), "unknown");
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: null })), "unknown");
+  // ...and a non-number never reaches the comparison, where "200k" >= 128000 is
+  // false but "999999" >= 128000 is true. Strings are not windows.
+  assert.equal(bucketFor(M({ kind: "text", contextTokens: "999999" })), "unknown");
+});
+
+test("a measured reasoning flag outranks the context proxy, in both directions", () => {
+  // The proxy is a fallback for rows with no reasoning flag at all, never a
+  // second opinion about a row that has one.
+  assert.equal(bucketFor(M({ kind: "text", reason: false, contextTokens: 1000000 })), "weak");
+  assert.equal(bucketFor(M({ kind: "text", reason: true, contextTokens: 4096 })), "capable");
+});
+
+test("non-chat outranks a true reasoning flag, so the order cannot be swapped", () => {
+  // Mutation boundary 4. Reordering `reason` above `kind` sends google/lyria and
+  // google/veo-2 to weak instead of nonchat -- and BOTH carry reasoning:false, so
+  // every count in the audit still sums to 83 and nothing else fails. Only a row
+  // that is nontext and reasoning:true at once can see the difference.
+  assert.equal(bucketFor(M({ kind: "nontext", reason: true, contextTokens: 2000000 })), "nonchat");
+  assert.equal(bucketFor(M({ kind: "nontext", reason: false, contextTokens: 480 })), "nonchat");
+});
+
+test("bucketFor reads an object the PIPELINE built, not a hand-written literal", () => {
+  // §1.4, and the reason this test exists at all. Every assertion above feeds
+  // bucketFor an object literal, so all of them stay green if the classifier
+  // reads `ctx` -- the menu pipeline's name for the same number. Driving it with
+  // normalizeModel's output is what checks the field NAME rather than assuming
+  // it. Under `ctx`, the two proxy rows below would both return "unknown".
+  const bigProxy = normalizeModel("cerebras-8b", {
+    limits: { contextTokens: 128000 }, modalities: { output: ["text"] }, capabilities: {} });
+  const smallProxy = normalizeModel("mistral-tiny", {
+    limits: { contextTokens: 8192 }, modalities: { output: ["text"] }, capabilities: {} });
+  assert.equal(bucketFor(bigProxy), "capable");
+  assert.equal(bucketFor(smallProxy), "weak");
+  // The real non-chat rows, spelled as the catalogue spells them.
+  const lyria = normalizeModel("lyria", {
+    limits: { contextTokens: 0 },
+    modalities: { input: ["text"], output: ["audio"] }, capabilities: { reasoning: false } });
+  const veo = normalizeModel("veo-2", {
+    limits: { contextTokens: 480 },
+    modalities: { input: ["text"], output: ["video"] }, capabilities: { reasoning: false } });
+  const flux = normalizeModel("flux.1-schnell", {
+    modalities: { input: ["text"], output: ["image"] } });
+  assert.deepEqual([lyria, veo, flux].map((m) => bucketFor(m)),
+    ["nonchat", "nonchat", "nonchat"]);
+  // ...and a testModel with no entry at all is unknown, not weak.
+  assert.equal(bucketFor(normalizeModel("vault-probe-1", undefined)), "unknown");
+});
+
+test("the bucket table is a vetted set, and every classification lands inside it", () => {
+  assert.deepEqual(Object.keys(BUCKET_TARGETS).sort(),
+    ["capable", "nonchat", "unknown", "weak"]);
+  for (const [bucket, target] of Object.entries(BUCKET_TARGETS)) {
+    assert.ok(ALLOWED_BEHAVES_AS.includes(target),
+      `${bucket} -> ${target} must be an allowlisted target, not a typo`);
+    assert.equal(PROMPT_BUNDLE_MODELS.test(target), false,
+      `${bucket} -> ${target} carries a model-specific prompt bundle`);
+  }
+  // Only `capable` may point at the capable target. Setting `unknown` or
+  // `nonchat` to it flips 38 or 4 rows into over-declaration while a
+  // capable-vs-weak inequality stays true.
+  assert.equal(BUCKET_TARGETS.weak, BUCKET_TARGETS.unknown);
+  assert.equal(BUCKET_TARGETS.weak, BUCKET_TARGETS.nonchat);
+  assert.notEqual(BUCKET_TARGETS.capable, BUCKET_TARGETS.weak);
+  // haiku-4-5 is capability-identical to the weak target and deliberately absent:
+  // its interleaved_thinking flips false on gateway / custom base URLs, i.e. on
+  // every provider shape UW routes through (report 18 §10.2 fn 1).
+  assert.equal(ALLOWED_BEHAVES_AS.includes("claude-haiku-4-5"), false);
+});
+
+test("behavesAsFor always returns a target, never null or empty", () => {
+  // D6. An absent declaration is the MAXIMAL one, not the honest one: lH()
+  // resolves it to every effort tier with thinking forced on, plus a launch
+  // warning (report 18 §3). Even a row that cannot answer a chat request at all
+  // declares the weak target, because inert beats maximal.
+  for (const model of [M({}), M({ kind: "nontext" }), M({ reason: true }),
+                       M({ reason: false }), M({ contextTokens: 0 })]) {
+    const t = behavesAsFor(model);
+    assert.equal(typeof t, "string");
+    assert.ok(t.length > 0);
+    assert.ok(ALLOWED_BEHAVES_AS.includes(t));
+  }
+  assert.equal(behavesAsFor(M({ kind: "nontext", reason: true })), BUCKET_TARGETS.weak);
+  assert.equal(behavesAsFor(M({ reason: true })), BUCKET_TARGETS.capable);
+});
+
+test("UW_BEHAVES_AS is retired: no env var can flatten the table", () => {
+  // D7-A. A whole-table override and the table-shape rule are mutually exclusive
+  // -- one env value sets every bucket equal, so the rule would fail the build
+  // the first time anyone used the hatch. The table IS the hatch now: two
+  // allowlist-validated lines beat an env var that fails silently on a typo.
+  const src = fs.readFileSync(new URL("../keysync/keysync.mjs", import.meta.url), "utf8");
+  assert.equal(/UW_BEHAVES_AS/.test(src), false,
+    "the override must be gone from the source, not merely unread");
+  const saved = process.env.UW_BEHAVES_AS;
+  process.env.UW_BEHAVES_AS = "claude-opus-5";
+  try {
+    assert.equal(behavesAsFor(M({ reason: true })), BUCKET_TARGETS.capable);
+  } finally {
+    if (saved === undefined) delete process.env.UW_BEHAVES_AS;
+    else process.env.UW_BEHAVES_AS = saved;
+  }
+});
+
+// A fixture catalogue reproducing the MEASURED §1.2 shape of the 83 live rows:
+// 4 nonchat, 24 reasoning:true, 3 context-proxy>=128k, 10 reasoning:false,
+// 4 context-proxy<128k, 38 with no catalogue entry at all. Entry SHAPES are
+// copied from the real catalogue (google/lyria's contextTokens 0, google/veo-2's
+// 480 video seconds, cerebras/llama3.1-8b's exact 128000); the counts are scaled
+// up by repetition, since three providers of three rows classify identically to
+// one provider of nine and MAX_MODELS_PER_PROVIDER caps each at three.
+const E = (model, o) => ({ provider: o.provider, model, ...o.entry });
+function capabilityFixture() {
+  const chosen = [];
+  const vault = new Map();
+  const byProvider = new Map();
+  let n = 0;
+  const provider = (entries, testModel) => {
+    const name = `fx${n++}`;
+    chosen.push({ id: `personal.${name}.free`, provider: name });
+    vault.set(name, { protocol: "openai", baseUrl: `https://${name}.invalid/v1`,
+                      ...(testModel ? { testModel } : {}) });
+    if (entries.length) {
+      byProvider.set(name, entries.map((e, i) =>
+        E(`${name}-m${i}`, { provider: name, entry: e })));
+    }
+    return name;
+  };
+  const text = (extra) => ({ modalities: { output: ["text"] }, ...extra });
+  // 38 rows with no signal at all: a vault testModel this provider's catalogue
+  // does not list. This is D3's population and the largest single group.
+  for (let i = 0; i < 38; i++) provider([], `probe-${i}`);
+  // 4 non-chat rows, two providers, as the real four are shaped.
+  provider([
+    { limits: { contextTokens: 0 }, modalities: { input: ["text"], output: ["audio"] },
+      capabilities: { reasoning: false } },
+    { limits: { contextTokens: 480 }, modalities: { input: ["text"], output: ["video"] },
+      capabilities: { reasoning: false } },
+  ]);
+  provider([
+    { modalities: { input: ["text"], output: ["image"] } },
+    { modalities: { input: ["text"], output: ["image"] } },
+  ]);
+  // 24 reasoning:true rows, 8 providers of 3.
+  for (let i = 0; i < 8; i++) {
+    provider([0, 1, 2].map(() => text({ limits: { contextTokens: 4096 },
+      capabilities: { reasoning: true } })));
+  }
+  // 3 context-proxy rows at or above the cutoff, no reasoning flag.
+  provider([128000, 131000, 131072].map((c) =>
+    text({ limits: { contextTokens: c }, capabilities: {} })));
+  // 10 reasoning:false rows, three providers of 3 plus one of 1.
+  for (let i = 0; i < 3; i++) {
+    provider([0, 1, 2].map(() => text({ limits: { contextTokens: 1000000 },
+      capabilities: { reasoning: false } })));
+  }
+  provider([text({ limits: { contextTokens: 1000000 }, capabilities: { reasoning: false } })]);
+  // 4 context-proxy rows below the cutoff, no reasoning flag.
+  provider([4096, 8192].map((c) => text({ limits: { contextTokens: c }, capabilities: {} })));
+  provider([4096, 8192].map((c) => text({ limits: { contextTokens: c }, capabilities: {} })));
+  return { chosen, vault, catalog: { generatedAt: "fixture", byProvider } };
+}
+
+test("END TO END: 83 rows classify 4/27/14/38 and declare 27 capable, 56 weak", () => {
+  const { chosen, vault, catalog } = capabilityFixture();
+  const built = buildProviders(chosen, vault, catalog, () => "sk-test-not-a-real-key");
+  assert.equal(built.picker.length, 83, "the fixture must reproduce the measured row count");
+
+  // TWO SEPARATE JOBS, AND THEY MUST NOT BE CONFLATED.
+  //
+  // (1) ORDERING INTERLOCK. Routing through orderNativePickerOptions is what
+  //     orders T1 before T7: with the old scoping in place this function keeps
+  //     only the Anthropic rows, so the distribution below cannot be satisfied
+  //     and T7 cannot land on an unreversed Decision 4. It is NOT the classifier
+  //     check -- post-T1 the function is a pass-through, so "count the rows that
+  //     survive" is input.length by construction and proves nothing.
+  //
+  // (2) THE DISTRIBUTION, asserted over the returned array on its own terms.
+  //     The relay rows are unshifted first exactly as run.mjs:482 does, so the
+  //     third-party half has to be picked back out by name rather than by
+  //     assuming the whole array is third-party.
+  const relayRows = ANTHROPIC_FULL.map((m) => ({
+    model: `${ANTHROPIC_RELAY.name}/${m}`, label: `Anthropic > ${m}`,
+    description: "subscription"   // no behavesAs: Claude Code knows these ids
+  }));
+  const out = orderNativePickerOptions([...relayRows, ...built.picker]);
+  assert.equal(out.length, 83 + relayRows.length, "nothing may be filtered out");
+  assert.equal(out.slice(0, relayRows.length).every((r) =>
+    r.model.startsWith(`${ANTHROPIC_RELAY.name}/`)), true);
+
+  const third = out.filter((r) => !r.model.startsWith(`${ANTHROPIC_RELAY.name}/`));
+  assert.equal(third.length, 83);
+  const targets = {};
+  for (const r of third) targets[r.behavesAs] = (targets[r.behavesAs] ?? 0) + 1;
+  assert.deepEqual(targets, { "claude-sonnet-4-6": 27, "claude-sonnet-4-5": 56 },
+    "27 rows byte-identical to the constant this replaces; 56 stepped down");
+  assert.equal(third.some((r) => !r.behavesAs), false, "no row may lose its declaration");
+
+  // The four-way classification behind that 27/56, which the two targets alone
+  // cannot show: `weak`, `unknown` and `nonchat` all resolve to one string, so a
+  // table that pointed `unknown` at the capable target would move 38 rows while
+  // every count above still summed to 83.
+  const buckets = {};
+  for (const [name, entries] of catalog.byProvider) {
+    for (const e of entries) {
+      const b = bucketFor(normalizeModel(e.model, e));
+      buckets[b] = (buckets[b] ?? 0) + 1;
+    }
+    void name;
+  }
+  buckets.unknown = (buckets.unknown ?? 0) + 38;   // the no-entry testModel rows
+  assert.deepEqual(buckets, { nonchat: 4, capable: 27, weak: 14, unknown: 38 });
+
+  // Every non-chat row still carries a declaration, and it is the weak one (V5's
+  // subject, asserted here from the commit that creates the field).
+  const nonchat = third.filter((r) => r.kind === "nontext");
+  assert.equal(nonchat.length, 4);
+  assert.equal(nonchat.every((r) => r.behavesAs === BUCKET_TARGETS.weak), true);
+});
+
+test("run.mjs strips both UW-side fields, so a written row keeps four keys", () => {
+  // T7 step 5. `kind` is added to the picker row in this same commit, so the
+  // strip is extended in it too: a commit that added the field without extending
+  // the strip is a legitimate stopping point that writes a fifth key into a
+  // schema the binary defines as exactly {model, label?, description?,
+  // behavesAs?}. Asserted against the source, because the write site itself runs
+  // only under --target and cannot be driven from a test.
+  const src = fs.readFileSync(new URL("../keysync/run.mjs", import.meta.url), "utf8");
+  assert.match(src, /options: optionRows\.map\(\(\{ contextTokens, kind, \.\.\.row \}\) => row\)/);
+  // ...and the fields really are on the built row, or the strip would be a no-op
+  // that passes this test while the schema violation lives somewhere else.
+  const { chosen, vault, catalog } = capabilityFixture();
+  const rows = buildProviders(chosen, vault, catalog, () => "k").picker;
+  assert.equal(rows.every((r) => "kind" in r), true);
+  const written = rows.map(({ contextTokens, kind, ...row }) => row);
+  const allowed = new Set(["model", "label", "description", "behavesAs"]);
+  for (const row of written) {
+    for (const k of Object.keys(row)) assert.ok(allowed.has(k), `unexpected key "${k}"`);
+  }
 });
