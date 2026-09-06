@@ -1041,6 +1041,46 @@ test("every built row is written to modelPicker.options, Anthropic first", () =>
     "a reseller's Claude-shaped row must not ride into the head on a loose prefix match");
 });
 
+test("an INTERLEAVED build is partitioned, and the third-party half keeps its order", () => {
+  // THE FIXTURE THE OTHER FOUR TESTS LACK. FULL_BUILT is already Anthropic-first
+  // and the relay-down case has no Anthropic rows at all, so `(rows) => [...rows]`
+  // -- a function that partitions nothing -- satisfies every one of them. Nothing
+  // observed the partition actually moving a row.
+  //
+  // It is not a hypothetical input either: the pipeline unshifts the relay rows
+  // onto an already-built vault set, so any future edit that appends them, or
+  // adds a second Anthropic source, produces exactly this shape.
+  const interleaved = [
+    ROW("groq/openai/gpt-oss-20b", "free · api.groq.com"),
+    ROW("anthropic/claude-opus-5[1m]", "subscription"),
+    ROW("tabiai/claude-opus-5", "free · tabitoken.com"),
+    ROW("mistral/mistral-small-latest", "paid · api.mistral.ai"),
+    ROW("anthropic/claude-sonnet-5[1m]", "subscription"),
+    ROW("cerebras/llama3.1-8b", "free · cerebras.ai"),
+  ];
+  const out = orderNativePickerOptions(interleaved);
+
+  assert.deepEqual(out.map((r) => r.model).slice(0, 2),
+    ["anthropic/claude-opus-5[1m]", "anthropic/claude-sonnet-5[1m]"],
+    "the Anthropic rows lead, in their own input order");
+
+  // The third-party order is DISTINGUISHABLE -- groq, tabiai, mistral, cerebras
+  // is not sorted by any key -- so a re-sort rather than a stable partition shows
+  // up here. `Ato()` renders options[] in array order and the build already
+  // sorted these (free-first, then catalogue rank), so that order is a result.
+  assert.deepEqual(out.map((r) => r.model).slice(2), [
+    "groq/openai/gpt-oss-20b", "tabiai/claude-opus-5",
+    "mistral/mistral-small-latest", "cerebras/llama3.1-8b"]);
+
+  // And the identity check: the partition moves rows, it does not rebuild them.
+  assert.equal(out.length, interleaved.length);
+  assert.equal(out[0], interleaved[1], "the same row objects, relocated");
+  assert.deepEqual(interleaved.map((r) => r.model), [
+    "groq/openai/gpt-oss-20b", "anthropic/claude-opus-5[1m]", "tabiai/claude-opus-5",
+    "mistral/mistral-small-latest", "anthropic/claude-sonnet-5[1m]",
+    "cerebras/llama3.1-8b"], "and the caller's array is still in build order");
+});
+
 test("ordering returns a NEW array and leaves the caller's rows exactly as built", () => {
   // `built.picker` is read AFTER this by reconcileUserModelPin (run.mjs:842) and
   // as `built.picker[0].model` (:681, the profile anchor), so neither the input
