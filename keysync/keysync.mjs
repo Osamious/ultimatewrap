@@ -344,6 +344,47 @@ export const ANCHOR_PREFERENCE = [
   "bigmodel/"
 ];
 
+/**
+ * One catalogue entry -> the normalized model object the row builder consumes.
+ *
+ * ONE FUNCTION, TWO CALL SITES, AND THAT IS THE POINT. The two push sites below
+ * (the vault's testModel, and the catalogue-ranked extras) built this literal
+ * separately, which is the single recorded downside of reading capability
+ * signals from the entry already in hand: two places to keep in sync. Widening
+ * both by hand is how they drift. It is exported for the same reason
+ * `checkBareCollisions` and `deriveAnthropicSets` are: the pipeline cannot be
+ * driven from a test without a vault, so a shape left inline is a shape nothing
+ * can assert on -- and the ONE thing worth asserting here is the field NAME.
+ *
+ * `contextTokens`, NOT `ctx`. `ctx` is the menu pipeline's name for the same
+ * number (`menu/catalog.mjs:176`); this side has always called it
+ * `contextTokens`. A classifier reading `ctx` here gets `undefined` for every
+ * row, silently sends all 7 context-proxy rows to the weak bucket (27/56 becomes
+ * 24/59) and stays green under any test that feeds it an object literal. Hence
+ * the paired test that drives the classifier with an object THIS function built.
+ *
+ * `?? null`, NEVER `||`. `false || null === null`, so `||` would turn a
+ * MEASURED-false capability back into "unknown" -- the same conflation as
+ * `!!undefined === false`, wearing a different operator. `reasoning` is `false`
+ * on 12 of the 45 matched rows, and each of those is a real signal.
+ *
+ * `entry` is undefined for 38 of the 83 rows (a vault testModel with no
+ * catalogue entry at all). Every derived field is then `null` or `"unknown"`:
+ * no signal is not a small model.
+ *
+ * @param {string} id                     the model id as the provider spells it
+ * @param {object|null|undefined} entry   its bundled-catalogue entry, if any
+ */
+export function normalizeModel(id, entry) {
+  return {
+    id,
+    tier: entry ? inferTier(entry) : "unknown",
+    contextTokens: entry?.limits?.contextTokens,
+    reason: entry?.capabilities?.reasoning ?? null,
+    kind: outputKind(entry)
+  };
+}
+
 export function buildProviders(chosen, providers, catalog, keyReader) {
   const out = [];
   const picker = [];
@@ -384,12 +425,9 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
     const models = [];
     const seen = new Set();
     if (safeTestModel) {
+      // `cat` is undefined for 38 of the 83 rows — this is the no-signal case.
       const cat = safeEntries.find((m) => m.model === safeTestModel);
-      models.push({
-        id: safeTestModel,
-        tier: cat ? inferTier(cat) : "unknown",
-        contextTokens: cat?.limits?.contextTokens
-      });
+      models.push(normalizeModel(safeTestModel, cat));
       seen.add(safeTestModel);
     }
     if (safeEntries.length) {
@@ -399,9 +437,14 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
         .map((m) => ({ m, tier: inferTier(m) }))
         .sort((a, b) => (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
           a.m.model.length - b.m.model.length);
-      for (const { m, tier } of ranked) {
+      // The entry is in hand by construction, so the capability signals need no
+      // lookup — which is what makes cross-provider name matching structurally
+      // impossible here rather than merely discouraged. `ranked`'s `tier` is
+      // dropped in favour of normalizeModel recomputing it: same value from the
+      // same entry, and one owner of the shape beats a second literal.
+      for (const { m } of ranked) {
         if (models.length >= MAX_MODELS_PER_PROVIDER || seen.has(m.model)) continue;
-        models.push({ id: m.model, tier, contextTokens: m.limits?.contextTokens });
+        models.push(normalizeModel(m.model, m));
         seen.add(m.model);
       }
     }

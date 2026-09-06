@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { isReserved, admitRemoteModels, RESERVED } from "../menu/denylist.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
 import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
-         ANTHROPIC_FALLBACK_TAGS, ONE_M_TOKENS, buildAnthropicPickerRows } from "../keysync/keysync.mjs";
+         ANTHROPIC_FALLBACK_TAGS, ONE_M_TOKENS, buildAnthropicPickerRows,
+         normalizeModel } from "../keysync/keysync.mjs";
 // Imported for the S1 guard tests. `run.mjs` must therefore export
 // `checkBareCollisions` and keep its pipeline behind an entry-point check rather
 // than at module top level -- the same requirement Task B8 places on
@@ -1019,4 +1020,114 @@ test("every built row reaches options[], because options[] is the only channel t
   const out = orderNativePickerOptions(FULL_BUILT);
   const dropped = FULL_BUILT.filter((r) => !out.some((o) => o.model === r.model));
   assert.deepEqual(dropped, []);
+});
+
+// ---- T6: the capability signals reach the write site --------------------------
+//
+// Every assertion here is on the object the PIPELINE produced, never on a hand
+// written literal. The field is `contextTokens`; `ctx` is the menu pipeline's
+// name for the same number, and a classifier reading `ctx` on this side would
+// see `undefined` for every row while staying green under any literal-driven
+// test. Naming the field once, in normalizeModel, is what makes that checkable.
+
+test("normalizeModel names the context field contextTokens, not ctx", () => {
+  // §1.4. The whole reason this function is exported. Reading `ctx` here would
+  // silently move all 7 context-proxy rows from capable to weak (27/56 -> 24/59)
+  // with no test failing anywhere.
+  const m = normalizeModel("big-1", {
+    provider: "acme", model: "big-1",
+    limits: { contextTokens: 131072 },
+    modalities: { output: ["text"] },
+    capabilities: { reasoning: true }
+  });
+  assert.equal(m.contextTokens, 131072);
+  assert.equal("ctx" in m, false, "`ctx` belongs to the menu pipeline, not to this one");
+});
+
+test("a MEASURED reasoning:false survives as false, and never becomes null", () => {
+  // Mutation boundary 2. `?? null` vs `|| null`: `false || null === null`, so the
+  // wrong operator turns a measured capability back into "unknown" -- the same
+  // conflation as `!!undefined === false` wearing a different operator. Invisible
+  // to any test that only checks the absent case, so this asserts on `false`.
+  const measured = normalizeModel("small-1", {
+    limits: { contextTokens: 8192 },
+    modalities: { output: ["text"] },
+    capabilities: { reasoning: false }
+  });
+  assert.equal(measured.reason, false);
+  const absent = normalizeModel("quiet-1", {
+    limits: { contextTokens: 8192 }, modalities: { output: ["text"] }, capabilities: {}
+  });
+  assert.equal(absent.reason, null, "an absent key is unknown, not a measured false");
+});
+
+test("a testModel with no catalogue entry carries null, never false", () => {
+  // 38 of the 83 rows. This is D3's population: no reasoning flag, no context, no
+  // modality. Every field must say "we do not know" rather than "we measured it
+  // small" -- the two are counted separately by the classifier, and only the
+  // distinct `unknown` classification makes the no-signal case observable.
+  const m = normalizeModel("vault-probe-1", undefined);
+  assert.deepEqual(m, {
+    id: "vault-probe-1", tier: "unknown", contextTokens: undefined,
+    reason: null, kind: null
+  });
+});
+
+test("normalizeModel carries the modality label, so a non-chat row is knowable", () => {
+  // google/lyria and google/veo-2 as the catalogue really spells them: both
+  // carry a NUMBER in contextTokens (0 seconds and 480 seconds of media), so a
+  // proxy that ran before the modality check would read them as tiny models.
+  const lyria = normalizeModel("lyria", {
+    limits: { contextTokens: 0 },
+    modalities: { input: ["text"], output: ["audio"] },
+    capabilities: { reasoning: false }
+  });
+  assert.equal(lyria.kind, "nontext");
+  assert.equal(lyria.contextTokens, 0, "kept as-is; the classifier owns the > 0 guard");
+  const chat = normalizeModel("orca-auto", {
+    modalities: { input: ["image", "text"], output: ["text"] },
+    capabilities: { reasoning: false }
+  });
+  assert.equal(chat.kind, "text", "multimodal INPUT is still a chat model");
+});
+
+test("buildProviders plumbs reason and kind onto every model it builds", () => {
+  // End to end through the real row builder, both push sites in one call: the
+  // vault testModel path (`probe-1`, which HAS a catalogue entry here) and the
+  // catalogue-ranked path (`acme-vision`, `acme-embed`).
+  const built = buildProviders(
+    [{ id: "personal.acme.free", provider: "acme" }],
+    new Map([["acme", { protocol: "openai", baseUrl: "https://x.invalid/v1",
+                        testModel: "probe-1" }]]),
+    { generatedAt: "x", byProvider: new Map([["acme", [
+      { provider: "acme", model: "probe-1", limits: { contextTokens: 200000 },
+        modalities: { output: ["text"] }, capabilities: { reasoning: true } },
+      { provider: "acme", model: "acme-vision", limits: { contextTokens: 4096 },
+        modalities: { output: ["image", "text"] }, capabilities: { reasoning: false } },
+      { provider: "acme", model: "acme-embed", limits: { contextTokens: 8192 },
+        modalities: { output: ["embedding", "text"] }, capabilities: {} },
+    ]]]) },
+    () => "sk-test-not-a-real-key",
+  );
+  // testModel first, then catalogue rank -- which today is shortest-id, since
+  // inferTier's free-first key is dead (0 of 4,298 entries yield a price).
+  assert.deepEqual(built.picker.map((r) => r.model),
+    ["acme/probe-1", "acme/acme-embed", "acme/acme-vision"]);
+  // The picker rows carry no capability fields yet -- T7 adds `kind` and the
+  // bucketed `behavesAs`. What T6 owns is that the SIGNALS exist by the time the
+  // row builder runs, which the shared normalizer is the single owner of.
+  const norm = [
+    normalizeModel("probe-1", { limits: { contextTokens: 200000 },
+      modalities: { output: ["text"] }, capabilities: { reasoning: true } }),
+    normalizeModel("acme-embed", { limits: { contextTokens: 8192 },
+      modalities: { output: ["embedding", "text"] }, capabilities: {} }),
+    normalizeModel("acme-vision", { limits: { contextTokens: 4096 },
+      modalities: { output: ["image", "text"] }, capabilities: { reasoning: false } }),
+  ];
+  assert.deepEqual(norm.map((m) => [m.reason, m.kind]),
+    [[true, "text"], [null, "nontext"], [false, "text"]],
+    "embedding+text is still not a chat model; image+text is");
+  // contextTokens is the one signal already visible on the row, so it is the one
+  // that proves the normalizer's output really is what the builder consumed.
+  assert.deepEqual(built.picker.map((r) => r.contextTokens), [200000, 8192, 4096]);
 });
