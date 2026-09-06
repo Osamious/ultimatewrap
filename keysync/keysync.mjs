@@ -619,6 +619,65 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
 }
 
 // ------------------------------------------------------------- validations
+
+/**
+ * V1, V2 and V6: the rules whose subject is the BUCKET TABLE itself.
+ *
+ * Split out of `validate()` for one reason, and it is a testing reason rather
+ * than a structural one. The table is a frozen module constant, so a test could
+ * not make it wrong -- which left these three rules with no test that could
+ * FAIL. What stood in for one re-implemented all three in the test body against
+ * the same constants and never called `validate()` at all, so deleting the rules
+ * outright left the suite green. Parameterising the table is what makes the
+ * failure branch reachable, and T8's acceptance criterion (one test per rule,
+ * asserting the message names its reason) satisfiable.
+ *
+ * Defaults are the live constants, so the production call site is unchanged and
+ * the real table is still validated on every run.
+ *
+ * @param {Record<string,string>} [targets]  the bucket -> behavesAs table
+ * @param {readonly string[]} [allowed]      the vetted behavesAs allowlist
+ * @param {RegExp} [bundle]                  ids carrying a model-specific prompt bundle
+ * @returns {string[]} problems, empty when the table is sound
+ */
+export function validateBucketTable(targets = BUCKET_TARGETS,
+                                    allowed = ALLOWED_BEHAVES_AS,
+                                    bundle = PROMPT_BUNDLE_MODELS) {
+  const problems = [];
+
+  // V1 -- the table holds vetted targets, not typos. An allowlist rather than a
+  // denylist because a denylist passes `claude-sonnet-4-51` in silence, and
+  // silence is the failure mode this exists to prevent.
+  // V2 -- and no target may carry a model-specific prompt bundle.
+  for (const [bucket, target] of Object.entries(targets)) {
+    if (!allowed.includes(target)) {
+      problems.push(`bucket "${bucket}" target "${target}" is not in ALLOWED_BEHAVES_AS ` +
+        `— a vetted target, not a typo`);
+    }
+    if (bundle.test(target)) {
+      problems.push(`bucket target "${target}" carries a model-specific prompt bundle ` +
+        `(report 18 §10.3) and must never be inherited by a third-party model`);
+    }
+  }
+
+  // V6 -- THE WHOLE TABLE SHAPE, over all four keys, not one inequality.
+  // This is the canary for the failure that looks like success. `capable !== weak`
+  // guards one of the three ways the table can break: pointing `unknown` or
+  // `nonchat` at the capable target flips 38 or 4 rows back into over-declaration
+  // with that inequality still true and every other rule green.
+  if (targets.capable === targets.weak) {
+    problems.push(`BUCKET_TARGETS.capable and .weak name the same target ` +
+      `("${targets.weak}"); the table would classify without declaring anything`);
+  }
+  for (const bucket of ["unknown", "nonchat"]) {
+    if (targets[bucket] !== targets.weak) {
+      problems.push(`BUCKET_TARGETS.${bucket} points at the capable target; only "capable" may`);
+    }
+  }
+
+  return problems;
+}
+
 export function validate({ providers, picker }, expectedCount) {
   const problems = [];
 
@@ -673,35 +732,8 @@ export function validate({ providers, picker }, expectedCount) {
   // where its subject does not yet exist is how a rule passes vacuously.
   const targets = new Set(Object.values(BUCKET_TARGETS));
 
-  // V1 -- the table holds vetted targets, not typos. An allowlist rather than a
-  // denylist because a denylist passes `claude-sonnet-4-51` in silence, and
-  // silence is the failure mode this exists to prevent.
-  // V2 -- and no target may carry a model-specific prompt bundle.
-  for (const [bucket, target] of Object.entries(BUCKET_TARGETS)) {
-    if (!ALLOWED_BEHAVES_AS.includes(target)) {
-      problems.push(`bucket "${bucket}" target "${target}" is not in ALLOWED_BEHAVES_AS ` +
-        `— a vetted target, not a typo`);
-    }
-    if (PROMPT_BUNDLE_MODELS.test(target)) {
-      problems.push(`bucket target "${target}" carries a model-specific prompt bundle ` +
-        `(report 18 §10.3) and must never be inherited by a third-party model`);
-    }
-  }
-
-  // V6 -- THE WHOLE TABLE SHAPE, over all four keys, not one inequality.
-  // This is the canary for the failure that looks like success. `capable !== weak`
-  // guards one of the three ways the table can break: pointing `unknown` or
-  // `nonchat` at the capable target flips 38 or 4 rows back into over-declaration
-  // with that inequality still true and every other rule green.
-  if (BUCKET_TARGETS.capable === BUCKET_TARGETS.weak) {
-    problems.push(`BUCKET_TARGETS.capable and .weak name the same target ` +
-      `("${BUCKET_TARGETS.weak}"); the table would classify without declaring anything`);
-  }
-  for (const bucket of ["unknown", "nonchat"]) {
-    if (BUCKET_TARGETS[bucket] !== BUCKET_TARGETS.weak) {
-      problems.push(`BUCKET_TARGETS.${bucket} points at the capable target; only "capable" may`);
-    }
-  }
+  // V1, V2 and V6, whose subject is the TABLE rather than this build.
+  problems.push(...validateBucketTable());
 
   // V3 -- every non-relay row declares, and declares a table value.
   // The relay rows are exempt BY CONSTRUCTION, not by oversight: they carry no

@@ -6,7 +6,8 @@ import { buildFrom } from "../menu/catalog.mjs";
 import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
          ANTHROPIC_FALLBACK_TAGS, ONE_M_TOKENS, buildAnthropicPickerRows,
          normalizeModel, bucketFor, behavesAsFor, BUCKET_TARGETS,
-         ALLOWED_BEHAVES_AS, PROMPT_BUNDLE_MODELS, CTX_CAPABLE_MIN
+         ALLOWED_BEHAVES_AS, PROMPT_BUNDLE_MODELS, CTX_CAPABLE_MIN,
+         validateBucketTable
        } from "../keysync/keysync.mjs";
 // Imported for the S1 guard tests. `run.mjs` must therefore export
 // `checkBareCollisions` and keep its pipeline behind an entry-point check rather
@@ -1484,22 +1485,86 @@ test("a clean build produces NO problems, so every rule below fails alone", () =
   assert.deepEqual(validate({ providers: OK_PROVIDERS, picker: [OK_ROW()] }, 1), []);
 });
 
-test("V1/V2/V6: the table itself is validated, and the message names the bucket", () => {
-  // The table is a module constant, so it cannot be made wrong from a test
-  // without editing the source. What IS assertable is that the live table
-  // satisfies all three rules and that validate() actually reads it -- V1 over
-  // the allowlist, V2 over the prompt-bundle pattern, V6 over all four keys.
-  for (const [bucket, target] of Object.entries(BUCKET_TARGETS)) {
-    assert.ok(ALLOWED_BEHAVES_AS.includes(target), `${bucket} -> ${target} (V1)`);
-    assert.equal(PROMPT_BUNDLE_MODELS.test(target), false, `${bucket} -> ${target} (V2)`);
-  }
-  assert.notEqual(BUCKET_TARGETS.capable, BUCKET_TARGETS.weak);
-  assert.equal(BUCKET_TARGETS.unknown, BUCKET_TARGETS.weak);
-  assert.equal(BUCKET_TARGETS.nonchat, BUCKET_TARGETS.weak);
-  // ...and the table is frozen, which is what makes the above a property of the
-  // build rather than of the moment this test ran.
+// The live table, and the fact that it is frozen -- which is what makes the rest
+// of this block a property of the build rather than of the moment it ran.
+test("the shipped bucket table passes its own rules, and cannot drift at runtime", () => {
+  assert.deepEqual(validateBucketTable(), []);
+  assert.deepEqual(validate({ providers: OK_PROVIDERS, picker: [OK_ROW()] }, 1), []);
   assert.equal(Object.isFrozen(BUCKET_TARGETS), true);
   assert.equal(Object.isFrozen(ALLOWED_BEHAVES_AS), true);
+});
+
+// WHY THESE DRIVE A TABLE ARGUMENT RATHER THAN THE CONSTANT. What stood here
+// before re-implemented all three rules in its own body against the frozen
+// constants and never called validate(): deleting the rules from keysync.mjs
+// entirely left the suite green, so half the tier-1 rules had no test that could
+// fail. Parameterising the table is what makes the failure branch reachable.
+test("V1: a bucket target outside the allowlist is a problem naming the bucket", () => {
+  // An allowlist rather than a denylist precisely because a denylist passes a
+  // typo in silence, so the message has to carry the value it rejected.
+  const problems = validateBucketTable(
+    { ...BUCKET_TARGETS, capable: "claude-sonnet-4-51" });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /bucket "capable"/);
+  assert.match(problems[0], /claude-sonnet-4-51/);
+  assert.match(problems[0], /not in ALLOWED_BEHAVES_AS/);
+});
+
+test("V2: a target carrying a model-specific prompt bundle is refused, with the reason", () => {
+  // A bundle is inherited by every third-party model pointed at that target, so
+  // this is the rule that keeps one model's prompt profile from leaking onto 83
+  // rows.
+  //
+  // THE ALLOWLIST IS INJECTED, and that is a finding rather than test
+  // convenience: no entry in the live ALLOWED_BEHAVES_AS matches
+  // PROMPT_BUNDLE_MODELS, so against today's constants V2 can only ever fire
+  // together with V1 and is not independently observable. Widening the allowlist
+  // to admit `claude-opus-5` is what isolates V2 -- and it models the exact edit
+  // V2 exists to catch, someone adding a bundle-carrying id to the allowlist.
+  const bundled = "claude-opus-5";
+  assert.equal(PROMPT_BUNDLE_MODELS.test(bundled), true);
+  assert.equal(ALLOWED_BEHAVES_AS.includes(bundled), false,
+    "V1 would otherwise mask V2 -- see above");
+  const problems = validateBucketTable({ ...BUCKET_TARGETS, capable: bundled },
+                                       [bundled, ...ALLOWED_BEHAVES_AS]);
+  assert.equal(problems.length, 1, "V1 admits it, so only V2 may fire");
+  assert.match(problems[0], /claude-opus-5/);
+  assert.match(problems[0], /model-specific prompt bundle/);
+  assert.match(problems[0], /never be inherited by a third-party model/);
+});
+
+test("V6: unknown or nonchat pointed at the capable target is caught, not just capable === weak", () => {
+  // THE CANARY FOR THE FAILURE THAT LOOKS LIKE SUCCESS. `capable !== weak` alone
+  // guards one of three ways the table breaks: repointing `unknown` flips 38 rows
+  // and `nonchat` 4 rows back into over-declaration with that inequality still
+  // true and every other rule green.
+  const unknownBroken = validateBucketTable(
+    { ...BUCKET_TARGETS, unknown: BUCKET_TARGETS.capable });
+  assert.equal(unknownBroken.length, 1);
+  assert.match(unknownBroken[0], /BUCKET_TARGETS\.unknown points at the capable target/);
+
+  const nonchatBroken = validateBucketTable(
+    { ...BUCKET_TARGETS, nonchat: BUCKET_TARGETS.capable });
+  assert.equal(nonchatBroken.length, 1);
+  assert.match(nonchatBroken[0], /BUCKET_TARGETS\.nonchat points at the capable target/);
+
+  // And the collapse the inequality DOES cover, with the message saying what a
+  // collapsed table would do rather than merely that two names matched.
+  const collapsed = validateBucketTable(
+    { ...BUCKET_TARGETS, weak: BUCKET_TARGETS.capable });
+  assert.ok(collapsed.some((p) => /classify without declaring anything/.test(p)));
+});
+
+test("the table rules are WIRED INTO validate(), not merely exported beside it", () => {
+  // The three tests above have teeth only if the pipeline still runs the rules.
+  // Extracting them created a second way for the acceptance criterion to go
+  // unmet: keep validateBucketTable, tested and green, and drop its call site --
+  // and every assertion above still passes while the pipeline validates nothing.
+  //
+  // Asserted against the function's own source rather than a file line, because
+  // a line citation goes stale on the next insertion above it and this must not.
+  assert.match(validate.toString(), /validateBucketTable\(/,
+    "validate() must call validateBucketTable, or a broken table reaches the writer");
 });
 
 test("V3: a non-relay row with no behavesAs is a problem that names the row", () => {
