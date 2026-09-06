@@ -14,7 +14,7 @@ import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
 // `checkProviderFloor`, and for the same reason. If importing run.mjs runs the
 // pipeline, that is the defect to fix, not a reason to test the guard indirectly.
 import { checkBareCollisions, deriveAnthropicSets, orderNativePickerOptions,
-         assertOptionsComplete, ROUTING_MAX_STALENESS_MS,
+         assertOptionsComplete, assertVouchedSetIsNarrower, ROUTING_MAX_STALENESS_MS,
          routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
@@ -876,6 +876,33 @@ test("relayOwned NEVER grows with live data -- the invariant the guard rests on"
   assert.ok(relayOwned.size < routingIds.size,
     "live data added ids, so the vouched set MUST be strictly smaller than the routed set");
   for (const id of relayOwned) assert.equal(routingIds.has(id), true, "and a subset of it");
+});
+
+test("the pipeline's guard fires on the reunification it names, not just on shrinkage", () => {
+  // The shape this replaces was `relayOwned.size > routingIds.size`, whose stated
+  // purpose was to catch "a future edit that reunifies them" -- but reunification
+  // makes the two sets EQUAL, and `>` cannot see equality. The security review
+  // confirmed it: relayOwned = routingIds passed, and passing silently disarms
+  // checkBareCollisions' FATAL path. This test is the one that fails if the
+  // assertion is deleted or weakened back.
+  const { routingIds, relayOwned } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+
+  // The good state must stay quiet, on BOTH branches -- with live data present,
+  // and with none, where both sets legitimately reduce to the curated constant.
+  // That second case is why `!==` could not be the fix.
+  assertVouchedSetIsNarrower(relayOwned, routingIds, LIVE);
+  const off = deriveAnthropicSets(null, ANTHROPIC_FULL);
+  assertVouchedSetIsNarrower(off.relayOwned, off.routingIds, null);
+
+  // THE REUNIFICATION. This is precisely what the old check waved through.
+  assert.throws(() => assertVouchedSetIsNarrower(new Set(LIVE), new Set(LIVE), LIVE),
+    /FATAL sole-owner path becomes structurally unreachable/,
+    "vouching for a live id disarms the guard, and the message must say so");
+
+  // The inverse: routing stopped auto-adding, so the picker advertises rows CCR
+  // will not route. Guard stays armed; the config is still wrong.
+  assert.throws(() => assertVouchedSetIsNarrower(relayOwned, new Set(ANTHROPIC_FULL), LIVE),
+    /routing did not grow/);
 });
 
 test("the picker shows every live id, not just the curated four (decision 3 reversed)", () => {

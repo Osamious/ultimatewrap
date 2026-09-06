@@ -291,6 +291,56 @@ export function deriveAnthropicSets(liveIds, curatedIds = ANTHROPIC_FULL,
 }
 
 /**
+ * The one invariant that keeps `checkBareCollisions`' FATAL path reachable.
+ *
+ * `relayOwned` is what the relay's ownership VOUCHES for and `routingIds` is
+ * what it merely ROUTES. Auto-add grows routing with every live id; nothing may
+ * ever grow the vouched set. If the two are reunified, every id the guard
+ * considers becomes vouched, `effective` keeps the relay in every owner set, and
+ * the sole-owner branch that reports a hijack can no longer be entered. That is
+ * not a hypothetical -- it is the HIGH regression this branch shipped and fixed,
+ * and it was invisible in the diff of the guard itself, which did not change.
+ *
+ * THE OLD SHAPE OF THIS CHECK COULD NOT FIRE ON THE FAILURE IT NAMED. It was
+ * `relayOwned.size > routingIds.size`, and reunification makes the two sets
+ * EQUAL, which `>` cannot see. `!==` is not the fix either: when there is no
+ * usable live data both sets legitimately reduce to the curated constant, so
+ * inequality is the normal state exactly half the time.
+ *
+ * So the property is asserted against the CURATED CONSTANT rather than against
+ * the other derived set -- comparing two derivations of the same edit is how the
+ * first version talked itself into passing:
+ *   1. the vouched set is the curated list and never grows with live data, and
+ *   2. where live data supplied an id outside that list, routing DID grow.
+ * Rule 1 catches the reunifying edit directly. Rule 2 catches the inverse -- a
+ * routing set that stopped auto-adding -- which leaves the guard armed but the
+ * picker advertising rows CCR will not route.
+ *
+ * @param {Set<string>} relayOwned   the vouched set as derived
+ * @param {Set<string>} routingIds   the routed set as derived
+ * @param {Set<string>|null} liveIds the routable live ids, or null when there
+ *   are none usable; the raw input both sets are derived FROM
+ * @param {readonly string[]} [curated]
+ */
+export function assertVouchedSetIsNarrower(relayOwned, routingIds, liveIds,
+                                           curated = ANTHROPIC_FULL) {
+  const curatedSet = new Set(curated);
+  const grew = [...relayOwned].filter((id) => !curatedSet.has(id));
+  if (grew.length) {
+    throw new Error(`internal: relayOwned grew beyond the curated set ` +
+      `(${grew.slice(0, 3).join(", ")}) — the relay would then vouch for every id ` +
+      `checkBareCollisions considers, and its FATAL sole-owner path becomes ` +
+      `structurally unreachable, exactly as it did before this guard existed`);
+  }
+  const liveOnly = liveIds ? [...liveIds].filter((id) => !curatedSet.has(id)) : [];
+  if (liveOnly.length && routingIds.size <= relayOwned.size) {
+    throw new Error(`internal: live data supplied ${liveOnly.length} id(s) outside the ` +
+      `curated set but routing did not grow (routing ${routingIds.size} <= vouched ` +
+      `${relayOwned.size}) — the picker would advertise rows CCR will not route`);
+  }
+}
+
+/**
  * What actually gets written to `settings.json`'s `modelPicker.options`: every
  * built row, Anthropic first.
  *
@@ -494,12 +544,13 @@ console.log(`anthropic catalog: ${liveCatalog
   : "UNAVAILABLE (relay down and no cache) — using the curated set"}` +
   ` -> ${pickerRows.length} picker row(s), ${taggedLive} tagged [1m] from live data`);
 // The guard's vouched set must never be the routed set -- that equality is what
-// disarmed checkBareCollisions once already. Asserted here, at the one place
-// both are in scope, because a future edit that reunifies them would otherwise
-// produce a config that looks correct and silently protects nothing.
-if (relayOwned.size > routingIds.size) {
-  throw new Error("internal: relayOwned must be a subset of routingIds");
-}
+// disarmed checkBareCollisions once already. Checked here, at the one place all
+// three of the derived sets and their raw input are in scope, because a future
+// edit that reunifies them would otherwise produce a config that looks correct
+// and silently protects nothing. The rules themselves live in the exported
+// function so a test can drive them; see its doc for why they compare against
+// the curated constant rather than against each other.
+assertVouchedSetIsNarrower(relayOwned, routingIds, routableIds);
 
 // Anthropic via the local OAuth relay, unless --no-anthropic. Checked for
 // liveness first: a dead relay would produce picker rows that cannot serve.
