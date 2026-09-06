@@ -678,7 +678,13 @@ export function validateBucketTable(targets = BUCKET_TARGETS,
   return problems;
 }
 
-export function validate({ providers, picker }, expectedCount) {
+// `table` exists so the tier-1 rules can be OBSERVED firing, not merely asserted
+// to be present. It defaults to the live constants, so every production call is
+// unchanged. Without it the only available check was a source-string match on
+// validate.toString(), which passes when the call appears in a COMMENT and never
+// shows the returned problems reaching `problems` -- a test for a vacuity that
+// was shaped like one.
+export function validate({ providers, picker }, expectedCount, table = {}) {
   const problems = [];
 
   if (providers.length !== expectedCount) {
@@ -733,7 +739,7 @@ export function validate({ providers, picker }, expectedCount) {
   const targets = new Set(Object.values(BUCKET_TARGETS));
 
   // V1, V2 and V6, whose subject is the TABLE rather than this build.
-  problems.push(...validateBucketTable());
+  problems.push(...validateBucketTable(table.targets, table.allowed, table.bundle));
 
   // V3 -- every non-relay row declares, and declares a table value.
   // The relay rows are exempt BY CONSTRUCTION, not by oversight: they carry no

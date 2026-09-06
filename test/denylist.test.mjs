@@ -1612,10 +1612,16 @@ test("the table rules are WIRED INTO validate(), not merely exported beside it",
   // unmet: keep validateBucketTable, tested and green, and drop its call site --
   // and every assertion above still passes while the pipeline validates nothing.
   //
-  // Asserted against the function's own source rather than a file line, because
-  // a line citation goes stale on the next insertion above it and this must not.
-  assert.match(validate.toString(), /validateBucketTable\(/,
-    "validate() must call validateBucketTable, or a broken table reaches the writer");
+  // Asserted BEHAVIOURALLY: hand validate() a table whose capable target is not
+  // in the allowlist and require the V1 message to come back in `problems`. A
+  // source-string match on validate.toString() was the first version of this and
+  // is strictly weaker -- it passes when the call sits in a comment, and it never
+  // shows the returned problems reaching the array. A test for a vacuity should
+  // not itself be one.
+  const problems = validate({ providers: OK_PROVIDERS, picker: [OK_ROW()] }, 1,
+    { targets: { ...BUCKET_TARGETS, capable: "claude-sonnet-4-51" } });
+  assert.ok(problems.some((p) => /claude-sonnet-4-51/.test(p)),
+    "a broken table must surface through validate(), not just through validateBucketTable");
 });
 
 test("V3: a non-relay row with no behavesAs is a problem that names the row", () => {

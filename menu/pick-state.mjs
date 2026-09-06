@@ -54,14 +54,22 @@ export function nextSelectable(list, from, dir) {
 // first, then backward, and DELIBERATELY NOT WRAPPING -- this is the whole
 // difference from nextSelectable, whose wrap belongs to the arrow path alone.
 //
-// clamp() calls this on every filter keystroke, favourite toggle and resize, not
-// just on arrows, and there a wrap teleports: with 5 rows and a non-chat model at
-// index 3, a cursor sitting at 4 when one filter character is typed wraps forward
-// past the end and lands at 0, jumping BACKWARDS over three selectable rows. The
-// arrow comment below states the invariant that breaks -- "a filter that shortens
-// the list must not teleport the cursor to the far end" -- and this is where it is
-// enforced. The backward scan is the fallback for exactly the case the wrap was
-// silently covering: nothing selectable at or after `i`.
+// WHERE AN UNSETTLED CURSOR ACTUALLY REACHES clamp(), corrected 2026-09-06.
+// A review reported this as a filter-keystroke teleport; that repro was wrong and
+// the wrong version was briefly written here. The filter path is
+// `clamp(reset(...))` (three call sites), and reset() zeroes `cur` before clamp
+// ever sees it, so a filter can neither preserve a cursor nor wrap one.
+//
+// The paths that DO hand clamp a preserved cursor over a changed list take no
+// reset: resize, the scope toggle, and the two esc steps (flat->tree, level 1->0).
+// Each keeps `cur` while the list under it changes, so the cursor can land on an
+// unselectable row -- and a wrap there jumps to the far end, which is exactly what
+// the arrow comment below forbids: "a filter that shortens the list must not
+// teleport the cursor to the far end. Only an explicit arrow press means 'move',
+// so only an arrow press may wrap." This is where that is enforced.
+//
+// The backward scan is the fallback for the case the wrap was silently covering:
+// nothing selectable at or after `i`.
 //
 // Idempotent on an already-selectable index by construction, which is what lets
 // clamp() run on the arrow path without correcting a second time and moving two
