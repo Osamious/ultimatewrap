@@ -14,7 +14,8 @@ import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
 // `checkProviderFloor`, and for the same reason. If importing run.mjs runs the
 // pipeline, that is the defect to fix, not a reason to test the guard indirectly.
 import { checkBareCollisions, deriveAnthropicSets, orderNativePickerOptions,
-         assertOptionsComplete, assertVouchedSetIsNarrower, ROUTING_MAX_STALENESS_MS,
+         assertOptionsComplete, assertVouchedSetIsNarrower, assertRelayNameUnclaimed,
+         ROUTING_MAX_STALENESS_MS,
          routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
@@ -876,6 +877,27 @@ test("relayOwned NEVER grows with live data -- the invariant the guard rests on"
   assert.ok(relayOwned.size < routingIds.size,
     "live data added ids, so the vouched set MUST be strictly smaller than the routed set");
   for (const id of relayOwned) assert.equal(routingIds.has(id), true, "and a subset of it");
+});
+
+test("the relay's provider name is reserved, and the message says what breaks", () => {
+  // Three consumers key off "the provider called `anthropic` is ours" and none
+  // of them enforced it -- checkBareCollisions keys owners by provider NAME, so
+  // an impostor sharing it collapses both into one owner and the guard reports
+  // "no collisions" while a sole-owning reseller sits there. Demonstrated first,
+  // because a guard whose absence is harmless does not need to exist.
+  const impostor = [
+    { name: "anthropic", api_key: "k", models: ["claude-opus-5"] },
+    { name: "anthropic", api_key: "k", models: ["claude-opus-5"] },
+  ];
+  const collapsed = checkBareCollisions(impostor, { relay: "anthropic" });
+  assert.equal(collapsed.fatal, false, "two providers, one owner -- the guard goes quiet");
+
+  assert.doesNotThrow(() => assertRelayNameUnclaimed(
+    [{ name: "tabiai" }, { name: "gorouter" }], "anthropic"));
+  assert.throws(() => assertRelayNameUnclaimed(
+    [{ name: "tabiai" }, { name: "anthropic" }], "anthropic"),
+    /checkBareCollisions[\s\S]*orderNativePickerOptions[\s\S]*behavesAs/,
+    "the message must name all three dependents, not just say 'reserved'");
 });
 
 test("the pipeline's guard fires on the reunification it names, not just on shrinkage", () => {

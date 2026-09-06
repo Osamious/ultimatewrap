@@ -291,6 +291,44 @@ export function deriveAnthropicSets(liveIds, curatedIds = ANTHROPIC_FULL,
 }
 
 /**
+ * The relay's provider name is RESERVED, and until now that was asserted in
+ * prose in three places and enforced in none.
+ *
+ * Three separate consumers key off "the provider called `anthropic` is ours",
+ * and this branch added two of them:
+ *   checkBareCollisions       owners are keyed by provider NAME, so two providers
+ *                             sharing it collapse into ONE owner -- the guard then
+ *                             reports "no collisions" while an impostor SOLE-OWNS
+ *                             a Claude-shaped id. Measured; it goes quiet.
+ *   orderNativePickerOptions  partitions rows by the `anthropic/` prefix, so a
+ *                             vault row would be hoisted to the head of the
+ *                             /model menu as if Anthropic served it.
+ *   validate()'s V3 exemption rows under this prefix are excused from declaring
+ *                             `behavesAs`, and an undeclared id resolves through
+ *                             lH() to the maximal assumption set (report 18 §3).
+ *
+ * NOT CURRENTLY EXPOSED, which is why this is a guard and not a bug fix:
+ * providers.json carries an `anthropic` profile but registry.json has no matching
+ * key, so it is dropped as an orphan upstream. That is one edit away from being
+ * untrue, and the failure it would cause is silent in all three places.
+ *
+ * The message names all three dependents deliberately. "Reserved name" alone
+ * tells an operator nothing about why renaming their provider is not optional.
+ *
+ * @param {{name: string}[]} providers  the built vault set, pre-unshift
+ * @param {string} relayName
+ */
+export function assertRelayNameUnclaimed(providers, relayName = ANTHROPIC_RELAY.name) {
+  if (!(providers ?? []).some((p) => p?.name === relayName)) return;
+  throw new Error(`a vault provider is named "${relayName}", which is reserved for the ` +
+    `relay: checkBareCollisions keys owners by provider name and would collapse the two ` +
+    `into one owner (reporting no collisions while an impostor sole-owns a Claude id), ` +
+    `orderNativePickerOptions would hoist its rows to the head of the /model menu, and ` +
+    `validate()'s V3 exemption would excuse them from declaring behavesAs — which lH() ` +
+    `resolves to the maximal assumption set. Rename it in providers.json.`);
+}
+
+/**
  * The one invariant that keeps `checkBareCollisions`' FATAL path reachable.
  *
  * `relayOwned` is what the relay's ownership VOUCHES for and `routingIds` is
@@ -572,6 +610,9 @@ if (!has("--no-anthropic")) {
     // `picker` and `routing` are UW-side fields and must not reach CCR's config,
     // which is why they are destructured out rather than spread through.
     const { picker: _picker, routing: _routing, ...relayProvider } = ANTHROPIC_RELAY;
+    // Enforced HERE, at the injection, because this is the line that would create
+    // the duplicate -- and a throw before the write leaves settings.json untouched.
+    assertRelayNameUnclaimed(built.providers, relayProvider.name);
     // `routingIds` is BARE by construction (live /v1/models ids unioned with the
     // curated four), and that is load-bearing in two ways. It is what CCR routes
     // and what the relay forwards toward Anthropic, whose real API 404s on a
