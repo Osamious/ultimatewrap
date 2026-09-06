@@ -191,6 +191,48 @@ Also folding in, from the same two reviews, independent of the above:
 - The new-models state file write should not precede the guard's fatal-exit check in a way
   that leaves a stale/wrong banner advertising a rejected configuration.
 
+## Decision 4 REVERSED, 2026-09-06 — the native picker carries all rows again
+
+Decision 4 scoped `modelPicker.options[]` to Anthropic-subscription rows only, to drop "83 rows
+of third-party noise from a flat native menu." That was decided without knowing the field
+serves two roles at once.
+
+Established 2026-09-06 by direct binary read (build 2.1.261): `options[]` is **simultaneously
+the rendered `/model` row list and the only registry that can hold `behavesAs` for an arbitrary
+number of models.** `Ato()` builds the visible rows from it and `_re()` reads `behavesAs` from
+the same array. Dropping a row therefore drops that model's capability declaration.
+
+Consequence, which decision 4 was never weighed against: a third-party id with no `behavesAs`
+on UW's `firstParty` shape resolves through `lH()` to the **maximal** assumption set — every
+effort tier offered, adaptive thinking on, thinking forced un-disableable — plus an
+unknown-model launch warning. Report 18 §3 measures that as strictly worse than any bucket
+choice. So the scoping traded menu tidiness for a silent capability regression on all 83 rows.
+
+Alternatives checked before reversing, both dead:
+- **`modelOverrides`** — right visibility (produces no picker rows), confers the identical
+  eight-predicate profile through the same `Fe`→`RL`→`_i` chain, flips `isKnown`. But its key is
+  the *Anthropic* id and the baked catalog holds 19 models, so unique JSON keys cap it at **19
+  declarations, not 83**. A first-party-spelled key also hijacks that Anthropic model's outgoing
+  id (`a_()` rewrites the resolved-model table), which is the Bedrock-ARN feature working as
+  designed and fatal for use as a silent declaration.
+- **A hidden-row field** — none exists. The row schema is exactly `{model, label?, description?,
+  behavesAs?}`, confirmed from the binary's own zod definition. The one structural way to hide a
+  row while keeping its `behavesAs` (failing `Gun()` via the `availableModels` allowlist) also
+  makes the model unselectable and unusable.
+- **`modelSettings`** — keyed by model id with unbounded cardinality and no rows, so the right
+  shape, but it carries only `effortLevel`, a preference rather than a capability declaration.
+
+**Decision: revert the scoping.** All rows go back into `modelPicker.options[]`, each carrying
+its own bucketed `behavesAs`, with the Anthropic subscription rows ordered **first** — `Ato()`
+iterates `options[]` in array order, so render order is controllable. The menu length that
+decision 4 objected to returns; it is the price of the declaration channel, and ordering keeps
+the rows that matter at the top.
+
+`scopeNativePickerOptions` in `keysync/run.mjs` and its relay-down fallback become an ordering
+function rather than a filter. Note the live `settings.json` still holds the pre-scoping 87 rows
+— keysync has not run `--target live` since commit `4151639`, so this reversal restores what is
+on disk today rather than changing it.
+
 ## Decided, not yet built — model-type filtering in the picker
 
 Decided 2026-09-06, alongside the `behavesAs` bucketing work (context/compaction work parked
