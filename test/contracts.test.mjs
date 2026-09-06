@@ -91,6 +91,28 @@ test("routableFromConfig flattens providers and models", () => {
   assert.equal(CCR.routableFromConfig(null).size, 0);
 });
 
+test("a malformed config body yields nothing rather than crashing or inventing targets", () => {
+  // rpc() never throws -- it returns undefined when there was no answer -- so the
+  // only way to get here with junk is a well-formed HTTP response carrying a
+  // malformed body, which nothing upstream checks for.
+  assert.equal(CCR.routableFromConfig({ Providers: 5 }).size, 0,
+    "a non-array Providers threw `number 5 is not iterable` into the picker's startup");
+  assert.equal(CCR.routableFromConfig({ Providers: "abc" }).size, 0);
+
+  // THE SILENT ONE, and the reason Array.isArray is required rather than a
+  // truthiness check: a STRING IS ITERABLE, so for..of walked it per character.
+  const perChar = CCR.routableFromConfig({ Providers: [{ name: "x", models: "ab" }] });
+  assert.equal(perChar.size, 0, "not the per-character targets x/a and x/b");
+  assert.equal(perChar.has("x/a"), false);
+
+  // A well-formed sibling still survives a malformed neighbour: skipping the bad
+  // provider must not abandon the rest, or one junk entry dims the entire menu.
+  const mixed = CCR.routableFromConfig({
+    Providers: [{ name: "x", models: "ab" }, { name: "y", models: ["m1"] }],
+  });
+  assert.deepEqual([...mixed], ["y/m1"]);
+});
+
 const SVC = { origin: "http://x", token: "t" };
 
 test("rpc never throws when the gateway misbehaves", async () => {
