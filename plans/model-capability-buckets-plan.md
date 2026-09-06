@@ -854,7 +854,16 @@ throws. This does **not** order T1 and T7 (§1.9); what it does is make T1 perma
    - **judge the ~94% dim ratio on the rendered screen** (T4's accepted consequence). If it reads as
      unusable rather than informative, invert the emphasis at `style.mjs:358` — normal weight for the
      routable set, base colour for the rest — rather than reverting T4;
-   - the four non-chat rows show their modality in the `ctx` cell;
+   - ~~the four non-chat rows show their modality in the `ctx` cell~~ — **amended 2026-09-06:
+     the four non-chat rows show `nochat` in the `ctx` cell.** The original is unsatisfiable and
+     was never implementable: D2-A specifies rendering `AUDIO`/`VIDEO`/`IMAGE` and rejects D2-C on
+     the ground that *"a glyph cannot name which modality"*, but T3 fixes `outputKind` at
+     `"text" | "nontext" | null`, so the value reaching that cell cannot name it either. The two
+     decisions are mutually inconsistent and it survived three adversarial review rounds. Naming
+     the modality needs a fourth per-model field and a second schema bump, which C38/§4.3's
+     "the snapshot shape changes once, at T4" forbids mid-branch. Tracked for a future bump as
+     issue #43; D2-C's rejection reasoning should be revisited there, since its constraint has
+     already bitten;
    - a pre-existing non-chat entry in recents produces no pinned row.
 
 ---
