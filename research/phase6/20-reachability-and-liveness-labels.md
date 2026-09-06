@@ -283,7 +283,113 @@ exit that would refuse to run once bare Claude-shaped reseller names arrive at s
 
 ---
 
-## 8. Open decisions for phase B
+## 8. Phase B scope: provider and key expandability
+
+Added at the user's direction 2026-09-06. **Adding a new key — Anthropic or otherwise — must be
+as simple, automated and reliable as it gets.** Today it is simple for the common case and
+unreliable at the edges, and the edges are where a new provider actually lands.
+
+### 8.1 What exists
+
+The vault is `~/.llmkeys/`, two files, read by `loadVault()` at `keysync/keysync.mjs:22-26`:
+
+```jsonc
+// providers.json — 47 entries, the provider profile
+{ "provider": "groq",
+  "baseUrl": "https://api.groq.com/openai/v1",
+  "protocol": "openai",
+  "headersTemplate": "Authorization: Bearer {key}",
+  "testModel": "openai/gpt-oss-20b",
+  "requiresBalance": false, "docsUrl": "...", "notes": "..." }
+
+// registry.json — 56 entries, the credential
+{ "id": "personal.groq.free", "provider": "groq",
+  "bucket": "personal", "tier": "free",
+  "envVarName": "LLM_PERSONAL_GROQ_FREE" }
+```
+
+Secrets are never in the vault — only `envVarName`. Protocol distribution is **44 `openai`, 1
+`anthropic`, 2 `generic`**, and `generic` is filtered out entirely at `keysync.mjs:36`. So the
+happy path is: add two JSON entries, set one env var, run keysync. No code. That covers anything
+OpenAI-compatible, which is most of the market.
+
+### 8.2 Where it stops being config-only — four measured obstacles
+
+**(a) A new provider gets exactly one model.** Model discovery reads CCR's bundled `models.json`
+via `loadCatalog()`. A provider absent from that file returns `[]` from
+`catalog.byProvider.get(name)`, so the only row is the `testModel` injected at
+`menu/catalog.mjs:189-193` — with no context size, no capabilities, no pricing. This is the
+largest limit, and §7's recommendation (switch the candidate source to each provider's own
+authenticated listing) is the same fix.
+
+**(b) `KEY_CHOICES` is a hardcoded map in source** (`keysync/keysync.mjs:43-49`). Multi-key
+providers are tie-broken by name, deliberately rather than by timestamp — the reasoning is sound
+and recorded — but it is code, not data. A third multi-key provider is a source edit.
+
+**(c) `filterRegistry` carries hardcoded policy** (`:31-37`): a `/^sportsvector/i` bucket
+exclusion, `tier !== "management"`, `protocol !== "generic"`. Reasonable rules living in the
+wrong layer.
+
+**(d) A third wire protocol needs gateway support.** CCR delegates translation to
+`@the-next-ai/ai-gateway` — 43 providers on `openai_chat_completions`, 1 on
+`gemini_generate_content`, 1 `anthropic_messages` passthrough (report 18 §7). A provider speaking
+anything else is blocked upstream of UW entirely.
+
+### 8.3 The Anthropic path is different, and sharper
+
+Two distinct cases, and only one of them is the relay:
+
+- **The subscription itself** is a single relay provider on the `anthropic` protocol, authenticated
+  by OAuth through `apiKeyHelper`, not by an API key in the vault. Adding a *second* subscription
+  is not a vault operation at all.
+- **Anthropic resellers** (`tabiai`, `gorouter`, and any future one) take the ordinary `openai`
+  path — but they list bare Claude-shaped ids, which is exactly what `checkBareCollisions` exists
+  to police. That guard is a **fatal exit**, and it was hardened earlier in this work with a
+  `relayOwned` set whose vouching logic assumes a small curated id list.
+
+So **adding an Anthropic reseller can refuse to build**, and the failure is a hard stop rather than
+a warning. There is no documented path for it today. Phase B must supply one: what a user does when
+a legitimately-added reseller trips the guard, and how the guard distinguishes that from the hijack
+it was built to catch (report 08 F1).
+
+### 8.4 What phase B should deliver
+
+1. **An `add` command that does the whole thing.** Take a provider name, base URL and key; probe
+   the listing endpoint; confirm auth; discover models; pick and record a working `testModel`;
+   write both vault entries. The pieces already exist as one-off scripts
+   (`keysync/probe-account-endpoints.mjs`, `control-probe.mjs`, `key-health.mjs`) and as report
+   01's 7 call-shape clusters. Nothing here is new capability — it is assembly.
+2. **Detect the protocol rather than declaring it.** A probe distinguishes `openai` from
+   `anthropic` from unsupported; a hand-typed `protocol` field is a silent misconfiguration waiting
+   to happen.
+3. **Move `KEY_CHOICES` and `filterRegistry`'s rules into data.** A `preferred: true` flag on a
+   registry entry, and exclusion rules in config. Adding a provider should never require a source
+   edit.
+4. **Break the dependency on CCR's bundled catalogue** (obstacle (a)). A provider's own listing is
+   ground truth, over-reports by 2.4× against the catalogue's 7.7×, and costs one request. This is
+   the same change §7 recommends for candidate selection — one fix, two benefits.
+5. **A documented, tested path for adding an Anthropic reseller** past `checkBareCollisions`
+   (§8.3).
+6. **Verify on add, not on next keysync.** The user should learn immediately whether the key works,
+   which models answer, and what health class the provider is in (§4) — not discover it later
+   through a failed selection.
+
+### 8.5 Acceptance criteria
+
+Adding a provider is *reliable* when all of these hold:
+
+- One command, no source edit, no manual JSON.
+- The command fails loudly and specifically on a bad key, an unreachable host, or an unsupported
+  protocol — naming which, using the §4 classification.
+- A newly added provider appears in the picker with **real** context and capability metadata, not
+  a bare `testModel` row.
+- Adding a multi-key provider, or an Anthropic reseller, needs no code change and no guard
+  override.
+- Removing a provider is equally clean, and leaves no orphaned routing entry.
+
+---
+
+## 9. Open decisions for phase B
 
 1. **Where do provider health labels render?** The existing `health` column
    (`healthOf(prof)`) currently derives from static profile data, not probe results. Reuse it and
