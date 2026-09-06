@@ -9,7 +9,7 @@ import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
 // than at module top level -- the same requirement Task B8 places on
 // `checkProviderFloor`, and for the same reason. If importing run.mjs runs the
 // pipeline, that is the defect to fix, not a reason to test the guard indirectly.
-import { checkBareCollisions, deriveAnthropicSets, scopeNativePickerOptions,
+import { checkBareCollisions, deriveAnthropicSets, orderNativePickerOptions,
          ROUTING_MAX_STALENESS_MS, routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
@@ -957,7 +957,7 @@ test("a too-stale snapshot still feeds the GUARD, only routing is bounded", () =
   assert.equal(r.fatal, true, "the guard still considers the id and still fires");
 });
 
-// ---- decision 4: the native picker is scoped to the subscription rows -------
+// ---- decision 4 REVERSED: every built row is written, Anthropic first -------
 
 const ROW = (model, description) => (description ? { model, description } : { model });
 const FULL_BUILT = [
@@ -970,53 +970,53 @@ const FULL_BUILT = [
   ROW("tabiai/claude-opus-5", "free · tabitoken.com"),
 ];
 
-test("only the Anthropic rows are written to modelPicker.options", () => {
-  // THE SCOPING CHANGE. Live, this is 4 rows written instead of 87. A mutation
-  // that passes the full built set through -- the exact shape of the code this
-  // replaced -- fails here rather than silently shipping the old menu.
-  const out = scopeNativePickerOptions(FULL_BUILT);
+test("every built row is written to modelPicker.options, Anthropic first", () => {
+  // THE REVERSAL. The predecessor asserted 4 rows out of 7; a mutation that
+  // reinstates the filter fails here. The third-party half must also keep its
+  // INPUT relative order -- `Ato()` renders options[] in array order, and the
+  // build already sorts those rows (free-first, then catalogue rank).
+  const out = orderNativePickerOptions(FULL_BUILT);
+  assert.equal(out.length, FULL_BUILT.length);
   assert.deepEqual(out.map((r) => r.model), [
     "anthropic/claude-opus-5[1m]", "anthropic/claude-sonnet-5[1m]",
-    "anthropic/claude-haiku-4-5-20251001", "anthropic/claude-fable-5-1[1m]"]);
-  assert.equal(out.length, 4);
-  assert.equal(out.some((r) => r.model.startsWith("tabiai/")), false,
-    "a reseller's Claude-shaped row must not ride in on a loose prefix match");
+    "anthropic/claude-haiku-4-5-20251001", "anthropic/claude-fable-5-1[1m]",
+    "groq/openai/gpt-oss-20b", "mistral/mistral-small-latest", "tabiai/claude-opus-5"]);
+  assert.equal(out.slice(0, 4).every((r) => r.model.startsWith("anthropic/")), true);
+  assert.equal(out.slice(4).some((r) => r.model.startsWith("anthropic/")), false,
+    "a reseller's Claude-shaped row must not ride into the head on a loose prefix match");
 });
 
-test("scoping returns a NEW array and leaves the caller's rows exactly as built", () => {
-  // `built.picker` is read AFTER this by reconcileUserModelPin and by the
-  // ANCHOR_PREFERENCE search, so neither the input array nor any row in it may
-  // be touched -- and the returned array must be separate, so a later edit to
-  // the options list cannot reach back into the built set.
+test("ordering returns a NEW array and leaves the caller's rows exactly as built", () => {
+  // `built.picker` is read AFTER this by reconcileUserModelPin (run.mjs:842) and
+  // as `built.picker[0].model` (:681, the profile anchor), so neither the input
+  // array nor any row in it may be touched. This is the test that rejects the
+  // one-line in-place `sort` -- it would reorder the caller's array and silently
+  // repoint the anchor at whichever row landed at index 0.
   const before = JSON.parse(JSON.stringify(FULL_BUILT));
-  const out = scopeNativePickerOptions(FULL_BUILT);
+  const out = orderNativePickerOptions(FULL_BUILT);
   assert.deepEqual(FULL_BUILT, before, "the input array and its rows must be untouched");
   assert.notEqual(out, FULL_BUILT, "the result must not alias the input array");
-  assert.deepEqual(out.map((r) => r.description), Array(4).fill("subscription"),
-    "and no row picks up an annotation: there is no longer a note to append");
 });
 
-test("with the relay DOWN the full built set is written, never an empty options[]", () => {
-  // run.mjs verifies `modelPicker.options.length` after the write and throws --
-  // rolling settings.json back -- if it is zero. Scoping to zero Anthropic rows
-  // would turn "the relay is down" into "settings.json write failed", and leave
-  // the user with no native menu at all. A menu of reachable third-party rows
-  // beats no menu.
+test("with no Anthropic rows the input is returned unchanged and in order", () => {
+  // The relay-down case. It used to need a fallback because scoping to zero
+  // Anthropic rows wrote an empty options[], failing the post-write check at
+  // run.mjs:882-883 and rolling settings.json back. A partition has nothing to
+  // fall back from: one half is simply empty.
   const noRelay = FULL_BUILT.filter((r) => !r.model.startsWith("anthropic/"));
-  const out = scopeNativePickerOptions(noRelay);
-  assert.equal(out.length, noRelay.length);
+  const out = orderNativePickerOptions(noRelay);
   assert.deepEqual(out.map((r) => r.model), noRelay.map((r) => r.model));
 });
 
-test("the scoped rows and the routable providers are deliberately different sets", () => {
-  // Decision 4's actual claim, stated as an assertion: dropping 83 rows from the
-  // NATIVE menu is not dropping them from routing. CCR routes on Providers[],
-  // and uwpick (ctrl+g) reads its own catalogue snapshot -- it has never read
-  // modelPicker.options. If a future change makes the native menu the source of
-  // truth for reachability, this is the test that should stop it.
-  const out = scopeNativePickerOptions(FULL_BUILT);
+test("every built row reaches options[], because options[] is the only channel that can carry behavesAs", () => {
+  // The V7 property, asserted from this commit rather than deferred to T8's
+  // assertOptionsComplete. `options[]` is simultaneously the rendered /model list
+  // (`Ato()`) and the registry `_re()` reads `behavesAs` from, so a dropped row
+  // loses its capability declaration and `lH()` resolves the id to the MAXIMAL
+  // assumption set plus an unknown-model launch warning (report 18 §3). The test
+  // this replaces stopped a future un-scoping; this one stops a future
+  // re-scoping.
+  const out = orderNativePickerOptions(FULL_BUILT);
   const dropped = FULL_BUILT.filter((r) => !out.some((o) => o.model === r.model));
-  assert.equal(dropped.length, 3);
-  assert.deepEqual(dropped.map((r) => r.model).sort(),
-    ["groq/openai/gpt-oss-20b", "mistral/mistral-small-latest", "tabiai/claude-opus-5"]);
+  assert.deepEqual(dropped, []);
 });

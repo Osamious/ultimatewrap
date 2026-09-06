@@ -291,26 +291,43 @@ export function deriveAnthropicSets(liveIds, curatedIds = ANTHROPIC_FULL,
 }
 
 /**
- * What actually gets written to `settings.json`'s `modelPicker.options`.
+ * What actually gets written to `settings.json`'s `modelPicker.options`: every
+ * built row, Anthropic first.
  *
- * Decision 4: the native menu is repurposed to the Anthropic subscription rows
- * only. The other providers are NOT lost -- uwpick (ctrl+g) reads its own
- * catalogue snapshot and has never read modelPicker.options, and CCR routes on
- * `Providers[]`, which keeps all 44 either way.
+ * DECISION 4 REVERSED, 2026-09-06. The scoping this replaces kept only the
+ * Anthropic rows, on the belief that `options[]` was nothing but the rendered
+ * `/model` menu. Read from the binary (build 2.1.261) it does two jobs at once:
+ * `Ato()` renders the rows from it and `_re()` reads `behavesAs` from the same
+ * array, so it is also the only registry that can declare a capability profile
+ * for an arbitrary number of models. Dropping a row drops that model's
+ * declaration, and an id with no `behavesAs` resolves through `lH()` to the
+ * MAXIMAL assumption set -- every effort tier, adaptive thinking on, thinking
+ * un-disableable -- plus an unknown-model launch warning. Report 18 §3 measures
+ * that as strictly worse than any declared bucket, so the scoping was a silent
+ * capability regression on all 83 third-party rows.
  *
- * The relay-down case deliberately returns the full set instead of an empty
- * one: `options: []` would fail run.mjs's own post-write verification and leave
- * the user with no native menu at all, which is strictly worse than a menu of
- * reachable third-party rows.
+ * The partition is a DEFENSIVE INVARIANT, not a transformation: the unshift at
+ * :465 already puts the relay rows first and no vault provider may be named
+ * `anthropic`, so this is a no-op on today's data. It exists so "Anthropic
+ * first" is true where `options[]` is built rather than by an accident 400 lines
+ * upstream -- and `Ato()` iterates in array order, so that ordering is what
+ * keeps an 87-row menu usable.
+ *
+ * No relay-down fallback: nothing is filtered, so there is nothing to fall back
+ * from. The empty-`options[]` case that fallback guarded is still caught, by the
+ * post-write check at :882-883 throwing into the restore at :891.
  *
  * @param {{model: string, description?: string}[]} pickerRows  the full built set
  * @param {{relay?: string}} [opts]
- * @returns {object[]} new array; row objects are copied before mutation
+ * @returns {object[]} a NEW array holding the same row objects. Never sorts in
+ *   place: `built.picker` is read afterwards by reconcileUserModelPin (:842) and
+ *   as `built.picker[0].model` (:681), so a mutation here would silently repoint
+ *   the profile anchor.
  */
-export function scopeNativePickerOptions(pickerRows, { relay = ANTHROPIC_RELAY.name } = {}) {
+export function orderNativePickerOptions(pickerRows, { relay = ANTHROPIC_RELAY.name } = {}) {
   const rows = pickerRows ?? [];
-  const scoped = rows.filter((r) => String(r?.model ?? "").startsWith(`${relay}/`));
-  return scoped.length ? [...scoped] : [...rows];
+  const isRelay = (r) => String(r?.model ?? "").startsWith(`${relay}/`);
+  return [...rows.filter(isRelay), ...rows.filter((r) => !isRelay(r))];
 }
 
 // ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
@@ -829,16 +846,18 @@ if (!noProfileDone) {
   // `/model` persists the user's pick into this same file. Respect it while it
   // still points at a live row; clear it once stale so a pruned row cannot
   // leave them pinned to a model that no longer exists.
-  // THE FULL BUILT SET, NOT THE SCOPED PICKER ROWS -- verified, not assumed.
+  // THE FULL BUILT SET, NOT THE WRITTEN OPTIONS -- verified, not assumed.
   // `settings.model` is where Claude Code persists a /model pick, and uwpick
   // (ctrl+g) drives exactly that: cc-contract.mjs's modelCommand emits
-  // `/model <provider>/<id>` for ANY of the 44 providers. Since the write below
-  // narrows `modelPicker.options` to the Anthropic rows, checking the pin
-  // against that narrowed list would clear every uwpick-made pin on the next
-  // run -- deleting the user's default for a model that is still perfectly
-  // routable, because Providers[] still carries all 44. What this function is
-  // actually for is a pin naming a row that no longer EXISTS anywhere; the
-  // full built set is the right definition of "still exists".
+  // `/model <provider>/<id>` for ANY of the 44 providers.
+  // The original reason is now FALSE and is recorded so it is not re-derived:
+  // the write below used to narrow `modelPicker.options` to the Anthropic rows,
+  // so checking the pin against that narrowed list would have cleared every
+  // uwpick-made pin on the next run. Decision 4 was reversed, the two lists now
+  // hold the same models in a different order, and the argument that outlives
+  // the reversal is the one that was always the real one: the pin's question is
+  // EXISTENCE, and `built.picker` is that definition regardless of what the
+  // write below chooses to render.
   const pin = reconcileUserModelPin(settings, built.picker);
   if (pin.action === "kept") {
     console.log(`kept user's /model pin: ${pin.pinned}`);
@@ -853,27 +872,20 @@ if (!noProfileDone) {
   }
   if (pin.action === "cleared") console.log(`cleared stale /model pin "${pin.pinned}" (no longer a picker row)`);
 
-  // ---- the native picker is Anthropic-subscription-only (decision 4) --------
-  // The other 43 providers do NOT lose reachability: uwpick (ctrl+g) reads its
-  // own pre-built catalogue snapshot and has never read modelPicker.options at
-  // all, and `built.providers` -- what CCR actually routes on -- is untouched.
-  // What this drops is 83 rows of third-party noise from a flat native menu.
-  //
-  // WITH THE RELAY DOWN there are no Anthropic rows, and writing an empty
-  // options[] would fail the post-write verification below and leave the user
-  // with no native menu whatsoever. That case keeps today's full list: a menu of
-  // reachable third-party rows beats no menu.
+  // ---- the native picker carries every built row, Anthropic first ----------
+  // Decision 4 reversed; see orderNativePickerOptions for the binary read behind
+  // it. `options[]` is the only channel that can carry `behavesAs` for an
+  // arbitrary number of models, so the rows the old scoping dropped were losing a
+  // capability declaration rather than a menu slot.
   const anthropicRows = built.picker.filter((r) => r.model.startsWith(`${ANTHROPIC_RELAY.name}/`));
-  const optionRows = scopeNativePickerOptions(built.picker);
+  const optionRows = orderNativePickerOptions(built.picker);
   settings.modelPicker = {
     options: optionRows.map(({ contextTokens, ...row }) => row),
     replaceBuiltInOptions: true
   };
   console.log(`modelPicker: ${optionRows.length} row(s) written` +
-    (anthropicRows.length
-      ? ` (Anthropic subscription only; the other ${built.picker.length - anthropicRows.length} ` +
-        `rows stay reachable via uwpick / ctrl+g)`
-      : ` (relay down — full built set, no Anthropic rows to scope to)`));
+    ` (${anthropicRows.length} Anthropic subscription row(s) first, then ` +
+    `${optionRows.length - anthropicRows.length} third-party row(s) carrying behavesAs)`);
   // Temp + rename: a crash mid-write must not truncate the real settings file.
   atomicWriteJson(SETTINGS, settings);
 

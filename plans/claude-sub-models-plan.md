@@ -228,10 +228,11 @@ iterates `options[]` in array order, so render order is controllable. The menu l
 decision 4 objected to returns; it is the price of the declaration channel, and ordering keeps
 the rows that matter at the top.
 
-`scopeNativePickerOptions` in `keysync/run.mjs` and its relay-down fallback become an ordering
-function rather than a filter. Note the live `settings.json` still holds the pre-scoping 87 rows
-— keysync has not run `--target live` since commit `4151639`, so this reversal restores what is
-on disk today rather than changing it.
+**Built 2026-09-06.** `scopeNativePickerOptions` in `keysync/run.mjs` is now
+`orderNativePickerOptions`, a stable Anthropic-first partition returning a new array, and the
+relay-down fallback is gone — a partition has nothing to fall back from. Note the live
+`settings.json` still holds the pre-scoping 87 rows — keysync has not run `--target live` since
+commit `4151639`, so this reversal restores what is on disk today rather than changing it.
 
 ## Decided, not yet built — model-type filtering in the picker
 
