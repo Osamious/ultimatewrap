@@ -657,6 +657,72 @@ export function validate({ providers, picker }, expectedCount) {
     if (!p.api_key || typeof p.api_key !== "string") problems.push(`provider "${p.name}" has no api_key`);
   }
 
+  // ---- tier 1: the capability declarations ---------------------------------
+  // Subject = the BUILT set. Everything asserted here has its subject in scope
+  // at this point in the run; the two rules whose subject is the WRITTEN artifact
+  // live in run.mjs's assertOptionsComplete instead, because `options[]` does not
+  // exist until 350 lines below this function is called. Asserting an invariant
+  // where its subject does not yet exist is how a rule passes vacuously.
+  const targets = new Set(Object.values(BUCKET_TARGETS));
+
+  // V1 -- the table holds vetted targets, not typos. An allowlist rather than a
+  // denylist because a denylist passes `claude-sonnet-4-51` in silence, and
+  // silence is the failure mode this exists to prevent.
+  // V2 -- and no target may carry a model-specific prompt bundle.
+  for (const [bucket, target] of Object.entries(BUCKET_TARGETS)) {
+    if (!ALLOWED_BEHAVES_AS.includes(target)) {
+      problems.push(`bucket "${bucket}" target "${target}" is not in ALLOWED_BEHAVES_AS ` +
+        `— a vetted target, not a typo`);
+    }
+    if (PROMPT_BUNDLE_MODELS.test(target)) {
+      problems.push(`bucket target "${target}" carries a model-specific prompt bundle ` +
+        `(report 18 §10.3) and must never be inherited by a third-party model`);
+    }
+  }
+
+  // V6 -- THE WHOLE TABLE SHAPE, over all four keys, not one inequality.
+  // This is the canary for the failure that looks like success. `capable !== weak`
+  // guards one of the three ways the table can break: pointing `unknown` or
+  // `nonchat` at the capable target flips 38 or 4 rows back into over-declaration
+  // with that inequality still true and every other rule green.
+  if (BUCKET_TARGETS.capable === BUCKET_TARGETS.weak) {
+    problems.push(`BUCKET_TARGETS.capable and .weak name the same target ` +
+      `("${BUCKET_TARGETS.weak}"); the table would classify without declaring anything`);
+  }
+  for (const bucket of ["unknown", "nonchat"]) {
+    if (BUCKET_TARGETS[bucket] !== BUCKET_TARGETS.weak) {
+      problems.push(`BUCKET_TARGETS.${bucket} points at the capable target; only "capable" may`);
+    }
+  }
+
+  // V3 -- every non-relay row declares, and declares a table value.
+  // The relay rows are exempt BY CONSTRUCTION, not by oversight: they carry no
+  // `behavesAs` because Claude Code already knows those ids, so a declaration
+  // there would be borrowed from the model itself.
+  // V5 -- a non-chat row declares the WEAK target specifically. Inverted from an
+  // earlier draft that had it declare nothing: absence resolves through lH() to
+  // the maximal assumption set, which is the state this branch exists to remove.
+  const relayPrefix = `${ANTHROPIC_RELAY.name}/`;
+  for (const row of picker) {
+    if (row.model.startsWith(relayPrefix)) continue;
+    if (!row.behavesAs || !targets.has(row.behavesAs)) {
+      problems.push(`picker row "${row.model}" has behavesAs ` +
+        `${row.behavesAs ? `"${row.behavesAs}"` : "(none)"}, which is not a bucket target`);
+    } else if (row.kind === "nontext" && row.behavesAs !== BUCKET_TARGETS.weak) {
+      problems.push(`non-chat row "${row.model}" declares "${row.behavesAs}"; a non-chat row ` +
+        `must declare the weak target — omitting it resolves to the maximal assumption ` +
+        `set (report 18 §3)`);
+    }
+  }
+
+  // V4 -- `options[]` is a registry keyed by `model`, so a duplicate makes array
+  // order decide which declaration wins for that id. Report 19 §6.3.
+  const seenRows = new Set();
+  for (const row of picker) {
+    if (seenRows.has(row.model)) problems.push(`duplicate picker row "${row.model}"`);
+    seenRows.add(row.model);
+  }
+
   return problems;
 }
 

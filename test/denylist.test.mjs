@@ -14,7 +14,8 @@ import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
 // `checkProviderFloor`, and for the same reason. If importing run.mjs runs the
 // pipeline, that is the defect to fix, not a reason to test the guard indirectly.
 import { checkBareCollisions, deriveAnthropicSets, orderNativePickerOptions,
-         ROUTING_MAX_STALENESS_MS, routableCatalogIds } from "../keysync/run.mjs";
+         assertOptionsComplete, ROUTING_MAX_STALENESS_MS,
+         routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
   // Not a formality. Before the entry-point guard, run.mjs ran all 470 lines at
@@ -1414,4 +1415,142 @@ test("run.mjs strips both UW-side fields, so a written row keeps four keys", () 
   for (const row of written) {
     for (const k of Object.keys(row)) assert.ok(allowed.has(k), `unexpected key "${k}"`);
   }
+});
+
+// ---- T8: two-tier validation --------------------------------------------------
+//
+// Every rule asserts the MESSAGE names its reason, not merely that the problem
+// count rose. A validation channel whose output is "1 problem" is a channel the
+// next reader has to re-derive, which is how one stops being read.
+
+// A minimal, otherwise-valid built set, so each rule below fails alone.
+const OK_PROVIDERS = [{ name: "acme", provider: "acme", api_key: "x", models: ["m1"] }];
+const OK_ROW = (o) => ({ model: "acme/m1", label: "acme > m1",
+                         behavesAs: BUCKET_TARGETS.capable, kind: "text", ...o });
+
+test("a clean build produces NO problems, so every rule below fails alone", () => {
+  // The criterion an earlier revision made unsatisfiable by pointing tier 2 at
+  // the pre-strip array. If this test cannot pass, none of the others mean
+  // anything: they would only be measuring which failure fires first.
+  assert.deepEqual(validate({ providers: OK_PROVIDERS, picker: [OK_ROW()] }, 1), []);
+});
+
+test("V1/V2/V6: the table itself is validated, and the message names the bucket", () => {
+  // The table is a module constant, so it cannot be made wrong from a test
+  // without editing the source. What IS assertable is that the live table
+  // satisfies all three rules and that validate() actually reads it -- V1 over
+  // the allowlist, V2 over the prompt-bundle pattern, V6 over all four keys.
+  for (const [bucket, target] of Object.entries(BUCKET_TARGETS)) {
+    assert.ok(ALLOWED_BEHAVES_AS.includes(target), `${bucket} -> ${target} (V1)`);
+    assert.equal(PROMPT_BUNDLE_MODELS.test(target), false, `${bucket} -> ${target} (V2)`);
+  }
+  assert.notEqual(BUCKET_TARGETS.capable, BUCKET_TARGETS.weak);
+  assert.equal(BUCKET_TARGETS.unknown, BUCKET_TARGETS.weak);
+  assert.equal(BUCKET_TARGETS.nonchat, BUCKET_TARGETS.weak);
+  // ...and the table is frozen, which is what makes the above a property of the
+  // build rather than of the moment this test ran.
+  assert.equal(Object.isFrozen(BUCKET_TARGETS), true);
+  assert.equal(Object.isFrozen(ALLOWED_BEHAVES_AS), true);
+});
+
+test("V3: a non-relay row with no behavesAs is a problem that names the row", () => {
+  const picker = [OK_ROW({ behavesAs: undefined })];
+  const problems = validate({ providers: OK_PROVIDERS, picker }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /acme\/m1/);
+  assert.match(problems[0], /not a bucket target/);
+  // A target outside the table is the same failure with a different cause, and
+  // the message must say WHICH value it saw -- a typo is the case V1's allowlist
+  // exists for, and this is where a typo would actually surface.
+  const typo = validate({ providers: OK_PROVIDERS,
+    picker: [OK_ROW({ behavesAs: "claude-sonnet-4-51" })] }, 1);
+  assert.equal(typo.length, 1);
+  assert.match(typo[0], /claude-sonnet-4-51/);
+});
+
+test("V3: relay rows are exempt BY CONSTRUCTION, not by oversight", () => {
+  // The relay rows carry no behavesAs because Claude Code already knows those
+  // ids; a declaration there would be borrowed from the model itself. If this
+  // exemption were dropped, every healthy live run would fail validation.
+  const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       models: [...ANTHROPIC_RELAY.models] }];
+  const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
+  assert.deepEqual(validate({ providers, picker }, 1), []);
+});
+
+test("V4: a duplicate picker row is named, because options[] is keyed by model", () => {
+  const picker = [OK_ROW(), OK_ROW()];
+  const problems = validate({ providers: OK_PROVIDERS, picker }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /duplicate picker row "acme\/m1"/);
+});
+
+test("V5: a non-chat row declaring the capable target names the maximal-set reason", () => {
+  // Inverted from the draft that had non-chat rows declare nothing. The message
+  // has to carry WHY the weak target is required, or the next reader reads the
+  // rule as arbitrary and "fixes" it by omitting the declaration -- which is the
+  // maximal over-declaration, not the honest minimum.
+  const picker = [OK_ROW({ kind: "nontext", behavesAs: BUCKET_TARGETS.capable })];
+  const problems = validate({ providers: OK_PROVIDERS, picker }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /non-chat row "acme\/m1"/);
+  assert.match(problems[0], /maximal assumption set/);
+  // ...and the same row declaring the weak target is fine.
+  assert.deepEqual(validate({ providers: OK_PROVIDERS,
+    picker: [OK_ROW({ kind: "nontext", behavesAs: BUCKET_TARGETS.weak })] }, 1), []);
+});
+
+test("V7: a filtered options[] throws, naming the count and the first lost row", () => {
+  const built = [{ model: "anthropic/claude-opus-5" }, { model: "acme/m1" },
+                 { model: "acme/m2" }];
+  const scoped = built.filter((r) => r.model.startsWith("anthropic/"));
+  assert.throws(() => assertOptionsComplete(built, scoped), (e) => {
+    assert.match(e.message, /2 built row\(s\) did not reach modelPicker\.options/);
+    assert.match(e.message, /first: "acme\/m1"/);
+    assert.match(e.message, /only channel that can carry behavesAs/);
+    return true;
+  });
+});
+
+test("V8: a UW-side field surviving the strip throws, naming the key", () => {
+  const built = [{ model: "acme/m1" }];
+  assert.throws(() => assertOptionsComplete(built,
+    [{ model: "acme/m1", label: "x", behavesAs: "claude-sonnet-4-5", kind: "text" }]),
+    (e) => {
+      assert.match(e.message, /would write key "kind"/);
+      assert.match(e.message, /model, label\?, description\?, behavesAs\?/);
+      return true;
+    });
+  assert.throws(() => assertOptionsComplete(built,
+    [{ model: "acme/m1", contextTokens: 8192 }]), /would write key "contextTokens"/);
+});
+
+test("tier 2 returns normally on the array the write site really passes it", () => {
+  // The regression an earlier revision shipped: handing V8 `optionRows` instead
+  // of `settings.modelPicker.options` fires on EVERY row of EVERY clean build,
+  // throws into the catch that restores settings.json from backup, and rolls back
+  // a run that did nothing wrong. This drives both arrays through the real
+  // strip expression and asserts the correct one passes while the other does not.
+  const { chosen, vault, catalog } = capabilityFixture();
+  const built = buildProviders(chosen, vault, catalog, () => "k");
+  const optionRows = orderNativePickerOptions(built.picker);
+  const written = optionRows.map(({ contextTokens, kind, ...row }) => row);
+  assert.doesNotThrow(() => assertOptionsComplete(built.picker, written));
+  assert.throws(() => assertOptionsComplete(built.picker, optionRows),
+    /would write key "kind"/,
+    "the pre-strip array is the wrong argument, and this is what proves it");
+});
+
+test("the write site calls tier 2 on the post-strip array, after the assignment", () => {
+  // Asserted against the source: the call runs only under --target, which no test
+  // may drive. Order matters as much as the argument -- called before the
+  // assignment there would be nothing to pass.
+  const src = fs.readFileSync(new URL("../keysync/run.mjs", import.meta.url), "utf8");
+  const assign = src.indexOf("settings.modelPicker = {");
+  const call = src.indexOf("assertOptionsComplete(built.picker, settings.modelPicker.options)");
+  const write = src.indexOf("atomicWriteJson(SETTINGS, settings)");
+  assert.ok(assign > 0 && call > assign, "tier 2 runs after modelPicker is assigned");
+  assert.ok(write > call, "and before the file is written");
+  assert.equal(src.includes("assertOptionsComplete(built.picker, optionRows)"), false,
+    "optionRows is pre-strip; passing it fails V8 on every clean build");
 });

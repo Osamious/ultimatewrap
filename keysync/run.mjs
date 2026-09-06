@@ -330,6 +330,63 @@ export function orderNativePickerOptions(pickerRows, { relay = ANTHROPIC_RELAY.n
   return [...rows.filter(isRelay), ...rows.filter((r) => !isRelay(r))];
 }
 
+/**
+ * Tier 2 of validation: the rules whose subject is the WRITTEN artifact.
+ *
+ * `validate()` receives the built set and nothing else, 350 lines before
+ * `options[]` exists, so these two rules cannot live there -- an invariant
+ * asserted where its subject does not yet exist passes vacuously, which is the
+ * failure mode the whole two-tier split is against.
+ *
+ * ARGUMENT POSITION IS LOAD-BEARING AND EASY TO GET WRONG. `writtenOptions` must
+ * be the POST-strip array, i.e. `settings.modelPicker.options`, never the
+ * `optionRows` it was mapped from. `optionRows` still carries `contextTokens`
+ * and `kind`, so pointing V8 at it would report a schema violation on every row
+ * of every clean build, throw into the catch below and roll settings.json back
+ * from backup on a run that did nothing wrong. `model` survives the strip, so
+ * one array serves both rules.
+ *
+ * Throws rather than returning problems: `validate()`'s problems are collected
+ * before anything is written, while this runs with a half-merged settings.json
+ * on disk, and the existing catch restores it from backup. That restore IS the
+ * failure machinery; none is added here.
+ *
+ * WHAT THIS DOES AND DOES NOT BUY. It does not order T1 before T7 -- it is
+ * introduced after both, so at the moment a T7-without-T1 commit could exist
+ * this guard does not. What it does is make the reversal PERMANENT at the write
+ * site: a unit test on the ordering function cannot see a `.filter()` reintroduced
+ * here, 350 lines away, and that is the mutation this catches.
+ *
+ * @param {{model: string}[]} builtPicker      every row the build produced
+ * @param {object[]} writtenOptions            settings.modelPicker.options
+ */
+export function assertOptionsComplete(builtPicker, writtenOptions) {
+  const written = new Set((writtenOptions ?? []).map((r) => r.model));
+  // V7. `options[]` is simultaneously the rendered /model list and the only
+  // registry that can carry `behavesAs`, so a dropped row loses its capability
+  // declaration -- and an undeclared id resolves through lH() to the maximal
+  // assumption set plus an unknown-model launch warning, which report 18 §3
+  // measures as strictly worse than any declared bucket.
+  const missing = (builtPicker ?? []).filter((r) => !written.has(r.model));
+  if (missing.length) {
+    throw new Error(`${missing.length} built row(s) did not reach modelPicker.options ` +
+      `(first: "${missing[0].model}") — options[] is the only channel that can carry ` +
+      `behavesAs; lH() resolves a missing declaration to the maximal assumption set ` +
+      `(report 18 §3, OQ-1)`);
+  }
+  // V8. Claude Code's own zod definition of a row is exactly these four keys.
+  // A fifth is not merely ignored, and this is the rule that pins the strip.
+  const allowed = new Set(["model", "label", "description", "behavesAs"]);
+  for (const row of writtenOptions ?? []) {
+    for (const k of Object.keys(row)) {
+      if (!allowed.has(k)) {
+        throw new Error(`row "${row.model}" would write key "${k}", which is not in ` +
+          `Claude Code's row schema {model, label?, description?, behavesAs?}`);
+      }
+    }
+  }
+}
+
 // ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
 // writes built-rows.json, and on the dry path calls process.exit(0). Without
 // this check, `import { checkBareCollisions } from "./run.mjs"` would run all of
@@ -889,6 +946,9 @@ if (!noProfileDone) {
     options: optionRows.map(({ contextTokens, kind, ...row }) => row),
     replaceBuiltInOptions: true
   };
+  // Tier 2, on the array that is actually about to be written -- not on
+  // `optionRows`, which is pre-strip and would fail V8 on every clean build.
+  assertOptionsComplete(built.picker, settings.modelPicker.options);
   console.log(`modelPicker: ${optionRows.length} row(s) written` +
     ` (${anthropicRows.length} Anthropic subscription row(s) first, then ` +
     `${optionRows.length - anthropicRows.length} third-party row(s) carrying behavesAs)`);
