@@ -317,7 +317,10 @@ const hostOf = (u) => { try { return new URL(u).host; } catch { return ""; } };
 export const ANTHROPIC_FULL = Object.freeze([
   "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-fable-5-1"
 ]);
-const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
+// EXPORTED because checkBareCollisions must exempt these four from its realIds
+// narrowing, and a second copy of the list there would be free to drift from this
+// one -- which is the drift that produced the hole eeea057 opened.
+export const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
 
 // `[1m]`, on the PICKER list only -- never on `models`/`routing`.
 //

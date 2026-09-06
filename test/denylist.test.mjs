@@ -875,11 +875,66 @@ test("relayOwned NEVER grows with live data -- the invariant the guard rests on"
   // the same way, the relay would own every id the guard considers and its FATAL
   // path could never fire. relayOwned must stay curated-only, and must therefore
   // be a strict subset whenever live data adds anything.
-  const { routingIds, relayOwned } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
-  assert.deepEqual([...relayOwned].sort(), [...ANTHROPIC_FULL].sort());
-  assert.ok(relayOwned.size < routingIds.size,
-    "live data added ids, so the vouched set MUST be strictly smaller than the routed set");
-  for (const id of relayOwned) assert.equal(routingIds.has(id), true, "and a subset of it");
+  const { routingIds, relayOwned, relayAliases } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+
+  // Asserted as the INVARIANT, not as a literal set. The literal was
+  // ANTHROPIC_FULL until 2026-09-06, when the four static bare aliases had to
+  // join relayOwned -- without them the relay could not vouch for the ids it
+  // most certainly serves, and co-owning bare `opus` read as an unvouched sole
+  // owner and went FATAL on a merely-ambiguous config. The rule was never
+  // "curated only"; it is "nothing that came from LIVE data".
+  const vouchable = new Set([...ANTHROPIC_FULL, ...relayAliases]);
+  for (const id of relayOwned) {
+    assert.equal(vouchable.has(id), true,
+      `relayOwned gained "${id}", which is neither curated nor a static alias`);
+  }
+  for (const id of LIVE) {
+    if (ANTHROPIC_FULL.includes(id)) continue;
+    assert.equal(relayOwned.has(id), false,
+      `relayOwned absorbed the live id "${id}" -- the FATAL path is now unreachable`);
+  }
+  assert.ok(relayOwned.size < routingIds.size + relayAliases.length,
+    "live data added ids the relay does not vouch for");
+});
+
+test("the four bare aliases survive the realIds narrowing -- they are what CC actually sends", () => {
+  // THE REGRESSION TEST FOR A LIVE HIJACK HOLE, open from eeea057 to 2026-09-06.
+  // The narrowing's premise was "Claude Code never emits a name Anthropic has not
+  // published". False for precisely the four names it emits most: Anthropic's
+  // /v1/models lists dated ids and never bare aliases, and ANTHROPIC_RELAY.models
+  // is ANTHROPIC_FULL (dated), so realIds contains none of `opus`/`sonnet`/
+  // `haiku`/`fable`. All four were skipped before classification on every run
+  // where the catalogue resolved -- including from a stale cache, the normal path.
+  //
+  // INVISIBLE TO 412 TESTS because every existing alias test omitted `realIds`
+  // and so exercised the null path run.mjs never uses. This one passes the
+  // production shape, which is the only reason it can fail.
+  const liveIds = new Set([...ANTHROPIC_FULL, "claude-opus-4-8"]);
+  const realIds = new Set([...liveIds, ...ANTHROPIC_RELAY.models]);
+  const { relayOwned, routingIds, relayAliases } = deriveAnthropicSets(liveIds, ANTHROPIC_FULL);
+
+  assert.equal(realIds.has("opus"), false,
+    "the premise: realIds genuinely does not contain the bare aliases");
+
+  const hostile = checkBareCollisions([{ name: "tokenrouter", models: ["opus"] }],
+    { realIds, relayOwned });
+  assert.equal(hostile.fatal, true,
+    "a reseller sole-owning bare opus with the relay down is report 08 F1 itself");
+  assert.match(hostile.message, /opus/);
+
+  // ...and the relay co-owning it is still merely ambiguous, not a hijack:
+  // CCR's resolve() returns undefined on a two-owner bare name rather than
+  // binding either host.
+  const shared = checkBareCollisions(
+    [{ name: "tokenrouter", models: ["opus"] },
+     { name: "anthropic", models: [...routingIds, ...relayAliases] }],
+    { realIds, relayOwned });
+  assert.equal(shared.fatal, false, "co-owned is shadowed, not fatal");
+
+  // The narrowing still does its own job: a reseller invention is not a threat.
+  const invented = checkBareCollisions([{ name: "tabiai", models: ["claude-opus-5-thinking"] }],
+    { realIds, relayOwned });
+  assert.equal(invented.fatal, false, "the narrowing must survive the alias exemption");
 });
 
 test("the relay's provider name is reserved, and the message says what breaks", () => {
@@ -952,10 +1007,16 @@ test("a null catalog falls back to the curated set for routing AND the picker", 
   // An unreachable relay is not evidence about anything. Four reviewed rows is
   // the right degradation; zero rows would fail the post-write verification and
   // an empty routing set would remove Claude from Claude Code entirely.
-  const { routingIds, relayOwned, pickerIds } = deriveAnthropicSets(null, ANTHROPIC_FULL);
+  const { routingIds, relayOwned, pickerIds, relayAliases } =
+    deriveAnthropicSets(null, ANTHROPIC_FULL);
   assert.deepEqual([...routingIds].sort(), [...ANTHROPIC_FULL].sort());
   assert.deepEqual([...pickerIds], [...ANTHROPIC_FULL]);
-  assert.deepEqual([...relayOwned].sort(), [...ANTHROPIC_FULL].sort());
+  // Vouched = curated PLUS the static aliases. The aliases are hardcoded, so
+  // they are available to vouch even with the relay unreachable -- which is the
+  // case that matters, since a reseller sole-owning bare `opus` while the relay
+  // is down is the hijack this guard exists for.
+  assert.deepEqual([...relayOwned].sort(),
+    [...ANTHROPIC_FULL, ...relayAliases].sort());
 });
 
 test("relayAliases stays exactly the bare aliases, however routingIds grows", () => {

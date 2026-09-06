@@ -18,7 +18,7 @@ import {
   loadVault, filterRegistry, chooseKeys, loadCatalog, buildProviders,
   validate, stripOneMSuffix, reconcileUserModelPin, KEY_CHOICES, ANCHOR_PREFERENCE,
   ANTHROPIC_RELAY, ANTHROPIC_TIERS, ANTHROPIC_FULL, ANTHROPIC_FALLBACK_TAGS,
-  buildAnthropicPickerRows
+  ANTHROPIC_ALIASES, buildAnthropicPickerRows
 } from "./keysync.mjs";
 import {
   snapshotConfigDb, deleteStaleWifToken, retainOnSuccess, capFailedSnapshots,
@@ -108,7 +108,22 @@ export function checkBareCollisions(providers, {
       // under-flag; silently rejecting all of them would refuse the escape
       // hatch this guard exists to preserve. RESERVED alone, unchanged, is what
       // shipped before this task and is the safe default when unverifiable.
-      if (realIds !== null && !realIds.has(id)) continue;
+      //
+      // THE ALIASES ARE EXEMPT, and leaving them out was a live hijack hole from
+      // eeea057 until 2026-09-06. The premise above -- "Claude Code never emits a
+      // name Anthropic has not published" -- is false for exactly the four names
+      // Claude Code emits MOST: `opus`, `sonnet`, `haiku`, `fable`. Anthropic's
+      // /v1/models lists dated ids and never bare aliases, and ANTHROPIC_RELAY
+      // .models is ANTHROPIC_FULL (dated), so realIds contains none of the four.
+      // Every one was `continue`d before classification whenever the catalogue
+      // resolved at all -- including from a stale cache, which is the normal path.
+      //
+      // MEASURED with production-shaped arguments: a reseller sole-owning bare
+      // `opus` with the relay down returned {fatal: false, hijackable: 0,
+      // "no bare Claude-shaped collisions"}. That is report 08 F1 in its purest
+      // form, reported as safe. Invisible to all 412 tests because none of them
+      // passed `realIds` -- they exercised the null path that run.mjs never uses.
+      if (realIds !== null && !ANTHROPIC_ALIASES.includes(id) && !realIds.has(id)) continue;
       if (!byBare.has(id)) byBare.set(id, new Set());
       byBare.get(id).add(p.name);
     }
@@ -275,18 +290,29 @@ export function deriveAnthropicSets(liveIds, curatedIds = ANTHROPIC_FULL,
   // Auto-add. A live id joins routing on its own: this is our own authenticated
   // relay, and a picker row that is shown must actually route.
   const routingIds = liveIds ? new Set([...liveIds, ...curated]) : new Set(curated);
+  // The bare aliases (`opus`, ...) the relay co-owns so a third party cannot
+  // sole-own them. Computed as "in the static routing list but not a model id",
+  // so it stays correct however routingIds grows.
+  const relayAliases = (aliasList ?? []).filter((id) => !routingIds.has(id));
   return {
     routingIds,
-    // NEVER unioned with live data. See checkBareCollisions' vouching block.
-    relayOwned: new Set(curated),
+    // NEVER unioned with LIVE data -- that is what would let auto-add launder a
+    // real hijack into an accepted ambiguity.
+    //
+    // The aliases ARE included, and must be. They are static and hardcoded, so
+    // they are exactly as curated as ANTHROPIC_FULL and carry none of the live-
+    // data risk the rule above exists for. Omitting them made the relay unable
+    // to vouch for the four ids it most certainly serves: with the relay UP and
+    // co-owning bare `opus`, the guard read the reseller as an unvouched sole
+    // owner and went FATAL on a configuration that is merely ambiguous --
+    // CCR's resolve() returns undefined on a two-owner bare name rather than
+    // binding either, which is the `shadowed` case, not the hijack case.
+    relayOwned: new Set([...curated, ...relayAliases]),
     // Decision 3, reversed: the native menu shows every live id, not the
     // curated four. Falls back to curated only when there is no usable live
     // data at all -- showing four reviewed rows beats showing none.
     pickerIds: liveIds ? [...liveIds] : [...curated],
-    // The bare aliases (`opus`, ...) the relay co-owns so a third party cannot
-    // sole-own them. Computed as "in the static routing list but not a model
-    // id", so it stays correct however routingIds grows.
-    relayAliases: (aliasList ?? []).filter((id) => !routingIds.has(id)),
+    relayAliases,
   };
 }
 
@@ -361,8 +387,15 @@ export function assertRelayNameUnclaimed(providers, relayName = ANTHROPIC_RELAY.
  * @param {readonly string[]} [curated]
  */
 export function assertVouchedSetIsNarrower(relayOwned, routingIds, liveIds,
-                                           curated = ANTHROPIC_FULL) {
-  const curatedSet = new Set(curated);
+                                           curated = ANTHROPIC_FULL,
+                                           aliases = ANTHROPIC_ALIASES) {
+  // The vouchable set is curated ids PLUS the static bare aliases. Both are
+  // hardcoded; neither can come from a provider. The rule this enforces is not
+  // "curated only" -- it is "nothing that arrived as LIVE data" -- and the
+  // aliases had to join it on 2026-09-06, because without them the relay could
+  // not vouch for `opus`/`sonnet`/`haiku`/`fable`, the four ids it most
+  // certainly serves and the four Claude Code actually sends.
+  const curatedSet = new Set([...curated, ...aliases]);
   const grew = [...relayOwned].filter((id) => !curatedSet.has(id));
   if (grew.length) {
     throw new Error(`internal: relayOwned grew beyond the curated set ` +
@@ -371,10 +404,14 @@ export function assertVouchedSetIsNarrower(relayOwned, routingIds, liveIds,
       `structurally unreachable, exactly as it did before this guard existed`);
   }
   const liveOnly = liveIds ? [...liveIds].filter((id) => !curatedSet.has(id)) : [];
-  if (liveOnly.length && routingIds.size <= relayOwned.size) {
+  // Compared against the vouched set MINUS the aliases: the aliases are never in
+  // routingIds by construction (relayAliases is "in the routing list but not a
+  // model id"), so counting them here would make routing look smaller than it is.
+  const vouchedModelIds = [...relayOwned].filter((id) => !aliases.includes(id)).length;
+  if (liveOnly.length && routingIds.size <= vouchedModelIds) {
     throw new Error(`internal: live data supplied ${liveOnly.length} id(s) outside the ` +
       `curated set but routing did not grow (routing ${routingIds.size} <= vouched ` +
-      `${relayOwned.size}) — the picker would advertise rows CCR will not route`);
+      `${vouchedModelIds}) — the picker would advertise rows CCR will not route`);
   }
 }
 
