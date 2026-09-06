@@ -129,6 +129,15 @@ test("outputKind blocks only on a positive non-text signal", () => {
   assert.equal(outputKind({ capabilities: {} }), null);
   assert.equal(outputKind({ modalities: {} }), null);
   assert.equal(outputKind(undefined), null);
+  // An EMPTY array is the same absence of signal as a missing field, and it is
+  // the one shape where "not text" and "no evidence" are easy to conflate. The
+  // cost of getting it wrong is not just a dim row: an unselectable model has
+  // its pin dropped from recents and favourites at initState, so a single empty
+  // upstream field would delete a user's saved selection. isTextOut in
+  // menu/catalog.mjs already reads this shape as text; the two must agree.
+  assert.equal(outputKind({ modalities: { output: [] } }), null);
+  assert.equal(isTextOut({ modalities: { output: [] } }), true,
+    "the two lanes must not disagree about the empty array");
 
   // The measured miss, asserted so it is a recorded decision rather than a gap:
   // nvidia/bge-m3 is an embedding model the catalogue declares output ["text"].

@@ -124,7 +124,15 @@ export function inferTier(entry) {
  */
 export function outputKind(entry) {
   const out = entry?.modalities?.output;
-  if (!Array.isArray(out)) return null;
+  // An EMPTY array is absence of signal, exactly like a missing field, and the
+  // doc above binds this function to answer `null` for absence. Falling through
+  // returned "nontext" -- a positive claim built from no evidence -- which made
+  // the row unselectable AND silently deleted its pin from recents and
+  // favourites at initState (menu/pick-state.mjs's `known` set). A user-visible
+  // deletion triggered by an empty upstream field. menu/catalog.mjs's isTextOut
+  // already treats the same shape as text; this is the two agreeing.
+  // MEASURED 2026-09-06: 0 of 4,298 catalogue entries, so latent, not live.
+  if (!Array.isArray(out) || out.length === 0) return null;
   if (out.includes("embedding") || out.includes("score")) return "nontext";
   return out.includes("text") ? "text" : "nontext";
 }
