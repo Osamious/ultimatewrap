@@ -191,6 +191,19 @@ Also folding in, from the same two reviews, independent of the above:
 - The new-models state file write should not precede the guard's fatal-exit check in a way
   that leaves a stale/wrong banner advertising a rejected configuration.
 
+## Decided, not yet built — model-type filtering in the picker
+
+Decided 2026-09-06, alongside the `behavesAs` bucketing work (context/compaction work parked
+separately). Add a "model type" field to UW's catalogue (chat / image / audio / embedding /
+etc.). In `uwpick.mjs`, non-chat rows are shown (never hidden — matches this project's own
+"never silently hide" stance) but greyed out and skipped by the row selector, reusing the
+existing "routable dimming" UI pattern already designed for a different reason (not
+currently reachable). Effect: a non-chat row can never become the active model, which also
+makes the `behavesAs`-for-non-chat-models question moot — no capability profile needs to be
+chosen for a row nobody can select. Default when type is genuinely unknown (catalogue
+coverage will have gaps, same as context data does): SELECTABLE, not blocked — wrongly hiding
+a real chat model is worse than occasionally letting an ambiguous one through.
+
 ## Explicitly out of scope for this branch
 
 - The `behavesAs: claude-sonnet-4-6` 83-row over-declaration issue (separate, unaffected).
