@@ -72,7 +72,26 @@ export function checkBareCollisions(providers, {
   relay = ANTHROPIC_RELAY.name, allowBare = false, realIds = null,
   relayOwned = null, relayRouting = null,
 } = {}) {
-  const byBare = new Map();
+  // WHAT EACH PROVIDER ADVERTISES, TRIMMED. Ownership is NOT keyed on these --
+  // see the selector set below. This is only the raw material both match stages
+  // read, and it is trimmed because `providerModelMatches` does `let a = s.trim()`
+  // before it compares: the trimmed form is the one CCR actually matches on, so
+  // it is the only form a faithful guard may hold.
+  //
+  // THE TRIM HAS A SECOND EFFECT, AND IT IS A GATING ONE. RESERVED is anchored
+  // (`/^(claude|opus|...)([-._\d\/]|$)/i`), and the trim runs BEFORE it, so it
+  // changes WHICH IDS ARE ADMITTED to the guard at all -- not merely how an
+  // admitted id matches. `" opus"` was invisible here and is now classified;
+  // `"claude-opus-5 "` and `"claude-opus-5"` were two distinct keys and are now
+  // one. Both are the FAITHFUL readings, since CCR compares the trimmed forms,
+  // but this is a behaviour change on the `realIds === null` branch as well as
+  // the narrowed one, and stating only the matching fidelity while leaving the
+  // gating effect unsaid is this file's named failure mode.
+  //
+  // NOT LIVE TODAY: `admitId(" opus")` returns null, because the allowlist
+  // anchors on an alphanumeric, so no such id reaches the built config. It goes
+  // live the moment R2 inverts that allowlist to a denylist.
+  const advertised = [];
   for (const p of providers ?? []) {
     // CCR's own gate. `providerModelMatches` checks the provider is enabled before
     // it looks at any id, so a disabled co-owner does not count towards ownership
@@ -80,10 +99,16 @@ export function checkBareCollisions(providers, {
     // sees exactly one match and binds. Always true in today's generated config,
     // so this is a latent divergence rather than a live one.
     if (p.enabled === false) continue;
+    // AN ARRAY, NOT A SET, AND THAT IS LOAD-BEARING. `providerModelMatches`
+    // pushes once per matching entry of `i.models`, so a provider listing the
+    // same id twice -- byte-identically, or as `Opus` and `OPUS` -- produces two
+    // matches and `resolve()` returns undefined. De-duplicating here would hide
+    // the second entry and report a sole owner CCR never binds.
+    const ids = [];
     for (const m of p.models ?? []) {
       // Accepts both shapes deliberately: the built config carries `models` as a
       // string[], while the guard's own tests inject `{id}` objects.
-      const id = String(m?.id ?? m ?? "");
+      const id = String(m?.id ?? m ?? "").trim();
       // An id that already carries a `/` is vendor-prefixed and is not what
       // Claude Code sends for a built-in row, so it cannot be the stage-4 match.
       // tokenharbor lists exactly this shape; treating it as hijackable would
@@ -94,39 +119,104 @@ export function checkBareCollisions(providers, {
       // its boundary class was narrower than the denylist's, so `sonnet.1` and
       // `haiku_2` were reserved by one definition and invisible to the other.
       if (!RESERVED.test(id)) continue;
-      // NARROWING (BACKLOG item 2). RESERVED asks "is this Claude-SHAPED"; the
-      // guard's actual concern is "could Claude Code send this bare and bind it
-      // to the wrong host", which only a REAL Anthropic id can ever trigger --
-      // Claude Code never emits a name Anthropic has not published. Without
-      // this, `claude-opus-5-thinking` (a reseller invention; extended thinking
-      // is a request parameter, not a model) reads as hijackable at tabiai and
-      // gorouter for a threat that cannot reach it.
-      //
-      // realIds === null means "could not be determined" (relay unreachable,
-      // no cache) -- fall back to the OLD broad behaviour rather than either
-      // extreme. Silently trusting every RESERVED id when uncertain would
-      // under-flag; silently rejecting all of them would refuse the escape
-      // hatch this guard exists to preserve. RESERVED alone, unchanged, is what
-      // shipped before this task and is the safe default when unverifiable.
-      //
-      // THE ALIASES ARE EXEMPT, and leaving them out was a live hijack hole from
-      // eeea057 until 2026-09-06. The premise above -- "Claude Code never emits a
-      // name Anthropic has not published" -- is false for exactly the four names
-      // Claude Code emits MOST: `opus`, `sonnet`, `haiku`, `fable`. Anthropic's
-      // /v1/models lists dated ids and never bare aliases, and ANTHROPIC_RELAY
-      // .models is ANTHROPIC_FULL (dated), so realIds contains none of the four.
-      // Every one was `continue`d before classification whenever the catalogue
-      // resolved at all -- including from a stale cache, which is the normal path.
-      //
-      // MEASURED with production-shaped arguments: a reseller sole-owning bare
-      // `opus` with the relay down returned {fatal: false, hijackable: 0,
-      // "no bare Claude-shaped collisions"}. That is report 08 F1 in its purest
-      // form, reported as safe. Invisible to all 412 tests because none of them
-      // passed `realIds` -- they exercised the null path that run.mjs never uses.
-      if (realIds !== null && !ANTHROPIC_ALIASES.includes(id) && !realIds.has(id)) continue;
-      if (!byBare.has(id)) byBare.set(id, new Set());
-      byBare.get(id).add(p.name);
+      ids.push(id);
     }
+    if (ids.length) advertised.push({ name: p.name, ids });
+  }
+
+  // THE SELECTOR SET -- the strings Claude Code can actually SEND. Ownership is
+  // keyed on these, never on the advertised spelling, and that inversion IS the
+  // #53 fix.
+  //
+  // NARROWING (BACKLOG item 2). RESERVED asks "is this Claude-SHAPED"; the
+  // guard's actual concern is "could Claude Code send this bare and bind it
+  // to the wrong host", which only a REAL Anthropic id can ever trigger --
+  // Claude Code never emits a name Anthropic has not published. Without
+  // this, `claude-opus-5-thinking` (a reseller invention; extended thinking
+  // is a request parameter, not a model) reads as hijackable at tabiai and
+  // gorouter for a threat that cannot reach it.
+  //
+  // realIds === null means "could not be determined" (relay unreachable,
+  // no cache) -- fall back to the OLD broad behaviour rather than either
+  // extreme. Silently trusting every RESERVED id when uncertain would
+  // under-flag; silently rejecting all of them would refuse the escape
+  // hatch this guard exists to preserve. RESERVED alone is the safe default
+  // when unverifiable -- though NOT bit-for-bit what shipped before this task:
+  // RESERVED now tests the TRIMMED string, so this branch admits `" opus"` and
+  // merges `"claude-opus-5 "` with `"claude-opus-5"` where it previously did
+  // neither. See the gating note at the trim. R6 replaces the SELECTOR SOURCE of
+  // this branch (with ANTHROPIC_FULL) and leaves that trim in place.
+  //
+  // THE ALIASES ARE EXEMPT, and leaving them out was a live hijack hole from
+  // eeea057 until 2026-09-06. The premise above -- "Claude Code never emits a
+  // name Anthropic has not published" -- is false for exactly the four names
+  // Claude Code emits MOST: `opus`, `sonnet`, `haiku`, `fable`. Anthropic's
+  // /v1/models lists dated ids and never bare aliases, and ANTHROPIC_RELAY
+  // .models is ANTHROPIC_FULL (dated), so realIds contains none of the four.
+  // Every one was `continue`d before classification whenever the catalogue
+  // resolved at all -- including from a stale cache, which is the normal path.
+  //
+  // MEASURED with production-shaped arguments: a reseller sole-owning bare
+  // `opus` with the relay down returned {fatal: false, hijackable: 0,
+  // "no bare Claude-shaped collisions"}. That is report 08 F1 in its purest
+  // form, reported as safe. Invisible to all 412 tests because none of them
+  // passed `realIds` -- they exercised the null path that run.mjs never uses.
+  //
+  // #53: THE NARROWING USED TO FILTER THE ADVERTISED STRING, and did it with
+  // strict equality -- `ANTHROPIC_ALIASES.includes(id)` and `realIds.has(id)`.
+  // Anthropic publishes lowercase, so a reseller advertising `Opus` was dropped
+  // before classification while CCR bound to it. The set below is instead the
+  // set of selectors, which is where case-insensitivity belongs: `Opus` is not
+  // a selector, it is one provider's spelling OF the selector `opus`.
+  //
+  // The `.trim()` here is the SELECTOR side of the pair, and unlike the
+  // advertised side it is DEFENSIVE, NOT MUTATION-CHECKED -- stated rather than
+  // implied, because a comment that lets an unverified line read as a verified
+  // one is the failure this file has a standing rule against. The selector
+  // normalizer trims too (`Qe` in @musistudio/claude-code-router@3.0.22,
+  // dist/main/cli.js, `let t=e?.trim()` -- cited by minified name AND version
+  // because that name is an allocation-order artifact one `npm i` can rename),
+  // so this is faithful. But no PRODUCTION-SHAPED fixture can kill it: neither
+  // ANTHROPIC_ALIASES nor a `realIds` built at the call site below (live
+  // /v1/models u ANTHROPIC_FULL) can carry whitespace. A hand-built
+  // `realIds: new Set([" claude-opus-5 "])` does kill it. It guards only the
+  // case where Anthropic's own API returns a padded id.
+  const selectors = realIds !== null
+    ? new Set([...ANTHROPIC_ALIASES, ...realIds].map((s) => String(s).trim()))
+    : new Set(advertised.flatMap((a) => [...a.ids]));
+
+  // OWNERSHIP THE WAY `resolve()` COMPUTES IT: the exact match list, and the
+  // case-folded list IF AND ONLY IF exact is empty. Both stages, in that order.
+  //
+  // WHAT IS COUNTED IS MATCHING ENTRIES, NOT PROVIDERS. `providerModelMatches`
+  // (`Qe`'s callee in @musistudio/claude-code-router@3.0.22, dist/main/cli.js;
+  // readable source VENDORED, not a repo-root path:
+  // spike/research/ccr-scratch/claude-code-router-main/packages/core/src/routing/
+  // model-registry.ts:103-118, same 3.0.22 -- source-vs-built, not version skew)
+  // pushes
+  // inside its `for (let s of i.models)` loop, and `resolve()` returns undefined
+  // when that list has length > 1. So ONE provider advertising `Opus` and `OPUS`
+  // is two matches and binds NOTHING, and a name-keyed accumulator that collapsed
+  // them into one owner would report a FATAL sole claim against a config CCR
+  // refuses to route. Hence a list of names, one per matching entry, deduplicated
+  // only when a message is rendered.
+  //
+  // ORDERING. `exact` is always a SUBSET of the fold -- `id === sel` implies
+  // `id.toLowerCase() === sel.toLowerCase()` -- so the two stages can never name
+  // disjoint owners, and fold-empty implies exact-empty. What the ordering buys
+  // is therefore a COUNT, and through it a verdict: with `tabiai:Opus` and
+  // `gorouter:opus` the exact stage finds one entry and CCR binds gorouter
+  // (FATAL), while the fold finds two and would report a safe ambiguity. Because
+  // the fold contains the exact set, `fold.length ? fold : exact` reduces to
+  // plain `fold`: running the fold first and dropping the exact stage entirely
+  // are THE SAME PROGRAM, not two mutations.
+  const matchingEntries = (match) =>
+    advertised.flatMap((a) => a.ids.filter(match).map(() => a.name));
+  const byBare = new Map();
+  for (const sel of selectors) {
+    const folded = sel.toLowerCase();
+    const exact = matchingEntries((id) => id === sel);
+    byBare.set(sel, exact.length ? exact : matchingEntries((id) => id.toLowerCase() === folded));
   }
 
   // VOUCHING vs MERELY ROUTING. This distinction is the whole of the fix for a
@@ -137,8 +227,10 @@ export function checkBareCollisions(providers, {
   // Routing auto-add (a live /v1/models id joins Providers[].models on its own)
   // meant the relay came to own every id `realIds` even considers, since both
   // reduce to `liveCatalog.ids u ANTHROPIC_FULL`. The test below is
-  // `owners.size === 1 && !owners.has(relay)`, so with the relay owning
-  // everything the FATAL path became STRUCTURALLY UNREACHABLE. Measured against
+  // `effective.length === 1 && effective[0] !== relay` -- on the STRIPPED list,
+  // not on `owners`, which stays unstripped precisely so the message can render
+  // the true co-owners -- so with the relay owning everything the FATAL path
+  // became STRUCTURALLY UNREACHABLE. Measured against
   // live data: `claude-opus-4-8` is served by the relay and also listed by
   // tabiai and gorouter, and it went from FATAL to a silent informational note.
   //
@@ -151,22 +243,33 @@ export function checkBareCollisions(providers, {
   const vouched = (id) => relayOwned === null || relayOwned.has(id);
   const hijackable = [], shadowed = [];
   for (const [id, owners] of byBare) {
-    const relayRoutes = owners.has(relay);
-    const effective = vouched(id) ? owners : new Set([...owners].filter((o) => o !== relay));
-    // Only the relay serves this id -- nothing to protect against. Redundant
-    // against the two branches below as they are written today (size 0 matches
-    // neither), and MUTATION-CHECKED as such: removing it changes no test.
-    // Kept because it states the rule, and because an edit that turns the pair
-    // below into an if/else chain would otherwise silently start classifying
-    // an empty owner set.
-    if (effective.size === 0) continue;
-    if (effective.size === 1 && !effective.has(relay)) {
-      hijackable.push({ id, owner: [...effective][0], relayRoutes });
-    } else if (effective.size > 1) {
+    const relayRoutes = owners.includes(relay);
+    const effective = vouched(id) ? owners : owners.filter((o) => o !== relay);
+    // NOTHING TO PROTECT AGAINST. Two ways to land here, and under #53's
+    // selector-keyed ownership the first is now THE COMMON CASE rather than a
+    // redundant one: every selector in the classification set that no enabled
+    // provider advertises -- most of `ANTHROPIC_ALIASES u realIds` in a typical
+    // config -- reaches this line with no matching entries. (The second way is
+    // the original one: the relay was the sole owner and stripping emptied the
+    // list.) The two branches below still both fail on length 0, so this
+    // `continue` remains behaviourally redundant against them AS THEY ARE
+    // WRITTEN; what is no longer true is the old comment's implication that
+    // reaching it is rare. Kept because it states the rule, and because an edit
+    // that turns the pair below into an if/else chain would otherwise silently
+    // start classifying an empty owner list.
+    if (effective.length === 0) continue;
+    if (effective.length === 1 && effective[0] !== relay) {
+      hijackable.push({ id, owner: effective[0], relayRoutes });
+    } else if (effective.length > 1) {
       // The TRUE owner list is reported, relay included. Classification must not
       // count the relay here, but a message that hides a real co-owner would be
       // describing a config the operator does not have.
-      shadowed.push({ id, owners: [...owners].sort() });
+      //
+      // DEDUPLICATED ONLY HERE, at render. Ownership above counts entries, so a
+      // single provider advertising `Opus` and `OPUS` arrives as two entries and
+      // must be reported once -- the operator has one provider to look at, not
+      // two. The COUNT is what decided the verdict; the NAMES are what is shown.
+      shadowed.push({ id, owners: [...new Set(owners)].sort() });
     }
   }
   hijackable.sort((a, b) => a.id.localeCompare(b.id));
@@ -221,7 +324,11 @@ export function checkBareCollisions(providers, {
       `deliberately.`;
   } else if (shadowed.length) {
     message =
-      `note: bare Claude-shaped id(s) with more than one owner -- ` +
+      // "MATCH", not "owner": under entry-counting ownership a single provider
+      // listing `Opus` and `OPUS` lands here with one name in the list, and
+      // "more than one owner" in front of one name is the confident-wrong
+      // message this file has a standing rule against.
+      `note: bare Claude-shaped id(s) with more than one match -- ` +
       `${shadowed.map((s) => `${s.id} (${s.owners.join(", ")})`).join("; ")}. ` +
       `resolve() returns undefined on an ambiguous match, so this is a clean ` +
       `failure, not a misroute.`;

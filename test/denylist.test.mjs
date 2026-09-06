@@ -535,6 +535,165 @@ test("realIds narrows both hijackable AND shadowed classification", () => {
   assert.deepEqual(r.shadowed, []);
 });
 
+// ---- #53: the guard must model resolve()'s TWO-STAGE match -----------------
+// The narrowing above filtered the ADVERTISED string with strict equality
+// (`ANTHROPIC_ALIASES.includes(id)`, `realIds.has(id)`). Anthropic publishes
+// lowercase, so a reseller advertising `Opus` was dropped before classification
+// while CCR bound to it: `providerModelMatches` compares case-INSENSITIVELY
+// once its exact stage finds nothing, and both sides are `.trim()`ed.
+//
+// The fix keys ownership on the SELECTOR (what Claude Code can send), not on
+// the advertised spelling, and computes owners the way resolve() does: exact
+// first, case-fold only if exact is empty.
+
+// Production shape, modelling the `realIds` the run builds at its
+// `checkBareCollisions` call site -- `liveCatalog.ids u ANTHROPIC_RELAY.models`.
+// (Cited by symbol on purpose: a line number here goes stale in the same commit
+// that adds it.) The load-bearing property is that it contains NO bare alias:
+// Anthropic's /v1/models lists dated ids only, so `opus` reaches the guard
+// solely through ANTHROPIC_ALIASES.
+const PROD_REAL_IDS = new Set([...ANTHROPIC_FULL, "claude-opus-4-1-20250805"]);
+
+test("#53: a case-variant bare alias sole-owned by a reseller is FATAL", () => {
+  // OBSERVABLE (1) -- the failing-today case. Each of these is a distinct
+  // spelling CCR's fold stage binds and the strict-equality narrowing dropped.
+  //
+  // The ENTRY is asserted, not just the verdict: `hijackable[].id` is the
+  // SELECTOR, and a `fatal`-only assertion would pass on the right verdict with
+  // the wrong id -- which is exactly the residual F2 records.
+  for (const [advertised, selector] of [
+    ["Opus", "opus"], ["OPUS", "opus"], ["Claude-Opus-5", "claude-opus-5"],
+  ]) {
+    const r = checkBareCollisions([P("tokenrouter", advertised)],
+      { realIds: PROD_REAL_IDS });
+    assert.equal(r.fatal, true,
+      `${advertised} folds onto a real Anthropic selector and must not be dropped`);
+    assert.deepEqual(r.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+      [{ id: selector, owner: "tokenrouter" }],
+      `${advertised} must be reported against the selector CCR would send`);
+  }
+});
+
+test("#53: the EXACT owner wins when exact and fold disagree", () => {
+  // OBSERVABLE (2) -- what stops the fix being half-made. CCR's stage B4 finds
+  // exactly one EXACT match for `opus` and binds gorouter; tabiai's `Opus` is
+  // never consulted, because the fold stage runs only when exact is empty.
+  //
+  // Exact is always a SUBSET of the fold, so the stages cannot name disjoint
+  // owners; what differs is the COUNT, and through it the verdict. A fold-first
+  // implementation sees two entries here and reports a safe ambiguity -- and
+  // still passes observable (1). Dropping the exact stage entirely is the SAME
+  // program as running the fold first, not a second mutation.
+  const r = checkBareCollisions([P("tabiai", "Opus"), P("gorouter", "opus")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(r.fatal, true,
+    "exact-before-fold: one exact owner binds, so this is a sole claim, not an ambiguity");
+  assert.deepEqual(r.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+    [{ id: "opus", owner: "gorouter" }]);
+});
+
+test("#53/A1: leading whitespace does not hide a sole claim", () => {
+  // OBSERVABLE (3) -- the two-ship hazard, asserted before it is reachable.
+  // `providerModelMatches` does `let a = s.trim()`, so CCR binds ` opus` to the
+  // selector `opus`. This id cannot reach the guard on main -- `admitId` still
+  // rejects it, because the ALLOWLIST anchors on an alphanumeric -- and it goes
+  // live the moment R2 inverts that allowlist. CTRL is [\x00-\x1f\x7f-\x9f];
+  // space is 0x20, outside it, so nothing else denies it.
+  const r = checkBareCollisions([P("tokenrouter", " opus")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(r.fatal, true,
+    "CCR trims both sides before comparing, so the guard must too");
+  assert.deepEqual(r.hijackable.map((h) => h.owner), ["tokenrouter"]);
+});
+
+// ---- B1: ownership counts MATCHING ENTRIES, not providers ------------------
+// `providerModelMatches` pushes once per matching entry of `i.models`:
+//
+//   for (let s of i.models) { let a = s.trim(), c = r ? a.toLowerCase() : a;
+//                             a && c === n && o.push({model: a, provider: i}) }
+//
+// and `resolve()` returns undefined when that list has length > 1. So a
+// name-keyed accumulator over-reports: it collapses two matching ENTRIES into
+// one owner and calls FATAL on a config CCR refuses to route. That matters more
+// than a normal false positive because `fatal` is gated by one run-wide
+// `allowBare` boolean -- the only escape from a false FATAL also silences every
+// true positive in the same run.
+
+test("B1: two case-spellings at ONE provider are two matches, so nothing binds", () => {
+  // The fold stage finds `Opus` AND `OPUS`, both folding to `opus`. CCR pushes
+  // two entries and resolve() returns undefined. Reporting a sole owner here
+  // would be a FATAL against a config that cannot be hijacked.
+  const r = checkBareCollisions([P("tokenrouter", "Opus", "OPUS")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(r.fatal, false, "two matching entries bind nothing");
+  assert.deepEqual(r.hijackable, []);
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["opus"]);
+  assert.deepEqual(r.shadowed[0].owners, ["tokenrouter"],
+    "one provider is named once: the COUNT decided the verdict, the NAMES are shown");
+});
+
+test("B1/F3: a byte-identical duplicate id at one provider is two matches", () => {
+  // The exact stage, same rule. `models: ["opus", "opus"]` is two entries in
+  // the array CCR iterates, so it pushes twice and binds nothing.
+  const r = checkBareCollisions([P("tokenrouter", "opus", "opus")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(r.fatal, false, "a duplicate entry is a second match, not a no-op");
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["opus"]);
+  assert.deepEqual(r.shadowed[0].owners, ["tokenrouter"],
+    "two entries, one provider: named once at render");
+});
+
+test("B1/L16: two providers SHARING a name are two matches, not one owner", () => {
+  // The residual the plan previously documented and accepted. CCR matches per
+  // provider entry and finds two; a Set keyed on the provider NAME collapsed
+  // them into one and read a sole owner. Entry-counting resolves it.
+  const r = checkBareCollisions([P("tabiai", "opus"), P("tabiai", "opus")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(r.fatal, false, "two provider entries sharing a name still bind nothing");
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["opus"]);
+  assert.deepEqual(r.shadowed[0].owners, ["tabiai"]);
+});
+
+test("B1: the relay strip removes EVERY relay entry, not one per name", () => {
+  // COVERAGE FOR THE OTHER HALF OF ENTRY-COUNTING. `effective` is
+  // `owners.filter(o => o !== relay)`, which drops all matching elements. A
+  // strip that removed only the FIRST relay entry would leave a stale
+  // ["anthropic", "tokenrouter"] here -- length 2 -- and silently downgrade a
+  // real sole claim to a safe-looking ambiguity. That is an UNDER-report, the
+  // one direction this guard must never fail in, so it gets a fixture rather
+  // than an annotation: unlike the selector-side trim, this mutant is killable.
+  //
+  // The relay lists the id TWICE (routing auto-add can only add it once, but
+  // ownership must not depend on that) and does not vouch for it, so the strip
+  // fires on two entries.
+  const liveId = "claude-opus-4-1-20250805";   // in PROD_REAL_IDS, not curated
+  const r = checkBareCollisions(
+    [P("anthropic", liveId, liveId), P("tokenrouter", liveId)],
+    { realIds: PROD_REAL_IDS, relayOwned: new Set(ANTHROPIC_FULL) });
+  assert.equal(r.fatal, true,
+    "both relay entries strip, leaving tokenrouter as the sole unvouched owner");
+  assert.deepEqual(r.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+    [{ id: liveId, owner: "tokenrouter" }]);
+  assert.equal(r.hijackable[0].relayRoutes, true,
+    "the relay does route it -- that is why stripping, not absence, is what empties it");
+});
+
+test("B1 control: entry-counting must not disarm the sole-owner FATAL", () => {
+  // THE PAIR THAT KEEPS THE FIX FROM BECOMING A BLANKET EXEMPTION. If counting
+  // entries ever made every id ambiguous, these two would flip and #53 would be
+  // back. Pinned with their owners, not just their verdicts.
+  const sole = checkBareCollisions([P("tokenrouter", "opus")], { realIds: PROD_REAL_IDS });
+  assert.equal(sole.fatal, true);
+  assert.deepEqual(sole.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+    [{ id: "opus", owner: "tokenrouter" }]);
+
+  const exactWins = checkBareCollisions([P("tabiai", "Opus"), P("gorouter", "opus")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(exactWins.fatal, true);
+  assert.deepEqual(exactWins.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+    [{ id: "opus", owner: "gorouter" }]);
+});
+
 // ---- relayOwned: routing auto-add must not disarm the FATAL path -----------
 // A HIGH regression shipped on this branch and none of the ~20 guard tests above
 // caught it, because the guard's own code did not change -- what changed was the
