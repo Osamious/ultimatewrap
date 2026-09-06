@@ -37,7 +37,13 @@
 // WHERE IT IS CALLED:
 //   1. keysync.mjs:buildProviders  -- routing. Sanitisation and `uw/`.
 //   2. menu/catalog.mjs:buildFrom  -- display. Same two rules.
-//   3. refresh/tiers.mjs           -- ingest (Task B6). Same two rules.
+// A third entry named a module in a planned `refresh/` tree that was never
+// built (Task B6, plans/phase6-menu-and-catalogue.md:289), stated in the present
+// tense as if it already called this. Removed 2026-09-06 for the same reason the
+// sibling claim in catalog.mjs was: a list of callers that names one nobody wrote
+// is read as evidence a wire exists, and that is precisely how the routability
+// wire stayed missing through two design reviews. When the ingest path is built
+// it can add its own line.
 //
 // A large share of the 44 providers are small aggregator hosts with no
 // meaningful security assurance -- routllm.pro, seekai.cc, tabitoken.com,

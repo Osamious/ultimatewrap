@@ -279,6 +279,57 @@ test("buildFrom: the relay is injected with PLAN badges", () => {
   assert.equal(relay.planCount, 2);
 });
 
+test("the routable predicate reaches every row, synthetic sites included", () => {
+  // B1's shape, asserted where it is pure. `buildFrom` defaulted `routableOf` to
+  // `() => null` and `build()` never overrode it, so the parameter was reachable
+  // only from this file's own tests and every real row carried no routability at
+  // all. The two synthetic sites are named explicitly because they construct
+  // their rows by hand and are exactly where a threading fix gets forgotten.
+  const p = new Map([["acme", { testModel: "acme-unlisted", notes: "" }]]);
+  for (const answer of [true, false]) {
+    const { rows } = buildFrom(input({
+      chosen: [{ id: "personal.acme.free", provider: "acme" }],
+      providers: p,
+      relay: { provider: "anthropic", models: ["claude-opus-5"] },
+      routableOf: () => answer,
+    }));
+    const every = rows.flatMap((r) => r.models);
+    assert.equal(every.length > 2, true, "fixture must cover catalogue and synthetic rows");
+    assert.deepEqual([...new Set(every.map((m) => m.routable))], [answer],
+      `every row must carry ${answer}`);
+    assert.equal(rows[0].models.find((m) => m.id === "acme-unlisted").routable, answer,
+      "the testModel row builds its object by hand");
+    assert.equal(rows.find((r) => r.provider === "anthropic").models[0].routable, answer,
+      "so does the relay row");
+  }
+
+  // The predicate is asked about the TARGET, not the bare id -- a bare id would
+  // be the cross-provider match that once made orcarouter/auto look like
+  // morph/auto.
+  const asked = [];
+  buildFrom(input({ routableOf: (t) => { asked.push(t); return null; } }));
+  assert.equal(asked.every((t) => t.includes("/")), true);
+  assert.equal(asked.includes("acme/acme-chat-1"), true);
+});
+
+test("no comment under menu/ names a module that was never built", () => {
+  // B5, and it is the causal root rather than a tidiness point: routableSet's
+  // doc comment claimed "exactly one caller, refresh/cli.mjs" for the whole life
+  // of the file. There is no refresh/ directory -- the module was planned and
+  // never written -- so an auditor looking for the caller met a confident
+  // sentence instead of an absence, and the missing wire survived design review
+  // twice.
+  const dir = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw", "menu");
+  for (const name of fs.readdirSync(dir).filter((n) => n.endsWith(".mjs"))) {
+    const body = fs.readFileSync(path.join(dir, name), "utf8");
+    for (const [, ref] of body.matchAll(/`?\b([a-z][a-z0-9-]*)\/([a-z][a-z0-9.-]*\.mjs)\b/g)) {
+      if (ref === "menu") continue;
+      assert.equal(fs.existsSync(path.join(dir, "..", ref)), true,
+        `${name} names ${ref}/, which does not exist`);
+    }
+  }
+});
+
 test("writeAtomic leaves no partial file and replaces the previous contents", () => {
   const dir = path.join(process.env.HOME ?? process.env.USERPROFILE,
                         ".uw", "harness", "scratch", "atomic");

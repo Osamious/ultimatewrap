@@ -126,6 +126,32 @@ test("uwpick.mjs contains no promise continuation and no resize listener", () =>
     "main must not be async: nothing awaits it, and the keyword invites the await above");
 });
 
+test("the routability fetch stays out of the picker's import graph", () => {
+  // The companion to the guard above, from the other side. Wiring routability
+  // into the snapshot build is one `await import` away from wiring it into the
+  // picker, and both wrong versions COMPILE and pass every behavioural test:
+  //
+  //   - making build() async moves the await onto uwpick's path, where the
+  //     blocking readSync loop never drains the microtask queue and the promise
+  //     is unreachable for the life of the process;
+  //   - a top-level `import { routableSet } from "./catalog.mjs"` in
+  //     snapshot.mjs pulls catalog.mjs -- and through it keysync.mjs -- into
+  //     uwpick's transitive graph, silently doubling what the line-budget test
+  //     below believes it is bounding.
+  //
+  // snapshot.mjs reaches build() through `await import("./catalog.mjs")` for
+  // exactly this reason, so the new imports must be destructured from that same
+  // call rather than added at the top.
+  const MENU = path.join(os.homedir(), ".uw", "menu");
+  const code = (f) => fs.readFileSync(path.join(MENU, f), "utf8").replace(/\/\/.*$/gm, "");
+  assert.doesNotMatch(code("catalog.mjs"), /export\s+async\s+function\s+build\b/,
+    "build() must stay synchronous: it is on the picker's side of the split");
+  assert.doesNotMatch(code("snapshot.mjs"), /^\s*import[^\n]*["']\.\/catalog\.mjs["']/m,
+    "a static import of catalog.mjs puts keysync.mjs on the picker's startup path");
+  assert.match(code("snapshot.mjs"), /await import\(["']\.\/catalog\.mjs["']\)/,
+    "the dynamic import is the seam; it must still be the only one");
+});
+
 test("the empty state renders a row instead of a blank pane", () => {
   let s = initState(ROWS);
   for (const k of ["z", "z", "z", "z"]) s = reduce(s, k).state;

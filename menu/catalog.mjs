@@ -104,10 +104,22 @@ export const healthOf = (p) =>
  * Changes from the spike version, all of them Q1.3, Q7.2 and Q4.1:
  *   - the RPC itself now lives in ccr-client.mjs, so this file names no CCR path;
  *   - the timeout drops from 8000 ms to 400 ms;
- *   - THE PICKER NEVER CALLS THIS. This function has exactly one caller,
- *     refresh/cli.mjs, which has an event loop, no latency budget, and a reason
- *     to be talking to CCR anyway. The result is baked into snapshot.json as a
- *     per-model `routable` field with a `routableAsOf` stamp.
+ *   - THE PICKER NEVER CALLS THIS. Its one caller is `menu/snapshot.mjs:main()`,
+ *     the `--build` path, which has an event loop, no latency budget, and a
+ *     reason to be talking to CCR anyway. The result is baked into snapshot.json
+ *     as a per-model `routable` field with a `routableAsOf` stamp.
+ *
+ *     Until 2026-09-06 that sentence named a caller in a planned `refresh/`
+ *     module which was never built -- see plans/phase6-menu-and-catalogue.md:289,
+ *     which lists it as "the one place routability is resolved and stamped onto
+ *     the snapshot". THAT IS WHY THE WIRE STAYED MISSING FOR SO LONG. For the
+ *     whole life of this file the only caller of routableSet was its own test,
+ *     and every model in the built snapshot carried no `routable` property at
+ *     all -- but a reader auditing the function met a confident claim about a
+ *     caller instead of an absence, twice through design review. A comment that
+ *     names a module nobody wrote is not a documentation defect; it is the
+ *     defect, and it is why this file's comments may no longer name a module
+ *     path that does not exist.
  *
  * The previous draft had the picker call this and redraw in a `.then()`. That
  * cannot work and the reason is structural rather than a bug: uwpick's input loop
@@ -259,12 +271,28 @@ export function buildFrom({ chosen, providers, catalog, relay,
   return { rows, generatedAt: catalog.generatedAt };
 }
 
-export function build() {
+/**
+ * SYNCHRONOUS, and that is a constraint rather than an accident.
+ *
+ * Resolving routability means awaiting an RPC, and uwpick's input loop is a
+ * blocking `readSync` with no `await` in its body -- the microtask queue never
+ * drains there, so a promise on that path is unreachable by construction (see
+ * routableSet's comment above, and `test/uwpick.test.mjs:119`). Keeping `build()`
+ * synchronous is what keeps the fetch in the refresher, which has an event loop
+ * and no latency budget. The caller resolves the set and hands in a plain
+ * predicate; `routableAsOf` rides alongside `generatedAt` for the same reason it
+ * is its sibling -- one stamps the catalogue, the other stamps the routing check,
+ * and both belong to whoever did the work rather than to whoever reads it.
+ */
+export function build({ routableOf, routableAsOf = null } = {}) {
   const { registry, providers } = K.loadVault();
   const chosen = K.chooseKeys(K.filterRegistry(registry, providers));
-  return buildFrom({
-    chosen, providers, catalog: K.loadCatalog(), relay: K.ANTHROPIC_RELAY,
-  });
+  return {
+    ...buildFrom({
+      chosen, providers, catalog: K.loadCatalog(), relay: K.ANTHROPIC_RELAY, routableOf,
+    }),
+    routableAsOf,
+  };
 }
 
 // Both take an optional path for the same reason every function in state.mjs

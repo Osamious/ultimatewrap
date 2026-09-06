@@ -362,6 +362,18 @@ export function frame(v, meta, { caps }) {
       // dims; `null` -- nobody checked -- does not, because dimming everything the
       // one time the gateway was unreachable says "nothing works" when the truth
       // is "nothing was asked".
+      //
+      // DIM ONLY, never skip, and the asymmetry with the non-chat dim is
+      // deliberate rather than an oversight. Block a row only when selecting it
+      // cannot possibly succeed; dim it when it might. An image model cannot
+      // answer a chat request under any configuration, so it is unselectable. A
+      // row CCR did not list when the snapshot was built may be routable right
+      // now -- MEASURED 2026-09-06: about 205 of 1,588 models are reachable at
+      // current balances and about 260 if the unfunded accounts were paid, while
+      // Providers[].models names 91, so this dim covers roughly 114 models that
+      // genuinely work. Blocking on it would convert snapshot staleness into a
+      // functional outage. The failure is loud anyway: ModelRegistry.resolve()
+      // returns undefined and the request errors rather than silently rerouting.
       if (m.routable === false) body = p.dim(strip(body));
     }
     L.push(bar(g, selected ? p.inv(strip(body)) : body));
