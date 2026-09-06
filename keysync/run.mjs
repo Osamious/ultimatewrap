@@ -13,11 +13,12 @@ import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import { RESERVED } from "../menu/denylist.mjs";
-import { fetchAnthropicIds } from "./anthropic-catalog.mjs";
+import { fetchAnthropicCatalog } from "./anthropic-catalog.mjs";
 import {
   loadVault, filterRegistry, chooseKeys, loadCatalog, buildProviders,
   validate, stripOneMSuffix, reconcileUserModelPin, KEY_CHOICES, ANCHOR_PREFERENCE,
-  ANTHROPIC_RELAY, ANTHROPIC_TIERS
+  ANTHROPIC_RELAY, ANTHROPIC_TIERS, ANTHROPIC_FULL, ANTHROPIC_FALLBACK_TAGS,
+  buildAnthropicPickerRows
 } from "./keysync.mjs";
 import {
   snapshotConfigDb, deleteStaleWifToken, retainOnSuccess, capFailedSnapshots,
@@ -57,9 +58,20 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  *   (from anthropic-catalog.mjs's live /v1/models, unioned with ANTHROPIC_FULL by
  *   the caller). null means "could not be determined" and the guard falls back
  *   to the old, broader RESERVED-only match -- see the narrowing comment below.
+ * @param {Set<string>|null} [opts.relayOwned=null]  the CURATED ids the relay
+ *   vouches for. See the vouching block in the classification loop -- this is
+ *   the parameter that keeps routing auto-add from disarming the guard. null
+ *   means "no distinction", i.e. the pre-auto-add behaviour, which is what every
+ *   caller that predates auto-add still wants.
+ * @param {Set<string>|null} [opts.relayRouting=null]  what the relay serves or
+ *   WOULD serve if started; used only to keep the remedy wording honest.
+ *   Defaults to the static ANTHROPIC_RELAY.routing.
  * @returns {{hijackable: object[], shadowed: object[], fatal: boolean, message: string}}
  */
-export function checkBareCollisions(providers, { relay = "anthropic", allowBare = false, realIds = null } = {}) {
+export function checkBareCollisions(providers, {
+  relay = ANTHROPIC_RELAY.name, allowBare = false, realIds = null,
+  relayOwned = null, relayRouting = null,
+} = {}) {
   const byBare = new Map();
   for (const p of providers ?? []) {
     // CCR's own gate. `providerModelMatches` checks the provider is enabled before
@@ -102,10 +114,45 @@ export function checkBareCollisions(providers, { relay = "anthropic", allowBare 
     }
   }
 
+  // VOUCHING vs MERELY ROUTING. This distinction is the whole of the fix for a
+  // HIGH regression this guard shipped with, and it is worth stating plainly
+  // because the bug was invisible in the diff of this function -- which did not
+  // change at all.
+  //
+  // Routing auto-add (a live /v1/models id joins Providers[].models on its own)
+  // meant the relay came to own every id `realIds` even considers, since both
+  // reduce to `liveCatalog.ids u ANTHROPIC_FULL`. The test below is
+  // `owners.size === 1 && !owners.has(relay)`, so with the relay owning
+  // everything the FATAL path became STRUCTURALLY UNREACHABLE. Measured against
+  // live data: `claude-opus-4-8` is served by the relay and also listed by
+  // tabiai and gorouter, and it went from FATAL to a silent informational note.
+  //
+  // So the relay's ownership counts as SAFETY only where a human curated the id.
+  // Everywhere else the relay is stripped from the owner set before classifying:
+  // our own config auto-adding a name must never be what makes a reseller's
+  // sole claim on it look acceptable. Stripping cannot manufacture a finding
+  // either -- if the relay was the ONLY claimant, nothing remains to protect
+  // against and the id is simply dropped.
+  const vouched = (id) => relayOwned === null || relayOwned.has(id);
   const hijackable = [], shadowed = [];
   for (const [id, owners] of byBare) {
-    if (owners.size === 1 && !owners.has(relay)) hijackable.push({ id, owner: [...owners][0] });
-    else if (owners.size > 1) shadowed.push({ id, owners: [...owners].sort() });
+    const relayRoutes = owners.has(relay);
+    const effective = vouched(id) ? owners : new Set([...owners].filter((o) => o !== relay));
+    // Only the relay serves this id -- nothing to protect against. Redundant
+    // against the two branches below as they are written today (size 0 matches
+    // neither), and MUTATION-CHECKED as such: removing it changes no test.
+    // Kept because it states the rule, and because an edit that turns the pair
+    // below into an if/else chain would otherwise silently start classifying
+    // an empty owner set.
+    if (effective.size === 0) continue;
+    if (effective.size === 1 && !effective.has(relay)) {
+      hijackable.push({ id, owner: [...effective][0], relayRoutes });
+    } else if (effective.size > 1) {
+      // The TRUE owner list is reported, relay included. Classification must not
+      // count the relay here, but a message that hides a real co-owner would be
+      // describing a config the operator does not have.
+      shadowed.push({ id, owners: [...owners].sort() });
+    }
   }
   hijackable.sort((a, b) => a.id.localeCompare(b.id));
   shadowed.sort((a, b) => a.id.localeCompare(b.id));
@@ -122,18 +169,36 @@ export function checkBareCollisions(providers, { relay = "anthropic", allowBare 
     // `claude-opus-4-8` -- a retired name two resellers still list and the relay
     // has never served. Telling the operator to start the relay for that id sends
     // them to do something that cannot work, and the only real remedy is the flag.
-    const relayHelps = hijackable.filter((h) => ANTHROPIC_RELAY.routing.includes(h.id));
+    // THE EFFECTIVE routing set, not the stale static constant: with auto-add,
+    // what the relay serves is decided at run time, and a remedy computed from
+    // a hardcoded list can tell the operator to start a relay that would not
+    // help, or fail to offer one that would.
+    const wouldServe = relayRouting ?? new Set(ANTHROPIC_RELAY.routing);
+    // Starting the relay only helps for an id it both serves AND vouches for.
+    // For an id it merely routes, its ownership is deliberately not counted (see
+    // the vouching block above), so "start the relay" would be advice that
+    // changes nothing -- the precise class of unachievable remedy the
+    // claude-opus-4-8 case already taught us not to print.
+    const relayHelps = hijackable.filter((h) => !h.relayRoutes && wouldServe.has(h.id) && vouched(h.id));
+    const routedNotVouched = hijackable.filter((h) => h.relayRoutes && !vouched(h.id));
     const remedy = relayHelps.length === hijackable.length
       ? `start the Anthropic relay so it co-owns these ids and they become ambiguous, or `
       : relayHelps.length
         ? `start the Anthropic relay, which co-owns ${relayHelps.map((h) => h.id).join(", ")} ` +
           `but not the rest, and/or `
-        : `the relay does not serve ${hijackable.length === 1 ? "this id" : "these ids"}, ` +
-          `so co-ownership cannot resolve ${hijackable.length === 1 ? "it" : "them"}; `;
+        : routedNotVouched.length === hijackable.length
+          ? `the relay already routes ${routedNotVouched.length === 1 ? "this id" : "these ids"} but ` +
+            `${routedNotVouched.length === 1 ? "it is" : "they are"} not in the reviewed set ` +
+            `(ANTHROPIC_FULL), so that ownership is not treated as vouching for ` +
+            `${routedNotVouched.length === 1 ? "it" : "them"}; review and add ` +
+            `${routedNotVouched.map((h) => h.id).join(", ")} to ANTHROPIC_FULL in keysync.mjs, or `
+          : `the relay does not serve ${hijackable.length === 1 ? "this id" : "these ids"}, ` +
+            `so co-ownership cannot resolve ${hijackable.length === 1 ? "it" : "them"}; `;
     message =
       `SECURITY: ${hijackable.length} bare Claude-shaped model id(s) have a single ` +
-      `owner and it is not the relay:\n` +
-      hijackable.map((h) => `  ${h.id}  <-  sole owner: ${h.owner}`).join("\n") +
+      `owner this config does not vouch for:\n` +
+      hijackable.map((h) => `  ${h.id}  <-  sole owner: ${h.owner}` +
+        (h.relayRoutes ? `  (the relay routes this id but does not curate it)` : "")).join("\n") +
       `\nCCR's resolve() binds Claude Code's built-in rows to a uniquely-owned bare ` +
       `id, so the full system prompt, tool definitions and file contents would go ` +
       `to that host.\n` +
@@ -150,6 +215,102 @@ export function checkBareCollisions(providers, { relay = "anthropic", allowBare 
   }
 
   return { hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message };
+}
+
+// How stale the catalog may be and still decide what we ROUTE. The fetch's own
+// TTL is one hour; past this ceiling the relay has been unreachable for a week
+// and the cached id list is no longer good enough to write into live
+// Providers[].models, where a retired id becomes a picker row that 404s.
+//
+// Deliberately NOT applied to the collision guard's use of the same snapshot:
+// there, any real evidence beats none (the alternative is `null`, which widens
+// the guard back to matching every Claude-SHAPED name), and a retired id being
+// considered costs a false positive rather than a misroute.
+export const ROUTING_MAX_STALENESS_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * The catalog's ids IF the snapshot is recent enough to decide what we route.
+ *
+ * Returns null past the ceiling, which `deriveAnthropicSets` reads as "no live
+ * data" and answers with the curated set -- four reviewed rows rather than a
+ * week-old list that may advertise a model Anthropic has since retired.
+ *
+ * A record with no timestamp (the legacy cache shape) reports `at: 0` and so
+ * fails every ceiling. That is the right default: unknown age is not fresh.
+ *
+ * @param {{ids: Set<string>, at: number}|null} catalog
+ * @returns {Set<string>|null}
+ */
+export function routableCatalogIds(catalog, now = Date.now(), maxAgeMs = ROUTING_MAX_STALENESS_MS) {
+  if (!catalog) return null;
+  return now - (catalog.at || 0) <= maxAgeMs ? catalog.ids : null;
+}
+
+/**
+ * Every id set the Anthropic relay needs, derived from one live catalog.
+ *
+ * Exported and pure for the same reason `checkBareCollisions` above it is: the
+ * pipeline below cannot be run from a test (it reads the vault, spawns
+ * PowerShell for 44 credentials and parses a 19.7 MB catalogue), so any logic
+ * left inline down there is logic nothing can assert on. That is not a
+ * hypothetical here -- the vouching regression this function's `relayOwned`
+ * exists to fix shipped precisely because these sets were inline and untested.
+ *
+ * THE INVARIANT THE CALLER DEPENDS ON: `relayOwned` is the CURATED set and
+ * never grows with live data, while `routingIds` and `pickerIds` do. When live
+ * data adds an id, the two must diverge -- if they were ever made equal again,
+ * the guard's FATAL path silently disappears.
+ *
+ * @param {Set<string>|string[]|null} liveIds  live ids, or null if unavailable
+ *   / too stale to route on. null falls back to the curated set for everything.
+ * @param {readonly string[]} [curatedIds]
+ * @param {readonly string[]} [aliasList]  the relay's static routing list, whose
+ *   bare aliases (`opus`, `sonnet`, ...) are not model ids and never appear live
+ * @returns {{routingIds: Set<string>, relayOwned: Set<string>,
+ *            pickerIds: string[], relayAliases: string[]}}
+ */
+export function deriveAnthropicSets(liveIds, curatedIds = ANTHROPIC_FULL,
+                                    aliasList = ANTHROPIC_RELAY.routing) {
+  const curated = [...(curatedIds ?? [])];
+  // Auto-add. A live id joins routing on its own: this is our own authenticated
+  // relay, and a picker row that is shown must actually route.
+  const routingIds = liveIds ? new Set([...liveIds, ...curated]) : new Set(curated);
+  return {
+    routingIds,
+    // NEVER unioned with live data. See checkBareCollisions' vouching block.
+    relayOwned: new Set(curated),
+    // Decision 3, reversed: the native menu shows every live id, not the
+    // curated four. Falls back to curated only when there is no usable live
+    // data at all -- showing four reviewed rows beats showing none.
+    pickerIds: liveIds ? [...liveIds] : [...curated],
+    // The bare aliases (`opus`, ...) the relay co-owns so a third party cannot
+    // sole-own them. Computed as "in the static routing list but not a model
+    // id", so it stays correct however routingIds grows.
+    relayAliases: (aliasList ?? []).filter((id) => !routingIds.has(id)),
+  };
+}
+
+/**
+ * What actually gets written to `settings.json`'s `modelPicker.options`.
+ *
+ * Decision 4: the native menu is repurposed to the Anthropic subscription rows
+ * only. The other providers are NOT lost -- uwpick (ctrl+g) reads its own
+ * catalogue snapshot and has never read modelPicker.options, and CCR routes on
+ * `Providers[]`, which keeps all 44 either way.
+ *
+ * The relay-down case deliberately returns the full set instead of an empty
+ * one: `options: []` would fail run.mjs's own post-write verification and leave
+ * the user with no native menu at all, which is strictly worse than a menu of
+ * reachable third-party rows.
+ *
+ * @param {{model: string, description?: string}[]} pickerRows  the full built set
+ * @param {{relay?: string}} [opts]
+ * @returns {object[]} new array; row objects are copied before mutation
+ */
+export function scopeNativePickerOptions(pickerRows, { relay = ANTHROPIC_RELAY.name } = {}) {
+  const rows = pickerRows ?? [];
+  const scoped = rows.filter((r) => String(r?.model ?? "").startsWith(`${relay}/`));
+  return scoped.length ? [...scoped] : [...rows];
 }
 
 // ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
@@ -227,6 +388,45 @@ if (has("--verified-only")) {
   }
 }
 
+// ---- Anthropic's live catalog: ONE fetch, three consumers -------------------
+// Hoisted above both the relay block and the collision guard because all three
+// need it and it must not be fetched twice. Unconditional, exactly as the
+// guard's own call site was: --no-anthropic suppresses the relay PROVIDER, not
+// the question "what does Anthropic actually publish", which the security guard
+// asks regardless. null still means "could not be determined" everywhere.
+const liveCatalog = await fetchAnthropicCatalog();
+const contextById = liveCatalog?.contextById ?? new Map();
+
+// STALENESS CEILING, applied to ROUTING ONLY. Past it the snapshot is too old
+// to decide what we advertise -- a retired id written into Providers[].models
+// becomes a picker row that 404s on selection. The collision guard below keeps
+// using the raw snapshot regardless of age, deliberately: there the alternative
+// to old evidence is `null`, which widens it back to matching every
+// Claude-SHAPED name, and an over-considered id costs a false positive rather
+// than a misroute.
+const catalogAgeMs = liveCatalog ? Date.now() - (liveCatalog.at || 0) : Infinity;
+const routableIds = routableCatalogIds(liveCatalog);
+const { routingIds, relayOwned, pickerIds, relayAliases } =
+  deriveAnthropicSets(routableIds, ANTHROPIC_FULL);
+
+// Every routable id, tagged from its REAL context window. An id with no stated
+// window and no hand-tagged default renders bare -- never guess a larger
+// context than has been confirmed (see buildAnthropicPickerRows).
+const pickerRows = buildAnthropicPickerRows(pickerIds, contextById, ANTHROPIC_FALLBACK_TAGS);
+const taggedLive = pickerRows.filter((id) => /\[1m\]$/i.test(id) && contextById.has(id.replace(/\[1m\]$/i, ""))).length;
+console.log(`anthropic catalog: ${liveCatalog
+  ? `${liveCatalog.ids.size} live id(s), ${contextById.size} with a stated context window` +
+    (routableIds ? "" : `, but ${Math.floor(catalogAgeMs / 86400000)}d stale — too old to route on, using the curated set`)
+  : "UNAVAILABLE (relay down and no cache) — using the curated set"}` +
+  ` -> ${pickerRows.length} picker row(s), ${taggedLive} tagged [1m] from live data`);
+// The guard's vouched set must never be the routed set -- that equality is what
+// disarmed checkBareCollisions once already. Asserted here, at the one place
+// both are in scope, because a future edit that reunifies them would otherwise
+// produce a config that looks correct and silently protects nothing.
+if (relayOwned.size > routingIds.size) {
+  throw new Error("internal: relayOwned must be a subset of routingIds");
+}
+
 // Anthropic via the local OAuth relay, unless --no-anthropic. Checked for
 // liveness first: a dead relay would produce picker rows that cannot serve.
 let anthropicOn = false;
@@ -247,19 +447,31 @@ if (!has("--no-anthropic")) {
     // `picker` and `routing` are UW-side fields and must not reach CCR's config,
     // which is why they are destructured out rather than spread through.
     const { picker: _picker, routing: _routing, ...relayProvider } = ANTHROPIC_RELAY;
+    // `routingIds` is BARE by construction (live /v1/models ids unioned with the
+    // curated four), and that is load-bearing in two ways. It is what CCR routes
+    // and what the relay forwards toward Anthropic, whose real API 404s on a
+    // suffixed id -- and it is what checkBareCollisions reads to decide whether
+    // the relay CO-OWNS a Claude-shaped name. The previous expression fed
+    // `ANTHROPIC_RELAY.picker` here on the !aliasesOk branch, which became the
+    // `[1m]`-suffixed array when the picker rows were tagged: those ids match no
+    // real id, so on that branch the relay silently stopped co-owning
+    // `claude-opus-5` and a reseller listing it read as a sole owner (FATAL)
+    // instead of a shadowed ambiguity. Deriving both branches from `routingIds`
+    // removes the suffix from this path entirely.
     built.providers.unshift({
       ...relayProvider,
-      models: aliasesOk ? [...ANTHROPIC_RELAY.routing] : [...ANTHROPIC_RELAY.picker],
+      models: aliasesOk ? [...routingIds, ...relayAliases] : [...routingIds],
     });
-    built.picker.unshift(...ANTHROPIC_RELAY.picker.map((m) => ({
-      model: `anthropic/${m}`,
+    built.picker.unshift(...pickerRows.map((m) => ({
+      model: `${ANTHROPIC_RELAY.name}/${m}`,
       label: `Anthropic > ${m}`,
       description: "subscription"
       // no behavesAs: Claude Code already knows these ids.
     })));
-    console.log(`anthropic relay live -> +1 provider / +${ANTHROPIC_RELAY.picker.length} Claude rows` +
+    console.log(`anthropic relay live -> +1 provider / +${pickerRows.length} Claude rows` +
+      ` / routing owns ${routingIds.size} id(s)` +
       (aliasesOk
-        ? ` / routing also owns the bare aliases (${ANTHROPIC_RELAY.routing.length} ids)`
+        ? ` plus the ${relayAliases.length} bare aliases`
         : ` / bare aliases NOT advertised (relay does not report them; see Task A5.2)`));
   } else {
     console.log(`WARNING: anthropic relay not responding at ${ANTHROPIC_RELAY.api_base_url} — ` +
@@ -280,6 +492,15 @@ fs.writeFileSync(BUILT_ROWS, JSON.stringify({
   generatedAt: new Date().toISOString(),
   rows: builtAll.picker.map((r) => r.model)
 }, null, 2));
+
+// NO detect-and-warn block here any more, and its absence is deliberate.
+// It reported "the relay serves ids the picker does not carry", which stopped
+// being true the moment the picker started showing every live id: there is
+// nothing left to be "not added". The uncurated/curated split it half-described
+// survives only as a SECURITY concern (ANTHROPIC_FULL as the guard's vouched
+// set), and the guard already speaks for itself -- loudly and fatally -- at
+// exactly the moment it matters. A passive banner restating it would be a
+// warning with no action attached, which is how warnings stop being read.
 
 const problems = validate(built, has("--verified-only")
   ? built.providers.length
@@ -325,10 +546,20 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
   // what the live fetch returns -- ANTHROPIC_RELAY.models is already the
   // known-real backstop A5.2 uses for the same reason, so this costs nothing
   // and guards against a live response that anomalously omits one of them.
-  const liveIds = await fetchAnthropicIds();
-  const realIds = liveIds ? new Set([...liveIds, ...ANTHROPIC_RELAY.models]) : null;
+  // Reuses the single hoisted fetch above rather than calling again. Same
+  // semantics as before, id for id: `liveCatalog?.ids` IS what fetchAnthropicIds
+  // returned, and null still means "could not be determined".
+  const realIds = liveCatalog ? new Set([...liveCatalog.ids, ...ANTHROPIC_RELAY.models]) : null;
+  // TWO SETS, TWO JOBS, AND THEY MUST NOT BE THE SAME SET.
+  //   realIds    -- which ids the analysis CONSIDERS at all (broad; every id
+  //                 Anthropic publishes, however stale the snapshot).
+  //   relayOwned -- which ids the relay's ownership VOUCHES for (narrow;
+  //                 curated only, never grown by live data).
+  // Collapsing them is the regression this branch shipped and had to fix: with
+  // routing auto-add, the relay owns everything `realIds` considers, so the
+  // FATAL path could never fire. See the vouching block in checkBareCollisions.
   const collisions = checkBareCollisions(built.providers,
-    { allowBare: has("--allow-bare-claude-names"), realIds });
+    { allowBare: has("--allow-bare-claude-names"), realIds, relayOwned, relayRouting: routingIds });
   if (collisions.hijackable.length || collisions.shadowed.length) {
     console.warn(collisions.message);
   }
@@ -598,6 +829,16 @@ if (!noProfileDone) {
   // `/model` persists the user's pick into this same file. Respect it while it
   // still points at a live row; clear it once stale so a pruned row cannot
   // leave them pinned to a model that no longer exists.
+  // THE FULL BUILT SET, NOT THE SCOPED PICKER ROWS -- verified, not assumed.
+  // `settings.model` is where Claude Code persists a /model pick, and uwpick
+  // (ctrl+g) drives exactly that: cc-contract.mjs's modelCommand emits
+  // `/model <provider>/<id>` for ANY of the 44 providers. Since the write below
+  // narrows `modelPicker.options` to the Anthropic rows, checking the pin
+  // against that narrowed list would clear every uwpick-made pin on the next
+  // run -- deleting the user's default for a model that is still perfectly
+  // routable, because Providers[] still carries all 44. What this function is
+  // actually for is a pin naming a row that no longer EXISTS anywhere; the
+  // full built set is the right definition of "still exists".
   const pin = reconcileUserModelPin(settings, built.picker);
   if (pin.action === "kept") {
     console.log(`kept user's /model pin: ${pin.pinned}`);
@@ -612,10 +853,27 @@ if (!noProfileDone) {
   }
   if (pin.action === "cleared") console.log(`cleared stale /model pin "${pin.pinned}" (no longer a picker row)`);
 
+  // ---- the native picker is Anthropic-subscription-only (decision 4) --------
+  // The other 43 providers do NOT lose reachability: uwpick (ctrl+g) reads its
+  // own pre-built catalogue snapshot and has never read modelPicker.options at
+  // all, and `built.providers` -- what CCR actually routes on -- is untouched.
+  // What this drops is 83 rows of third-party noise from a flat native menu.
+  //
+  // WITH THE RELAY DOWN there are no Anthropic rows, and writing an empty
+  // options[] would fail the post-write verification below and leave the user
+  // with no native menu whatsoever. That case keeps today's full list: a menu of
+  // reachable third-party rows beats no menu.
+  const anthropicRows = built.picker.filter((r) => r.model.startsWith(`${ANTHROPIC_RELAY.name}/`));
+  const optionRows = scopeNativePickerOptions(built.picker);
   settings.modelPicker = {
-    options: built.picker.map(({ contextTokens, ...row }) => row),
+    options: optionRows.map(({ contextTokens, ...row }) => row),
     replaceBuiltInOptions: true
   };
+  console.log(`modelPicker: ${optionRows.length} row(s) written` +
+    (anthropicRows.length
+      ? ` (Anthropic subscription only; the other ${built.picker.length - anthropicRows.length} ` +
+        `rows stay reachable via uwpick / ctrl+g)`
+      : ` (relay down — full built set, no Anthropic rows to scope to)`));
   // Temp + rename: a crash mid-write must not truncate the real settings file.
   atomicWriteJson(SETTINGS, settings);
 

@@ -2,13 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isReserved, admitRemoteModels, RESERVED } from "../menu/denylist.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
-import { buildProviders, validate, ANTHROPIC_RELAY } from "../keysync/keysync.mjs";
+import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
+         ANTHROPIC_FALLBACK_TAGS, ONE_M_TOKENS, buildAnthropicPickerRows } from "../keysync/keysync.mjs";
 // Imported for the S1 guard tests. `run.mjs` must therefore export
 // `checkBareCollisions` and keep its pipeline behind an entry-point check rather
 // than at module top level -- the same requirement Task B8 places on
 // `checkProviderFloor`, and for the same reason. If importing run.mjs runs the
 // pipeline, that is the defect to fix, not a reason to test the guard indirectly.
-import { checkBareCollisions } from "../keysync/run.mjs";
+import { checkBareCollisions, deriveAnthropicSets, scopeNativePickerOptions,
+         ROUTING_MAX_STALENESS_MS, routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
   // Not a formality. Before the entry-point guard, run.mjs ran all 470 lines at
@@ -376,7 +378,13 @@ test("the guard and the denylist share one definition of Claude-shaped", () => {
 
 // ---- S2: the relay owns the four bare aliases -------------------------------
 
-test("the relay's routing list holds eight ids and its picker list holds four", () => {
+// REFRAMED 2026-09-05. `ANTHROPIC_RELAY.picker` is no longer the live truth: it
+// is the FALLBACK tag set, shipped only when the live catalog cannot be reached
+// at all (relay down AND no cache). The assertions below are unchanged and still
+// exactly right -- they now describe the shape of that fallback rather than the
+// shape of every run's output, which `buildAnthropicPickerRows` computes from
+// live `max_input_tokens` (see the dynamic-tagging section further down).
+test("the FALLBACK picker holds four ids and the routing list holds eight", () => {
   // Missing this split ships a visibly broken menu: run.mjs maps the relay's
   // model list straight into picker rows, so four duplicate rows appear.
   //
@@ -429,11 +437,27 @@ test("the relay constant keeps every field CCR needs, so it can still be spread"
   // 2026-09-05: models and picker deliberately DIVERGE now -- models stays
   // bare for CCR routing / the real API, picker carries [1m] so Claude Code
   // believes the right context window once a row is selected (see
-  // ANTHROPIC_PICKER's comment in keysync.mjs). What must still hold is that
-  // stripping the marker recovers the same four ids in the same order.
+  // ANTHROPIC_PICKER_FALLBACK's comment in keysync.mjs). What must still hold is
+  // that stripping the marker recovers the same four ids in the same order.
   assert.deepEqual([...ANTHROPIC_RELAY.models],
     [...ANTHROPIC_RELAY.picker].map((id) => id.replace(/\[1m\]$/i, "")),
-    "picker's underlying ids, marker stripped, must match models exactly");
+    "the fallback picker's underlying ids, marker stripped, must match models exactly");
+  // ...and `models` IS the curated set, which is what run.mjs unions the live
+  // ids on top of rather than replacing.
+  assert.deepEqual([...ANTHROPIC_RELAY.models], [...ANTHROPIC_FULL]);
+});
+
+test("the fallback tag map is derived from the fallback array, so they cannot drift", () => {
+  // Two hand-maintained lists of one fact is how they drift. The map must be
+  // generated, and a keysync.mjs that re-typed it would fail here.
+  assert.deepEqual(Object.keys(ANTHROPIC_FALLBACK_TAGS).sort(), [...ANTHROPIC_FULL].sort());
+  for (const [bare, tagged] of Object.entries(ANTHROPIC_FALLBACK_TAGS)) {
+    assert.equal(tagged.replace(/\[1m\]$/i, ""), bare);
+    assert.ok(ANTHROPIC_RELAY.picker.includes(tagged));
+  }
+  // The one deliberately-bare id: Haiku 4.5's real ceiling is 200,000 and no 1M
+  // variant exists, so tagging it would be a false claim, not a bigger window.
+  assert.equal(ANTHROPIC_FALLBACK_TAGS["claude-haiku-4-5-20251001"], "claude-haiku-4-5-20251001");
 });
 
 test("with the relay owning the aliases, a reseller publishing opus is only shadowed", () => {
@@ -502,6 +526,138 @@ test("realIds narrows both hijackable AND shadowed classification", () => {
   assert.deepEqual(r.shadowed, []);
 });
 
+// ---- relayOwned: routing auto-add must not disarm the FATAL path -----------
+// A HIGH regression shipped on this branch and none of the ~20 guard tests above
+// caught it, because the guard's own code did not change -- what changed was the
+// set feeding it. `routingIds` and `realIds` both became `live u curated`, so
+// the relay owned every id the guard considered and `owners.size === 1 &&
+// !owners.has(relay)` could never be true. Measured live: `claude-opus-4-8` is
+// served by the relay and also listed by tabiai and gorouter, and it went from
+// FATAL on master to a silent informational note.
+
+const CURATED = new Set(ANTHROPIC_FULL);
+
+test("a reseller sole-claiming a live-but-UNCURATED id is still FATAL", () => {
+  // THE LOAD-BEARING TEST FOR THE REGRESSION. The relay is present in
+  // Providers[].models for this id -- exactly what routing auto-add produces --
+  // and that must NOT be what makes tabiai's sole claim acceptable. Delete the
+  // relayOwned check and this is the test that fails.
+  const r = checkBareCollisions([
+    { name: "anthropic", models: ["claude-opus-5", "claude-opus-4-8"] },   // auto-added
+    P("tabiai", "claude-opus-4-8", "reseller-chat-1"),
+  ], { realIds: new Set(["claude-opus-5", "claude-opus-4-8"]), relayOwned: CURATED });
+  assert.equal(r.fatal, true,
+    "our own config auto-adding an unreviewed id must never launder a reseller's sole claim");
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-4-8"]);
+  assert.equal(r.hijackable[0].owner, "tabiai", "the reseller is named, not the relay");
+});
+
+test("a CURATED id co-owned by the relay stays a safe ambiguity, exactly as before", () => {
+  // The other half: curated ids keep the original protection unchanged. If the
+  // fix over-applied and stripped the relay everywhere, this would turn a
+  // deliberate, reviewed co-ownership into a spurious FATAL on every run.
+  const r = checkBareCollisions([
+    { name: "anthropic", models: [...ANTHROPIC_FULL] },
+    P("tabiai", "claude-opus-5", "reseller-chat-1"),
+  ], { realIds: new Set(ANTHROPIC_FULL), relayOwned: CURATED });
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["claude-opus-5"]);
+  assert.deepEqual(r.shadowed[0].owners, ["anthropic", "tabiai"],
+    "and the reported owner list stays truthful, relay included");
+});
+
+test("an uncurated id the relay ALONE serves is not a finding", () => {
+  // Stripping the relay must not manufacture findings either. Nobody else
+  // claims this id, so there is no one to be hijacked by.
+  const r = checkBareCollisions([{ name: "anthropic", models: ["claude-opus-4-8"] }],
+    { realIds: new Set(["claude-opus-4-8"]), relayOwned: CURATED });
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.hijackable, []);
+  assert.deepEqual(r.shadowed, []);
+});
+
+test("an uncurated id claimed by TWO resellers is shadowed, not fatal", () => {
+  // Two non-relay claimants make resolve() ambiguous on their own, which is a
+  // clean failure rather than a misroute -- the relay's presence is irrelevant.
+  const r = checkBareCollisions([
+    { name: "anthropic", models: ["claude-opus-4-8"] },
+    P("tabiai", "claude-opus-4-8"), P("gorouter", "claude-opus-4-8"),
+  ], { realIds: new Set(["claude-opus-4-8"]), relayOwned: CURATED });
+  assert.equal(r.fatal, false);
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["claude-opus-4-8"]);
+  assert.deepEqual(r.shadowed[0].owners, ["anthropic", "gorouter", "tabiai"]);
+});
+
+test("END TO END: the sets the pipeline derives really do keep the FATAL path armed", () => {
+  // MUTATION-FOUND GAP. The guard tests above pass `relayOwned: CURATED` by
+  // hand, and the derivation tests assert set shapes -- so a mutation at the
+  // ROOT CAUSE (`relayOwned: new Set(routingIds)`, which is literally what
+  // shipped) was caught only by an abstract invariant, never by anything showing
+  // the security consequence. Nothing exercised the WIRING, which is precisely
+  // where the regression lived. This test builds the sets the way run.mjs does
+  // and feeds them straight into the guard.
+  const live = new Set([...ANTHROPIC_FULL, "claude-opus-4-8"]);
+  const { routingIds, relayOwned } = deriveAnthropicSets(live, ANTHROPIC_FULL);
+  // The relay's Providers[] entry, exactly as the pipeline unshifts it.
+  const providers = [
+    { name: "anthropic", models: [...routingIds] },
+    P("tabiai", "claude-opus-4-8", "reseller-chat-1"),
+  ];
+  const realIds = new Set([...live, ...ANTHROPIC_RELAY.models]);
+  const r = checkBareCollisions(providers, { realIds, relayOwned, relayRouting: routingIds });
+  assert.equal(r.fatal, true,
+    "auto-add put claude-opus-4-8 in the relay's models[]; that must not disarm the guard");
+  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-4-8"]);
+  // ...while a curated id in the same config is still the safe ambiguity.
+  const curatedToo = checkBareCollisions([
+    { name: "anthropic", models: [...routingIds] },
+    P("tabiai", "claude-opus-5"),
+  ], { realIds, relayOwned, relayRouting: routingIds });
+  assert.equal(curatedToo.fatal, false);
+  assert.deepEqual(curatedToo.shadowed.map((s) => s.id), ["claude-opus-5"]);
+});
+
+test("omitting relayOwned keeps the pre-auto-add behaviour intact", () => {
+  // Backward compatible on purpose: every guard test above this section calls
+  // checkBareCollisions without relayOwned and must keep passing unmodified.
+  const r = checkBareCollisions([
+    { name: "anthropic", models: ["claude-opus-4-8"] },
+    P("tabiai", "claude-opus-4-8"),
+  ], { realIds: new Set(["claude-opus-4-8"]) });
+  assert.equal(r.fatal, false, "with no vouching distinction the relay shields everything");
+});
+
+test("the remedy for an uncurated hijack is review, not an unachievable restart", () => {
+  // "Start the relay" is false advice here -- the relay is already running and
+  // already routes the id; starting it again changes nothing. The honest remedy
+  // is to review the id into ANTHROPIC_FULL, or take the opt-out.
+  const r = checkBareCollisions([
+    { name: "anthropic", models: ["claude-opus-4-8"] },
+    P("tabiai", "claude-opus-4-8"),
+  ], { realIds: new Set(["claude-opus-4-8"]), relayOwned: CURATED,
+       relayRouting: new Set([...ANTHROPIC_FULL, "claude-opus-4-8"]) });
+  assert.equal(r.fatal, true);
+  assert.doesNotMatch(r.message, /start the Anthropic relay/);
+  assert.match(r.message, /ANTHROPIC_FULL/, "it must name where the review lands");
+  assert.match(r.message, /--allow-bare-claude-names/);
+  assert.match(r.message, /routes this id but does not curate it/,
+    "and the finding line must say why the relay's ownership did not count");
+});
+
+test("the remedy consults the EFFECTIVE routing set, not the static constant", () => {
+  // A remedy computed from a hardcoded list goes stale the moment routing
+  // becomes dynamic: here the relay would serve `claude-opus-9` if started, and
+  // it is curated, so "start the relay" is the correct advice -- but nothing in
+  // ANTHROPIC_RELAY.routing mentions that id.
+  const r = checkBareCollisions([P("tokenrouter", "claude-opus-9")], {
+    realIds: new Set(["claude-opus-9"]),
+    relayOwned: new Set(["claude-opus-9"]),
+    relayRouting: new Set(["claude-opus-9"]),
+  });
+  assert.equal(r.fatal, true);
+  assert.match(r.message, /start the Anthropic relay/);
+});
+
 test("an empty realIds set narrows everything away, rather than matching everything", () => {
   // Distinguishes null ("unknown, use the old behaviour") from an empty Set
   // ("checked, and nothing is real") -- a relay that answered with zero models
@@ -542,4 +698,325 @@ test("validate() accepts the real ANTHROPIC_RELAY picker against its own models"
                        models: [...ANTHROPIC_RELAY.models] }];
   const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);
+});
+
+// ---- dynamic [1m] tagging from live max_input_tokens -----------------------
+// The static hand-tagged array goes stale the moment Anthropic changes a context
+// window or ships a 1M variant of a model currently tagged bare. These assert
+// that the tag is now COMPUTED, and -- the part that matters -- that the
+// computation degrades to the hand-tagged default rather than to a bare row
+// whenever live data says nothing about a given id.
+
+const CTX = (o) => new Map(Object.entries(o));
+
+test("live data confirming a 1M window produces a [1m] row", () => {
+  const rows = buildAnthropicPickerRows(["claude-opus-5"], CTX({ "claude-opus-5": 1000000 }));
+  assert.deepEqual(rows, ["claude-opus-5[1m]"]);
+});
+
+test("live data confirming a sub-1M window produces a BARE row", () => {
+  const rows = buildAnthropicPickerRows(["claude-haiku-4-5-20251001"],
+    CTX({ "claude-haiku-4-5-20251001": 200000 }));
+  assert.deepEqual(rows, ["claude-haiku-4-5-20251001"],
+    "tagging a 200k model would be a false claim, not a bigger window");
+});
+
+test("live data OVERRIDES a stale hand-tagged default in both directions", () => {
+  // The whole point of the change. If Anthropic ships a 1M Haiku, or retires
+  // Opus's 1M window, the row follows the API without a code edit -- and the
+  // curated fallback, which now disagrees, must lose.
+  assert.deepEqual(
+    buildAnthropicPickerRows(["claude-haiku-4-5-20251001"],
+      CTX({ "claude-haiku-4-5-20251001": 1000000 }), ANTHROPIC_FALLBACK_TAGS),
+    ["claude-haiku-4-5-20251001[1m]"],
+    "a curated BARE default must not survive live data saying 1M");
+  assert.deepEqual(
+    buildAnthropicPickerRows(["claude-opus-5"], CTX({ "claude-opus-5": 200000 }),
+      ANTHROPIC_FALLBACK_TAGS),
+    ["claude-opus-5"],
+    "a curated [1m] default must not survive live data saying 200k");
+});
+
+test("an id with no live entry falls back to ITS OWN hand-tagged default", () => {
+  // Per-id, not all-or-nothing: a response that stated a window for one of the
+  // four must not drag the other three to a default they never had.
+  //
+  // THE LIVE ID HERE IS THE BARE ONE, DELIBERATELY, and that arrangement is the
+  // whole value of this test. Written the other way round -- live data for the
+  // three tagged ids, nothing for haiku -- it passes even if the function treats
+  // a missing entry as a ZERO window, because haiku's expected output is bare
+  // either way. MUTATION-CHECKED: `ctx.get(id) ?? 0` left that arrangement
+  // green. This arrangement fails it, because coercing a missing entry to 0
+  // strips [1m] from the three ids whose curated default carries it -- which is
+  // the dangerous direction, a real 1M row silently dropping to a believed 200k
+  // window on the exact path (no live data) that the fallback exists to cover.
+  const rows = buildAnthropicPickerRows(ANTHROPIC_FULL,
+    CTX({ "claude-haiku-4-5-20251001": 200000 }), ANTHROPIC_FALLBACK_TAGS);
+  assert.deepEqual(rows, ["claude-opus-5[1m]", "claude-sonnet-5[1m]",
+                          "claude-haiku-4-5-20251001", "claude-fable-5-1[1m]"]);
+});
+
+test("an EMPTY contextById reproduces the curated fallback array exactly", () => {
+  // The total-failure path: relay down, no cache, contextById empty. This must
+  // ship today's exact rows -- degrading to untagged rows would silently put
+  // every session back on a believed 200k window, the defect the [1m] work fixed.
+  assert.deepEqual(buildAnthropicPickerRows(ANTHROPIC_FULL, new Map(), ANTHROPIC_FALLBACK_TAGS),
+    [...ANTHROPIC_RELAY.picker]);
+});
+
+test("an id with NEITHER live data NOR a fallback default renders BARE", () => {
+  // The case decision 3's reversal created: the picker now shows every live id,
+  // and the hand-tagged defaults only ever covered the curated four. For
+  // anything else with no stated window there is no evidence of a 1M context,
+  // and the two errors are not symmetric -- under-claiming is a display
+  // inaccuracy, over-claiming lets a session send a prompt larger than the model
+  // can hold. Guess downward, or not at all.
+  assert.deepEqual(buildAnthropicPickerRows(["claude-opus-4-8"], new Map(), ANTHROPIC_FALLBACK_TAGS),
+    ["claude-opus-4-8"]);
+  // ...and it still tags when the live data DOES confirm one.
+  assert.deepEqual(buildAnthropicPickerRows(["claude-opus-4-8"],
+    CTX({ "claude-opus-4-8": 1000000 }), ANTHROPIC_FALLBACK_TAGS), ["claude-opus-4-8[1m]"]);
+});
+
+test("a full live id list tags per-id, mixing live, fallback and bare in one pass", () => {
+  // The realistic shape after the reversal: 11 live ids, some with a stated
+  // window, some without, only four of them covered by a hand-tagged default.
+  const rows = buildAnthropicPickerRows(
+    ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-4-6"],
+    CTX({ "claude-opus-5": 1000000, "claude-sonnet-4-6": 200000 }),
+    ANTHROPIC_FALLBACK_TAGS);
+  assert.deepEqual(rows, [
+    "claude-opus-5[1m]",      // live says 1M
+    "claude-sonnet-5[1m]",    // no live window, curated default says 1M
+    "claude-opus-4-8",        // no live window, no default -> bare
+    "claude-sonnet-4-6",      // live says 200k
+  ]);
+});
+
+test("the 1M threshold is inclusive at EXACTLY 1,000,000", () => {
+  // THE BOUNDARY. Claude Code's own lever is `/\[1m\]/i.test(e) -> 1e6`, so a
+  // model whose stated window is exactly 1e6 is a 1M model and must be tagged.
+  // A `>` here instead of `>=` is a one-character mutation that leaves every
+  // other assertion in this file green while shipping an untagged row for the
+  // most likely value the API will ever report.
+  assert.equal(ONE_M_TOKENS, 1000000);
+  assert.deepEqual(buildAnthropicPickerRows(["m"], CTX({ m: ONE_M_TOKENS })), ["m[1m]"],
+    "exactly 1,000,000 is a 1M window: >= not >");
+  assert.deepEqual(buildAnthropicPickerRows(["m"], CTX({ m: ONE_M_TOKENS - 1 })), ["m"],
+    "one token under is not");
+  assert.deepEqual(buildAnthropicPickerRows(["m"], CTX({ m: ONE_M_TOKENS + 1 })), ["m[1m]"]);
+  // ...and a 2M model still tags [1m], which is the accepted ceiling: Gc()
+  // recognizes no other marker, so this is not a regression versus native mode.
+  assert.deepEqual(buildAnthropicPickerRows(["m"], CTX({ m: 2000000 })), ["m[1m]"]);
+});
+
+test("the function is pure and order-preserving, and accepts a plain object", () => {
+  const ctx = CTX({ "claude-opus-5": 1000000 });
+  const before = [...ANTHROPIC_FULL];
+  buildAnthropicPickerRows(ANTHROPIC_FULL, ctx);
+  assert.deepEqual([...ANTHROPIC_FULL], before, "the curated list must not be mutated");
+  assert.equal(ctx.size, 1, "nor the context map");
+  // run.mjs passes a Map; the state file and any JSON round-trip give an object.
+  assert.deepEqual(buildAnthropicPickerRows(["a", "b"], { a: 1000000 }, { b: "b[1m]" }),
+    ["a[1m]", "b[1m]"]);
+});
+
+test("an already-tagged curated id cannot become claude-opus-5[1m][1m]", () => {
+  // Defensive, and cheap: the curated list is bare today, but a future one-line
+  // human edit adding a tagged id would otherwise miss its contextById lookup
+  // AND emit a doubled marker -- a model string nothing resolves, in the one
+  // place where a wrong string fails silently.
+  assert.deepEqual(buildAnthropicPickerRows(["claude-opus-5[1m]"],
+    CTX({ "claude-opus-5": 1000000 })), ["claude-opus-5[1m]"]);
+  assert.deepEqual(buildAnthropicPickerRows(["claude-opus-5[1m]"],
+    CTX({ "claude-opus-5": 200000 })), ["claude-opus-5"]);
+});
+
+test("dynamically tagged rows still pass validate() against bare routing ids", () => {
+  // End to end, the property the whole feature rests on: whatever the tagger
+  // emits must survive validate()'s picker<=models check against the BARE ids
+  // that CCR routes on. Asserting the tagger's output in isolation would not
+  // catch a tag shape validate() rejects.
+  const rows = buildAnthropicPickerRows(ANTHROPIC_FULL,
+    CTX({ "claude-opus-5": 1000000, "claude-haiku-4-5-20251001": 200000 }));
+  const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       models: [...ANTHROPIC_FULL] }];
+  const picker = rows.map((m) => ({ model: `anthropic/${m}`, label: m }));
+  assert.deepEqual(validate({ providers, picker }, 1), []);
+});
+
+// ---- deriveAnthropicSets: routing auto-add vs the guard's vouched set -------
+// These four sets were inline in the pipeline, where nothing could assert on
+// them, and that is exactly how the vouching regression shipped. The invariant
+// they must hold is the one the security guard depends on.
+
+const LIVE = new Set([...ANTHROPIC_FULL, "claude-opus-4-8", "claude-sonnet-4-6"]);
+
+test("routing auto-adds every live id, unioned with the curated set", () => {
+  const { routingIds } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+  assert.deepEqual([...routingIds].sort(), [...LIVE].sort());
+  // The curated four survive even a live response that omits one of them.
+  const partial = deriveAnthropicSets(new Set(["claude-opus-4-8"]), ANTHROPIC_FULL);
+  for (const id of ANTHROPIC_FULL) assert.equal(partial.routingIds.has(id), true);
+});
+
+test("relayOwned NEVER grows with live data -- the invariant the guard rests on", () => {
+  // THE REGRESSION TEST FOR THE REGRESSION'S CAUSE. `routingIds` and the guard's
+  // `realIds` both reduce to `live u curated`; if the VOUCHED set were computed
+  // the same way, the relay would own every id the guard considers and its FATAL
+  // path could never fire. relayOwned must stay curated-only, and must therefore
+  // be a strict subset whenever live data adds anything.
+  const { routingIds, relayOwned } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+  assert.deepEqual([...relayOwned].sort(), [...ANTHROPIC_FULL].sort());
+  assert.ok(relayOwned.size < routingIds.size,
+    "live data added ids, so the vouched set MUST be strictly smaller than the routed set");
+  for (const id of relayOwned) assert.equal(routingIds.has(id), true, "and a subset of it");
+});
+
+test("the picker shows every live id, not just the curated four (decision 3 reversed)", () => {
+  const { pickerIds } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+  assert.deepEqual([...pickerIds].sort(), [...LIVE].sort());
+  assert.ok(pickerIds.includes("claude-opus-4-8"));
+});
+
+test("every picker id is routable, so validate() can never reject a shown row", () => {
+  // A row the menu offers but Providers[].models does not carry fails
+  // validate() and aborts the run. Asserted as a property of the derivation
+  // rather than left to the two happening to be built from the same input.
+  for (const live of [LIVE, new Set(["claude-opus-9"]), null]) {
+    const { pickerIds, routingIds } = deriveAnthropicSets(live, ANTHROPIC_FULL);
+    for (const id of pickerIds) {
+      assert.equal(routingIds.has(id), true, `${id} is shown but not routed`);
+    }
+  }
+});
+
+test("a null catalog falls back to the curated set for routing AND the picker", () => {
+  // An unreachable relay is not evidence about anything. Four reviewed rows is
+  // the right degradation; zero rows would fail the post-write verification and
+  // an empty routing set would remove Claude from Claude Code entirely.
+  const { routingIds, relayOwned, pickerIds } = deriveAnthropicSets(null, ANTHROPIC_FULL);
+  assert.deepEqual([...routingIds].sort(), [...ANTHROPIC_FULL].sort());
+  assert.deepEqual([...pickerIds], [...ANTHROPIC_FULL]);
+  assert.deepEqual([...relayOwned].sort(), [...ANTHROPIC_FULL].sort());
+});
+
+test("relayAliases stays exactly the bare aliases, however routingIds grows", () => {
+  // Computed as "in the static routing list but not a model id" rather than
+  // hardcoded, so a live id that happened to collide with the list cannot be
+  // double-advertised, and a growing routing set cannot drop an alias.
+  const { relayAliases } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+  assert.deepEqual([...relayAliases].sort(), ["fable", "haiku", "opus", "sonnet"]);
+  const none = deriveAnthropicSets(null, ANTHROPIC_FULL);
+  assert.deepEqual([...none.relayAliases].sort(), ["fable", "haiku", "opus", "sonnet"]);
+});
+
+test("the routing staleness ceiling is a real bound, not an unbounded default", () => {
+  // The fetch's own TTL is one hour; this bounds how old a CACHE may be and
+  // still decide what we advertise. An arbitrarily old snapshot would write
+  // retired ids into live Providers[].models as rows that 404 on selection.
+  assert.equal(typeof ROUTING_MAX_STALENESS_MS, "number");
+  assert.ok(ROUTING_MAX_STALENESS_MS > 60 * 60 * 1000, "must exceed the 1h fetch TTL");
+  assert.ok(ROUTING_MAX_STALENESS_MS <= 30 * 24 * 60 * 60 * 1000, "but must actually bound it");
+});
+
+test("a snapshot inside the ceiling routes; one past it falls back to curated", () => {
+  const now = 1_000_000_000_000;
+  const ids = new Set(["claude-opus-4-8"]);
+  const fresh = { ids, at: now - ROUTING_MAX_STALENESS_MS + 1000 };
+  const ancient = { ids, at: now - ROUTING_MAX_STALENESS_MS - 1000 };
+  assert.equal(routableCatalogIds(fresh, now), ids);
+  assert.equal(routableCatalogIds(ancient, now), null, "too old to decide what we advertise");
+  // Exactly at the ceiling is still routable: `<=`, not `<`.
+  assert.equal(routableCatalogIds({ ids, at: now - ROUTING_MAX_STALENESS_MS }, now), ids);
+  assert.equal(routableCatalogIds(null, now), null);
+});
+
+test("an unstamped (legacy) snapshot is treated as maximally stale, not as fresh", () => {
+  // `at: 0` must fail the ceiling rather than pass it. The inverted reading --
+  // "no timestamp, assume current" -- would let an arbitrarily old legacy cache
+  // write retired ids into live routing, which is the exact thing the ceiling
+  // exists to stop, on the one record shape that carries no age at all.
+  const now = 1_000_000_000_000;
+  assert.equal(routableCatalogIds({ ids: new Set(["x"]), at: 0 }, now), null);
+  assert.equal(routableCatalogIds({ ids: new Set(["x"]) }, now), null, "and a missing field too");
+});
+
+test("a too-stale snapshot still feeds the GUARD, only routing is bounded", () => {
+  // The ceiling must not become a security regression of its own. Routing falls
+  // back to curated, but `realIds` is built from the raw catalog, so the guard
+  // keeps its narrowing rather than reverting to null (= match every
+  // Claude-SHAPED name). Two different questions, two different tolerances.
+  const now = 1_000_000_000_000;
+  const catalog = { ids: new Set([...ANTHROPIC_FULL, "claude-opus-4-8"]), at: 0 };
+  const { routingIds } = deriveAnthropicSets(routableCatalogIds(catalog, now), ANTHROPIC_FULL);
+  assert.equal(routingIds.has("claude-opus-4-8"), false, "not routed: the snapshot is ancient");
+  const realIds = new Set([...catalog.ids, ...ANTHROPIC_RELAY.models]);
+  const r = checkBareCollisions([P("tabiai", "claude-opus-4-8")],
+    { realIds, relayOwned: new Set(ANTHROPIC_FULL), relayRouting: routingIds });
+  assert.equal(r.fatal, true, "the guard still considers the id and still fires");
+});
+
+// ---- decision 4: the native picker is scoped to the subscription rows -------
+
+const ROW = (model, description) => (description ? { model, description } : { model });
+const FULL_BUILT = [
+  ROW("anthropic/claude-opus-5[1m]", "subscription"),
+  ROW("anthropic/claude-sonnet-5[1m]", "subscription"),
+  ROW("anthropic/claude-haiku-4-5-20251001", "subscription"),
+  ROW("anthropic/claude-fable-5-1[1m]", "subscription"),
+  ROW("groq/openai/gpt-oss-20b", "free · api.groq.com"),
+  ROW("mistral/mistral-small-latest", "paid · api.mistral.ai"),
+  ROW("tabiai/claude-opus-5", "free · tabitoken.com"),
+];
+
+test("only the Anthropic rows are written to modelPicker.options", () => {
+  // THE SCOPING CHANGE. Live, this is 4 rows written instead of 87. A mutation
+  // that passes the full built set through -- the exact shape of the code this
+  // replaced -- fails here rather than silently shipping the old menu.
+  const out = scopeNativePickerOptions(FULL_BUILT);
+  assert.deepEqual(out.map((r) => r.model), [
+    "anthropic/claude-opus-5[1m]", "anthropic/claude-sonnet-5[1m]",
+    "anthropic/claude-haiku-4-5-20251001", "anthropic/claude-fable-5-1[1m]"]);
+  assert.equal(out.length, 4);
+  assert.equal(out.some((r) => r.model.startsWith("tabiai/")), false,
+    "a reseller's Claude-shaped row must not ride in on a loose prefix match");
+});
+
+test("scoping returns a NEW array and leaves the caller's rows exactly as built", () => {
+  // `built.picker` is read AFTER this by reconcileUserModelPin and by the
+  // ANCHOR_PREFERENCE search, so neither the input array nor any row in it may
+  // be touched -- and the returned array must be separate, so a later edit to
+  // the options list cannot reach back into the built set.
+  const before = JSON.parse(JSON.stringify(FULL_BUILT));
+  const out = scopeNativePickerOptions(FULL_BUILT);
+  assert.deepEqual(FULL_BUILT, before, "the input array and its rows must be untouched");
+  assert.notEqual(out, FULL_BUILT, "the result must not alias the input array");
+  assert.deepEqual(out.map((r) => r.description), Array(4).fill("subscription"),
+    "and no row picks up an annotation: there is no longer a note to append");
+});
+
+test("with the relay DOWN the full built set is written, never an empty options[]", () => {
+  // run.mjs verifies `modelPicker.options.length` after the write and throws --
+  // rolling settings.json back -- if it is zero. Scoping to zero Anthropic rows
+  // would turn "the relay is down" into "settings.json write failed", and leave
+  // the user with no native menu at all. A menu of reachable third-party rows
+  // beats no menu.
+  const noRelay = FULL_BUILT.filter((r) => !r.model.startsWith("anthropic/"));
+  const out = scopeNativePickerOptions(noRelay);
+  assert.equal(out.length, noRelay.length);
+  assert.deepEqual(out.map((r) => r.model), noRelay.map((r) => r.model));
+});
+
+test("the scoped rows and the routable providers are deliberately different sets", () => {
+  // Decision 4's actual claim, stated as an assertion: dropping 83 rows from the
+  // NATIVE menu is not dropping them from routing. CCR routes on Providers[],
+  // and uwpick (ctrl+g) reads its own catalogue snapshot -- it has never read
+  // modelPicker.options. If a future change makes the native menu the source of
+  // truth for reachability, this is the test that should stop it.
+  const out = scopeNativePickerOptions(FULL_BUILT);
+  const dropped = FULL_BUILT.filter((r) => !out.some((o) => o.model === r.model));
+  assert.equal(dropped.length, 3);
+  assert.deepEqual(dropped.map((r) => r.model).sort(),
+    ["groq/openai/gpt-oss-20b", "mistral/mistral-small-latest", "tabiai/claude-opus-5"]);
 });

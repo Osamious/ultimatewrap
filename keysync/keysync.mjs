@@ -159,7 +159,23 @@ const BEHAVES_AS = process.env.UW_BEHAVES_AS ?? "claude-sonnet-4-6";
 // degrade to a blank suffix, never throw during config generation.
 const hostOf = (u) => { try { return new URL(u).host; } catch { return ""; } };
 
-const ANTHROPIC_FULL = Object.freeze([
+// CURATED, REVIEWED, STATIC. This is NOT "the rows the picker shows" -- the
+// picker shows every id the live catalog returns. It has two narrower jobs, and
+// both are about what happens when live data is absent or untrustworthy:
+//
+//   1. FALLBACK. When the live fetch fails entirely (relay down, no cache) or
+//      the cache is past the routing staleness ceiling, these four ids are the
+//      routing set AND the picker set, because they are known-good by review.
+//   2. VOUCHING, for the collision guard. `checkBareCollisions` treats the
+//      relay's ownership of an id as evidence of SAFETY only for ids in here.
+//      Routing auto-adds every live id, and without this distinction that
+//      auto-add would make the guard's FATAL path structurally unreachable --
+//      a reseller sole-listing a live-but-unreviewed id would be laundered into
+//      an accepted ambiguity by our own routing config. See run.mjs.
+//
+// Adding an id here therefore stays a deliberate one-line human edit: it is an
+// assertion that a human looked at that id, not merely that Anthropic serves it.
+export const ANTHROPIC_FULL = Object.freeze([
   "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-fable-5-1"
 ]);
 const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
@@ -187,9 +203,70 @@ const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
 // anthropic-oauth-relay.mjs's `resolveModelId`), which is what makes it safe
 // for `validate()` to require the picker's suffixed id to also appear
 // verbatim in `models[]` -- see the picker-row construction below.
-const ANTHROPIC_PICKER = Object.freeze([
+//
+// THIS ARRAY IS NOW THE FALLBACK, NOT THE LIVE TRUTH. The tags below are what
+// ships when the live catalog cannot be reached at all (relay down AND no
+// cache): a hand-checked snapshot of the same facts, never deleted, so a
+// network failure degrades to today's exact behaviour rather than to untagged
+// rows. When live data IS available, `buildAnthropicPickerRows` recomputes each
+// tag from the model's real `max_input_tokens` and this array is not consulted
+// for that id -- so Anthropic changing a context window, or shipping a 1M
+// variant of Haiku, no longer needs a code edit.
+const ANTHROPIC_PICKER_FALLBACK = Object.freeze([
   "claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-4-5-20251001", "claude-fable-5-1[1m]"
 ]);
+
+// DERIVED from the array above, never re-typed. Two hand-maintained lists of one
+// fact are how they drift; this one cannot, because the map is generated from
+// the array at load time and a change to either is a change to both.
+export const ANTHROPIC_FALLBACK_TAGS = Object.freeze(Object.fromEntries(
+  ANTHROPIC_PICKER_FALLBACK.map((tagged) => [tagged.replace(/\[1m\]$/i, ""), tagged])
+));
+
+// Claude Code's client-side context-window lever, in full: `Gc(e) =
+// /\[1m\]/i.test(e) -> 1e6`. A string suffix and nothing else -- the
+// `modelPicker.options[]` schema has exactly four fields (model, label,
+// description, behavesAs) and no numeric context field -- so this constant is
+// the whole of the threshold, and `>=` is the whole of the comparison.
+export const ONE_M_TOKENS = 1_000_000;
+
+/**
+ * Tag each id with `[1m]` iff its LIVE context window says so.
+ *
+ * Pure: no fetch, no cache, no clock. `contextById` is whatever
+ * `fetchAnthropicCatalog` resolved (possibly from a stale cache, possibly
+ * empty); the fallback map covers ids it has no entry for.
+ *
+ * THREE INPUTS, IN PRECEDENCE ORDER, and the third is the one that matters:
+ *   1. live window stated  -> tag iff >= 1M. Authoritative.
+ *   2. no live window, but a hand-tagged default exists (the curated four)
+ *                          -> use that default. "Not stated" is NOT "small":
+ *      treating it as small would silently drop a real 1M row back to a
+ *      believed 200k window, the exact defect the `[1m]` work was done to fix.
+ *   3. no live window AND no default (any id beyond the curated four)
+ *                          -> BARE. Nothing has confirmed a 1M window for this
+ *      id, and the two errors are not symmetric: under-claiming costs display
+ *      accuracy, while over-claiming lets a session send a prompt larger than
+ *      the model can actually hold. Guess downward or not at all.
+ *
+ * @param {readonly string[]} ids              bare ids to build rows for
+ * @param {Map<string, number>|object} contextById  live max_input_tokens by id
+ * @param {object} [fallbackTags]              bare id -> hand-tagged default
+ * @returns {string[]} one entry per input id, in the same order
+ */
+export function buildAnthropicPickerRows(ids, contextById, fallbackTags = ANTHROPIC_FALLBACK_TAGS) {
+  const ctx = contextById instanceof Map ? contextById : new Map(Object.entries(contextById ?? {}));
+  return (ids ?? []).map((raw) => {
+    // Strip first, always. The curated list is bare today, but an id that ever
+    // arrived already tagged would otherwise be looked up under a key that is
+    // not in `contextById` and then emitted as `claude-opus-5[1m][1m]` -- a
+    // model string nothing resolves, in the one place a wrong string is silent.
+    const id = String(raw).replace(/\[1m\]$/i, "");
+    const live = ctx.get(id);
+    if (Number.isFinite(live)) return live >= ONE_M_TOKENS ? `${id}[1m]` : id;
+    return fallbackTags?.[id] ?? id;
+  });
+}
 
 export const ANTHROPIC_RELAY = {
   name: "anthropic",
@@ -199,9 +276,13 @@ export const ANTHROPIC_RELAY = {
   api_key: "relay-ignores-this",
   autoFetchModels: false,
   enabled: true,
-  // Verified live through CCR 2026-09-02.
+  // Verified live through CCR 2026-09-02. `models` and `routing` stay the
+  // curated set: they are the STATIC SAFETY NET for the same total-failure case
+  // `picker` covers, and run.mjs unions the live ids on top of them rather than
+  // replacing them, so a live response that anomalously omits one of the four
+  // cannot remove it from routing.
   models: ANTHROPIC_FULL,
-  picker: ANTHROPIC_PICKER,
+  picker: ANTHROPIC_PICKER_FALLBACK,
   routing: Object.freeze([...ANTHROPIC_FULL, ...ANTHROPIC_ALIASES])
 };
 

@@ -352,6 +352,12 @@ export function otherClaudeSessions() {
  */
 export function atomicWriteJson(file, obj) {
   const tmp = `${file}.uw-tmp-${process.pid}`;
+  // The temp file is written NEXT TO the target, so a missing parent directory
+  // fails the write rather than the rename -- and the caller sees ENOENT for a
+  // path it just constructed. settings.json's directory always exists; a state
+  // file under ~/.uw/state/ on a fresh machine does not, and assuming otherwise
+  // is the kind of thing that only breaks for a first-time user.
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch { /* the write below reports it */ }
   let acl = null;
   if (fs.existsSync(file)) {
     try { acl = ps(`(Get-Acl -LiteralPath '${psQuote(file)}').Sddl`).trim(); } catch { /* best effort */ }
