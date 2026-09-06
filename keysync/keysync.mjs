@@ -94,6 +94,41 @@ export function inferTier(entry) {
   return nums.every((v) => v === 0) ? "free" : "paid";
 }
 
+/**
+ * text / nontext / null, from the catalogue's own `modalities.output`.
+ *
+ * Sits beside `inferTier` for locality -- the other entry-to-label function over
+ * the catalogue -- but the rule it follows is `makeRoutableOf`'s
+ * (`menu/catalog.mjs:143`), not `inferTier`'s. MEASURED 2026-09-06: `inferTier`
+ * reads `pricing.inputPerMillion` while this schema stores
+ * `pricing.offers[].per1MTokens`, so it yields a usable value for 0 of 4,298
+ * entries and the free-first sort at :365 is a no-op (`menu/catalog.mjs:29-31`
+ * documents the same, and it is OQ-5, not fixed here). A dead function is the
+ * wrong exemplar for honest-unknown labelling.
+ *
+ * POSITIVE SIGNALS ONLY. Absence of `modalities.output` is `null` -- unknown,
+ * which renders selectable -- never `"nontext"`. Wrongly hiding a real chat
+ * model is worse than letting an ambiguous one through, and the catalogue is
+ * measurably wrong in that direction: `nvidia/bge-m3` is an embedding model
+ * declaring `output: ["text"]`, so it reads as `"text"` here and stays
+ * selectable. That miss is accepted, not worked around.
+ *
+ * The embedding/score clause runs BEFORE the text clause because 18 catalogue
+ * entries declare both -- an embedding model that also emits text is still not a
+ * chat model. The other 117 non-text entries never reach it.
+ *
+ * Same value as the keysync picker row's `kind` (T7), under different local
+ * pressure: `pick-state.mjs` already spends `item.kind` on
+ * "model" | "provider" | "pinned", so the menu pipeline cannot reuse the bare
+ * name without putting two vocabularies in one expression.
+ */
+export function outputKind(entry) {
+  const out = entry?.modalities?.output;
+  if (!Array.isArray(out)) return null;
+  if (out.includes("embedding") || out.includes("score")) return "nontext";
+  return out.includes("text") ? "text" : "nontext";
+}
+
 // ------------------------------------------------------------ protocol rule
 // VERIFIED 2026-09-01: CCR resolves a provider's protocol from its base-URL HOST
 // via a built-in registry, and that wins over an explicit `type` AND over

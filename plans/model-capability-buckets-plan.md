@@ -463,7 +463,10 @@ the head of the recorded order.
   rows keep input relative order.
 - Input array and every row object `deepEqual` a pre-call snapshot; result is a different reference.
 - With no Anthropic rows, all rows returned unchanged and in order.
-- No call site or test imports `scopeNativePickerOptions`.
+- No call site or test imports `scopeNativePickerOptions`. **Scope the check to `keysync/ menu/
+  test/`** — a bare repo-wide grep also hits `plans/open-questions.md` and this plan, both of which
+  record what the code *used to do* and are correct to keep the old name. Executed at T1: prose
+  left alone deliberately.
 - **The V7 property is asserted here, not deferred to T8** (§1.9 measure 1): the rewritten `:1011`
   test asserts `dropped.length === 0`, so from this commit onward restoring the filter fails a test
   rather than waiting for a guard that does not exist yet.
@@ -780,9 +783,15 @@ rather than assumed.
 - **One test drives `bucketFor` with an object the pipeline built**, not a literal (§1.4).
 - End-to-end from a fixture catalogue: 4 nonchat / 27 capable / 14 weak / 38 unknown; 27 rows at
   `claude-sonnet-4-6`, 56 at `claude-sonnet-4-5`. **The end-to-end assertion runs the built picker
-  through `orderNativePickerOptions` and counts the rows that survive** (§1.9 measure 2) — as R3
-  wrote it, this criterion passed identically with or without T1, which is the vacuity §1.9 exists
-  to name.
+  through `orderNativePickerOptions`** (§1.9 measure 2) — as R3 wrote it, this criterion passed
+  identically with or without T1, which is the vacuity §1.9 exists to name.
+
+  **Two separate jobs, do not conflate them** (found at T1 execution). Routing through
+  `orderNativePickerOptions` is an *ordering interlock*: pre-T1 the function filters, so the
+  distribution assertion fails and T7 cannot land without T1. Post-T1 the function is a
+  pass-through, so "count the rows that survive" is `input.length` by construction and proves
+  nothing about bucketing. **T7 must assert the 27/56 distribution over the returned array on its
+  own terms** — the routing is what orders the tasks, not what checks the classifier.
 - Every row has a `behavesAs`. None is `null`, `""`, `claude-haiku-4-5`, or matches
   `PROMPT_BUNDLE_MODELS`. `grep -r UW_BEHAVES_AS` returns nothing.
 
