@@ -50,10 +50,31 @@ export function nextSelectable(list, from, dir) {
   return from;
 }
 
-// "If the cursor is not on a selectable row, advance to one." Idempotent on an
-// already-selectable index by construction, which is what lets clamp() run on the
-// arrow path without correcting a second time and moving two rows per keypress.
-const settle = (list, i) => (isSelectable(list[i]) ? i : nextSelectable(list, i, 1));
+// "If the cursor is not on a selectable row, advance to the NEAREST one." Forward
+// first, then backward, and DELIBERATELY NOT WRAPPING -- this is the whole
+// difference from nextSelectable, whose wrap belongs to the arrow path alone.
+//
+// clamp() calls this on every filter keystroke, favourite toggle and resize, not
+// just on arrows, and there a wrap teleports: with 5 rows and a non-chat model at
+// index 3, a cursor sitting at 4 when one filter character is typed wraps forward
+// past the end and lands at 0, jumping BACKWARDS over three selectable rows. The
+// arrow comment below states the invariant that breaks -- "a filter that shortens
+// the list must not teleport the cursor to the far end" -- and this is where it is
+// enforced. The backward scan is the fallback for exactly the case the wrap was
+// silently covering: nothing selectable at or after `i`.
+//
+// Idempotent on an already-selectable index by construction, which is what lets
+// clamp() run on the arrow path without correcting a second time and moving two
+// rows per keypress. Both loops are bounded by the list, so an all-unselectable
+// list falls through to `return i` rather than spinning -- the same termination
+// guard nextSelectable's `k < n` provides, and reachable for the same reason
+// (filtering `flux` leaves 5 rows, every one of them `output: ["image"]`).
+const settle = (list, i) => {
+  if (isSelectable(list[i])) return i;
+  for (let j = i + 1; j < list.length; j++) if (isSelectable(list[j])) return j;
+  for (let j = i - 1; j >= 0; j--) if (isSelectable(list[j])) return j;
+  return i;
+};
 
 export function initState(rows, { recents = [], favourites = [], termRows = 30 } = {}) {
   const known = new Set();

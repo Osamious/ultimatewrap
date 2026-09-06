@@ -423,6 +423,43 @@ test("a list with nothing selectable terminates and leaves the cursor put", () =
   assert.equal(reduce(s, ENTER).exit, null);
 });
 
+test("clamp's settle takes the NEAREST selectable row and never wraps", () => {
+  // The invariant the arrow comment states -- "a filter that shortens the list
+  // must not teleport the cursor to the far end" -- asserted at the place that
+  // enforces it. clamp() runs on resize, on the scope toggle and after every
+  // filter edit; only an arrow press means "move", so only an arrow press may
+  // wrap. A wrapping settle here sends a cursor near the END of the list all the
+  // way back to index 0, moving it BACKWARDS over every selectable row between.
+  //
+  // WHITE-BOX ON PURPOSE, and the reason is worth stating so nobody "simplifies"
+  // it into a keystroke sequence. Through the public key API the two settles are
+  // today indistinguishable: the filter path is `clamp(reset(...))`, so the
+  // cursor is already 0 before settle sees it, and every other clamp call site
+  // inherits a cursor a previous clamp already settled. Reaching the branch
+  // therefore means handing clamp a cursor parked on an unselectable index --
+  // which is precisely the state a future list-shortening edit would produce.
+  const rows = [{ keyId: "p", provider: "p", free: null, planCount: 0, health: "ok",
+                  models: [CHAT("b0"), CHAT("b1"), CHAT("b2"), CHAT("b3"), PIC("bimg")] }];
+  const s = reduce(initState(rows), ENTER).state;
+  const parked = { ...s, cur: [s.cur[0], 4, s.cur[2]] };        // on the non-chat tail
+  const after = reduce(parked, { resize: 30 }).state;
+  assert.equal(view(after).cursor, 3,
+    "the cursor settles onto the adjacent selectable row, not across the whole list");
+  assert.ok(view(after).cursor <= 4,
+    "settling must never move the cursor UP past selectable rows");
+
+  // Forward is still preferred when a selectable row lies ahead, which is what
+  // keeps the viewport test above (leading non-chat rows) reading downward.
+  const lead = [{ keyId: "p", provider: "p", free: null, planCount: 0, health: "ok",
+                  models: [PIC("c0"), PIC("c1"), CHAT("c2")] }];
+  const l = reduce(initState(lead), ENTER).state;
+  assert.equal(view(l).cursor, 2, "from index 0 it scans forward, not backward");
+
+  // And the all-unselectable list still terminates rather than spinning.
+  const t = reduce(initState(IMAGES), ENTER).state;
+  assert.equal(view(reduce(t, { resize: 30 }).state).cursor, 0);
+});
+
 test("a recents entry naming a non-chat model produces no pinned row", () => {
   // The pinned path, which is the one that affects existing users: pins are
   // persisted target STRINGS with no model object, so isSelectable reads them as
