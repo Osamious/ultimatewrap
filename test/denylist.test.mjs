@@ -20,9 +20,11 @@ import { checkBareCollisions, deriveAnthropicSets, orderNativePickerOptions,
          routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
-  // Not a formality. Before the entry-point guard, run.mjs ran all 470 lines at
-  // module load: it has top-level await at :101 and `process.exit(0)` on the dry
-  // path at :192, and `node --test` passes no --target, so `dry` defaults true.
+  // Not a formality. Before the entry-point guard, run.mjs ran its whole pipeline
+  // at module load: it has a top-level `await fetchAnthropicCatalog()` and a
+  // `process.exit(0)` on the `if (dry)` path, and `node --test` passes no
+  // --target, so `dry` defaults true. (Cited by symbol: the line numbers that
+  // stood here described a file revision that no longer exists.)
   // Importing it would write built-rows.json and then kill the runner mid-suite.
   // Reaching this assertion at all is the proof that it no longer does.
   assert.equal(typeof checkBareCollisions, "function");
@@ -1082,11 +1084,18 @@ test("an INTERLEAVED build is partitioned, and the third-party half keeps its or
 });
 
 test("ordering returns a NEW array and leaves the caller's rows exactly as built", () => {
-  // `built.picker` is read AFTER this by reconcileUserModelPin (run.mjs:842) and
-  // as `built.picker[0].model` (:681, the profile anchor), so neither the input
-  // array nor any row in it may be touched. This is the test that rejects the
-  // one-line in-place `sort` -- it would reorder the caller's array and silently
-  // repoint the anchor at whichever row landed at index 0.
+  // `built.picker` is read AFTER this by `reconcileUserModelPin` and as
+  // `built.picker[0].model`, the last fallback of the `anchorModel` chain, so
+  // neither the input array nor any row in it may be touched. An in-place sort
+  // would reorder the caller's array and silently repoint the profile anchor at
+  // whichever row landed at index 0.
+  //
+  // WHICH ASSERTION DOES THE WORK, corrected: it is `notEqual(out, FULL_BUILT)`,
+  // not the deepEqual. FULL_BUILT is already Anthropic-first, so an in-place
+  // STABLE sort leaves it unreordered and the deepEqual passes -- only the
+  // aliasing check sees it. The deepEqual earns its place against an in-place
+  // sort on a fixture that is NOT already ordered, which the interleaved test
+  // above now supplies.
   const before = JSON.parse(JSON.stringify(FULL_BUILT));
   const out = orderNativePickerOptions(FULL_BUILT);
   assert.deepEqual(FULL_BUILT, before, "the input array and its rows must be untouched");
@@ -1095,9 +1104,10 @@ test("ordering returns a NEW array and leaves the caller's rows exactly as built
 
 test("with no Anthropic rows the input is returned unchanged and in order", () => {
   // The relay-down case. It used to need a fallback because scoping to zero
-  // Anthropic rows wrote an empty options[], failing the post-write check at
-  // run.mjs:882-883 and rolling settings.json back. A partition has nothing to
-  // fall back from: one half is simply empty.
+  // Anthropic rows wrote an empty options[], failing the post-write check
+  // (`assertOptionsComplete`) and rolling settings.json back through
+  // `restoreSettings`. A partition has nothing to fall back from: one half is
+  // simply empty.
   const noRelay = FULL_BUILT.filter((r) => !r.model.startsWith("anthropic/"));
   const out = orderNativePickerOptions(noRelay);
   assert.deepEqual(out.map((r) => r.model), noRelay.map((r) => r.model));
@@ -1444,7 +1454,8 @@ test("END TO END: 83 rows classify 4/27/14/38 and declare 27 capable, 56 weak", 
   //     survive" is input.length by construction and proves nothing.
   //
   // (2) THE DISTRIBUTION, asserted over the returned array on its own terms.
-  //     The relay rows are unshifted first exactly as run.mjs:482 does, so the
+  //     The relay rows are unshifted first exactly as the pipeline's
+  //     `built.picker.unshift` in the relay block does, so the
   //     third-party half has to be picked back out by name rather than by
   //     assuming the whole array is third-party.
   const relayRows = ANTHROPIC_FULL.map((m) => ({

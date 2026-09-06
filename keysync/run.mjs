@@ -394,23 +394,30 @@ export function assertVouchedSetIsNarrower(relayOwned, routingIds, liveIds,
  * that as strictly worse than any declared bucket, so the scoping was a silent
  * capability regression on all 83 third-party rows.
  *
- * The partition is a DEFENSIVE INVARIANT, not a transformation: the unshift at
- * :465 already puts the relay rows first and no vault provider may be named
- * `anthropic`, so this is a no-op on today's data. It exists so "Anthropic
- * first" is true where `options[]` is built rather than by an accident 400 lines
- * upstream -- and `Ato()` iterates in array order, so that ordering is what
- * keeps an 87-row menu usable.
+ * The partition is a DEFENSIVE INVARIANT, not a transformation: the relay block's
+ * `built.providers.unshift` already puts the relay rows first and
+ * `assertRelayNameUnclaimed` keeps any vault provider from taking the name, so
+ * this is a no-op on today's data. It exists so "Anthropic first" is true where
+ * `options[]` is built rather than by an accident 400 lines upstream -- and
+ * `Ato()` iterates in array order, so that ordering is what keeps an 87-row menu
+ * usable.
  *
  * No relay-down fallback: nothing is filtered, so there is nothing to fall back
  * from. The empty-`options[]` case that fallback guarded is still caught, by the
- * post-write check at :882-883 throwing into the restore at :891.
+ * post-write verification (`assertOptionsComplete`) throwing into the catch that
+ * calls `restoreSettings`.
+ *
+ * CITED BY SYMBOL, NOT BY LINE, and that is a correction rather than a style
+ * preference: the five line numbers this replaces were written in the same commit
+ * that added ~76 lines above them, so every one shipped already stale. A symbol
+ * survives insertion; `menu/`'s comments already do it this way.
  *
  * @param {{model: string, description?: string}[]} pickerRows  the full built set
  * @param {{relay?: string}} [opts]
  * @returns {object[]} a NEW array holding the same row objects. Never sorts in
- *   place: `built.picker` is read afterwards by reconcileUserModelPin (:842) and
- *   as `built.picker[0].model` (:681), so a mutation here would silently repoint
- *   the profile anchor.
+ *   place: `built.picker` is read afterwards by `reconcileUserModelPin` and as
+ *   `built.picker[0].model` (the last fallback of the `anchorModel` chain), so a
+ *   mutation here would silently repoint the profile anchor.
  */
 export function orderNativePickerOptions(pickerRows, { relay = ANTHROPIC_RELAY.name } = {}) {
   const rows = pickerRows ?? [];
