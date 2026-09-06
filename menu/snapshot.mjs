@@ -29,6 +29,11 @@ export function buildSnapshot(built) {
       models: r.models.map((m) => ({
         id: m.id, ctx: m.ctx, pin: m.pin, pout: m.pout, badge: m.badge,
         tools: m.tools, vision: m.vision, reason: m.reason,
+        // An explicit literal, so every field the picker draws has to be named
+        // here to survive. That is the property: a field buildFrom sets but this
+        // list omits is dropped silently, with the snapshot still valid and every
+        // test still green.
+        outputKind: m.outputKind,
       })),
     })),
   };

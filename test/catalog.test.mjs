@@ -5,6 +5,12 @@ import path from "node:path";
 import { priceOf, isTextOut, badgeOf, capsOf, buildFrom, routableSet, makeRoutableOf,
          writeSlot, readSlot } from "../menu/catalog.mjs";
 import { writeAtomic, readJsonOr } from "../menu/atomic.mjs";
+// outputKind is exported from keysync because both lanes need it and
+// menu/catalog.mjs imports keysync, never the reverse. Its cases are asserted
+// here, next to the pipeline that consumes them, rather than in the keysync
+// suite: this file owns the menu pipeline, and the same fixture drives both the
+// unit cases and the buildFrom carry-through below.
+import { outputKind } from "../keysync/keysync.mjs";
 
 const doc = JSON.parse(fs.readFileSync(new URL("./fixtures/catalog.json", import.meta.url), "utf8"));
 const byId = Object.fromEntries(doc.models.map((m) => [m.model, m]));
@@ -100,6 +106,37 @@ test("capsOf keeps a measured `false` distinct from an absent key", () => {
                    { tools: true, vision: false, reason: null });
 });
 
+test("outputKind blocks only on a positive non-text signal", () => {
+  // The four §1.2 rows, by shape rather than by name -- these are the exact
+  // modality blocks google/lyria, google/veo-2, nscale/flux.1-schnell and
+  // nscale/stable-diffusion-xl-base-1.0 carry.
+  assert.equal(outputKind({ modalities: { output: ["audio"] } }), "nontext");
+  assert.equal(outputKind({ modalities: { output: ["video"] } }), "nontext");
+  assert.equal(outputKind({ modalities: { output: ["image"] } }), "nontext");
+
+  // The embedding/score clause runs FIRST, and this is the only case that shows
+  // it: 18 catalogue entries declare embedding alongside text, and an embedding
+  // model that also emits text is still not a chat model. Move the text clause
+  // above it and this reads "text".
+  assert.equal(outputKind({ modalities: { output: ["embedding", "text"] } }), "nontext");
+  assert.equal(outputKind({ modalities: { output: ["score", "text"] } }), "nontext");
+
+  // orcarouter/auto's shape: multimodal INPUT with text output stays selectable.
+  assert.equal(outputKind({ modalities: { input: ["image", "text"], output: ["text"] } }), "text");
+  assert.equal(outputKind({ modalities: { output: ["image", "text"] } }), "text");
+
+  // No signal is null -- unknown, which renders selectable -- never "nontext".
+  assert.equal(outputKind({ capabilities: {} }), null);
+  assert.equal(outputKind({ modalities: {} }), null);
+  assert.equal(outputKind(undefined), null);
+
+  // The measured miss, asserted so it is a recorded decision rather than a gap:
+  // nvidia/bge-m3 is an embedding model the catalogue declares output ["text"].
+  // It reads as text and stays selectable, because a positive text signal is all
+  // this function has and hiding a real chat model is the worse error (OQ-3).
+  assert.equal(outputKind({ modalities: { output: ["text"] } }), "text");
+});
+
 test("buildFrom carries the tri-state through, and synthetic rows do not invent one", () => {
   const { rows } = buildFrom(input({
     relay: { provider: "anthropic", models: ["claude-opus-5"] },
@@ -130,6 +167,30 @@ test("buildFrom carries the tri-state through, and synthetic rows do not invent 
   const relay = rows.find((r) => r.provider === "anthropic");
   assert.deepEqual([relay.models[0].tools, relay.models[0].vision, relay.models[0].reason],
                    [true, true, true]);
+});
+
+test("buildFrom labels each model's output modality on the row itself", () => {
+  // On the row, not looked up later. The row-building loop already holds the
+  // catalogue entry, so there is no second match to loosen into a cross-provider
+  // one -- which is how orcarouter/auto once matched morph/auto.
+  const { rows } = buildFrom(input({
+    relay: { provider: "anthropic", models: ["claude-opus-5"] },
+  }));
+  const acme = rows.find((r) => r.provider === "acme");
+  const row = Object.fromEntries(acme.models.map((m) => [m.id, m]));
+  assert.equal(row["acme-chat-1"].outputKind, "text");
+  assert.equal(row["acme-image-1"].outputKind, "nontext", "output: [image]");
+  assert.equal(row["acme-legacy-1"].outputKind, null, "no modalities block at all");
+
+  // Synthetic rows, consistent with their capability values: a testModel with no
+  // catalogue entry has no measured modality either, and the relay's four models
+  // are chat models known first-hand.
+  const p = new Map([["acme", { testModel: "acme-unlisted", notes: "" }]]);
+  const solo = buildFrom(input({
+    chosen: [{ id: "personal.acme.free", provider: "acme" }], providers: p,
+  })).rows[0].models[0];
+  assert.equal(solo.outputKind, null);
+  assert.equal(rows.find((r) => r.provider === "anthropic").models[0].outputKind, "text");
 });
 
 test("badgeOf: planCovered wins over price", () => {

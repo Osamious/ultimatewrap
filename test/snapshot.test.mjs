@@ -36,7 +36,28 @@ test("buildSnapshot stamps the schema and keeps every display field", () => {
   assert.deepEqual(Object.keys(s.rows[0]).sort(),
                    ["free", "health", "keyId", "models", "planCount", "provider"]);
   assert.deepEqual(Object.keys(s.rows[0].models[0]).sort(),
-                   ["badge", "ctx", "id", "pin", "pout", "reason", "tools", "vision"]);
+                   ["badge", "ctx", "id", "outputKind", "pin", "pout", "reason",
+                    "tools", "vision"]);
+});
+
+test("outputKind survives serialization, for every value it can take", () => {
+  // A key-set assertion alone is not enough and the previous eight-key list is
+  // the proof: it stated exactly which keys buildSnapshot emits and was green
+  // while the field the picker needs was being dropped. It passes just as
+  // happily over a snapshot where every value is `undefined`.
+  //
+  // So assert the value round-trips, on all three, and drive it from a fixture
+  // that carries all three -- `null` in particular, because `outputKind: null`
+  // for a testModel row is the common case and `undefined` would be
+  // indistinguishable from it in the key set.
+  const built = { generatedAt: null, rows: [{ keyId: "k", provider: "p", free: null,
+    planCount: 0, health: "ok", models: [
+      { id: "chat", outputKind: "text" },
+      { id: "pic", outputKind: "nontext" },
+      { id: "unlisted", outputKind: null }] }] };
+  const back = JSON.parse(JSON.stringify(buildSnapshot(built))).rows[0].models;
+  assert.deepEqual(back.map((m) => m.outputKind), ["text", "nontext", null]);
+  for (const m of back) assert.equal("outputKind" in m, true, `${m.id} lost the key`);
 });
 
 test("a snapshot round-trips through the file", () => {

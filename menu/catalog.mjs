@@ -198,6 +198,13 @@ export function buildFrom({ chosen, providers, catalog, relay,
         id: e.model, ctx: e?.limits?.contextTokens ?? null,
         pin: p ? p.in : null, pout: p ? p.out : null, badge: badgeOf(e, opts),
         ...capsOf(e),
+        // `outputKind`, not `kind`. pick-state.mjs already spends `item.kind` on
+        // "model" | "provider" | "pinned", so `item.model.kind` would put two
+        // unrelated vocabularies into one expression -- and `routable` sits right
+        // beside this as a second per-model status field. keysync's own picker row
+        // carries the same value under the bare name `kind`, where nothing competes
+        // for it.
+        outputKind: K.outputKind(e),
         // Q1.3: a value, not a promise. null means nobody checked and does not dim.
         routable: routableOf(`${cred.provider}/${e.model}`),
       });
@@ -216,7 +223,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
       // coercion capsOf removes.
       models.unshift({ id: tm, ctx: null, pin: null, pout: null,
                        badge: opts.planCovered ? "PLAN" : "",
-                       tools: null, vision: null, reason: null,
+                       tools: null, vision: null, reason: null, outputKind: null,
                        routable: routableOf(`${cred.provider}/${tm}`) });
     }
     const priced = models.some((m) => m.badge !== "");
@@ -240,7 +247,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
     // all-false literal here was a coercion; this one is a measurement.
     const models = (relay.models ?? []).map((id) => ({
       id, ctx: null, pin: null, pout: null, badge: "PLAN",
-      tools: true, vision: true, reason: true,
+      tools: true, vision: true, reason: true, outputKind: "text",
       routable: routableOf(`${relay.provider}/${id}`) }));
     rows.push({
       keyId: "relay.anthropic.subscription", provider: relay.provider, models,
