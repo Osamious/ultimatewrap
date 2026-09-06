@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { priceOf, isTextOut, badgeOf, buildFrom, routableSet, makeRoutableOf,
+import { priceOf, isTextOut, badgeOf, capsOf, buildFrom, routableSet, makeRoutableOf,
          writeSlot, readSlot } from "../menu/catalog.mjs";
 import { writeAtomic, readJsonOr } from "../menu/atomic.mjs";
 
@@ -79,6 +79,57 @@ test("badgeOf: zero price with a one-time grant is blank, not FREE and not PAID"
 test("badgeOf: guard G1 blanks a zero token price on a non-text-output model", () => {
   assert.equal(badgeOf(byId["acme-image-1"]), "");
   assert.equal(badgeOf(byId["acme-image-1"], { cadence: "recurring" }), "");
+});
+
+test("capsOf keeps a measured `false` distinct from an absent key", () => {
+  // The whole bug in two assertions. `!!undefined === false` made an entry with no
+  // `reasoning` key indistinguishable from one the catalogue measured as lacking
+  // reasoning, and 9 of the 45 matched picker rows are in exactly that state.
+  //
+  // The `false` half is the one that matters, and it is the half a test written
+  // only around the unknown case cannot see: mutating `?? null` to `|| null` fixes
+  // nothing and breaks this line, because `false || null === null` sends a known
+  // capability straight back to unknown (mutation boundary 2).
+  assert.equal(capsOf({ capabilities: { reasoning: false } }).reason, false);
+  assert.equal(capsOf({ capabilities: {} }).reason, null);
+
+  assert.deepEqual(capsOf({ capabilities: {} }), { tools: null, vision: null, reason: null });
+  assert.deepEqual(capsOf({}), { tools: null, vision: null, reason: null });
+  assert.deepEqual(capsOf(undefined), { tools: null, vision: null, reason: null });
+  assert.deepEqual(capsOf({ capabilities: { toolCalling: true, imageInput: false } }),
+                   { tools: true, vision: false, reason: null });
+});
+
+test("buildFrom carries the tri-state through, and synthetic rows do not invent one", () => {
+  const { rows } = buildFrom(input({
+    relay: { provider: "anthropic", models: ["claude-opus-5"] },
+  }));
+  const acme = rows.find((r) => r.provider === "acme");
+  const row = Object.fromEntries(acme.models.map((m) => [m.id, m]));
+
+  // capabilities: {toolCalling: true, imageInput: false, reasoning: true}
+  assert.equal(row["acme-chat-1"].tools, true);
+  assert.equal(row["acme-chat-1"].vision, false, "a measured false stays false");
+  // capabilities: {} -- no key at all
+  assert.deepEqual([row["acme-image-1"].tools, row["acme-image-1"].vision,
+                    row["acme-image-1"].reason], [null, null, null]);
+  // capabilities: {..., reasoning: false}
+  assert.equal(row["acme-pro-1"].reason, false);
+
+  // A testModel with no catalogue entry: the row exists BECAUSE nothing was
+  // measured, so all-false would be a claim the code cannot support.
+  const p = new Map([["acme", { testModel: "acme-unlisted", notes: "" }]]);
+  const solo = buildFrom(input({
+    chosen: [{ id: "personal.acme.free", provider: "acme" }], providers: p,
+  })).rows[0].models[0];
+  assert.equal(solo.id, "acme-unlisted");
+  assert.deepEqual([solo.tools, solo.vision, solo.reason], [null, null, null]);
+
+  // The relay is the one all-true set that survives: the Anthropic subscription
+  // models are known first-hand, not looked up.
+  const relay = rows.find((r) => r.provider === "anthropic");
+  assert.deepEqual([relay.models[0].tools, relay.models[0].vision, relay.models[0].reason],
+                   [true, true, true]);
 });
 
 test("badgeOf: planCovered wins over price", () => {

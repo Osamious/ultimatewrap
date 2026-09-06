@@ -333,7 +333,14 @@ export function frame(v, meta, { caps }) {
              highlight(pad(it.target, W.keyId + W.count), v.filter, p);
     } else {
       const m = it.model;
-      const cap = (on, ch, colour) => (on ? p[colour](ch) : p.dim("-"));
+      // Three states, three glyphs. capsOf now distinguishes "the catalogue says
+      // no" from "the catalogue does not say", and rendering both as `-` would
+      // move the lie one layer out rather than remove it -- the correctness fix
+      // upstream creates a NEW ambiguity here if this cell stays binary. ASCII and
+      // one column each, so W.caps is unchanged and the frame-width invariant
+      // holds in both glyph sets.
+      const cap = (on, ch, colour) =>
+        on === true ? p[colour](ch) : on === false ? p.dim("-") : p.dim("?");
       // COLOUR AFTER PADDING, never before. `pad` runs sanitizeDisplay, which
       // strips CSI sequences by design (A3) -- so passing an already-coloured
       // string into it silently deleted the colour and then padded the bare text

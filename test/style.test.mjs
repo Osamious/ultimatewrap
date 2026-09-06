@@ -217,6 +217,33 @@ test("a coloured badge occupies exactly W.badge visible columns", () => {
   assert.equal(s.indexOf("TVR"), badgeCol + W.badge);
 });
 
+test("the capability cell has three glyphs, not two, and still occupies W.caps", () => {
+  // capsOf distinguishes "the catalogue says no" (false) from "the catalogue does
+  // not say" (null). Rendering both as `-` would move the coercion one layer out
+  // instead of removing it, so the correctness fix upstream is only real if this
+  // cell is tri-state too.
+  //
+  // Width is asserted alongside, because the cell sits at the right-hand end of
+  // the model row and a two-column "??" would push the frame character out --
+  // which `every line of every frame is exactly FRAME_W` would report as a whole
+  // frame failing, with nothing to say which cell caused it.
+  const mk = (caps) => ({ kind: "model", target: "p/m", row: {},
+    model: { id: "m", ctx: null, pin: null, pout: null, badge: "", routable: null, ...caps } });
+  const cell = (caps) => {
+    const v = { ...V1, filter: "", cursor: 9, items: [mk(caps)] };
+    const line = frame(v, META, { caps: PLAIN }).find((l) => l.includes(" m "));
+    const badgeCol = 1 + 2 + W.id + W.ctx + 1 + W.price * 2 + 2;
+    return strip(line).slice(badgeCol + W.badge, badgeCol + W.badge + W.caps);
+  };
+  assert.equal(cell({ tools: true, vision: true, reason: true }), "TVR");
+  assert.equal(cell({ tools: false, vision: false, reason: false }), "---");
+  assert.equal(cell({ tools: null, vision: null, reason: null }), "???");
+  // Mixed, so the three are read per column rather than per row.
+  assert.equal(cell({ tools: true, vision: false, reason: null }), "T-?");
+  const seen = new Set(["TVR", "---", "???"]);
+  assert.equal(seen.size, 3, "three states must render three distinct cells");
+});
+
 test("an astral id cannot render a short frame", () => {
   // NB-4's regression, and the reason one measure is authoritative. Thirty astral
   // code points are sixty UTF-16 code units. When `pad` counted units and `bar`

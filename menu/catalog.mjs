@@ -143,6 +143,28 @@ export async function routableSet({ timeoutMs = 400, rpc = CCR.rpc } = {}) {
 export const makeRoutableOf = (set, fresh) => (target) =>
   fresh ? set.has(target) : null;
 
+/**
+ * The three capability flags, as `true | false | null`.
+ *
+ * The previous form was `!!caps.toolCalling`, and `!!undefined === false`: a model
+ * whose catalogue entry simply does not carry the key rendered identically to one
+ * the catalogue measured as lacking it. That is the same coercion Principle 1
+ * already forbids for `routable` (makeRoutableOf) and for `free` -- unknown is a
+ * third value, never a coerced false -- applied to the one place it had been
+ * missed. MEASURED: of the 45 picker rows with a catalogue entry, `reasoning` is
+ * true on 24, false on 12 and ABSENT on 9 (report 18 §9.2); all 9 claimed a
+ * measured "no".
+ *
+ * `?? null`, never `|| null`: `false || null === null` would send a known-false
+ * capability back to unknown, which is the original bug wearing a different
+ * operator.
+ */
+export function capsOf(entry) {
+  const c = entry?.capabilities ?? {};
+  return { tools: c.toolCalling ?? null, vision: c.imageInput ?? null,
+           reason: c.reasoning ?? null };
+}
+
 const FREEISH = new Set(["FREE", "FREE?"]);
 
 /**
@@ -171,11 +193,11 @@ export function buildFrom({ chosen, providers, catalog, relay,
     const models = [];
     for (const e of entries) {
       if (!keptSet.has(e.model)) continue;
-      const p = priceOf(e, cred.provider), caps = e?.capabilities ?? {};
+      const p = priceOf(e, cred.provider);
       models.push({
         id: e.model, ctx: e?.limits?.contextTokens ?? null,
         pin: p ? p.in : null, pout: p ? p.out : null, badge: badgeOf(e, opts),
-        tools: !!caps.toolCalling, vision: !!caps.imageInput, reason: !!caps.reasoning,
+        ...capsOf(e),
         // Q1.3: a value, not a promise. null means nobody checked and does not dim.
         routable: routableOf(`${cred.provider}/${e.model}`),
       });
@@ -187,9 +209,14 @@ export function buildFrom({ chosen, providers, catalog, relay,
       ? (admitRemoteModels(cred.provider, [prof.testModel], { warn: false }).kept[0] ?? null)
       : null;
     if (tm && !models.some((m) => m.id === tm)) {
+      // null, not false. This row exists BECAUSE the catalogue has no entry for the
+      // model -- the `!models.some(...)` guard above is the proof -- so `false` is a
+      // claim about a measurement that was never taken. 38 of the 83 routable rows
+      // reach the picker this way, which made it the largest single source of the
+      // coercion capsOf removes.
       models.unshift({ id: tm, ctx: null, pin: null, pout: null,
                        badge: opts.planCovered ? "PLAN" : "",
-                       tools: false, vision: false, reason: false,
+                       tools: null, vision: null, reason: null,
                        routable: routableOf(`${cred.provider}/${tm}`) });
     }
     const priced = models.some((m) => m.badge !== "");
@@ -206,6 +233,11 @@ export function buildFrom({ chosen, providers, catalog, relay,
   // keysync injects it separately, so building from the vault alone silently drops
   // the four Claude models, which are the ones most likely to be routable.
   if (relay && !rows.some((r) => r.provider === relay.provider)) {
+    // The only all-true capability set left in this file, and it survives the audit
+    // capsOf triggered for a reason the catalogue cannot supply: these are the four
+    // Anthropic subscription models, whose tool use, vision and reasoning are known
+    // first-hand from ANTHROPIC_FULL rather than looked up. Every other all-true or
+    // all-false literal here was a coercion; this one is a measurement.
     const models = (relay.models ?? []).map((id) => ({
       id, ctx: null, pin: null, pout: null, badge: "PLAN",
       tools: true, vision: true, reason: true,
