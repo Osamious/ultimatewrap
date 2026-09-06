@@ -8,9 +8,70 @@
 
 const asTarget = (providerName, modelId) => `${providerName}/${modelId}`;
 
+/**
+ * Whether enter on this item can do anything.
+ *
+ * `false` for exactly one thing: a model whose output is measurably not text. It
+ * cannot answer a chat request under any configuration, so offering it is
+ * offering an error. `outputKind: null` -- the catalogue said nothing -- stays
+ * selectable, because a positive signal is required to take a row away.
+ *
+ * `routable === false` is DELIBERATELY not here, and the omission has to be said
+ * out loud because style.mjs dims both classes and the asymmetry then reads as an
+ * oversight. Block only when selection cannot possibly succeed; dim when it
+ * might. Non-text output is a fact about the model. Routability is a measurement
+ * of a gateway configuration at one moment, and a stale one costs about 114 rows
+ * that genuinely work -- so it dims, and enter still switches.
+ */
+export function isSelectable(item) {
+  return !(item?.kind === "model" && item.model?.outputKind === "nontext");
+}
+
+/**
+ * The nearest selectable index from `from` in `dir`, wrapping.
+ *
+ * Returns `from` when NOTHING in the list is selectable, and that guard is the
+ * whole reason this is a function. It is reachable: filtering `flux` in flat
+ * scope leaves 5 rows, every one of them `output: ["image"]`. Without the bound
+ * this is an unbounded loop inside a blocking readSync on //./CONIN$, which has
+ * no event loop to interrupt it and cannot be killed from the keyboard.
+ *
+ * `k < n` is that bound and it is the ONLY one needed: an empty list runs the
+ * body zero times and falls straight to `return from`, so a separate length
+ * check would be a guard that can never fire.
+ */
+export function nextSelectable(list, from, dir) {
+  const n = list.length;
+  let i = from;
+  for (let k = 0; k < n; k++) {
+    i = (i + dir + n) % n;
+    if (isSelectable(list[i])) return i;
+  }
+  return from;
+}
+
+// "If the cursor is not on a selectable row, advance to one." Idempotent on an
+// already-selectable index by construction, which is what lets clamp() run on the
+// arrow path without correcting a second time and moving two rows per keypress.
+const settle = (list, i) => (isSelectable(list[i]) ? i : nextSelectable(list, i, 1));
+
 export function initState(rows, { recents = [], favourites = [], termRows = 30 } = {}) {
   const known = new Set();
-  for (const r of rows) for (const m of r.models) known.add(asTarget(r.provider, m.id));
+  // Built from SELECTABLE models only, which is where the pinned path is handled.
+  // A pin is a persisted target STRING -- state.mjs returns nothing else -- so
+  // initState builds it into a row with no `model` object at all, and isSelectable
+  // reads it as selectable by construction. Anyone who ever selected
+  // nscale/flux.1-schnell has it in recents, and enter on that pin still switched.
+  //
+  // This is a hide, under a principle that says show and never hide, so: the row
+  // itself still renders in the tree, dimmed, with its modality. What is dropped
+  // is a DUPLICATE SHORTCUT to a row that is already visible and already refuses.
+  // A pin whose only possible action is refusal is not information, it is a dead
+  // control -- and the filter two lines below already establishes exactly this
+  // rule for a pin naming a model the catalogue dropped.
+  for (const r of rows) for (const m of r.models) {
+    if (isSelectable({ kind: "model", model: m })) known.add(asTarget(r.provider, m.id));
+  }
   // Favourites first, then recents, both filtered to targets that still exist.
   // A pinned row naming a model the catalogue dropped would be a dead selection.
   const pinned = [
@@ -71,6 +132,13 @@ function clamp(s) {
   const i = slot(s);
   const cur = [...s.cur], top = [...s.top];
   cur[i] = Math.min(Math.max(0, cur[i]), Math.max(0, list.length - 1));
+  // BEFORE the viewport arithmetic, not after. The three lines below derive `top`
+  // FROM `cur`; settling afterwards computes the window around the row the cursor
+  // was on rather than the one it ended on, and the screen scrolls to a row the
+  // marker is not drawn on. This is also the only place reset() needs -- every
+  // reset() call site is `clamp(reset(...))`, so a second settle there would be
+  // unreachable code.
+  cur[i] = settle(list, cur[i]);
   if (cur[i] < top[i]) top[i] = cur[i];
   if (cur[i] >= top[i] + avail) top[i] = cur[i] - avail + 1;
   top[i] = Math.max(0, Math.min(top[i], Math.max(0, list.length - avail)));
@@ -146,6 +214,9 @@ export function reduce(state, ev) {
   }
 
   if (c0 === 6 && focused?.kind === "model") {                                // ctrl+f
+    // A favourite is a target the user intends to switch to later, so pinning one
+    // that enter will refuse just moves the refusal into the future.
+    if (!isSelectable(focused)) return { ...NONE, state };
     return { ...NONE, state, favourite: focused.target };
   }
 
@@ -159,11 +230,19 @@ export function reduce(state, ev) {
     // right behaviour is to pin the cursor inside the new list -- a filter that
     // shortens the list must not teleport the cursor to the far end. Only an
     // explicit arrow press means "move", so only an arrow press may wrap.
+    //
+    // nextSelectable rather than a bare +/-1: it steps over non-chat rows and
+    // carries the wrap, so ONE keypress moves exactly one SELECTABLE row. The
+    // clamp below then finds an already-selectable index and leaves it alone --
+    // that idempotence is the whole reason `settle` is written as "if not
+    // selectable, advance" rather than "advance to the next selectable". Written
+    // the other way, a single arrow steps past the non-chat row here and then
+    // steps again in clamp, and the cursor moves two rows per press.
     const cur = [...state.cur];
     const n = list.length;
     if (n > 0) {
-      if (key[2] === "A") cur[i] = (cur[i] - 1 + n) % n;
-      if (key[2] === "B") cur[i] = (cur[i] + 1) % n;
+      if (key[2] === "A") cur[i] = nextSelectable(list, cur[i], -1);
+      if (key[2] === "B") cur[i] = nextSelectable(list, cur[i], +1);
     }
     return { ...NONE, state: clamp({ ...state, cur }) };
   }
@@ -185,6 +264,12 @@ export function reduce(state, ev) {
       q[1] = ""; cur[1] = 0; top[1] = 0;
       return { ...NONE, state: clamp({ ...state, level: 1, provider: focused.row, q, cur, top }) };
     }
+    // Refuse rather than switch. The row is reachable here even with the arrows
+    // stepping over it: a filter can land the cursor on one, and the pinned path
+    // could still carry an old target. Returning `state` unchanged makes the
+    // refusal silent and cheap, which is right -- the row is already dimmed and
+    // already labelled, so the screen has said why before the key was pressed.
+    if (!isSelectable(focused)) return { ...NONE, state };
     return { ...NONE, state, exit: { target: focused.target } };
   }
 

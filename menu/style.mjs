@@ -353,8 +353,25 @@ export function frame(v, meta, { caps }) {
       // drawn from every provider at once names no row the user can act on --
       // and the filter they typed was matched against the target, so the
       // highlight would land on text that is not shown.
+      // The ctx cell is polymorphic for one row class, and it is a correction
+      // rather than a decoration: `contextTokens` is not a context window for a
+      // model that does not emit text. google/veo-2 carries 480, which is a video
+      // duration in SECONDS, and google/lyria carries 0. Both are numbers, so the
+      // column renders them as very small chat models -- an active lie in the one
+      // cell whose job is telling a big window from a small one.
+      //
+      // The branch is here at the call site, not inside ctxS(), which stays a
+      // number formatter. `nochat` is six columns exactly, so W.ctx is untouched.
+      //
+      // NOT the modality name. The design intent was AUDIO / VIDEO / IMAGE, and
+      // the cell is wide enough -- but `outputKind` is a three-valued label and
+      // the specific modality is not carried on the row or in the snapshot.
+      // Naming it would need a fourth per-model field and a second schema bump,
+      // so the cell says the consequence it can prove instead of the cause it
+      // cannot. Recorded rather than quietly narrowed.
+      const ctxCell = m.outputKind === "nontext" ? "nochat" : ctxS(m.ctx);
       body = `${mark} ` + highlight(pad(flat ? it.target : m.id, W.id), v.filter, p) +
-             rpad(ctxS(m.ctx), W.ctx) + " " +
+             rpad(ctxCell, W.ctx) + " " +
              rpad(money(m.pin), W.price) + rpad(money(m.pout), W.price) + "  " +
              badgeOut +
              cap(m.tools, "T", "cya") + cap(m.vision, "V", "mag") + cap(m.reason, "R", "yel");
@@ -374,7 +391,12 @@ export function frame(v, meta, { caps }) {
       // genuinely work. Blocking on it would convert snapshot staleness into a
       // functional outage. The failure is loud anyway: ModelRegistry.resolve()
       // returns undefined and the request errors rather than silently rerouting.
-      if (m.routable === false) body = p.dim(strip(body));
+      //
+      // ONE dim for two reasons, and they stay distinguishable without new width:
+      // a non-chat row carries `nochat` in the cell above, a non-routable one
+      // keeps its real context window, and the header's `routable <date>` stamp
+      // says whether routability was resolved at all.
+      if (m.routable === false || m.outputKind === "nontext") body = p.dim(strip(body));
     }
     L.push(bar(g, selected ? p.inv(strip(body)) : body));
   });

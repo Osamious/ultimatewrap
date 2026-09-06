@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { initState, reduce, view, tokenize } from "../menu/pick-state.mjs";
+import { initState, reduce, view, tokenize,
+         isSelectable, nextSelectable } from "../menu/pick-state.mjs";
 
 const M = (id, badge = "") => ({ id, ctx: null, pin: null, pout: null, badge,
                                  tools: false, vision: false, reason: false,
@@ -302,6 +303,142 @@ test("an empty list does not wrap, and does not divide by zero", () => {
   assert.equal(view(s).cursor, 0);
   s = reduce(s, DOWN).state;
   assert.equal(view(s).cursor, 0);
+});
+
+// --- non-chat rows: shown, dimmed, and never selected ----------------------
+//
+// The picker offers four rows that cannot answer a chat request under any
+// configuration. They still RENDER -- the point is that enter refuses, not that
+// the row disappears.
+
+const PIC = (id) => ({ ...M(id), outputKind: "nontext" });
+const CHAT = (id) => ({ ...M(id), outputKind: "text" });
+// gap: a non-chat row sits BETWEEN two chat rows, so a single arrow has to cross
+// exactly one and land on the far side. With the non-chat row at an end, wrapping
+// and stepping produce the same index and the test cannot tell them apart.
+const MIXED = [
+  { keyId: "personal.mix.free", provider: "mix", free: null, planCount: 0, health: "ok",
+    models: [CHAT("mix-chat-1"), PIC("mix-image-1"), CHAT("mix-chat-2")] },
+];
+const IMAGES = [
+  { keyId: "personal.pic.free", provider: "pic", free: null, planCount: 0, health: "ok",
+    models: [PIC("pic-a"), PIC("pic-b"), PIC("pic-c")] },
+];
+
+test("isSelectable blocks non-text output and nothing else", () => {
+  assert.equal(isSelectable({ kind: "model", model: PIC("x") }), false);
+  assert.equal(isSelectable({ kind: "model", model: CHAT("x") }), true);
+  // The decided default: the catalogue said nothing, so the row stays usable. A
+  // positive signal is required to take a row away.
+  assert.equal(isSelectable({ kind: "model", model: { ...M("x"), outputKind: null } }), true);
+  assert.equal(isSelectable({ kind: "provider", row: {} }), true);
+  assert.equal(isSelectable({ kind: "pinned", target: "p/m" }), true);
+
+  // D9: routable is NOT part of this. A stale routing measurement costs about
+  // 114 rows that genuinely work, so it dims and enter still switches. Folding it
+  // in here is the change this assertion exists to fail.
+  assert.equal(isSelectable({ kind: "model", model: { ...CHAT("x"), routable: false } }), true);
+});
+
+test("a non-chat row is shown, not hidden", () => {
+  const s = reduce(initState(MIXED), ENTER).state;
+  assert.deepEqual(view(s).items.map((i) => i.model.id),
+                   ["mix-chat-1", "mix-image-1", "mix-chat-2"]);
+});
+
+test("one arrow keypress moves exactly one SELECTABLE row, in both directions", () => {
+  // The double-correction hazard, asserted directly. reduce computes the next
+  // index and then calls clamp; if clamp's pull were written as "advance to the
+  // next selectable" rather than "if not selectable, advance", a single press
+  // would step over mix-image-1 here and then step again, landing back on
+  // mix-chat-1 by way of the wrap. A test that only checks the cursor ended
+  // somewhere selectable cannot see that at all.
+  let s = reduce(initState(MIXED), ENTER).state;
+  assert.equal(view(s).cursor, 0);
+  s = reduce(s, DOWN).state;
+  assert.equal(view(s).cursor, 2, "down crosses the image row in one press");
+  s = reduce(s, UP).state;
+  assert.equal(view(s).cursor, 0, "and up crosses it back, once");
+  // Wrapping still works across the skip.
+  s = reduce(reduce(s, DOWN).state, DOWN).state;
+  assert.equal(view(s).cursor, 0, "down from the last selectable wraps to the first");
+});
+
+test("enter on a non-chat row changes nothing, and ctrl+f refuses to pin it", () => {
+  let s = reduce(initState(MIXED), ENTER).state;
+  // Reach it by FILTER rather than by arrow -- the arrows step over it, so this
+  // is the path that still lands the cursor on one.
+  for (const ch of "image") s = reduce(s, ch).state;
+  assert.equal(view(s).items.length, 1);
+  assert.equal(view(s).items[0].model.id, "mix-image-1");
+
+  const entered = reduce(s, ENTER);
+  assert.equal(entered.exit, null);
+  assert.equal(entered.state, s, "the state must be unchanged, not merely equivalent");
+  assert.equal(reduce(s, CTRL_F).favourite, null,
+    "a favourite is a target to switch to later; pinning one defers the refusal");
+});
+
+test("the viewport follows the corrected cursor, not the pre-correction one", () => {
+  // clamp derives `top` FROM `cur`, so the pull to a selectable row has to happen
+  // BEFORE that arithmetic. Settle afterwards and the window is computed around
+  // the row the cursor was on, leaving the marker drawn outside the visible slice.
+  //
+  // The shape matters, and the obvious one does not work: on the arrow path
+  // nextSelectable has already landed on a selectable index, so clamp's settle is
+  // a no-op and the ordering is unobservable. The path that exercises it is the
+  // one that hands clamp an UNSETTLED cursor -- reset() sets cur and top to 0 on
+  // every filter change -- and the correction only crosses a viewport boundary if
+  // the run of unselectable rows at the head is longer than the window. Ten
+  // image rows against a six-row window is that shape.
+  const models = Array.from({ length: 30 },
+    (_, i) => (i < 10 ? PIC(`m${i}`) : CHAT(`m${i}`)));
+  const rows = [{ keyId: "p", provider: "p", free: null, planCount: 0, health: "ok", models }];
+  let s = reduce(initState(rows, { termRows: 12 }), ENTER).state;
+  s = reduce(s, "m").state;                    // matches all 30; reset then clamp
+  const v = view(s);
+  assert.equal(v.cursor, 10, "the cursor clears the leading image rows");
+  assert.ok(v.cursor >= v.top && v.cursor < v.top + v.items.length,
+    `cursor ${v.cursor} outside window [${v.top}, ${v.top + v.items.length})`);
+  assert.equal(isSelectable(v.items[v.cursor - v.top]), true,
+    "the row under the marker must be one enter can act on");
+});
+
+test("a list with nothing selectable terminates and leaves the cursor put", () => {
+  // Reachable today: filtering `flux` in flat scope leaves 5 rows, every one of
+  // them output ["image"]. Without the bound in nextSelectable this is an
+  // unbounded loop inside a blocking readSync on //./CONIN$, with no event loop
+  // to interrupt it and no way to kill it from the keyboard.
+  assert.equal(nextSelectable([], 0, 1), 0);
+  const all = [{ kind: "model", model: PIC("a") }, { kind: "model", model: PIC("b") }];
+  assert.equal(nextSelectable(all, 0, 1), 0);
+  assert.equal(nextSelectable(all, 1, -1), 1);
+
+  let s = reduce(initState(IMAGES), ENTER).state;
+  assert.equal(view(s).items.length, 3);
+  s = reduce(s, DOWN).state;
+  assert.equal(view(s).cursor, 0);
+  s = reduce(s, UP).state;
+  assert.equal(view(s).cursor, 0);
+  assert.equal(reduce(s, ENTER).exit, null);
+});
+
+test("a recents entry naming a non-chat model produces no pinned row", () => {
+  // The pinned path, which is the one that affects existing users: pins are
+  // persisted target STRINGS with no model object, so isSelectable reads them as
+  // selectable by construction and enter on one still switched. Anyone who has
+  // ever selected an image model has it in recents.
+  //
+  // The row itself is still in the tree below, dimmed -- what is dropped is a
+  // duplicate shortcut whose only possible action is refusal.
+  const s = initState(MIXED, { recents: ["mix/mix-image-1", "mix/mix-chat-2"],
+                               favourites: ["mix/mix-image-1"] });
+  assert.deepEqual(s.pinned.map((p) => p.target), ["mix/mix-chat-2"]);
+  const v = view(s);
+  assert.deepEqual(v.items.map((i) => i.target ?? i.row.provider),
+                   ["mix/mix-chat-2", "mix"]);
+  assert.deepEqual(reduce(s, ENTER).exit, { target: "mix/mix-chat-2" },
+    "a chat-model pin must still select immediately");
 });
 
 test("a filter that shortens the list pins the cursor rather than wrapping it", () => {

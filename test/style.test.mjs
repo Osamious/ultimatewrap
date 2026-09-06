@@ -441,15 +441,23 @@ test("the context column never overflows, so the unit is never the thing clipped
   // column exists to tell a big window from a small one. Every power-of-two
   // window was affected; the operator hit it reading a real model's window off
   // the screen during P15.
-  const mk = (ctx) => ({ kind: "model", target: "p/m",
-    model: { id: "m", ctx, pin: 0, pout: 0, badge: "", tools: 0, vision: 0, reason: 0 },
+  const mk = (ctx, extra = {}) => ({ kind: "model", target: "p/m",
+    model: { id: "m", ctx, pin: 0, pout: 0, badge: "", tools: 0, vision: 0, reason: 0,
+             ...extra },
     row: {} });
   const V = { level: 1, scope: "tree", filter: "", legend: false, cursor: 0, top: 0,
               empty: false, more: 0, provider: { keyId: "p", provider: "p", models: [1] },
               items: [] };
-  const cell = (ctx) => {
-    V.items = [mk(ctx)];
-    return strip(frame(V, META, { caps: PLAIN })[4]).slice(38, 38 + W.ctx).trim();
+  // DERIVED, not the literal 38 this helper used to carry. The cell begins at
+  // frame character + `${mark} ` + W.id = 37, so the old window was shifted one
+  // column right and silently dropped the first character of the cell. Every
+  // value here was at most five wide and right-aligned, so `.trim()` hid it --
+  // until a six-column value filled the cell and read as `ochat`. A test whose
+  // whole subject is a cell being clipped was itself clipping the cell.
+  const ctxCol = 1 + 2 + W.id;
+  const cell = (ctx, extra) => {
+    V.items = [mk(ctx, extra)];
+    return strip(frame(V, META, { caps: PLAIN })[4]).slice(ctxCol, ctxCol + W.ctx).trim();
   };
   assert.equal(cell(1048576), "1.05M", "2^20 must keep its unit");
   assert.equal(cell(2097152), "2.1M");
@@ -462,4 +470,52 @@ test("the context column never overflows, so the unit is never the thing clipped
     assert.ok(cell(c).length <= W.ctx, `${c} rendered ${cell(c).length} columns`);
     if (c >= 1e6) assert.match(cell(c), /M$/, `${c} lost its unit`);
   }
+
+  // The cell is now polymorphic, so the same guard has to cover the other shape
+  // it can take. This is the test that catches a label too wide for the column --
+  // the failure mode it was written for, one `M` at a time.
+  //
+  // A number in this cell is a lie for a row that does not emit text:
+  // google/veo-2 carries 480, a video duration in SECONDS, and google/lyria
+  // carries 0. Both would render as very small chat models.
+  assert.equal(cell(480, { outputKind: "nontext" }), "nochat", "480 seconds is not a window");
+  assert.equal(cell(0, { outputKind: "nontext" }), "nochat");
+  assert.equal(cell(null, { outputKind: "nontext" }), "nochat");
+  assert.ok(cell(0, { outputKind: "nontext" }).length <= W.ctx);
+  // Only that one class. A chat row and an unknown row keep their real number.
+  assert.equal(cell(8192, { outputKind: "text" }), "8k");
+  assert.equal(cell(8192, { outputKind: null }), "8k");
+});
+
+test("a non-chat row is dimmed whole, and a chat row beside it is not", () => {
+  // Two dim classes now reach the same line. They stay distinguishable without
+  // any new width: the non-chat row carries `nochat` in the ctx cell, a
+  // non-routable one keeps its real window, and the header stamp says whether
+  // routability was resolved at all.
+  //
+  // Dimming a row is `p.dim(strip(body))`, which strips every inner sequence
+  // first, so a dimmed row's only codes are 2 and 0. A surviving capability or
+  // badge colour is exact evidence the row was left alone -- a bare search for
+  // \x1b[2m cannot express that, because PAID is dim by design.
+  const mk = (id, extra) => ({ kind: "model", target: `p/${id}`, row: {},
+    model: { id, ctx: 8192, pin: 0, pout: 0, badge: "FREE",
+             tools: true, vision: true, reason: true, routable: null, ...extra } });
+  const V = { level: 1, scope: "tree", filter: "", legend: false, cursor: 9, top: 0,
+              empty: false, more: 0, provider: { keyId: "p", provider: "p", models: [1, 2, 3] },
+              items: [mk("chat", { outputKind: "text" }),
+                      mk("pic", { outputKind: "nontext" }),
+                      mk("unroutable", { outputKind: "text", routable: false })] };
+  const lines = frame(V, META, { caps: VT });
+  const codes = (id) => [...lines.find((l) => strip(l).includes(` ${id} `))
+    .matchAll(/\x1b\[([0-9;]*)m/g)].map((m) => m[1]);
+
+  assert.equal(codes("chat").some((c) => c !== "2" && c !== "0"), true,
+    "a selectable, routable row must keep its colours");
+  assert.deepEqual([...new Set(codes("pic"))].sort(), ["0", "2"],
+    "a non-chat row is dimmed whole");
+  assert.deepEqual([...new Set(codes("unroutable"))].sort(), ["0", "2"],
+    "a non-routable row is dimmed the same way, though it stays selectable");
+  // ...and the reason is still readable off the row.
+  assert.match(strip(lines.find((l) => strip(l).includes(" pic "))), /nochat/);
+  assert.match(strip(lines.find((l) => strip(l).includes(" unroutable "))), /8k/);
 });
