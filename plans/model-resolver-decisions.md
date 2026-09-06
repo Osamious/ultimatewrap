@@ -162,9 +162,11 @@ edit. That is [[key-lifecycle-must-scale]] directly.
 
 **Locked.** The question splits in two, and the pillars answer them differently.
 
-### 4.1 Candidate source = live listings
+### 4.1 Candidate source = `union(discovery ids, catalogue ids, testModel)`, led by the live listing
 
-Named explicitly by [[key-lifecycle-must-scale]] and [[route-max-working-models]]:
+The live listing **leads** that union. Demoting the bundle from sole source to one contributor is
+what [[key-lifecycle-must-scale]] and [[route-max-working-models]] both point at, each citing report
+20's recommendation:
 
 > replacing the bundled catalogue with each provider's own authenticated listing as the candidate
 > source
@@ -176,13 +178,83 @@ local patch once (report 08 F9).
 Rows are unioned and ranked by provenance (discovery-design §2):
 
 ```
-call-verified  >  listing-verified  >  catalogue-only
+call-verified  >  config-asserted  >  listing-verified  >  catalogue-only
 ```
 
-- **`testModel` always survives** regardless of the listing. It is probe-verified, and listings
-  under-report — catalogue-first dropped the live pass rate to 4/44.
+- **`testModel` always survives** regardless of the listing. Listings under-report —
+  catalogue-first dropped the live pass rate to 4/44.
 - **catalogue-only rows are kept, dimmed, and ranked last.** Report 20 §4 class 1: model absent →
   dim, never prune. [[responding-provider-never-pruned]].
+
+**Correction, 2026-09-06 — the heading and epigraph asserted listing-as-*the*-candidate-source, which
+the two bullets above have never said. Both are rewritten; the bullets are untouched.** *(#58)*
+
+**What the heading and epigraph used to say, and why they were wrong.** The heading read *"Candidate
+source = live listings"*, and the epigraph introduced the report-20 quote as *"Named explicitly by
+[[key-lifecycle-must-scale]] and [[route-max-working-models]]"* — presenting the fragment as a pillar
+demand for an **exclusive** source. Two things are wrong with that. The narrower one: neither pillar
+demands it in its own voice. Both attribute it — [[route-max-working-models]] says *"report 20
+**recommends** replacing the bundled catalogue …"* — and that same pillar bounds it in the next
+breath: *"Blocking, capping, hiding and pruning all need affirmative justification and irrefutable
+evidence."* The load-bearing one: read as a candidate **rule**, "the candidate source is the live
+listing" **prunes** a provider whose listing returns empty — `keysync/keysync.mjs:558-564`'s
+`!models.length` skip `continue`s before the `out.push` — which is precisely what the two bullets
+above forbid.
+
+**The heading asserted one rule while the body specified another, and D5's routing clause inherited
+the heading's framing** rather than the body's. That is the path by which #58's pruning defect
+survived inside a locked decision; see D5's amendment below, which is the seventh and last site.
+Row survival is unchanged here: `testModel` always survives, catalogue-only rows are kept, dimmed and
+ranked last.
+
+**Amendment, 2026-09-06 — the ladder gains a fourth rung. Row survival is unchanged; only the
+confidence label moves.** *(#59)*
+
+This amends a locked decision, so it is recorded rather than edited silently.
+
+**What this section used to say, and why it was wrong.** The ladder had three rungs, and the
+`testModel` bullet read *"It is probe-verified, and listings under-report."* The second clause is
+still true. The first was a **confident-wrong**: nothing re-probes `testModel`. It is a field read
+out of `providers.json`, and the ladder's own definition of its top rung is *"a real completion
+returned 200."* A lapsed subscription, a revoked key, or a decommissioned `testModel` would keep
+rendering `call-verified` — the top of the ladder — for as long as the string sits in the vault. The
+picker then ranks a dead row **above** a live `listing-verified` one, which is the inversion the
+ladder exists to prevent. The same defect appears in the plan at §2.3 and R14, where the relay's
+four models are also assigned `call-verified` as a literal.
+
+**The fix.** `call-verified` is now reserved for an **actual dated probe result** — a completion
+this system ran and recorded. Nothing may assign it as a config literal. Two populations move down
+one rung to `config-asserted`:
+
+- the vault `testModel` for every provider;
+- the relay's four Anthropic models (hardcoded in `menu/catalog.mjs`'s relay branch; `anthropic` is
+  `listing: null` and is never discovered).
+
+`config-asserted` means *asserted by local configuration, never probed*. The `-asserted` suffix
+against `-verified` is the whole point: a `verified` rung was established by something this system
+**observed** (a completion, a keyed listing); an `asserted` rung by something a human **wrote
+down**. Naming it `vault-asserted` was considered and rejected — the relay's four models do not come
+from the vault at all, so that name would be a confident-wrong on half the population it labels.
+`config-asserted` names the *evidence class*, which is the same discipline `listing-verified` and
+`catalogue-only` already follow.
+
+**It sits above `listing-verified`, deliberately.** These are the subscription models and the
+provider's own nominated model; a third-party listing row must never read as *more* confident than
+the four Claude models the user certainly has. That inversion is #45, and demoting straight past
+`listing-verified` would have reintroduced it while fixing #59.
+
+**Row survival is untouched.** Everything above still holds exactly as written: `testModel` always
+survives regardless of the listing, and catalogue-only rows are kept, dimmed and ranked last. This
+amendment changes **what a row is labelled**, never **whether a row exists**. A careless reading
+could take a demotion for a prune; a prune here would be a direct [[responding-provider-never-pruned]]
+violation (#58), and none is intended or authorized by this amendment.
+
+**Why this ships now rather than deferring with the rest of the freshness work.** The rung
+vocabulary is persisted in snapshot schema 3. Shipping `call-verified` on unprobed rows would force
+phase B to either migrate 3 → 4 or carry two incompatible meanings of one string in one schema. The
+fix itself needs no probe, no clock and no cadence — it is honest today, at zero phase-B dependency.
+Actually *promoting* a row back to `call-verified` does need a probe, and that stays deferred; the
+ladder simply has an honest place to hold the row until then.
 
 ### 4.2 Capability = join to the bundle, `null` on miss
 
@@ -190,11 +262,51 @@ call-verified  >  listing-verified  >  catalogue-only
 deepseek, google and openrouter, whose live rows are `{capability, display_name, id, tier}`.
 So `bucketFor()` can only be fed by a join.
 
-| condition | `behavesAs` |
-|---|---|
-| joins, `capabilities.reasoning === true` | capable target |
-| joins, `=== false` | weak target |
-| no join → `null` | weak target |
+| condition | `bucketFor` | `behavesAs` | live rows of 83 |
+|---|---|---|--:|
+| `kind === "nontext"` | `nonchat` | weak target | 4 |
+| joins, `capabilities.reasoning === true` | `capable` | capable target | 24 |
+| joins, `=== false` | `weak` | weak target | 10 |
+| joins, no `reasoning`, `limits.contextTokens >= CTX_CAPABLE_MIN` | `capable` | **capable target** | 3 |
+| joins, no `reasoning`, `contextTokens > 0` and below it | `weak` | weak target | 4 |
+| no join → `null`, or joined with neither field usable | `unknown` | weak target | 38 |
+
+**Amendment, 2026-09-06 — the table had three rows where `bucketFor` has six branches. No target
+moves; the two missing rows are written down.** *(#66)*
+
+This amends a locked decision, so it is recorded rather than edited silently.
+
+**What this section used to say, and why it was wrong.** The table was:
+
+> | joins, `capabilities.reasoning === true` | capable target |
+> | joins, `=== false` | weak target |
+> | no join → `null` | weak target |
+
+The third row is right in **outcome** and is kept: a genuine miss yields `reason: null` *and*
+`contextTokens: undefined`, so `bucketFor` returns `"unknown"`, and
+`BUCKET_TARGETS.unknown === BUCKET_TARGETS.weak`. What the three rows omit is the case where a row
+**joins**, carries `limits.contextTokens`, and has **no** `capabilities.reasoning`. There reasoning is
+genuinely unknown and **context size is used as a proxy** — and unlike every other unknown path, that
+proxy can **promote a row to the capable target**. A reader taking the three rows as complete would
+believe an absent `reasoning` can only ever yield the weak target. It cannot only ever.
+
+**Footprint today: 3 of 83 rows**, and they are the same three the source comment at
+`keysync/keysync.mjs:207-213` already enumerates when it justifies `>=` over `>` at the boundary —
+`cerebras/llama3.1-8b` (exactly 128000), `cloudflare/granite-4.0-h-micro` (131000),
+`sambanova/gemma-4-31b-it` (131072). The classifier itself is `keysync/keysync.mjs:234-241`.
+
+**This is not the id-string inference this section forbids.** `contextTokens` is a *measured field* on a
+joined row, and it is used only where `reasoning` is absent. The prohibition below is on reading
+capability out of a **name** (`-thinking`, `-r1`, `o1`); a declared window is evidence, a substring is
+not.
+
+**Why this is not merely documentation.** D4 step 1 widens routing by ~43×, and R11 spends the live
+`capability` field from discovery. **A listing that reports a context window but no reasoning flag is
+a common shape**, so this branch governs a population far larger than 83 the moment discovery lands.
+The row has to be in the table *before* R11 is written against it.
+
+**No target changes.** `BUCKET_TARGETS`, `ALLOWED_BEHAVES_AS` and `CTX_CAPABLE_MIN` are untouched by
+this amendment and stay untouched by this branch (§9.1). It records what the code already does.
 
 Weak-on-unknown is not degradation, it is what [[models-used-as-designed]] prescribes:
 
@@ -222,7 +334,8 @@ mode before the join's ceiling is known.
 
 **Locked as two steps, in this order.**
 
-**Step 1 — widen `Providers[].models` to every discovered model.** *(measured)* 3,720 models across
+**Step 1 — widen `Providers[].models` to `union(discovery ids, catalogue ids, testModel)`.**
+*(measured)* 3,720 models across
 45 providers is 100 KB minified; CCR builds no index over `Providers[].models` at startup
 (`gatewayModels` comes from `Sd()`, virtual profiles only), so startup cost is zero. It breaks
 nothing on the 15-site consumer list — `validate()`'s tie at `keysync.mjs:724-729` is a **subset**
@@ -230,6 +343,37 @@ assertion (`picker ⊆ models`), which widening *relaxes*. Independently shippab
 
 This is the B2 fix: ~1,501 rows currently resolve to `undefined` and fall through CCR policy 7 to
 `anthropic/claude-opus-5`, which is the silent substitution in #47/#48.
+
+**Amendment, 2026-09-06 — the candidate set is a union, not the discovered set. The widening is
+unchanged; only its floor is.** *(#58)*
+
+This amends a locked decision, so it is recorded rather than edited silently.
+
+**What step 1 used to say, and why it was wrong.** It read *"widen `Providers[].models` to **every
+discovered model**."* The intent — stop sizing routing from a cap of 3 — was right and is untouched.
+But taken as the candidate **rule**, it removes a provider whose listing returns empty: in
+`keysync/keysync.mjs:558-564` the `!models.length` skip does a `continue` **before** the `out.push`,
+so an empty candidate list drops the provider from `Providers[]` **entirely** rather than dimming it.
+Four providers fall in on this branch's own data — `tabiai` and `gorouter` (HTTP **200** with
+`data: []`), `youcom` and `githubcopilot` (`listing: null`). Two of them answer.
+
+*(Consistency note, 2026-09-06. Those four are the four **discovery** outcomes. Only `tabiai` and
+`gorouter` can reach `buildProviders` at all: `filterRegistry` — `keysync/keysync.mjs:31-37`, the
+generic exclusion at `:36` — drops `youcom` and `githubcopilot` on `protocol: "generic"` first, as D6
+already records. **The amendment above is unaffected**; the candidate rule is still the union, and it
+would still prune two live, responding providers. This note exists so a test written from this
+paragraph asserts the two providers that can actually be lost rather than four.)*
+
+**It also contradicted D3 §4.1**, which is locked and explicit: *"`testModel` always survives
+regardless of the listing"* and *"model absent → dim, never prune."* A prune here is a direct
+[[responding-provider-never-pruned]] violation — a listing, auth or billing failure is state to
+surface, never a reason to stop routing. The union is the same candidate rule D3's ladder already
+implies and the same one the display path builds, so routing and display now agree by construction.
+
+**Nothing else about step 1 moves.** The measured figures, the zero startup cost, the `subset`
+argument at `keysync.mjs:724-729`, the B2 fix above, and step 1's independent shippability are all
+unchanged: a union is a superset of the discovered set, so every consequence measured for the wider
+set still holds.
 
 **Step 2 — the native `/model` menu stays curated.** It renders 10 rows at a time with 1-row
 scrolling and no filter (report 04), so it cannot hold 3,784. uwpick already renders 1,588 with
@@ -280,10 +424,11 @@ file is **23,242 bytes**, with `modelPicker.options` alone at **12,735 bytes ove
 bytes per row** *(measured 2026-09-06)*. At 1,584 rows the options array alone would exceed 200 KB,
 and Claude Code parses this file at every launch.
 
-**Amended decision.** Retire the constant **from routing** — routing takes the uncapped discovered
-set — and keep a **distinct, renamed** constant governing only the picker branch after the split.
-`UW_MAX_MODELS` and its `NaN` defect (#5: `Number("x")` is `NaN`, and `n >= NaN` is always false,
-so a non-numeric value silently removes the cap) die either way, as originally intended.
+**Amended decision.** Retire the constant **from routing** — routing takes the uncapped
+`union(discovery ids, catalogue ids, testModel)` — and keep a **distinct, renamed** constant
+governing only the picker branch after the split. `UW_MAX_MODELS` and its `NaN` defect (#5:
+`Number("x")` is `NaN`, and `n >= NaN` is always false, so a non-numeric value silently removes the
+cap) die either way, as originally intended.
 
 **Preferred form, if the measurement supports it:** size the picker branch by the *measured*
 serialized budget rather than by an inherited magic 3. Every row moved into the picker is a row
@@ -292,6 +437,34 @@ step 2's deferred bill instead of merely capping. `behavesAsFor` is
 `BUCKET_TARGETS[bucketFor(model)]` — total by construction *(verified)* — so **every picker row is
 declared**, and the undeclared population is exactly `routing \ picker`. Picker size is therefore
 the dial that controls that population, not a cosmetic choice.
+
+**Amendment, 2026-09-06 — the routing clause said "discovered set" and had to say "union". The
+retirement is unchanged; only the set routing falls back to is.** *(#58)*
+
+This amends a locked decision, so it is recorded rather than edited silently.
+
+**What the amended decision used to say, and why it was wrong.** The routing clause read *"routing
+takes the uncapped **discovered set**."* Retiring the cap is right and is untouched. But "the
+discovered set" is a candidate **rule**, and as a rule it prunes: in `keysync/keysync.mjs:558-564`
+the `!models.length` skip does a `continue` **before** the `out.push`, so a provider whose listing
+returns empty leaves `Providers[]` **entirely** instead of being dimmed. That is the identical defect
+corrected in D4 step 1 above, and a direct [[responding-provider-never-pruned]] violation — a
+listing, auth or billing failure is state to surface, never a reason to stop routing. The two
+providers it reaches are `tabiai` and `gorouter`, both of which answer with HTTP **200**.
+
+**Why this site survived a correction that reached six others.** D5 was amended earlier the same day
+for a **different** reason — the original wording's *"never touches the picker path"* terminology
+error, which the two-surface table above corrects. That amendment rewrote the decision's **picker**
+clause and left its **routing** clause untouched, so when #58 corrected the "discovered set" phrasing
+in six places, this one was never revisited. It is the site that matters most: the plan cites amended
+D5 **by name** as the authority for R11's routing change, so an executor who checked the authority
+landed on the one instruction that reintroduces the defect. The framing itself was inherited from
+§4.1's heading and epigraph, corrected above.
+
+**Nothing else about D5 moves.** The renamed picker-side constant, the two-surface table, the
+measured ~135-bytes-per-row budget, the preferred sizing-by-measurement form above, and
+`UW_MAX_MODELS` dying with its `NaN` defect are all unchanged: a union is a superset of the
+discovered set, so every consequence measured for routing at width still holds.
 
 **This also settles part of §8 item 2.** That item asks "what curates the native 87." The answer
 today is this constant; the amended decision is that a renamed successor keeps curating it, sized
@@ -332,9 +505,19 @@ diff-then-confirm. Nothing new runs on a timer.
 - `plans/phase6-discovery-design.md` §1 — profile-driven `listing.{url, envelope, idField, method}`
   with cluster-A defaults so 41 of 47 need no edit; `listing: null` as a positive assertion that no
   endpoint exists; six outcomes, with `empty` and `unsupported-shape` never collapsing into one
-  bucket. **Zero `unsupported-shape` is a non-waivable gate** — a provider being down is a fact
-  about the world, an unparseable shape is our own defect. Coverage ratio is waivable with
-  `--accept-coverage-delta`; this is not.
+  bucket. **`unsupported-shape` is a non-waivable gate for the provider that produced it** — a
+  provider being down is a fact about the world, an unparseable shape is our own defect. Coverage
+  ratio is waivable with `--accept-coverage-delta`; a shape failure is not waivable for its own
+  provider. *(**Amended 2026-09-06, #61.** This read **"Zero `unsupported-shape` is a non-waivable
+  gate"** — i.e. run-wide, so one provider's novel envelope discarded 43 successful listings and
+  forced a re-authorized re-run of all 44 authenticated calls, on the most expensive operation in the
+  branch. The defect-detection intent is unchanged and fully preserved per-provider; only the blast
+  radius is corrected. The run-wide form was also **asserted, never evidenced** — no measurement
+  shows zero unsupported shapes is achievable across 44 providers, and only 20 of 44 were ever probed
+  on a `/models` path, all unauthenticated. A run-wide gate may be adopted later **from a measured
+  shape-coverage number**, which is the standard D5's successor constant is held to; it is not
+  asserted ahead of the data. A partial or failed run **retains its cache**, so a re-run costs only
+  the providers that failed.)*
 - Report 01 — 7 call-shape clusters, A+B+C covering 41 of 47 through one code path. Six bespoke:
   `cloudflare` (405 → native `models/search`, `{result:[]}`, per-account URL, ids are UUIDs with
   names in a separate field so `idField` is unconfirmed), `agentrouter` (3 mandatory WAF headers),
@@ -393,7 +576,8 @@ budget. Cost per label, measured:
 
 | category | source | cost | budget |
 |---|---|---|---|
-| `call-verified` | `testModel` probe | already run | passes |
+| `call-verified` | a dated completion this system ran and recorded — the artifact exists (`keysync/verified-rows.json`: `generatedAt` + `working[]`, real-CLI ground truth) | already run; **not wired into the snapshot in this branch** | passes on cost; unpopulated until wired |
+| `config-asserted` | vault `testModel` / the relay literal | local config read | passes |
 | `listing-verified` | present in the live listing | falls out of D6's 44 calls | passes |
 | `catalogue-only` / listing-absent | in bundle, omitted by the listing | free, same 44 calls | passes |
 | `routable` | present in `Providers[].models` | local config read | passes |

@@ -148,9 +148,31 @@ Ownership is then computed with the relay **stripped** from the owner set unless
 never grow with live data (`assertVouchedSetIsNarrower` enforces exactly that).
 
 So the residual fatal is precisely: **a real Anthropic id that the relay routes (from live
-`/v1/models`) but does not curate, sole-owned by one reseller.** `claude-opus-4-8` is the named
-first instance; today it is non-fatal only because tabiai and gorouter both list it and neither is
-in the bundle, so both stand on one stale `testModel` each. Discovery removes that accident.
+`/v1/models`) but does not curate, sole-owned by one reseller.** The class is real; the instance this
+passage used to name is not.
+
+**Correction — this paragraph asserted the opposite of a locked decision** *(#58)*. Revision 5 read:
+*"`claude-opus-4-8` is the named first instance; today it is non-fatal only because tabiai and
+gorouter both list it and neither is in the bundle, so both stand on one stale `testModel` each.
+**Discovery removes that accident.**"* The final sentence is wrong, and wrong in the direction that
+breaks a pillar. **Discovery removes nothing here**: D3 §4.1 locks *"`testModel` always survives
+regardless of the listing"*, so after discovery tabiai and gorouter both still own `claude-opus-4-8`,
+`|owners| = 2`, and it stays `shadowed` at `run.mjs:165`.
+
+**The plan contradicted itself, and both passages could not ship.** §5 Scenario 1 already says
+exactly this at M9 — *"D3 §4.1 keeps `testModel` regardless of the listing. So both still own it
+after discovery and it stays `shadowed`"* — and dismisses `claude-opus-4-8` as an instance that
+cannot fire. §1.1's ownership argument needed `testModel` **not** to survive; Scenario 1's dismissal
+needs it to survive. **Scenario 1 matches the locked decision and stands unchanged; this paragraph
+was the defect.**
+
+**What the re-derivation costs, rather than absorbing it silently.** §1.1 loses its worked instance,
+not its conclusion: the residual class stated above is unchanged, and the A2 analysis below rests on
+the case table, never on `claude-opus-4-8`. **The first concrete instance is unknown until R10's
+smoke run** — which is what Scenario 1 already states, and is why R13's census is the detection
+mechanism rather than a name in this paragraph. This sentence also had a second life as a *licence*:
+it gave an executor a sanctioned reason to accept tabiai and gorouter disappearing from a build. See
+R11, where that is now blocked explicitly.
 
 **Chosen: A2 — keep the stripping for reporting, compute `fatal` from the unstripped owner set.**
 
@@ -303,8 +325,15 @@ ranking without a cap cuts nothing.)*
 
 `buildProviders` continues to return `{providers, picker, notes}`. After the split:
 
-- `providers[].models` = **every discovered model**, admitted and sanitised. **No cap** — this is
-  what D5 retires.
+- `providers[].models` = **`union(discovery ids, catalogue ids, testModel)`**, admitted and
+  sanitised. **No cap** — this is what D5 retires. **The candidate set is a union, not the discovered
+  set** *(#58)*. Revision 5 wrote *"every discovered model"*; fed literally into `buildProviders`
+  that **removes** a provider whose listing returns empty rather than dimming it, which is a
+  [[responding-provider-never-pruned]] violation with four named victims — the mechanism, the source
+  line and the four providers are worked through in §4/R11. This is the same candidate rule R14
+  already applies on the display side (§1.5a), so routing and display now agree by construction
+  rather than by coincidence. A provider whose discovery outcome is `empty`, `auth`, `no-endpoint` or
+  `error` keeps its catalogue and `testModel` rows.
 - `picker` = the curated subset, governed by a **distinct renamed constant**
   (`MAX_PICKER_MODELS_PER_PROVIDER`), **keeping today's value of 3 and today's ranking** in R11, so
   that task changes routing and nothing else. **Provenance ranking arrives in R13b**, together with
@@ -360,6 +389,21 @@ weakened and the write site is untouched.
 `lH()` to the *maximal* assumption set — strictly worse than any bucket target. That is the whole of
 D4 step 2's bill, and it is why step 2 is not paid here.
 
+**And it is a pillar-2 cost, named as one rather than left as a byte count** *(#64)*.
+[[models-used-as-designed]] asks for the honest-minimal assumption where a model's capability is
+unknown; `lH()`'s maximal set is the confident-wrong direction, and after R11 it applies to **~3,784
+routing rows against 83 declarations** — roughly 3,700 rows asserting capabilities on no evidence.
+This section books the pillar-1 benefit two paragraphs down (reach: rows that do not route at all
+today start routing) and must book this against it: **step 1 buys reach at the price of ~3,700
+maximally-assumed rows.** Both are real and the trade is still worth making — but it is a trade, and
+a reader should not have to derive the second half.
+
+**The mitigation is owned but not guaranteed.** R13b is the named owner of the shrink, which is
+correct process. However **R13b's acceptance criterion is a byte/parse-time budget, not a
+capability-declaration criterion**, and this section explicitly permits *"if the measurement justifies
+only 83, R13b lands 83."* That outcome leaves the pillar-2 cost unmitigated in full. R13b now states
+this at its own site, including that no successor task in this plan closes it.
+
 Two things make step 1 a clear improvement anyway:
 
 - Those rows do not route at all today. Degraded-but-working beats not-working under Principle 1.
@@ -408,7 +452,11 @@ scheduling under F8 — nothing may be put on a timer that holds a key or writes
 `built.picker` and `built.providers[].models` *(read)*, which is the never-prune violation #6 files
 and is also the backwards coupling D4 step 2's table names (routing filtered *by* surviving picker
 rows). Under the §1.2 split, routing and picker are independent, so the flag becomes a picker-side
-labeller/orderer and routing keeps every discovered model.
+labeller/orderer and routing keeps the full `union(discovery ids, catalogue ids, testModel)`. *(#58:
+this said "every discovered model", the phrasing corrected in §1.2 and R11. It matters especially
+here — this section exists to fix a **never-prune** violation, so leaving a candidate rule that
+prunes an empty-listing provider would have re-introduced by the fix the class of defect the fix
+addresses.)*
 
 Two consequences to carry: the count branch at `run.mjs:715-717` can return to the normal
 `EXPECTED_PROVIDERS + (anthropicOn ? 1 : 0)` expression, and the floor guard at `run.mjs:591-594`
@@ -418,12 +466,32 @@ which is #6's own observation, but a rename is a separate, purely cosmetic chang
 ### 1.5 Item 5 — provenance persistence and badging
 
 **Settled.** Snapshot `SNAPSHOT_SCHEMA` bumps **2 → 3**, adding a per-model
-`provenance: "call-verified" | "listing-verified" | "catalogue-only" | null` and a top-level
-`discoveredAsOf` stamp. The bump forces a rebuild via `loadSnapshot`'s existing schema branch, which
-is the mechanism that stops an old file rendering silently wrong.
+`provenance: "call-verified" | "config-asserted" | "listing-verified" | "catalogue-only" | null` and
+a top-level `discoveredAsOf` stamp. The bump forces a rebuild via `loadSnapshot`'s existing schema
+branch, which is the mechanism that stops an old file rendering silently wrong.
 
-**The badge column is not touched.** It is fully spent on `FREE`/`FREE?`/`PLAN`/`PAID`/blank
-(constraint 4). Provenance gets its own gutter — see §2.
+*(Revision 6, #59. The union was three-valued plus `null`; `config-asserted` was added between
+`call-verified` and `listing-verified` because two populations — the vault `testModel` and the
+relay's four models — were being assigned the top rung as a **config literal** with nothing ever
+probing them. Decisions §4.1 carries the amendment and its reasoning. **The vocabulary is fixed
+here, in the schema, deliberately**: this is the reason the fix lands now rather than deferring with
+the rest of the freshness work, since shipping the wrong vocabulary in schema 3 would cost phase B a
+3 → 4 migration or two meanings of one string.)*
+
+**The badge column *is* touched, by exactly one condition** *(revision 9, #67)*. This paragraph read:
+*"**The badge column is not touched.** It is fully spent on `FREE`/`FREE?`/`PLAN`/`PAID`/blank
+(constraint 4). Provenance gets its own gutter — see §2."* Its second and third sentences stand and
+are the operative ones — the badge set stays closed at five tokens, and **provenance never enters this
+column**; it gets its own gutter, exactly as §2.3 designs it. The first sentence was falsified by
+#67: `badgeOf` is the **second caller of `priceOf`**, and #55's all-zero rule (adopted in R3) reached
+only the first. **R5b changes one branch inside `badgeOf`**, and 123 of today's 124 `FREE?` rows
+render blank instead.
+
+**No token is added to the badge set and none is removed.** A population moves from `FREE?` to the
+blank that `menu/catalog.mjs:78` already defines as *"no evidence, guard G1, or price 0 with a
+ONE-TIME grant"* — price-absence is the *"no evidence"* case, so this spends a meaning the column
+already carries rather than widening it. Constraint 4 is untouched, and so is the §2.2 arithmetic
+that treats `badge: 6` as fully spent.
 
 ### 1.5a The producer, which revision 1 named nowhere (C2)
 
@@ -610,30 +678,74 @@ neither the id cell (where `highlight` operates), the badge cell, nor TVR.
 
 | provenance | UNI | ASCII | colour | established by |
 |---|---|---|---|---|
-| `call-verified` | `◆` | `#` | grn | a real completion returned 200 (`testModel`, `verify-cli.mjs`) |
+| `call-verified` | `◆` | `#` | grn | a real completion returned 200, **dated** (`keysync/verified-rows.json`) |
+| `config-asserted` | `◈` | `=` | yel | local config names it and nothing has probed it (vault `testModel`, the relay literal) |
 | `listing-verified` | `◇` | `+` | cya | the provider's own keyed listing named it |
 | `catalogue-only` | `·` | `.` | dim | only bundle metadata names it |
 | `null` (never discovered) | ` ` | ` ` | — | no discovery run has covered this provider |
 
-**The relay's four models are `call-verified`, not `null`, and getting this wrong inverts the whole
-column** *(A6, #45)*. `anthropic` is `listing: null` and is never discovered (R9), so a naive
+**Revision 6 split the top rung** *(#59; decisions §4.1 amendment)*. This table used to have four
+rows, and `call-verified` was described as *"a real completion returned 200 (`testModel`,
+`verify-cli.mjs`)"* while **being assigned as a config literal in two places that never probe
+anything** — the relay's four models here in §2.3, and the vault `testModel` in R14. A lapsed
+subscription, a revoked key or a decommissioned `testModel` would keep rendering the top rung of a
+ladder defined by a 200 response, indefinitely, and the picker would rank that dead row **above** a
+live `listing-verified` one. `call-verified` is now reserved for an **actual dated probe result**;
+nothing in this branch assigns it as a literal.
+
+**`call-verified` is defined but unpopulated in this branch, and that is deliberate, not dead
+code.** The artifact that would feed it already exists — `keysync/verify-cli.mjs` writes
+`verified-rows.json` with `generatedAt` and a `working[]` of models that returned 200 from a real
+CLI completion — but wiring it into `provenanceOf` is **not in scope here** and is not scoped
+elsewhere by this revision. R16 still renders the rung distinctly from fixtures, which is what keeps
+the glyph honest for the day it is fed.
+
+**The relay's four models are `config-asserted`, not `null`, and getting this wrong inverts the
+whole column** *(A6, #45)*. `anthropic` is `listing: null` and is never discovered (R9), so a naive
 `provenanceOf` returns `null` for it and R16 renders **blank — the bottom of a ladder whose top is
 `◆`**. The four Claude models the user certainly has would then render *less* confident than a
 third-party row marked `◆`, which is the exact inversion #45 already files against the picker.
+**`config-asserted` sits above `listing-verified` for precisely this reason**: demoting the relay
+past a third-party listing row would fix #59 by reintroducing #45.
 
 `Object.hasOwn` catches a missing field, not a misleading value, so no R14/R15/R16 observable fails on
 it. The justification is the one already in `menu/catalog.mjs`'s relay branch, which hardcodes
 `tools/vision/reason: true` under the comment *"Every other all-true or all-false literal here was a
-coercion; this one is a measurement."* The same argument applies: these are the subscription models,
-known first-hand. **R14 assigns them `call-verified` explicitly, and R16 asserts a relay row does not
-render blank.**
+coercion; this one is a measurement."* That argument still carries the relay to the second rung —
+these are the subscription models, known first-hand — but **not to the first**, because "known
+first-hand" is exactly an assertion and not a measurement this system took. **R14 assigns them
+`config-asserted` explicitly, and R16 asserts a relay row does not render blank.**
 
-Filled → hollow → dot → blank is a legible ladder with `caps.colours === 0`, which is the
-requirement `healthDot`'s own comment states and the requirement its predecessor failed. **The
+**This is a label change and never a prune.** Both demoted populations survive exactly as before:
+the vault `testModel` still always survives regardless of the listing, and catalogue-only rows are
+still kept and dimmed (D3 §4.1, unchanged). A reader taking the demotion for a removal would be
+reading in a [[responding-provider-never-pruned]] violation (#58) that is not here.
+
+Filled → filled-in-hollow → hollow → dot → blank is a legible ladder with `caps.colours === 0`,
+which is the requirement `healthDot`'s own comment states and the requirement its predecessor
+failed. `◈` (U+25C8, white diamond containing black small diamond) is the right shape for this rung
+on its own terms: a filled claim inside a hollow shell is what an unprobed assertion *is*. **The
 implementer must confirm each glyph measures one column under `vis()` and that
-`test/style.test.mjs`'s exact-`FRAME_W` invariant still holds** — `◆`/`◇`/`●` are East-Asian
-*Ambiguous* width, a risk this codebase has already accepted for `●◐○` but which must not be
-extended without checking.
+`test/style.test.mjs`'s exact-`FRAME_W` invariant still holds** — `◆`/`◈`/`◇`/`●` are all East-Asian
+*Ambiguous* width, a risk this codebase has already accepted for `●◐○`; `◈` extends that accepted
+risk to one more code point in the same block rather than opening a new class, but it must still be
+checked rather than assumed.
+
+**ASCII `=`, checked against the table** *(the distinguishability requirement, applied)*. In the
+five-glyph ASCII column `# = + . ␣`, every pair is separable in a monospace gutter; the closest pair
+is `=` against `+`, distinguished by the vertical stroke `+` has and `=` does not. `=` is also **not
+currently a value anywhere in the ASCII glyph table** (`style.mjs:72-77`) — worth noting because `#`
+is already `on` and `+` is already all four `frame` corners, so this rung is the only one of the
+four whose ASCII glyph is unshared. Those two pre-existing reuses are positionally unambiguous (a
+fixed-x gutter, as `healthDot` established) and are **not changed here**. One consequence to carry:
+adding `=` to the ASCII glyph table removes it from the free list the `padId` elision marker draws
+from below — which needs no new rule, because that constraint is already mechanical ("assert the
+elision marker is not a value in the ASCII glyph table") and will simply exclude it.
+
+**Colour `yel`, and the reuse is intentional.** `yel` already carries *provisional / unconfirmed* in
+this picker — `FREE?` in the badge column and `needs $` on the health dot — so `config-asserted`
+extends an existing meaning rather than introducing a fifth colour vocabulary (#3's objection).
+Colour is never the sole carrier here in any case; the glyph is.
 
 **`padId` — middle elision preserving the tail, one code point of cost** *(revision 2, F3/#49)*.
 
@@ -696,10 +808,41 @@ and neither substitutes for the other: a filter answers "show me only the verifi
 answers "what is *this* one" at the moment of choosing. The marker is the primary instrument here
 because provenance is a property of every row and the user's question at selection time is per-row.
 
-The staleness budget is what makes the marker legitimate at all, and it passes cleanly: all three
-levels fall out of the **same 44 discovery calls** that D6 already makes. Nothing in the ladder
-requires per-model completion probing, which is the label the budget rejects (~1,588 requests, costs
-money, decays in days).
+The staleness budget is what makes the marker legitimate at all. **The budget grants two clauses,
+and this section previously answered only one of them** *(#59)*. It used to read: *"it passes
+cleanly: all three levels fall out of the same 44 discovery calls that D6 already makes."* That is
+the **cost** clause, and it is still true — every discovered rung falls out of D6's existing 44
+calls, and nothing in the ladder requires the per-model completion probing the budget rejects
+(~1,588 requests, costs money, decays in days). But the grant is for a label that is *"free, 44
+requests, **and at the same cadence as provider health**"*, and the cadence clause went unanswered.
+
+**Answering it honestly: there is no refresh clock, and there will not be one in this branch.**
+`refresh/cli.mjs` is manual-invocation only, and D6 puts cadence and scheduling explicitly out of
+scope for phase B. So `listing-verified` does not mean "named by the listing *now*"; it means
+**"named by the listing as of the last time someone ran a refresh."**
+
+**The deferral stands** — it is confirmed, not reopened here — **and it is legitimate because the
+staleness is disclosed rather than hidden.** The budget tolerates old-and-dated; what it forbids is
+wrong-and-unmarked. Two things carry that disclosure:
+
+1. **The `discovered <date>` header stamp** (§2.3, R15, R16). This is what converts
+   `listing-verified` from a bare claim into a dated one, and it is the difference between a stale
+   label and a lying label. It is not decorative and it is not optional: R15 carries a **two-case**
+   observable — populated cache writes a non-null stamp, absent cache writes `null` — specifically
+   so a permanently-null stamp cannot pass (M13). A ladder whose freshness is deferred *depends* on
+   that stamp, which is why the observable is written to fail.
+2. **The user's stated phase-B plan: a single manual refresh command** covering model listings, the
+   bundle, and the id matching in one run. Under a manual refresher the semantics are coherent —
+   the user knows when they last refreshed because they are the one who ran it, and the stamp
+   corroborates it on screen. Cadence becomes an explicit user action rather than an absent clock.
+
+**This mitigation does not cover the §2.3 fix, and the asymmetry is the whole reason one half ships
+and the other defers.** The stamp discloses *when discovery last ran*. A hardcoded `call-verified`
+was **never discovered on any date**, so the stamp says nothing about it — a reader would see
+`discovered 2026-09-06` beside a `◆` established by a string in a config file written months
+earlier, and the stamp would be actively misleading rather than merely silent. Disclosure can carry
+a stale-but-dated label; it cannot carry an undated one claiming to be dated. That is why the rung
+split lands now and the refresh clock does not.
 
 A `@verified`-style filter token is a genuinely good complement and is **still out of scope**, but
 the reason has narrowed. It is no longer "that file is a different lane" — #51's drill-in opens
@@ -805,7 +948,7 @@ genuinely independent; **D is one landing with three internal checkpoints.**
 |---|---|---|---|
 | **0 — the #53 guard fix** | **R0 alone** | **yes, and independently revertible** | **security review; lands before everything** |
 |---|---|---|---|
-| **A — additive** | R1 R2 R3 R4 R5 | yes; nothing changes what routes | ordinary review |
+| **A — additive** | R1 R2 R3 R4 R5 **R5b** | yes; nothing changes what routes — **R5b changes what one column *says*** on 123 rows, and routes nothing differently | ordinary review |
 | **B — the guard** | R6 R7 | yes; two edits to one function | **security review** |
 | **C — discovery** | R8 R9 R10 | yes; cache-only, wired to nothing | **security review** + live-run authorization |
 | **D — widen routing (D4 step 1)** | R11 R12 R13, then **R13b** behind an internal gate | **no — one landing**, R11's intermediate state must not ship | **review + live-apply authorization**, and R13b reviewed separately |
@@ -823,6 +966,28 @@ genuinely independent; **D is one landing with three internal checkpoints.**
   (#44). V9 is a **dependency of the guard's correctness**, not tidying, and it already sits in
   Ship A ahead of Ship B.
 - **R5 before D.** The join is D's capability source.
+- **`menu/catalog.mjs` has exactly three writers, and they are strictly serial: R5 → R5b → R14**
+  *(revision 9, #67)*. Verified by inspection of every WRITES line in §4: **R5** (the `priceOf`
+  relocation only, Ship A), **R5b** (`badgeOf`'s price-absence branch only, Ship A), **R14**
+  (`discovery`, `provenanceOf`, the union candidate set, `capability` → `outputKind` precedence, and
+  `refused[]`, Ship E). No two may run as parallel lanes. `test/catalog.test.mjs` carries the same
+  three writers in the same order. The three subjects are disjoint by construction — a relocation, one
+  branch inside `badgeOf`, and `buildFrom`'s inputs — so serialization is the only constraint; none of
+  them needs to see another's diff. **R5b is also serial before R3**, for a shared-rule reason rather
+  than a file reason: see R3.
+- **R3's ranking guard is PROVISIONAL until R11, and the picker is measurably worse in between**
+  *(#62)*. The dependency order itself is correct and does not change — **R5 → R3 → R4 → R11**, with
+  R3 three ships ahead of R11. What belongs in this list rather than only in R3's prose is the
+  **consequence of that gap**: repairing `inferTier` reselects the top-3 for **21 of 118 providers**,
+  and two of those reselections are regressions R3 cannot fix with the data it has — **cohere** trades
+  three real chat models for two rerankers, and **google** *"re-creates the exact `google: lyria |
+  veo-2` embarrassment it cites as its motivation"*. The cure is spending the live `capability`
+  field, and R11 is the only task that spends it. **So from Ship A through Ship D the native picker
+  carries measurably worse rows than today, and the ranking is repaired only at the widening** —
+  against a governing caveat of *fix the ranking before widening anything*. R3's boolean gate is the
+  only thing that says so in the interval, and a gate is a detector, not a fix. Recorded here because
+  it is a property of the schedule; an executor reading R3 alone finds it filed as a task detail, and
+  a reviewer choosing what may ship in between would not find it at all.
 - **C before D.** D has no discovered set without R10's cache. *(Restored — revision 2 dropped this
   line while rewriting the B-before-C item, leaving the dependency asserted in prose only, M10.)*
 - **B before D**, not B before C. Revision 1 said B before C on the grounds that the vouch had to
@@ -1168,7 +1333,10 @@ it counts, with 40 recorded as corroboration.)*
 **R3 — `inferTier` reads the live pricing path (#10).**
 
 **WRITES:** `keysync/keysync.mjs`, `test/denylist.test.mjs`, `test/infertier.test.mjs` (new).
-**Serial after:** R5 (see the cycle finding below). **Serial before:** R4, R11.
+**Serial after:** R5 (see the cycle finding below), then R5b. **Serial before:** R4, R11.
+*(Revision 9: the R5b edge is not about files — R3 and R5b are write-disjoint. R5b lands
+`hasPricedOffer` in `catalog-join.mjs`, and change 2 below **consumes it** instead of re-implementing
+#55's rule at a second call site, which is the defect #67 exists because of.)*
 
 Point `inferTier` at `pricing.offers[].per1MTokens.{input,output}`, **matched to the provider in
 hand**, including `priceOf`'s rule that a non-matching offer yields `null` rather than falling back
@@ -1328,7 +1496,7 @@ provider and the bypass. Mutation check: deleting the rule fails that test and n
 **WRITES:** `keysync/catalog-join.mjs` (new), `keysync/keysync.mjs` (`loadCatalog` only),
 `menu/catalog.mjs` (the `priceOf` move only), `test/catalog-join.test.mjs` (new),
 `test/catalog.test.mjs` (the `priceOf` import).
-**Serial before:** R3, R4, R11, R14. **This is the shared helper every later lane needs — the
+**Serial before:** R5b, R3, R4, R11, R14. **This is the shared helper every later lane needs — the
 orchestrator lands it once, first, and no lane re-writes it.**
 
 It also **relocates `priceOf`** out of `menu/catalog.mjs` into this module, unchanged in behaviour,
@@ -1348,6 +1516,131 @@ Greedier normalisation (date-suffix stripping, `-instruct` stripping) is out of 
 measurement fixture only — never as a runtime source**. Expected observable: ≥75% of the 3,784 live
 (provider, model) pairs join (locked figure 80%), and `orcarouter/auto` does **not** join
 `morph/auto`. Then `node --test "test/catalog-join.test.mjs"`.
+
+---
+
+**R5b — `badgeOf` stops reading an absent price as `FREE?` (#67, #55).** *(revision 9)*
+
+**WRITES:** `keysync/catalog-join.mjs` (one added export; `priceOf` itself unchanged),
+`menu/catalog.mjs` (`badgeOf` only), `test/catalog-join.test.mjs`, `test/catalog.test.mjs`.
+**Serial after:** R5. **Serial before:** R3, R14.
+
+**Why a sibling task and not a fold, in one sentence each.** Folding into **R3** is the tempting fit
+because R3 owns the #55 rule — but R3's WRITES is `keysync/keysync.mjs`, its observable is a
+picker-membership diff, and the plan already flags it as *"three changes, not one"*; a fourth change,
+in a different file, on a different surface, with a different observable, is what makes a task's
+review unattributable. Folding into **R5** is worse: R5 is the shared helper four tasks depend on and
+its whole value is being a **behaviour-preserving relocation**, so putting a user-visible change to
+123 rows inside it means a revert of the join takes the badge fix with it. So: a small sibling,
+landing between them, owning one condition.
+
+#### The finding
+
+#55 established that the bundle encodes *"not priced per token"* as `{input: 0, output: 0}` under a
+token `sourceUnit` — **shape-identical to a genuine free tier**. R3 fixes the `inferTier` caller. It
+does not fix the other one.
+
+```
+priceOf's callers          R3 fixes it?   writes
+  inferTier / selection sort   yes         keysync/keysync.mjs
+  badgeOf                      NO          menu/catalog.mjs      <- #67
+```
+
+**Measured against `catalog/snapshot.json`'s 1,588 rows joined through `loadCatalog()`** *(team lead,
+this session)*: badge tally `{"": 925, "PAID": 535, "FREE?": 124, "PLAN": 4}`; of the 124 `FREE?`,
+**123 have every offer zero** (the #55 shape, price absent) and **1 has a non-zero offer** (a real free
+tier). None has zero numeric offers. So **123 of 124 `FREE?` badges assert a price the bundle does not
+contain.** Live instances: `openai/omni-moderation-latest`, `openai/text-moderation-007`,
+`mistral/mistral-moderation-2603`, and `google/lyria-3-clip-preview` — the compound case R3 already
+names, misread as text *and* as free.
+
+**Corroborated bundle-wide** *(measured this session, independently, wider scope: every provider in
+`byProvider`, not only credentialled ones)*: **245 `FREE?`, of which 244 all-zero and 1 genuine.** The
+two scopes differ in denominator and agree exactly on the discriminator — the same single genuine row.
+
+**The question mark is not the disclosure.** `menu/catalog.mjs:75` defines `FREE?` as *"price 0,
+cadence unknown"*. The hedge is about whether the grant **recurs**, not about whether price data
+**exists**. A user reads *"probably free, might not stay free"*; on 123 rows the truth is *"we have no
+price for this model"* — and the wrong reading is the reassuring one, on the axis a user makes cost
+decisions with.
+
+**Pillar bearing.** The staleness budget takes down a label that *"might go stale and be wrong most of
+the time, misleading the user"*. This one is wrong **99.2% of the time it appears**, and not by going
+stale — it was never right. Its only refresh is a global `npm i -g` of the CCR bundle (live
+`catalog.generatedAt` = `2026-08-24T12:22:28.162Z`), which is report 08 F9's recorded hazard.
+[[uwpick-shows-latest-functional-state]]
+
+**Precedent is already in the file.** `menu/catalog.mjs:66-71` carries **GUARD G1**, which suppresses a
+zero-price badge for non-text output. The file already accepts that a zero price can be meaningless
+and must be gated — it gates on **modality** and not on **price-absence**. This adds the missing half.
+
+#### The change
+
+One predicate, landed once in R5's module so that R3 and `badgeOf` **share one owner of the rule**
+rather than implementing #55 twice — the same discipline §2.5 applies to the sanitised-id shape, and
+the same rule R5 itself states about helpers two lanes need:
+
+```js
+// keysync/catalog-join.mjs, beside priceOf
+export function hasPricedOffer(entry)   // true iff some usable offer is non-zero
+```
+
+Then in `badgeOf`, inside the existing `p.in === 0 && p.out === 0` branch, **beside G1 and before the
+cadence branches**:
+
+```
+if (!isTextOut(entry)) return "";        // G1  modality
+if (!hasPricedOffer(entry)) return "";   // G2  price-absence  <- #67
+```
+
+**The ordering against cadence is deliberate.** `cadence === "recurring"` returns the hard `FREE`
+claim; a provider-level grant cadence says nothing about a model the bundle never priced, so G2 must
+precede it. No measured row reaches that path today (the tally has **zero** `FREE`), which is why this
+is stated rather than observed — it is the branch that would make the defect worse the first time a
+provider profile gains a recurring cadence.
+
+**The predicate reads the whole offers array, not the matched offer, and that is load-bearing.**
+`priceOf` matches by provider with `.find()` (`menu/catalog.mjs:57`), so on the one genuine row —
+`mistral/labs-devstral-small-2512`, offers `[mistral 0/0, mistral 0.1/0.3]` *(measured)* — the matched
+offer **is** 0/0 and the entry is nonetheless genuinely priced. A discriminator trusting the matched
+offer would blank the single row that must keep its badge. *(That two same-provider offers resolve by
+`.find()` order is a real separate defect in offer matching; it belongs to R3/#55's territory and is
+**not** touched here.)*
+
+#### Verify
+
+`node --test "test/catalog-join.test.mjs" "test/catalog.test.mjs"`. Expected observables, and the
+**123/1 split is the fixture basis** — both halves are required, because a fixture carrying only the
+all-zero case is satisfied by returning `""` unconditionally from the zero branch, which would delete
+the genuine free tier along with the lie:
+
+- an entry whose every usable offer is `{input: 0, output: 0}` under a token `sourceUnit` badges
+  **`""`** — the 123-row shape, fixtured from `openai/omni-moderation-latest`;
+- an entry with a matched `0/0` offer **and** a non-zero offer elsewhere in the array badges
+  **`FREE?`** — the 1-row shape, fixtured from `mistral/labs-devstral-small-2512` with its real
+  `[0/0, 0.1/0.3]` array. **This is the discriminator; the task fails without it.**
+- `PAID`, `PLAN`, G1-blank and the `cadence === "recurring"` → `FREE` paths are **unchanged**, asserted
+  individually, so the diff is provably one branch wide;
+- a corpus assertion over the snapshot join: **`FREE?` falls from 124 to 1**, and **`PAID` (535),
+  `PLAN` (4) and the total row count (1,588) are unchanged** — the blanks absorb exactly the 123.
+
+**Mutation check** *(§6.4)*: **deleting the `hasPricedOffer` line must fail the first corpus
+assertion and the `openai/omni-moderation-latest` fixture, and nothing else.** Inverting it (badging
+blank when a price *is* present) must fail the `mistral/labs-devstral-small-2512` fixture. Two
+mutations, two distinct failures — a single-mutation check here would pass on a stub that blanks the
+whole branch.
+
+**Secondary observable — a second-order effect, measured, and the existing contract already predicted
+it.** `buildFrom`'s provider row carries `free: priced ? …FREEISH… : null` under the comment *"`0
+free` is a measurement, `no price data` is the absence of one"* (`menu/catalog.mjs:244-245`), where
+`priced` is *some model has a non-blank badge*. Blanking the 123 therefore moves provider-level
+counts, and **bundle-wide this flips 25 providers' `free` from a number to `null`** *(measured:
+`gitlab` 23/23, `ollama` 14/14, `kenari` 8/8, `publicai` 8/8, `umans-ai-coding-plan` 8/8,
+`sagemaker` 6/6, … all-`FREE?` catalogues)*, and merely lowers it for 23 more (`nvidia` −34,
+`opencode` −20, `kilo` −19, `openrouter` −18, `requesty` −12, …). **That is the fix working, not a
+regression**: those providers have no price data, and `null` is what that comment already says the
+cell must show. Assert one flip-to-`null` provider and one merely-lowered provider, so the effect is
+pinned rather than discovered later at the picker.
 
 ---
 
@@ -1464,7 +1757,12 @@ Build `plans/phase6-discovery-design.md` §1 as specified; do not redesign it. R
 - Append exactly `/models` — never `/v1`. Every baseUrl is already version-complete.
 - Transport rules, non-negotiable: **direct fetch, never through the CCR gateway** (F2);
   `redirect: "manual"`; refuse non-https; refuse a query string on a listing URL; bounded concurrency
-  6; per-provider failure budget stopping after 3 consecutive auth failures; a scrubbed environment
+  6; **a failure budget stopping after 3 consecutive auth failures — per-provider, and never global**
+  *(#61: revision 5's phrasing was ambiguous, and only one reading is permitted. The counter is keyed
+  by provider and resets per provider; an exhausted budget stops **that** provider's requests and no
+  one else's. A **global** budget would let three unrelated expired keys curtail the fan-out for all
+  44 — [[responding-provider-never-pruned]]: auth failure is state to surface, not a reason to stop
+  reaching everyone else)*; a scrubbed environment
   (`CCR_UPSTREAM_PROXY_URL`, `HTTPS_PROXY`, `HTTP_PROXY`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`
   deleted) so the fan-out cannot inherit the gateway's proxy (F6).
 - **The projection's KEEP list, enumerated per model** *(E — revision 3 specified only what to drop,
@@ -1537,6 +1835,16 @@ followed.
 `test/discover.test.mjs`.
 **Serial after:** R8.
 
+**This task moves *away* from the key-lifecycle pillar, and says so here rather than only in §8.1**
+*(#63)*. §8.1's deferred-items table already carries the admission — ***"R9's `listing` migration is
+another hand-edit to `providers.json`** | this plan moves *away* from the pillar on R9 and should say
+so rather than imply neutrality"* — but that sits ~900 lines from where an executor actually reads,
+while this body framed the same hand-edit as compliance-by-precedent and said nothing about the
+pillar. Both statements are in the plan; only one was where the work happens.
+[[key-lifecycle-must-scale]] wants add/test/save/remove by one simple no-source-edit path, and a
+paste-in table is a hand-edit. **The precedent below mitigates the risk of the hand-edit, not its
+pillar cost.** Named successor, unchanged: phase B, first task after the refresher (§8.1).
+
 Modelled on Task B3's precedent: a documented human migration plus a code-side default plus a test
 that fails if the human step was skipped. Entries needing a block: `cloudflare` (absolute URL
 override, `result` envelope, `idField: ["name","id"]`), `youcom` (`null`), `githubcopilot` (`null`),
@@ -1563,14 +1871,35 @@ Two stages. **Smoke:** `--only` one provider each from clusters A, B, C plus **a
 
 **Verify:** the per-outcome table is printed with per-provider rows and providers named, never keys.
 Expected observables:
-- **`unsupported-shape === 0` — non-waivable.** A provider being down is a fact about the world; an
-  unparseable shape is our own defect and fails the run.
+
+- **`unsupported-shape` fails the provider that produced it, not the run** *(#61)*. What this task
+  used to say: *"**`unsupported-shape === 0` — non-waivable.** A provider being down is a fact about
+  the world; an unparseable shape is our own defect and fails the run."* **The second sentence is
+  still true; the blast radius was wrong.** One provider's novel envelope discarded 43 successful
+  listings and forced a re-authorized re-run of all 44 authenticated calls — on the single most
+  expensive operation in this branch, and the one requiring explicit user authorization. The rule is
+  now: record `unsupported-shape` **for that provider**, with the observed top-level keys (R8 already
+  captures them), keep every other provider's result, and re-run **only** the providers that failed.
+- **A partial or failed run RETAINS ITS CACHE, and retention is the default.** Stated explicitly
+  because it is what makes the per-provider gate worth anything: a re-run after a shape failure must
+  cost the failed providers, not 44 authenticated requests. A run that discards its own successes on
+  one failure is a run-wide gate wearing different words.
+- **The zero-shape ambition is not abandoned — it is un-asserted** *(#61)*. **No measurement supports
+  it.** Nothing in this branch shows zero unsupported shapes is achievable across 44 providers: R9 is
+  still migrating `listing` profiles when R10 starts, only 20 of 44 row-providers were ever probed on
+  a `/models` path, and **every one of those probes was unauthenticated** (119 × 401). Compare **R13b
+  in this same plan**, which sets its cap by a *measured* ceiling and writes the number and its date
+  beside the constant — that is the standard a gate must meet here too. If a run-wide gate is
+  genuinely wanted, it must be **evidenced first**, from this run's own measured shape-coverage
+  number, and adopted as a follow-up rather than asserted ahead of the data it would gate.
 - Coverage printed as `N of 44 eligible`, never "of 47", with `no-endpoint` excluded from the
   denominator and `testModel`-only / catalogue-only providers counted **separately** rather than
   folded into "covered".
 - `tabiai` and `gorouter` produce a real outcome (both returned `200 data: []` in the corpus, so
-  `empty` is the expected and correct answer — not a failure).
-- Coverage below the floor is waivable with `--accept-coverage-delta`; `unsupported-shape` is not.
+  `empty` is the expected and correct answer — not a failure). **And neither is pruned by that
+  outcome** — R11's candidate set is a union, not the discovered set (#58).
+- Coverage below the floor is waivable with `--accept-coverage-delta`. `unsupported-shape` is not
+  waivable **for the provider that produced it**, and does not gate the others.
 
 ---
 
@@ -1616,14 +1945,72 @@ recoverable backup before Ship D's apply is authorised.
 
 **WRITES:** `keysync/keysync.mjs`, `test/routing-split.test.mjs` (new), `test/denylist.test.mjs`.
 **Serial after:** R4, R5, **R10**. *(Revision 2 omitted R10 while the body claimed routing takes "the
-full discovered set" — M10. The discovered set comes from R10's cache, read through the same
-`discovery` input R14 defines; state the source rather than implying one.)*
+full discovered set" — M10. The **discovery half of the union** comes from R10's cache, read through
+the same `discovery` input R14 defines; state the source rather than implying one. The dependency
+survives revision 7's union correction below: the catalogue and `testModel` halves need no cache, but
+the discovery half still does, so R10 remains a hard predecessor.)*
 
-`buildProviders` stops sizing `providers[].models` and `picker` from one array. Routing takes the
-full discovered set (admitted, sanitised, joined) from R10's cache, **uncapped**; `picker` keeps a cap
+`buildProviders` stops sizing `providers[].models` and `picker` from one array. Routing takes
+**`union(discovery ids, catalogue ids, testModel)`** (admitted, sanitised, joined), the discovered
+half read from R10's cache, **uncapped**; `picker` keeps a cap
 under a **distinct renamed constant** `MAX_PICKER_MODELS_PER_PROVIDER`, **value 3, unchanged**, and
 ranked by the **two terms that actually exist** — R3's `outputKind` guard, then the R3-repaired
 free-first term, then id length. **No `localeCompare`** (A4, §1.2).
+
+#### The candidate set is a union, and "the full discovered set" would have pruned live providers (#58)
+
+**What this task used to say:** *"Routing takes the full discovered set (admitted, sanitised, joined)
+from R10's cache, **uncapped**."* Fed literally into `buildProviders`, that is not a dim — it is
+**removal from `Providers[]` entirely**, because the skip precedes the push *(read,
+`keysync/keysync.mjs:558-564`)*:
+
+```js
+if (!models.length) {
+  notes.push(`${reg.provider}: no testModel and no catalog entry — skipped`);
+  continue;                       // <- precedes the out.push below
+}
+const name = reg.provider;
+out.push({ name, provider: name, type, api_base_url: baseUrl, ... });
+```
+
+That branch is unreachable today **only** because `models` is seeded from `safeTestModel` and the
+catalogue entries earlier in the same loop (`:523-556`), independently of any listing. A
+discovered-set-only rule removes the seed and makes the branch reachable — for **four providers named
+in this plan's own data**:
+
+| provider | discovery outcome | source |
+|---|---|---|
+| `tabiai` | `empty` (HTTP **200**, `data: []`) | §4/R10 |
+| `gorouter` | `empty` (HTTP **200**, `data: []`) | §4/R10 |
+| `youcom` | `no-endpoint` (`listing: null`) | §4/R9 |
+| `githubcopilot` | `no-endpoint` (`listing: null`) | §4/R9 |
+
+**Only the first two can actually reach the skip** *(revision 8)*. This table is a **discovery**
+table — those are the four discovery outcomes, correctly cited to §4/R9 and §4/R10. In **routing**,
+`filterRegistry` (`keysync/keysync.mjs:31-37`) drops `youcom` and `githubcopilot` on
+`protocol: "generic"` before `buildProviders` ever runs, as D6 records. They are listed here because
+the discovered-set-only rule was argued from discovery data; the assertion that guards against the
+prune names `tabiai` and `gorouter` only, and says why under **Verify** below.
+
+**Two of them answer with HTTP 200.** A provider that responds and is then deleted from the config is
+precisely what [[responding-provider-never-pruned]] forbids: a listing, auth or billing failure is
+**state to surface**, never a reason to stop routing.
+
+**It also contradicted the locked decision it claims to implement.** D3 §4.1: *"**testModel always
+survives** regardless of the listing"*, and *"catalogue-only rows are kept, dimmed, and ranked last …
+model absent → **dim, never prune**."* The union restores that, and makes routing agree with the
+display path **by construction** — R14 already builds `union(discovery ids, catalogue ids, testModel)`
+(§1.5a). **A provider whose discovery outcome is `empty`, `auth`, `no-endpoint` or `error` keeps its
+catalogue and `testModel` rows and stays in `Providers[]`.**
+
+**Why the byte-identical observable was not a guard against this.** The `{model → behavesAs}`
+criterion below *would* detect the prune — a lost provider loses its picker rows and its
+declarations. But the plan simultaneously handed an executor a **documented innocent explanation** for
+exactly that delta: §1.1 said *"Discovery removes that accident"* of tabiai and gorouter, so a
+reviewer watching those two vanish had a sanctioned reason to rebaseline **in good faith**. **A
+detector whose failure has a blessed excuse is not a guard.** §1.1 is corrected (#58), and the
+presence assertion in this task's observables is stated separately so the two can never again be
+resolved in the wrong direction.
 
 **R11 spends the listing `capability` in the selection sort, and no task did** *(revision 5)*. The
 `capability` precedence is implemented by **R14, which writes `menu/catalog.mjs`** — the uwpick
@@ -1665,11 +2052,54 @@ constant and keeps `Number(process.env.UW_MAX_MODELS ?? 3)` passes all four crit
 **Assert that a non-numeric `UW_MAX_MODELS` (e.g. `"x"`) yields the default and a bounded picker**,
 not an uncapped one. One assertion, and it is the difference between fixing #5 and renaming it.
 
-The routing set's per-entry capability comes from **R5's join**, `null` on miss → weak bucket.
-`behavesAs` remains never-absent on every picker row.
+The routing set's per-entry capability comes from **R5's join**. `behavesAs` remains never-absent on
+every picker row.
+
+**The miss path is not one branch, and this task must not be written as if it were** *(revision 8,
+#66)*. This sentence read *"`null` on miss → weak bucket"*, restating D3 §4.2's three-row table.
+`bucketFor` (`keysync/keysync.mjs:234-241`) has **six** branches, and the one the short form hides is
+the row that **joins, carries `limits.contextTokens`, and has no `capabilities.reasoning`**: there
+context size is a **proxy** for unknown reasoning, and at `>= CTX_CAPABLE_MIN` (128000) it **promotes
+the row to the capable target**. A true miss — no join at all — does reach the weak *target*, but by
+way of the `unknown` bucket rather than the `weak` one (`BUCKET_TARGETS.unknown ===
+BUCKET_TARGETS.weak`), and the two are separately countable on purpose. Amended D3 §4.2 carries the
+completed six-row table; live footprint of the proxy branch is **3 of 83 rows**, all at the boundary
+the source comment at `keysync/keysync.mjs:207-213` enumerates.
+
+**Why this lands on R11 and not on the decisions doc alone.** R11 spends discovery's live
+`capability` field, and **a listing that reports a context window but no reasoning flag is a common
+shape** — so this branch governs a population far larger than 83 the moment discovery lands. R11
+still changes **no** `BUCKET_TARGETS` value, no `ALLOWED_BEHAVES_AS` entry and not `CTX_CAPABLE_MIN`
+(§0.1). The byte-identical `{model → behavesAs}` criterion below is what holds that line, and it
+holds it only if the executor knows all six branches it has to reproduce.
 
 **Verify:** `node keysync/run.mjs --dry`. Expected observables:
 
+- **Every provider present in the pre-R11 build is present after it, with at least its `testModel`
+  row** *(#58 — none of the four criteria below asserts this, and the widening is exactly where a
+  provider can be lost)*. Assert **per-provider presence** in `built.providers`, never a total count:
+  a count is satisfied by a provider gained elsewhere while another is dropped. Name the **two** at
+  risk explicitly — **`tabiai` and `gorouter`**, both `protocol: "openai"` with a real `testModel`
+  (`claude-opus-4-8`) and both answering `200` with `data: []` — and assert each by name, because
+  those are the rows the `!models.length` skip at `keysync/keysync.mjs:558` claims. **Mutation
+  check:** forcing a provider's discovery result to `[]` must leave it in `Providers[]` carrying its
+  `testModel`, and reverting the candidate set from the union to the discovered set must make this
+  assertion **fail**.
+  - **`youcom` and `githubcopilot` are out of this observable's scope, deliberately** *(revision 8)*.
+    `filterRegistry` (`keysync/keysync.mjs:31-37`, generic exclusion at `:36`) drops every
+    `protocol: "generic"` row **before** `chooseKeys` and `buildProviders`, and the live vault gives
+    both as `{"protocol":"generic","testModel":""}`. Neither is in `built.providers` before R11 or
+    after it, so asserting their presence is **failing or vacuous** — never a guard. D6 already
+    records this: *"`youcom` + `githubcopilot` (no HTTP surface, **already excluded by
+    `filterRegistry`**)"*. Do not "helpfully" re-add them.
+  - **What this criterion used to say, and why it was wrong** *(revision 8)*. It read *"Name the four
+    at risk explicitly — `tabiai` and `gorouter` (`empty`), `youcom` and `githubcopilot`
+    (`no-endpoint`)"*, which also put the plan in contradiction with D6. The four-provider list is
+    true **of discovery** — R9 assigns `listing: null` → `no-endpoint` to `youcom` and
+    `githubcopilot`, and §4's outcome table lists all four — and false **of routing**, which the two
+    `generic` providers never reach. **A true statement about one stage was carried into an assertion
+    about another.** The outcome table it came from is a discovery artifact and stands unchanged;
+    only this routing assertion was wrong.
 - `providers[].models` total ≫ picker row count — the two are now independent, which is the point.
 - `validate()` passes. Its picker⊆models tie (`keysync.mjs:724-729`) is a **subset** assertion, which
   widening *relaxes*; confirm it did not need editing.
@@ -1747,9 +2177,14 @@ Two changes, and they belong together because both decide *which* rows carry a d
 1. **Set `MAX_PICKER_MODELS_PER_PROVIDER` from measurement rather than inheritance.** Do not pick a
    number from taste, and do not carry 3 forward silently — either outcome must be stated with its
    reason.
-2. **Introduce provenance ranking** — `call-verified` > `listing-verified` > `catalogue-only`, then
+2. **Introduce provenance ranking** — `call-verified` > `config-asserted` > `listing-verified` >
+   `catalogue-only`, then
    the existing `outputKind` → free-first → id-length terms *(moved here from R11, G2; no
-   `localeCompare` — A4)*. This task is
+   `localeCompare` — A4)*. **The `config-asserted` term is revision 6's** *(#59)*: the order was
+   three-termed, and it is where "the new rung sits above `listing-verified`" is actually enforced
+   rather than merely asserted in §2.3 — a ranker that omits the rung would sort the relay's four
+   models and every vault `testModel` below a third-party listing row, which is #45. `null` ranks
+   last, unchanged. This task is
    serial after R10, so the cache exists; it deliberately changes declarations, so a reordering is
    the intent rather than a criterion violation; and it is what makes the ranker mutation in §6.4
    able to fail at all.
@@ -1768,6 +2203,22 @@ today's and whose options array stays within a **stated** byte budget. Both numb
 the code comment beside the constant, with the measurement date — so the next person to touch it
 inherits evidence rather than a magic 3. Report (1), (2) and (3) for every candidate, not only the
 chosen one; a table nobody can re-derive is not a measurement.
+
+**What this criterion does NOT target, stated plainly** *(#64)*. The acceptance criterion above is a
+**byte and parse-time budget**. It is **not** a capability-declaration criterion: nothing in it asks
+how many routing rows lack a `behavesAs`, and nothing in it forces the undeclared population down.
+Quantity (3) is reported precisely so the tradeoff is visible — but reporting is not shrinking. §1.2
+permits *"if the measurement justifies only 83, R13b lands 83"*, and that is a legitimate outcome of
+this task, so **this task may complete correctly and leave §1.2's pillar-2 cost — ~3,700 rows
+resolving through `lH()` to the maximal assumption set — unmitigated in full.** That is the honest
+reading of the gate, and an executor should not infer a guarantee from the fact that the shrink has an
+owner.
+
+**And no task in this plan closes it if that happens.** D4 step 2's remaining half is a *surface*
+question, not a declaration one (§8), and §8.1 names no successor for the declaration gap. **If the
+measurement lands at or near 83, filing that successor is part of this task's output** — a named
+follow-up, per §8.1's own rule that a deferral goes to a name rather than to nothing. This plan does
+not otherwise defer it, and must not be read as having done so.
 
 **Four things that must be re-checked because this task moves rows into `options[]`:**
 
@@ -1879,10 +2330,27 @@ and this consumes it (§2.5, G1/#52).
   `makeRoutableOf` because that is the pattern this codebase already uses for a refresher-resolved
   value injected into a pure builder.
 
+**The two config-literal assignments are `"config-asserted"`, never `"call-verified"`** *(revision
+6, #59; decisions §4.1 amendment)*. Every prior revision had this task assign `"call-verified"` to
+both the
+vault `testModel` and the relay's four models — a top-rung label, on a ladder whose top rung is
+defined as *"a real completion returned 200"*, written by a literal that nothing ever re-probes.
+**This task must not emit the string `"call-verified"` at all.** That rung is reserved for a dated
+probe result and has no producer wired in this branch (§2.3).
+
+**Row membership is unchanged by this correction.** The vault `testModel` still survives regardless
+of the listing, and every catalogue-only row is still kept; only the label on those rows moves one
+rung. Nothing about the union changes.
+
 **Verify:** `node --test "test/catalog.test.mjs"`. Expected observables:
 - a model present **only** in `discovery` becomes a row, with `provenance: "listing-verified"`;
 - a model present only in the bundle becomes a row with `provenance: "catalogue-only"`;
-- the vault `testModel` is `"call-verified"` and survives regardless of the listing (D3 §4.1);
+- the vault `testModel` is `"config-asserted"` and **survives regardless of the listing** (D3 §4.1)
+  — the survival half of this observable is unchanged from revision 3 and must stay asserted, so
+  that the label correction cannot be mistaken for, or silently become, a prune;
+- a relay (`anthropic`) model is `"config-asserted"`, not `null` and not `"call-verified"`;
+- **no row produced by this task carries `"call-verified"`** over a fixture set that includes both
+  a vault `testModel` and the relay — the observable that fails if either literal comes back;
 - with `discovery` defaulted empty, every row's provenance is `null` and **no row disappears** — the
   proof that the default is inert;
 - over a fixture whose live id differs cosmetically from the bundle's, `capsOf` returns real
@@ -1926,6 +2394,18 @@ bug); the key-set test is **updated to require it**, because a test asserting th
 exactly what certified `routable` being dropped on every build (B4/OQ-4); and an observable that
 **fails when the cache disagrees with the bundle** — a model in `discovery` but not the bundle must
 appear with `listing-verified`, so a silently-ignored cache cannot pass.
+
+**Schema 3 pins the rung vocabulary, and an observable must fail if it regresses to three**
+*(revision 6, #59)*. This is the reason the ladder split ships in this branch rather than deferring
+with the freshness work: schema 3 is where the vocabulary becomes persisted data, and a schema 3
+written with the old three rungs would force phase B to migrate 3 → 4 or to carry two incompatible
+meanings of `"call-verified"` in one schema. Assert the accepted set **as a set**, not by spot-checking
+one value: every serialized `provenance` is one of
+`{"call-verified", "config-asserted", "listing-verified", "catalogue-only", null}`, and
+`"config-asserted"` is **present in the accepted set** — an assertion that fails if a later edit
+drops the rung, collapses it back into `call-verified`, or renames it without updating the schema.
+Pair it with the R14-side observable that no snapshot row carries `"call-verified"` from a config
+literal, so the vocabulary is checked at both the producer and the persistence boundary.
 
 **#51 addition:** the per-provider literal gains `refused`, on the **same 2 → 3 bump** — one
 migration, not two. It carries the same `?? null` / explicit-array discipline as the rest: an
@@ -1981,9 +2461,18 @@ observables:
 - Every rendered line measures **exactly `FRAME_W` = 78** under `vis()` — the existing invariant,
   re-asserted with the new gutter, a 37-code-point id, an elided id, **and the ASCII glyph set**
   (the case where a reused `g.ell` would have put every row two columns over).
-- Each of the four provenance states renders a **distinct glyph** with `caps.colours === 0`, in both
-  UNI and ASCII. (This is `healthDot`'s own failure mode: its predecessor returned the same glyph for
-  ok, needs-$ and broken, under a test titled as if it checked otherwise.)
+- Each of the **five** provenance states renders a **distinct glyph** with `caps.colours === 0`, in
+  both UNI and ASCII — `◆ ◈ ◇ · ␣` and `# = + . ␣`. *(Revision 6, #59: this said "four" before the
+  ladder gained `config-asserted`. Pairwise-distinct across all five is the assertion, not
+  distinct-from-blank; `healthDot`'s own failure mode was a predecessor returning the same glyph for
+  ok, needs-$ and broken under a test titled as if it checked otherwise, and a four-way test left
+  passing while a fifth state renders as one of the others would reproduce it exactly.)*
+- **`call-verified` renders from a fixture even though nothing produces it in this branch** (§2.3).
+  The rung is defined and unfed; the glyph test is what keeps it correct for the day it is wired,
+  and dropping it because "no row can reach it" would delete the only check on the top of the
+  ladder.
+- **A relay row renders `◈`/`=`, not blank and not `◆`** — the #45 inversion guard, restated for the
+  corrected rung.
 - Padding happens **before** colouring — assert the coloured cell and the bare cell have the same
   `vis()`.
 - `null` provenance renders blank **and** the header shows the `discovered` stamp, so blank is
@@ -2050,6 +2539,16 @@ Live today *(measured)*: **10 stored recents, 0 favourites** — 9 render after 
 - **Cap the display in `initState`, applied *after* the existing
   `known.has(t) && !favourites.includes(t)` filter.** Capping before it lets a recent that is also a
   favourite consume a slot while rendering zero rows.
+- **The cap must disclose itself: render a `… N more` line** *(#60)*. Revision 5 cut the display
+  10 → 5 with **no affordance at all**, so against today's live state — 10 stored, 9 rendering after
+  the `known` filter — **4 entries vanish with nothing saying they exist**. They are not gone:
+  `MAX_RECENTS = 10` is deliberately untouched (next bullet), so the storage is still there to be
+  disclosed. That is a hiding action without disclosure **in the same ship that builds an entire
+  drill-in overlay so refused ids are disclosed with per-id reasons** (#51) — two hiding actions, one
+  ship, opposite treatment, and no stated reason for the asymmetry. Use the picker's existing "more"
+  affordance if one exists; otherwise a single dimmed `… N more` line immediately below the pinned
+  block, `N = (displayable recents) − 5`, **omitted entirely when `N === 0`**. **Display-side only:**
+  no new persisted state, no probe, no cadence, no change to `MAX_RECENTS`, and no new key binding.
 - **`MAX_RECENTS = 10` is untouched.** The complaint is menu inflation, which is a rendering property;
   changing the storage bound would silently discard history on the next `recordRecent` write — a
   larger change to persisted-state semantics for the same visible effect.
@@ -2070,7 +2569,10 @@ influenced by anything the reducer holds.
 **Verify:** `initState` with **9 known recents and 0 favourites yields exactly 5** `mark: "~"` entries,
 in most-recent-first order; and a favourite that is also a recent appears **once as `"*"` and does not
 reduce the recent count below 5**. The second is the ordering trap — a test counting only total pinned
-rows passes while the cap silently loses a slot.
+rows passes while the cap silently loses a slot. **And the disclosure gets both cases** *(#60)*: the
+same 9-recent fixture renders **`… 4 more`**, while a **5-recent fixture renders no such line at
+all** — the second half is what stops the affordance from being hardcoded on and reading `… 0 more`
+in the common case.
 
 **`sanitizeDisplay` at render, as defence in depth — not as the guarantee.** Under §2.5's single
 representation the id arriving here is already safe, so this pass exists only because the snapshot is
@@ -2179,10 +2681,14 @@ in exactly the manner it was written against.
 outcomes with `empty` and `unsupported-shape` structurally separate. `unsupported-shape` records the
 top-level keys observed, so the next parse is a data change rather than an investigation.
 
-**Detection.** **Zero `unsupported-shape` is a non-waivable gate** on R10 — coverage may be waived
-with `--accept-coverage-delta`, this may not. The per-provider outcome table prints every provider,
-so a zero is visible per-name rather than as a ratio. R8's offline fixture asserts the two-line
-header case directly.
+**Detection.** **`unsupported-shape` is non-waivable for the provider that produced it** — coverage
+may be waived with `--accept-coverage-delta`, a shape failure may not be waived for its own provider.
+*(Revised, #61: this previously read "Zero `unsupported-shape` is a non-waivable gate on R10", i.e.
+run-wide. The scenario this paragraph defends against is **one provider silently yielding zero
+models**, and a per-provider gate detects that exactly as well — while a run-wide gate additionally
+discarded 43 good listings on one novel envelope. The detection is unchanged; only the blast radius
+is. See R10.)* The per-provider outcome table prints every provider, so a zero is visible per-name
+rather than as a ratio. R8's offline fixture asserts the two-line header case directly.
 
 **Residual, stated rather than hidden.** `githubcopilot` and `youcom` have no listing endpoint that
 exists, so a coverage report of 100% always means *100% of the 44 eligible*, never of 47, and must
@@ -2459,7 +2965,7 @@ Two effects worth recording, because a reader tracking issues should not have to
   changes what the picker looks like more than any render task in Ship E**, and it happens in Ship D
   where no render observable is watching. R16's rendering judgements should be made against a
   post-R11 snapshot, not today's.
-| **Refresh cadence** (#17, #14) | D6 puts it in phase B; unblocker is a scheduling decision under F8 |
+| **Refresh cadence** (#17, #14, and the cadence half of #59) | D6 puts it in phase B; unblocker is a scheduling decision under F8. **Deferral confirmed, with its mitigations named** *(revision 6)*: `refresh/cli.mjs` is manual-invocation only, so `listing-verified` means "as of the last refresh" and the ladder has no clock. Two things make that disclosed rather than hidden staleness — the `discovered <date>` header stamp (R15's two-case observable exists so a permanently-null stamp cannot pass) and the user's stated phase-B plan of a single manual command refreshing listings, bundle and id matching together. The budget tolerates old-and-dated and forbids wrong-and-unmarked; see §2.4, which previously answered only the budget's cost clause and now answers its cadence clause too. **This mitigation does not cover the rung split** — a stamp cannot date a label that was never discovered, which is why that half shipped instead |
 | **`--verified-only`'s name** (#6) | it becomes a labeller in R12; the rename is cosmetic and separable |
 | **A `@verified` filter token in uwpick** | decisions doc §7.2 asked for filtering to be *"weighed against per-row markers"*; §2.4 did that weighing and **chose the marker**, because provenance is a per-row property and the question at selection time is per-row. The token remains a good complement and is **cheaper now that R18 opens the reducer** — deferred on the weighing, not on cost or reach |
 | **#12** — hardcoded `CATALOG_FILE` with no `require.resolve` | pre-existing; touching it inside the join work would mix a crash-hardening change into a data change |
