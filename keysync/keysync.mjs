@@ -305,7 +305,49 @@ export function resolveProtocol(vaultProvider) {
 // that ambiguity is what let one number stand in for two decisions.
 //
 // This is the DEFAULT. `pickerCapFrom` resolves `UW_MAX_MODELS` against it.
-export const MAX_PICKER_MODELS_PER_PROVIDER = 3;
+//
+// SIZED FROM MEASUREMENT, 2026-09-08 (R13b). Two budgets, both stated here so a
+// later edit argues against numbers rather than against taste:
+//
+//   PARSE CEILING  <= 2x today's median `JSON.parse` of the WHOLE settings.json.
+//                  Claude Code parses that file at every launch, so this is a
+//                  growth discipline on the startup path, not a stall guard.
+//   BYTE BUDGET    `modelPicker.options` <= 100 KB serialized. The resolver plan
+//                  already names "past 200 KB" as the failure retiring this cap
+//                  outright would cause; 100 KB keeps a full doubling in hand.
+//
+// MEASURED against the real vault (44 providers, 1,584 routing ids), median of 7
+// trials x 1,500 parses each, trial spread under 1%:
+//
+//   cap   picker rows   options bytes   settings.json   parse ms   x today   undeclared
+//     3            94          12,965          23,447     0.0539     1.00x        1,501
+//    10           200          27,126          43,332     0.1005     1.86x        1,395
+//    25           379          52,424          78,296     0.1803     3.35x        1,216
+//    50           586          82,490         119,540     0.2709     5.03x        1,009
+//   inf         1,595         245,679         337,215     0.7202    13.36x            0
+//
+// 10 is the largest cap inside BOTH budgets: parse binds first (25 is 3.35x), and
+// the byte budget would have allowed 50. So the parse ceiling is the operative
+// one and the byte budget is slack -- stated anyway, because it is the budget the
+// plan's "past 200 KB" was about and the one that stops `inf`.
+//
+// WHAT THIS DOES NOT CLAIM. The absolute cost is sub-millisecond at EVERY
+// candidate -- 0.72 ms uncapped -- so no candidate here is perceptible at launch
+// and this cap is not rescuing anyone from a stall. It bounds unbounded growth of
+// a startup-path file, which is a different and smaller claim.
+//
+// WHAT WOULD BIND FIRST IF IT WERE MEASURED. Not bytes and not parse: the native
+// `/model` menu renders 10 rows with 1-row scrolling and NO FILTER (resolver plan
+// D4 step 2), and this raises it from 94 rows to 200. `orderNativePickerOptions`
+// keeps the relay's rows at the head, which is what keeps the top of a 200-row
+// menu useful; uwpick is the surface meant to go wide. A future task that wants a
+// larger cap should measure the menu, not re-argue the parse ceiling.
+//
+// THE UNDECLARED POPULATION IS NOT WHAT SIZED THIS. It falls 1,501 -> 1,395 of
+// 1,584 (7.1%), which is a by-product and NOT a fix. The residual population is
+// filed as its own [LIMIT] issue; no number is cited here because it did not
+// exist when this shipped, and a guessed one is worse than none.
+export const MAX_PICKER_MODELS_PER_PROVIDER = 10;
 
 /**
  * `UW_MAX_MODELS` -> a usable positive integer, or the default.
@@ -331,6 +373,131 @@ export function pickerCapFrom(raw, fallback = MAX_PICKER_MODELS_PER_PROVIDER) {
   if (!/^\d+$/.test(s)) return fallback;
   const n = Number.parseInt(s, 10);
   return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+// ------------------------------------------------------- provenance (R13b)
+//
+// HOW STRONG THE EVIDENCE IS THAT AN ID IS REAL, as the FIRST term of the
+// selection sort. Before this, the sort carried no provenance term at all, so a
+// row the provider's own listing named and a row only the bundled snapshot
+// mentions were separated by nothing but insertion order (see `extras` below).
+//
+// THE RUNG ORDER, AND WHY `config-asserted` SITS SECOND RATHER THAN THIRD OR
+// FIRST. Two real populations are asserted by local config with nothing ever
+// probing them: the vault's `testModel` (one per provider) and the relay's
+// literal model list. Ranking them BELOW `listing-verified` sorts the relay's
+// models and every `testModel` under third-party listing rows, which is exactly
+// the regression #59 fixed once already. Ranking them at the TOP conflates "a
+// human wrote this id in a config file" with "a completion came back 200 on a
+// dated run", which is the only rung carrying real evidence. So: second.
+//
+// A DATED REAL CALL OUTRANKS A LIVE LISTING OUTRANKS A SNAPSHOT. `call-verified`
+// is verify-prune.mjs's probe -- an actual completion, the strongest signal any
+// of these carry. `listing-verified` is what the provider says it serves TODAY,
+// which is real-time evidence that a config literal is not. `catalogue-only` is
+// the bundled `models.json`: a periodic snapshot merged across hosts, and the
+// weakest positive claim. Absence of all four is `null`, which sorts LAST and
+// leaves such rows exactly where they are relative to each other.
+export const PROVENANCE_ORDER = Object.freeze([
+  "call-verified", "config-asserted", "listing-verified", "catalogue-only",
+]);
+
+// Unranked sorts after every named rung. Derived from the array rather than
+// written as a literal so adding a rung cannot leave this stale.
+export const PROVENANCE_UNRANKED = PROVENANCE_ORDER.length;
+
+/**
+ * A provenance label -> its sort position. `null`/unknown -> last.
+ *
+ * Separated from `provenanceOf` for the same reason `capabilityKind` is
+ * separated from `outputKind`: the vocabulary is assertable on its own, and the
+ * sort reads one number rather than a chain of string comparisons.
+ */
+export function provenanceRank(label) {
+  const i = PROVENANCE_ORDER.indexOf(label);
+  return i === -1 ? PROVENANCE_UNRANKED : i;
+}
+
+/**
+ * The STRONGEST rung an id qualifies for, or `null` for none.
+ *
+ * Membership sets, not booleans, because every caller already holds sets and
+ * because "strongest wins" has to be decided in one place -- an id is routinely
+ * in several at once (a `testModel` that also appears in the catalogue and was
+ * also probed). Checking them in rung order and returning the first hit is what
+ * makes that precedence a property of this function rather than of each call
+ * site's `if` order.
+ *
+ * Every set is optional and a missing one contributes nothing rather than
+ * throwing: this is enrichment over inputs that may legitimately be absent (see
+ * `buildProviders` -- run.mjs passes neither a discovery cache nor probe
+ * results today), and an absent input must degrade to a lower rung, never stop
+ * a build.
+ *
+ * @param {string} id                     the model id as the provider spells it
+ * @param {object} [sets]
+ * @param {Set<string>} [sets.verified]   ids a real completion returned 200 for
+ * @param {Set<string>} [sets.asserted]   ids local config names (testModel, relay)
+ * @param {Set<string>} [sets.listed]     ids the provider's live listing named
+ * @param {Set<string>} [sets.catalogued] ids the bundled catalogue names
+ * @returns {"call-verified"|"config-asserted"|"listing-verified"|"catalogue-only"|null}
+ */
+export function provenanceOf(id, { verified, asserted, listed, catalogued } = {}) {
+  if (verified?.has(id)) return "call-verified";
+  if (asserted?.has(id)) return "config-asserted";
+  if (listed?.has(id)) return "listing-verified";
+  if (catalogued?.has(id)) return "catalogue-only";
+  return null;
+}
+
+/**
+ * verify-prune.mjs's output -> `provider -> Set<id>` of call-verified ids.
+ *
+ * Accepts the file as it is on disk (`{working: [...], results: [...]}`), the
+ * `working` array on its own, or an already-grouped Map/object -- the same
+ * shape-tolerance `discoveryIndex` has, for the same reason: a malformed or
+ * absent input must cost a rung, never a build.
+ *
+ * READS `working`, OR `results` FILTERED BY `ok`, AND NEVER `results` WHOLE.
+ * `results` records failures too (4 of 22 on the live file), and a row that
+ * returned 401 or timed out is the opposite of call-verified. verify-prune.mjs
+ * derives `working` as exactly `results.filter(r => r.ok)`, so the two paths
+ * agree by construction; the filter exists for a caller holding only `results`.
+ *
+ * SPLIT ON THE FIRST SLASH ONLY. Ids contain slashes -- `cloudflare/@cf/openai/
+ * gpt-oss-120b` and `nscale/Qwen/Qwen3-4B-Instruct-2507` are both real rows --
+ * so splitting on every slash would key them under a provider that does not
+ * exist and silently drop the strongest rung for the rows most likely to have
+ * earned it. verify-prune.mjs's own `m.split("/")[0]` reads the provider the
+ * same way.
+ */
+export function verifiedIndex(verified) {
+  const out = new Map();
+  if (!verified) return out;
+  let flat = null;
+  if (Array.isArray(verified)) flat = verified;
+  else if (Array.isArray(verified?.working)) flat = verified.working;
+  else if (Array.isArray(verified?.results)) {
+    flat = verified.results.filter((r) => r?.ok === true).map((r) => r?.model);
+  }
+  if (flat) {
+    for (const full of flat) {
+      if (typeof full !== "string") continue;
+      const cut = full.indexOf("/");
+      if (cut <= 0 || cut === full.length - 1) continue;
+      const provider = full.slice(0, cut);
+      if (!out.has(provider)) out.set(provider, new Set());
+      out.get(provider).add(full.slice(cut + 1));
+    }
+    return out;
+  }
+  const pairs = verified instanceof Map ? verified.entries()
+    : (typeof verified === "object" ? Object.entries(verified) : []);
+  for (const [provider, ids] of pairs) {
+    if (!Array.isArray(ids)) continue;
+    out.set(provider, new Set(ids.filter((i) => typeof i === "string" && i !== "")));
+  }
+  return out;
 }
 
 // --------------------------------------------------- capability buckets (D4)
@@ -719,12 +886,19 @@ function discoveryIndex(discovery) {
  *   or malformed leaves the candidate set at `testModel u catalogue`, which is
  *   the pre-R11 set MINUS nothing -- discovery only ever ADDS ids, so a caller
  *   with no cache loses no reach it had before.
+ * @param {object|string[]|Map|null} [verified]  verify-prune.mjs's probe output.
+ *   RANKING ONLY -- unlike `discovery` it contributes no candidates, so it can
+ *   reorder the picker's prefix but can never change which ids route. Absent
+ *   drops every row to a lower provenance rung together, which is a no-op on the
+ *   sort rather than a reordering.
  */
-export function buildProviders(chosen, providers, catalog, keyReader, discovery = null) {
+export function buildProviders(chosen, providers, catalog, keyReader, discovery = null,
+                               verified = null) {
   const out = [];
   const picker = [];
   const notes = [];
   const discoveredBy = discoveryIndex(discovery);
+  const verifiedBy = verifiedIndex(verified);
   // READ PER CALL, NOT AT MODULE LOAD, so a test can set the variable and
   // observe the bound it produces. Reading it once at import made the only
   // assertable thing about the parse its return value, which is exactly the
@@ -921,10 +1095,57 @@ export function buildProviders(chosen, providers, catalog, keyReader, discovery 
       // make the SAME vault and the SAME bundle produce a different top-3 on a
       // different machine -- an ordering that cannot be reproduced from the
       // inputs is not an ordering this config may be built on.
+      //
+      // PROVENANCE IS THE SECOND TERM (R13b), BELOW `kind` AND ABOVE FREE-FIRST.
+      // See PROVENANCE_ORDER for the rung order and why `config-asserted` is
+      // second within it. The four sets are all already in hand: nothing here is
+      // fetched or re-derived, so the term costs one Map lookup per row.
+      //
+      // R13b's brief specified this term ABOVE `kind`. THAT ORDER IS WRONG, and
+      // it is wrong in a way this fixture proves rather than argues: the live
+      // `capability` token is BOTH the thing that demotes a row through `kind`
+      // and the thing that promotes it to `listing-verified`, because a row
+      // carries a capability only when a listing named it. Ranked above `kind`,
+      // the promotion wins and supplying discovery data makes a declared
+      // `image_gen` row sort HIGHER than it did with no discovery at all -- the
+      // exact inverse of what the precedence exists to do. MEASURED: it inverts
+      // "a capability demotes a row in the SELECTION SORT, not only in `kind`"
+      // (test/routing-split.test.mjs), which is a shipped R11 invariant.
+      //
+      // The general form, which is why this is a correction and not a local
+      // patch: `kind === "nontext"` is a DISQUALIFIER -- "is this a chat model
+      // at all" -- and provenance is a QUALITY ranking over rows that already
+      // passed it. Strong evidence that an image generator exists is still
+      // strong evidence about an image generator. Every other term here
+      // (free-first, id length) is a preference among comparable rows, so
+      // provenance sits directly beneath the one disqualifier and above them.
+      //
+      // `asserted` IS THE testModel AND THE testModel IS NOT IN `extras`. It is
+      // pushed into `models` above, ahead of this sort, so today the set is
+      // always disjoint from what is being sorted and the rung is unreachable
+      // from here. It is passed anyway, because `provenanceOf`'s precedence is
+      // only correct if every caller hands it every set it has -- and the day
+      // `testModel` stops being special-cased upstream, this sort must already
+      // rank it second rather than dropping it to `catalogue-only`.
+      //
+      // MEASURED 2026-09-08: run.mjs passes NEITHER `discovery` NOR `verified`,
+      // so on today's production build every extra resolves to `catalogue-only`,
+      // the term evaluates 3 - 3 = 0 for every pair, and the ordering is exactly
+      // what it was before this change. That is the honest state of it: the
+      // ranking is correct and tested, and it moves nothing until a caller wires
+      // the inputs in. The same shape as R11's `discovery` parameter.
+      const provSets = {
+        verified: verifiedBy.get(reg.provider),
+        asserted: safeTestModel ? new Set([safeTestModel]) : undefined,
+        listed: discoveredKept,
+        catalogued: keptIds,
+      };
       const ranked = extras
         .map((e) => ({ e, kind: outputKind(e.entry, e.capability),
-                       tier: e.entry ? inferTier(e.entry, reg.provider) : "unknown" }))
+                       tier: e.entry ? inferTier(e.entry, reg.provider) : "unknown",
+                       prov: provenanceRank(provenanceOf(e.id, provSets)) }))
         .sort((a, b) => (a.kind === "nontext" ? 1 : 0) - (b.kind === "nontext" ? 1 : 0) ||
+          a.prov - b.prov ||
           (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
           a.e.id.length - b.e.id.length);
       // The entry is in hand by construction, so the capability signals need no

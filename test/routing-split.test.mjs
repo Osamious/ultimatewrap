@@ -21,9 +21,12 @@ import {
   buildProviders, validate, bucketFor, normalizeModel, outputKind, capabilityKind,
   pickerCapFrom, MAX_PICKER_MODELS_PER_PROVIDER, BUCKET_TARGETS, CTX_CAPABLE_MIN,
   ANCHOR_PREFERENCE, ANTHROPIC_TIERS, ANTHROPIC_RELAY, ANTHROPIC_FULL,
+  PROVENANCE_ORDER, PROVENANCE_UNRANKED, provenanceOf, provenanceRank, verifiedIndex,
+  reconcileUserModelPin,
 } from "../keysync/keysync.mjs";
 import {
   resolveAnchor, resolveBare, bareIdCensus, checkBareCollisions,
+  orderNativePickerOptions, assertOptionsComplete,
 } from "../keysync/run.mjs";
 
 // ---------------------------------------------------------------- fixtures
@@ -59,8 +62,15 @@ function fixture({ discovery = {} } = {}) {
                  testModel: "listed-probe" }],
   ]);
   const byProvider = new Map([
-    ["wide", Array.from({ length: 9 }, (_, i) =>
-      ({ provider: "wide", model: `wide-m${i}`, id: `wide/wide-m${i}`,
+    // FORTY, AND ZERO-PADDED, both for reasons R13b made load-bearing. The cap
+    // went 3 -> 10, so nine entries no longer produce a routing/picker GAP at
+    // all -- the picker would take every row and the tests below would prove
+    // nothing about the split they exist to pin. The padding keeps every id the
+    // same LENGTH, so the id-length sort term still ties and insertion order is
+    // still the whole of the ranking, which is what the ordering tests assert.
+    ["wide", Array.from({ length: 40 }, (_, i) =>
+      ({ provider: "wide", model: `wide-m${String(i).padStart(2, "0")}`,
+         id: `wide/wide-m${String(i).padStart(2, "0")}`,
          ...text({ limits: { contextTokens: 32768 }, capabilities: { reasoning: true } }) }))],
   ]);
   return {
@@ -176,8 +186,8 @@ test("routing carries every candidate; the picker carries a bounded prefix", () 
   const built = build(fixture());
   const wide = byName(built, "wide");
 
-  // A GAP, not a number. `wide` has one testModel plus nine catalogue entries.
-  assert.equal(wide.models.length, 10, "testModel + 9 catalogue entries, uncapped");
+  // A GAP, not a number. `wide` has one testModel plus forty catalogue entries.
+  assert.equal(wide.models.length, 41, "testModel + 40 catalogue entries, uncapped");
   assert.equal(pickerFor(built, "wide").length, MAX_PICKER_MODELS_PER_PROVIDER);
   assert.ok(wide.models.length > pickerFor(built, "wide").length * 3,
     "routing must be much larger than the picker once the two are decoupled");
@@ -381,32 +391,52 @@ test("malformed discovery ENTRIES are dropped before the admission gate", () => 
 
 // ---- provenance ORDER, pinned so R13b's decision stays deliberate ----------
 
-test("catalogue ids precede discovery-only ids, and that order decides the top-3", () => {
-  // keysync.mjs:822-835 gathers `safeEntries` and THEN discovery-only ids. The
-  // sort carries no provenance term and is stable, so for rows equal on all
-  // three terms (kind, tier, id length) insertion order is the whole of the
-  // ranking -- and the picker is a prefix, so it decides which three rows are
-  // advertised.
+test("R13b: a live listing now OUTRANKS the bundle, and insertion order is the tiebreak", () => {
+  // THE DEFERRED DECISION, NOW MADE. Until R13b this asserted the opposite --
+  // "catalogue ids precede discovery-only ids, and that order decides the top-3"
+  // -- and said so explicitly: *"Ranking a live listing above the bundle is
+  // R13b's call, with its own evidence."* This is that call, and the evidence is
+  // in PROVENANCE_ORDER: a listing is what the provider serves TODAY, the bundle
+  // is a periodic snapshot merged across hosts.
   //
-  // PINNED BECAUSE IT IS A DEFERRED DECISION, NOT A SETTLED ONE. Ranking a live
-  // listing above the bundle is R13b's call, with its own evidence. Swapping the
-  // two loops today changes every tied provider's advertised top-3 and passes
-  // the rest of this file in silence; this is the assertion that stops that
-  // happening as a side effect of an unrelated refactor.
+  // WHAT THE OLD ASSERTION PROTECTED IS STILL PROTECTED. Its real subject was
+  // that ordering must not change as an invisible side effect of swapping the
+  // two gather loops. That is now pinned one layer down: the loops still gather
+  // catalogue-then-discovery, and for rows on the SAME rung insertion order is
+  // still the whole of the ranking -- asserted below on the two catalogue rows
+  // the listing does not name.
   const f = fixture();
   f.chosen = [{ id: "personal.ord.free", provider: "ord" }];
   f.vault = new Map([["ord", { protocol: "openai", baseUrl: "https://ord.invalid/v1" }]]);
-  // Six ids, all length 2, all text-or-no-signal, all tier `unknown`: every
-  // sort term ties by construction, so nothing but insertion order is left.
+  // Five ids, all length 2, all text-or-no-signal, all tier `unknown`: every
+  // OTHER sort term ties by construction, so the only two things that can order
+  // these rows are the provenance rung and, within a rung, insertion order.
   f.catalog.byProvider = new Map([["ord", ["c1", "c2", "c3"].map((m) =>
     ({ provider: "ord", model: m, id: `ord/${m}`, modalities: { output: ["text"] } }))]]);
-  f.discovery = { ord: { outcome: "ok", models: [{ id: "d1" }, { id: "d2" }, { id: "d3" }] } };
+  // The listing names `c3` -- a CATALOGUE row -- as well as the two it
+  // contributes on its own. Promoting c3 is what proves the rung is keyed by id
+  // rather than by which loop gathered the row.
+  f.discovery = { ord: { outcome: "ok", models: [{ id: "c3" }, { id: "d1" }, { id: "d2" }] } };
 
   const built = build(f);
-  assert.deepEqual(byName(built, "ord").models, ["c1", "c2", "c3", "d1", "d2", "d3"],
-    "catalogue first, discovery-only after: the shipped order, deliberately unranked");
-  assert.deepEqual(pickerFor(built, "ord"), ["ord/c1", "ord/c2", "ord/c3"],
-    "swapping the two loops advertises d1/d2/d3 instead, changing the menu with no diff nearby");
+  assert.deepEqual(byName(built, "ord").models, ["c3", "d1", "d2", "c1", "c2"],
+    "listing-verified rows first, catalogue-only after");
+  // WITHIN A RUNG, INSERTION ORDER IS UNCHANGED: the gather loops still run
+  // catalogue-then-discovery, so `c3` leads `d1`/`d2` on the same rung and `c1`
+  // leads `c2` on theirs. Swapping the two loops still changes this, and still
+  // must not happen silently.
+  assert.deepEqual(byName(built, "ord").models.slice(0, 3), ["c3", "d1", "d2"]);
+  assert.deepEqual(byName(built, "ord").models.slice(3), ["c1", "c2"]);
+  // The picker is still a prefix of that one ordering, so the menu agrees.
+  assert.deepEqual(pickerFor(built, "ord"),
+    ["ord/c3", "ord/d1", "ord/d2", "ord/c1", "ord/c2"]);
+
+  // CONTROL: strike the discovery input and every row drops to `catalogue-only`
+  // together, the term evaluates 3 - 3 = 0 for every pair, and the pre-R13b
+  // order returns. This is what proves the reordering above is the rung and not
+  // the gather order.
+  f.discovery = {};
+  assert.deepEqual(byName(build(f), "ord").models, ["c1", "c2", "c3"]);
 });
 
 // ---- the declaration channel, asserted as a SET ----------------------------
@@ -433,6 +463,13 @@ test("widening routing leaves the {model, behavesAs} declaration channel intact"
   //   routing 83 -> 1,584 third-party entries across 44 providers while the
   //   third-party picker stays at 83 rows (1,501 undeclared, which the dry run
   //   now prints). With the relay: 45 providers, 94 picker rows.
+  //   R13b, 2026-09-08: the cap moved 3 -> 10, so the picker now declares TEN
+  //   rows per provider instead of three and this pin grew with it. That is
+  //   R13b's deliberate change and the reason it is the task that owns the
+  //   sizing -- R11's claim was that widening ROUTING changed no declaration,
+  //   and it still holds: what changed the declarations here is the cap, not the
+  //   union. On the real vault the third-party picker goes 83 -> 189 rows
+  //   (94 -> 200 with the relay) and undeclared falls 1,501 -> 1,395 of 1,584.
   const built = build(fixture());
   const pairs = built.picker.map((r) => [r.model, r.behavesAs ?? null]).sort();
 
@@ -440,17 +477,22 @@ test("widening routing leaves the {model, behavesAs} declaration channel intact"
     ["gorouter/claude-opus-4-8", "claude-sonnet-4-5"],
     ["listed/listed-probe", "claude-sonnet-4-5"],
     ["tabiai/claude-opus-4-8", "claude-sonnet-4-5"],
-    ["wide/wide-m0", "claude-sonnet-4-6"],
-    ["wide/wide-m1", "claude-sonnet-4-6"],
+    ...Array.from({ length: 9 }, (_, i) =>
+      [`wide/wide-m0${i}`, "claude-sonnet-4-6"]),
     ["wide/wide-probe", "claude-sonnet-4-5"],
   ], "the declaration channel, pair for pair");
 
-  // The gap the pin is a statement ABOUT: routing carries more than twice what
-  // the picker declares, so "the declarations did not change" is a claim with
-  // content rather than a restatement of an unchanged build.
+  // EVERY ROW STILL CARRIES ONE. The count grew; the invariant that no picker
+  // row is left undeclared did not, and that is the half `lH()` punishes.
+  assert.ok(built.picker.every((r) => typeof r.behavesAs === "string" && r.behavesAs),
+    "an absent declaration resolves to the MAXIMAL assumption set, never to none");
+
+  // The gap the pin is a statement ABOUT: routing carries more than three times
+  // what the picker declares, so "the declarations did not change" is a claim
+  // with content rather than a restatement of an unchanged build.
   const routing = built.providers.reduce((n, p) => n + p.models.length, 0);
-  assert.equal(routing, 13);
-  assert.equal(built.picker.length, 6);
+  assert.equal(routing, 44);
+  assert.equal(built.picker.length, 13);
   assert.ok(routing > built.picker.length,
     "if routing did not widen, this test proves nothing about widening");
 });
@@ -823,4 +865,279 @@ test("ENTRIES, not providers: one provider listing an id twice binds nothing", (
   assert.equal(resolveBare(providers, "m"), undefined, "...but two ENTRIES, so nothing binds");
   assert.equal(resolveBare(providers, "n")?.provider, "solo");
   assert.equal(resolveBare(providers, "absent"), undefined, "and an unadvertised name binds nothing");
+});
+
+// ==========================================================================
+// R13b: the picker cap is sized from measurement, and selection carries a
+// provenance term.
+//
+// The measurement itself is a report, not a test (it needs the real vault) --
+// see the table beside MAX_PICKER_MODELS_PER_PROVIDER. What is testable, and
+// what these cover, is the BEHAVIOUR the chosen cap and the new sort term
+// produce, plus the four invariants that adding rows to `options[]` can break.
+// ==========================================================================
+
+/**
+ * A single provider whose extras are separated by provenance and NOTHING else.
+ *
+ * Every catalogue id is the SAME LENGTH, the same `kind` and the same tier, so
+ * the three pre-existing sort terms all evaluate to 0 for every pair and the
+ * only thing that can reorder these rows is the term under test. Without that,
+ * a passing assertion could be id-length doing the work.
+ */
+function provFixture() {
+  const chosen = [{ id: "personal.prov.free", provider: "prov" }];
+  const vault = new Map([["prov",
+    { protocol: "openai", baseUrl: "https://prov.invalid/v1", testModel: "prov-probe" }]]);
+  const byProvider = new Map([["prov", ["aaa1", "aaa2", "aaa3", "aaa4"].map((m) =>
+    ({ provider: "prov", model: m, id: `prov/${m}`, ...text({}) }))]]);
+  return { chosen, vault, catalog: { generatedAt: "fixture", byProvider, byAlias: new Map() } };
+}
+const provIds = (built) =>
+  built.picker.filter((r) => r.model.startsWith("prov/")).map((r) => r.model.slice("prov/".length));
+
+test("R13b: the four provenance rungs rank in the stated order, unranked last", () => {
+  // The vocabulary on its own, which is the only place all five levels are
+  // reachable at once -- see the buildProviders test below for why
+  // `config-asserted` cannot appear in that sort today.
+  assert.deepEqual([...PROVENANCE_ORDER],
+    ["call-verified", "config-asserted", "listing-verified", "catalogue-only"]);
+  const ranks = PROVENANCE_ORDER.map(provenanceRank);
+  assert.deepEqual(ranks, [0, 1, 2, 3], "strictly increasing, best first");
+  assert.equal(provenanceRank(null), PROVENANCE_UNRANKED);
+  assert.equal(provenanceRank("something-else"), PROVENANCE_UNRANKED);
+  assert.ok(PROVENANCE_UNRANKED > Math.max(...ranks), "unranked sorts after every named rung");
+});
+
+test("R13b: an id in several sets takes the STRONGEST rung, not the first checked", () => {
+  const all = {
+    verified: new Set(["m"]), asserted: new Set(["m"]),
+    listed: new Set(["m"]), catalogued: new Set(["m"]),
+  };
+  assert.equal(provenanceOf("m", all), "call-verified");
+  assert.equal(provenanceOf("m", { ...all, verified: undefined }), "config-asserted");
+  assert.equal(provenanceOf("m", { ...all, verified: undefined, asserted: undefined }),
+    "listing-verified");
+  assert.equal(provenanceOf("m", { catalogued: all.catalogued }), "catalogue-only");
+  assert.equal(provenanceOf("m", {}), null, "no set names it -> unranked");
+  assert.equal(provenanceOf("m"), null, "and no sets at all must not throw");
+});
+
+test("R13b (#59): config-asserted outranks listing-verified, not the reverse", () => {
+  // THE REGRESSION THIS PINS. The vault's `testModel` and the relay's four model
+  // ids are asserted by local config with nothing probing them. Ranked below
+  // `listing-verified` they sort under every third-party listing row, which is
+  // what #59 fixed once already.
+  assert.ok(provenanceRank("config-asserted") < provenanceRank("listing-verified"),
+    "a config literal must not sort below a third-party listing row");
+  // ...and it is still BELOW a real dated completion, which is the other half:
+  // "a human wrote this id in a file" is not "a 200 came back".
+  assert.ok(provenanceRank("call-verified") < provenanceRank("config-asserted"));
+  const sets = { asserted: new Set(["x"]), listed: new Set(["x"]) };
+  assert.equal(provenanceOf("x", sets), "config-asserted");
+});
+
+test("R13b: verifiedIndex reads verify-prune's shape and splits on the FIRST slash", () => {
+  // Ids contain slashes. Splitting on every slash keys these under a provider
+  // that does not exist and silently drops the strongest rung.
+  const doc = { working: ["cloudflare/@cf/openai/gpt-oss-120b",
+                          "nscale/Qwen/Qwen3-4B-Instruct-2507", "google/gemini-3.5-flash-lite"] };
+  const idx = verifiedIndex(doc);
+  assert.ok(idx.get("cloudflare").has("@cf/openai/gpt-oss-120b"));
+  assert.ok(idx.get("nscale").has("Qwen/Qwen3-4B-Instruct-2507"));
+  assert.ok(idx.get("google").has("gemini-3.5-flash-lite"));
+  // `results` is filtered by `ok` -- a 401 or a timeout is the OPPOSITE of
+  // call-verified, and verify-prune records those in the same array.
+  const fromResults = verifiedIndex({ results: [
+    { model: "p/good", ok: true }, { model: "p/bad", ok: false },
+  ] });
+  assert.deepEqual([...fromResults.get("p")], ["good"], "only ok:true rows are call-verified");
+  // Absent / malformed costs a rung, never a build.
+  assert.equal(verifiedIndex(null).size, 0);
+  assert.equal(verifiedIndex({ nonsense: 1 }).size, 0);
+  assert.equal(verifiedIndex(["nostash", "/leading", "trailing/"]).size, 0,
+    "an entry with no usable provider/id split contributes nothing");
+});
+
+test("R13b: provenance reorders buildProviders' extras, and is a no-op without inputs", () => {
+  const f = provFixture();
+  // CONTROL FIRST. With neither input the term evaluates 3 - 3 = 0 for every
+  // pair -- every extra is catalogue-only -- so the order is insertion order.
+  // This is also today's production state: run.mjs passes neither.
+  const plain = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  assert.deepEqual(provIds(plain), ["prov-probe", "aaa1", "aaa2", "aaa3", "aaa4"]);
+
+  // Now supply both. `aaa3` was probed; `aaa2` and the discovery-only `bbb1`
+  // are listed; `aaa1`/`aaa4` are catalogue-only.
+  const ranked = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test",
+    { prov: { outcome: "ok", models: [{ id: "aaa2" }, { id: "bbb1" }] } },
+    { working: ["prov/aaa3"] });
+  assert.deepEqual(provIds(ranked),
+    ["prov-probe", "aaa3", "aaa2", "bbb1", "aaa1", "aaa4"],
+    "call-verified, then the two listed rows, then catalogue-only");
+
+  // The testModel still LEADS, and that is not the sort's doing: it is pushed
+  // ahead of `extras` and so is never ranked at all. If that ever changes, the
+  // `asserted` set passed to provenanceOf is what keeps it second rather than
+  // dropping it to catalogue-only.
+  assert.equal(provIds(ranked)[0], "prov-probe");
+  assert.ok(!provIds(ranked).slice(1).includes("prov-probe"));
+});
+
+test("R13b: provenance outranks tier and id length, but NOT `kind`", () => {
+  // A catalogue-only row that wins every term below provenance (shortest id,
+  // text) must still sort BELOW a longer call-verified row.
+  const f = provFixture();
+  f.catalog.byProvider.set("prov", [
+    { provider: "prov", model: "z", id: "prov/z", ...text({}) },
+    { provider: "prov", model: "much-longer-id", id: "prov/much-longer-id", ...text({}) },
+  ]);
+  const plain = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  assert.deepEqual(provIds(plain).slice(1), ["z", "much-longer-id"], "length decides, unranked");
+  const ranked = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test", null,
+    { working: ["prov/much-longer-id"] });
+  assert.deepEqual(provIds(ranked).slice(1), ["much-longer-id", "z"],
+    "a probed row beats a shorter unprobed one");
+});
+
+test("R13b: `kind` outranks provenance -- evidence never promotes a non-chat row", () => {
+  // R13b's brief put provenance ABOVE `kind`. That order is self-defeating and
+  // this is the fixture that shows it: the live `capability` token is the SAME
+  // signal on both sides -- it demotes the row through `outputKind` and, because
+  // only a listing can carry it, promotes the row to `listing-verified`. Ranked
+  // above `kind` the promotion wins, so supplying discovery makes a declared
+  // image generator sort HIGHER than it did with no discovery at all.
+  //
+  // `kind === "nontext"` is a DISQUALIFIER; provenance is a quality ranking over
+  // rows that already passed it. Strong evidence about an image generator is
+  // still evidence about an image generator.
+  const f = provFixture();
+  f.catalog.byProvider.set("prov", [
+    { provider: "prov", model: "gen", id: "prov/gen", modalities: { output: ["audio", "text"] } },
+    { provider: "prov", model: "chatchat", id: "prov/chatchat", ...text({}) },
+  ]);
+  // `gen` is BOTH listing-verified and call-verified -- the strongest rung there
+  // is -- while `chatchat` is catalogue-only and has the longer id, so every
+  // other term favours `gen`. Only `kind` can hold it back.
+  const built = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test",
+    { prov: { outcome: "ok", models: [{ id: "gen", capabilityRaw: "image_gen" }] } },
+    { working: ["prov/gen"] });
+  assert.deepEqual(provIds(built).slice(1), ["chatchat", "gen"],
+    "the declared non-text row stays demoted despite outranking on every other term");
+  // NEVER PRUNED, only reordered -- rule 1 is not a ranking rule.
+  assert.ok(byName(built, "prov").models.includes("gen"));
+  // CONTROL: strike only the capability token and `gen` returns to the head,
+  // which proves `kind` is what demoted it rather than anything else here.
+  const noCap = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test",
+    { prov: { outcome: "ok", models: [{ id: "gen" }] } }, { working: ["prov/gen"] });
+  assert.deepEqual(provIds(noCap).slice(1), ["gen", "chatchat"]);
+});
+
+test("R13b: the cap is 10, and it bounds the PICKER without touching routing", () => {
+  assert.equal(MAX_PICKER_MODELS_PER_PROVIDER, 10,
+    "sized 2026-09-08 from the five-candidate parse/byte measurement; see the table at the constant");
+  // 1 testModel + 14 catalogue ids: past the cap, so the bound is observable.
+  const f = provFixture();
+  f.catalog.byProvider.set("prov", Array.from({ length: 14 }, (_, i) =>
+    ({ provider: "prov", model: `m${String(i).padStart(2, "0")}`,
+       id: `prov/m${i}`, ...text({}) })));
+  const built = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  assert.equal(provIds(built).length, MAX_PICKER_MODELS_PER_PROVIDER);
+  assert.equal(byName(built, "prov").models.length, 15, "routing keeps every id, uncapped");
+  // The picker is a PREFIX of routing, not a re-ranking -- the two must not
+  // disagree about which rows a provider's best ten are.
+  assert.deepEqual(provIds(built), byName(built, "prov").models.slice(0, 10));
+});
+
+// ---- the four invariants a larger picker can break -------------------------
+
+test("R13b re-check: V7 (assertOptionsComplete) still passes at the larger cap", () => {
+  // Adding rows to `options[]` is safe for a SUBSET assertion, but V7 is what
+  // guarantees `behavesAs` reaches every built row, so it is confirmed rather
+  // than assumed.
+  const f = provFixture();
+  f.catalog.byProvider.set("prov", Array.from({ length: 14 }, (_, i) =>
+    ({ provider: "prov", model: `m${i}`, id: `prov/m${i}`, ...text({}) })));
+  const built = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  const written = orderNativePickerOptions(built.picker)
+    .map(({ contextTokens, kind, ...row }) => row);
+  assert.doesNotThrow(() => assertOptionsComplete(built.picker, written));
+  // The control: V7 is reachable, so the pass above is not vacuous.
+  assert.throws(() => assertOptionsComplete(built.picker, written.slice(1)),
+    /did not reach modelPicker\.options/);
+});
+
+test("R13b re-check: relay rows stay at the head of a longer menu", () => {
+  // `Ato()` iterates options[] in array order and the native menu shows 10 rows
+  // with 1-row scrolling and no filter, so relay-first is what keeps a 200-row
+  // menu usable at all.
+  const f = provFixture();
+  f.catalog.byProvider.set("prov", Array.from({ length: 14 }, (_, i) =>
+    ({ provider: "prov", model: `m${i}`, id: `prov/m${i}`, ...text({}) })));
+  const built = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  const relay = ANTHROPIC_RELAY.models.map((m) => ({ model: `${ANTHROPIC_RELAY.name}/${m}` }));
+  // Deliberately appended LAST, so the partition has something to do.
+  const ordered = orderNativePickerOptions([...built.picker, ...relay]);
+  assert.deepEqual(ordered.slice(0, relay.length).map((r) => r.model), relay.map((r) => r.model));
+  assert.equal(ordered.length, built.picker.length + relay.length, "nothing is dropped");
+});
+
+test("R13b re-check: the anchor cannot be moved by picker WIDTH alone", () => {
+  // R13b is the task that can actually change picker ordering, so this is
+  // re-asserted rather than inherited. A wider picker adds rows AFTER the
+  // preference hit, so ANCHOR_PREFERENCE resolves to the same row and `via` is
+  // unchanged -- both fields, because a matching id via a different rule is a
+  // different decision.
+  const narrow = [{ model: ANCHOR_PREFERENCE[0] }, { model: "prov/aaa1" }];
+  const wide = [...narrow, ...Array.from({ length: 40 }, (_, i) => ({ model: `prov/x${i}` }))];
+  const a = resolveAnchor(narrow, { anthropicOn: false });
+  const b = resolveAnchor(wide, { anthropicOn: false });
+  assert.deepEqual(a, b);
+  assert.equal(b.via, `preference:${ANCHOR_PREFERENCE[0]}`);
+  // And with the relay live the picker does not get a vote at all.
+  assert.equal(resolveAnchor(wide, { anthropicOn: true }).model, ANTHROPIC_TIERS.model);
+  // The fallback the width COULD move, pinned so a future reordering is visible:
+  // with no preference hit and no verified row, the head of the picker wins.
+  const noPref = [{ model: "prov/first" }, { model: "prov/second" }];
+  assert.deepEqual(resolveAnchor(noPref, { anthropicOn: false }),
+    { model: "prov/first", via: "picker-head" });
+});
+
+test("R13b re-check: a larger picker can only PRESERVE more pins, never fewer", () => {
+  const f = provFixture();
+  f.catalog.byProvider.set("prov", Array.from({ length: 14 }, (_, i) =>
+    ({ provider: "prov", model: `m${String(i).padStart(2, "0")}`,
+       id: `prov/m${i}`, ...text({}) })));
+  const large = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  const smallRows = large.picker.slice(0, 3);
+  assert.ok(large.picker.length > smallRows.length, "the fixture must actually widen");
+  // MONOTONE: every pin the narrow picker kept is still kept by the wide one.
+  for (const r of smallRows) {
+    assert.equal(reconcileUserModelPin({ model: r.model }, smallRows).action, "kept");
+    assert.equal(reconcileUserModelPin({ model: r.model }, large.picker).action, "kept",
+      `${r.model} was pinnable at the smaller cap and must stay pinnable`);
+  }
+  // ...and a pin only the WIDER picker carries goes cleared -> kept, which is
+  // the direction that proves the widening is what did it.
+  const onlyWide = large.picker.find((r) => !smallRows.some((s) => s.model === r.model)).model;
+  assert.equal(reconcileUserModelPin({ model: onlyWide }, smallRows).action, "cleared");
+  assert.equal(reconcileUserModelPin({ model: onlyWide }, large.picker).action, "kept");
+  // A pin naming no row at all is still cleared at either width.
+  assert.equal(reconcileUserModelPin({ model: "prov/gone" }, large.picker).action, "cleared");
+});
+
+test("R13b: provenance cannot change WHICH ids route, only their order", () => {
+  // The census (bareIdCensus / resolveBare) counts ownership, which is
+  // set-valued and order-independent -- so re-ranking cannot move it. This pins
+  // the SET equality that makes that argument true rather than asserted.
+  const f = provFixture();
+  const plain = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
+  const ranked = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test",
+    { prov: { models: [{ id: "aaa4" }] } }, { working: ["prov/aaa3"] });
+  assert.deepEqual([...byName(ranked, "prov").models].sort(),
+    [...byName(plain, "prov").models].sort(), "same SET of routing ids");
+  assert.notDeepEqual(byName(ranked, "prov").models, byName(plain, "prov").models,
+    "...in a different order, so the fixture is actually exercising the term");
+  assert.deepEqual(bareIdCensus(ranked.providers).ambiguous,
+    bareIdCensus(plain.providers).ambiguous, "census is unaffected by ordering");
 });

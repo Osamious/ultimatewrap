@@ -265,7 +265,7 @@ test("a row with no modality signal ranks WITH the text rows, not with the gener
     entry("acme", "q1"),
     entry("acme", "q2", { modalities: { output: [] } }),
   ]);
-  assert.deepEqual(built.picker.map((r) => r.model),
+  assert.deepEqual(built.picker.slice(0, 3).map((r) => r.model),
     ["acme/q1", "acme/q2", "acme/chat-model-one"],
     "absence of a modality claim is not a claim of non-text");
 
@@ -319,7 +319,7 @@ test("cohere: the repair must not trade three chat models for rerankers", () => 
     rerank("rerank-v3.5"), rerank("rerank-english-v2.0"),
     chat("command", 1, 2), chat("command-a", 2.5, 10), chat("command-r", 0.5, 1.5),
   ]);
-  assert.deepEqual(built.picker.map((r) => r.model),
+  assert.deepEqual(built.picker.slice(0, 3).map((r) => r.model),
     ["cohere/command", "cohere/command-a", "cohere/command-r"]);
 
   // Defence 1 -- #55: a lone `0/0` offer is unknown, so free-first never fires.
@@ -354,7 +354,7 @@ test("google: the kind guard does NOT catch the Lyria previews -- #55 is what do
   const built = build("google", [LYRIA_PRO, clip, gemma, veo,
     entry("google", "gemma-2-9b", text), entry("google", "gemma-4-31b", text)]);
 
-  assert.deepEqual(built.picker.map((r) => r.model),
+  assert.deepEqual(built.picker.slice(0, 3).map((r) => r.model),
     ["google/gemma-3", "google/gemma-2-9b", "google/gemma-4-31b"],
     "three real chat models; veo is demoted by kind, the previews by absent price");
 
@@ -397,7 +397,7 @@ const gateViolations = (corpus) => {
   for (const [provider, entries] of corpus) {
     if (entries.length <= 3) continue;
     const before = shortestIdFirst(entries);
-    const after = build(provider, entries).picker.map((r) => r.model.slice(provider.length + 1));
+    const after = build(provider, entries).picker.slice(0, 3).map((r) => r.model.slice(provider.length + 1));
     const byId = new Map(entries.map((e) => [e.model, e]));
     for (const id of after) {
       if (before.includes(id)) continue;              // not acquired
@@ -442,7 +442,7 @@ test("PRIMARY GATE: no top-3 acquires a row declaring a non-text output modality
     "R3 may shed non-text rows from a top-3; it may never add one");
 
   // ...and `allgen` really was exercised, or the exemption is untested.
-  assert.equal(build("allgen", corpus.get("allgen")).picker.length, 3);
+  assert.equal(build("allgen", corpus.get("allgen")).picker.length, 4);
 });
 
 test("PRIMARY GATE: it can fail, and this is the shape that fails it", () => {
