@@ -879,6 +879,51 @@ export function assertOptionsComplete(builtPicker, writtenOptions) {
   }
 }
 
+/**
+ * `--verified-only` filters the PICKER, and deliberately not ROUTING.
+ *
+ * THE ASYMMETRY IS THE WHOLE POINT, so read it before restoring the symmetry.
+ * The two sets are not two views of one thing:
+ *   - the picker is what we ADVERTISE. A row that 404s on selection is worse
+ *     than an absent one -- the user picks it, it fails, and nothing explains
+ *     why. Pruning it to what a live probe actually served is a real guarantee.
+ *   - `providers[].models` is what CCR can ROUTE. Post-R11 it is an uncapped
+ *     union (1,584 third-party ids over 45 providers) and it costs nothing to
+ *     carry: an id nobody names is never dialled.
+ *
+ * So the probe is EVIDENCE OF PRESENCE, NEVER OF ABSENCE. On the current
+ * snapshot it attempted 22 ids and 18 answered, of which 14 match a third-party
+ * picker row -- against 1,584 routing ids. Every id outside that sample is
+ * unprobed, not known-dead. Filtering routing by it would delete 1,570 of the
+ * 1,584 on no evidence at all, and one 503 mid-probe is enough to lose a whole
+ * provider (mistral, once).
+ *
+ * That is what this function was fixed from. It used to filter both, so the flag
+ * silently cut reach 1,584 -> 14 while printing "13 providers / 14 rows survive"
+ * -- which reads as verification and was truncation. Opt-in, so not a pillar-4
+ * violation, but the console line was the only thing standing where the loss was.
+ *
+ * `providers` is returned BY IDENTITY, not rebuilt, so "untouched" is assertable
+ * rather than merely intended.
+ *
+ * @param {{picker: {model: string}[], providers: object[]}} built
+ * @param {{working: string[], results: {model: string, ok: boolean, ms: number}[]}} verified
+ *   parsed verify-prune.mjs output; `working` is namespaced `provider/model` ids
+ * @returns {{providers: object[], picker: object[], verifiedOrder: string[]}}
+ *   `verifiedOrder` is fastest-first, so the profile anchor is a responsive model
+ */
+export function applyVerifiedOnly(built, verified) {
+  const ok = new Set(verified.working ?? []);
+  return {
+    providers: built.providers,
+    picker: built.picker.filter((r) => ok.has(r.model)),
+    verifiedOrder: (verified.results ?? [])
+      .filter((r) => r.ok)
+      .sort((a, b) => a.ms - b.ms)
+      .map((r) => r.model),
+  };
+}
+
 // ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
 // writes built-rows.json, and on the dry path calls process.exit(0). Without
 // this check, `import { checkBareCollisions } from "./run.mjs"` would run all of
@@ -926,10 +971,10 @@ const readKey = (id) => {
 const built = buildProviders(chosen, providers, catalog, dry ? () => "dry-run-placeholder" : readKey);
 for (const n of built.notes) console.log(`  note: ${n}`);
 
-// --verified-only: keep only rows a live probe confirmed serve completions. A
-// picker row that 404s is worse than an absent one — the user selects it, it
-// fails, and nothing explains why.
-// Snapshot before --verified-only mutates `built` in place.
+// --verified-only: keep only PICKER rows a live probe confirmed serve
+// completions. Routing is left whole -- see `applyVerifiedOnly` for why the
+// asymmetry is deliberate.
+// Snapshot before --verified-only replaces `built.picker`.
 const builtAll = { picker: [...built.picker] };
 
 let verifiedOrder = null;
@@ -937,17 +982,17 @@ if (has("--verified-only")) {
   const vf = "C:\\Users\\osami\\.uw\\keysync\\verified-rows.json";
   if (!fs.existsSync(vf)) { console.error(`--verified-only needs ${vf}; run verify-prune.mjs first`); process.exit(2); }
   const verified = JSON.parse(fs.readFileSync(vf, "utf8"));
-  const ok = new Set(verified.working);
-  // Fastest-first, so the profile anchor is a responsive model.
-  verifiedOrder = verified.results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms).map((r) => r.model);
-  built.picker = built.picker.filter((r) => ok.has(r.model));
-  built.providers = built.providers
-    .map((p) => ({ ...p, models: p.models.filter((m) => ok.has(`${p.name}/${m}`)) }))
-    .filter((p) => p.models.length);
-  console.log(`--verified-only: ${built.providers.length} providers / ${built.picker.length} rows survive`);
-  // The count check below is a tautology under --verified-only, so it cannot
-  // catch an empty result. Without this floor, zero rows would pass validation
-  // and then crash when anchoring the profile.
+  const applied = applyVerifiedOnly(built, verified);
+  verifiedOrder = applied.verifiedOrder;
+  built.picker = applied.picker;
+  // Says what was pruned AND what was not. The old line reported a surviving
+  // provider count, which read as verification while the flag was truncating
+  // routing behind it.
+  console.log(`--verified-only: ${built.picker.length} of ${builtAll.picker.length} picker rows ` +
+    `survive; routing untouched (${built.providers.length} providers)`);
+  // Routing can no longer reach zero from this flag, but the picker can, and a
+  // zero-row picker passes validation and then crashes when anchoring the
+  // profile. The count check below cannot catch it: it counts providers.
   if (!built.picker.length) {
     console.error("--verified-only pruned every row — nothing to apply. Re-run verify-cli.mjs.");
     process.exit(2);
@@ -1052,9 +1097,11 @@ if (!has("--no-anthropic")) {
 }
 
 // The Anthropic relay is added on top of the vault set, so the expected count
-// must account for it. Without this the primary path (live, Claude available)
-// fails validation outright: 45 !== 44. Only --verified-only got through, and
-// only because its own count check is a tautology (see the floor guard above).
+// must account for it. Without this every path fails validation outright:
+// 45 !== 44. `--verified-only` used to be exempted here, passing the built
+// provider count back as its own expectation -- a tautology, because that flag
+// pruned providers and there was no independent number left to check against.
+// It no longer prunes them, so it takes the same real count as everything else.
 // (4) Write the full built set BEFORE pruning. verify-cli previously probed the
 // shipped picker, which made pruning a one-way ratchet: a row dropped for a
 // transient failure was never probed again (mistral was lost to a single 503).
@@ -1072,9 +1119,7 @@ fs.writeFileSync(BUILT_ROWS, JSON.stringify({
 // exactly the moment it matters. A passive banner restating it would be a
 // warning with no action attached, which is how warnings stop being read.
 
-const problems = validate(built, has("--verified-only")
-  ? built.providers.length
-  : EXPECTED_PROVIDERS + (anthropicOn ? 1 : 0));
+const problems = validate(built, EXPECTED_PROVIDERS + (anthropicOn ? 1 : 0));
 const covered = built.providers.filter((p) => catalog.byProvider.has(p.name)).length;
 console.log(`built: ${built.providers.length} providers, ${built.picker.length} picker rows ` +
   `(${covered} catalog-covered, ${built.providers.length - covered} on vault testModel)`);
