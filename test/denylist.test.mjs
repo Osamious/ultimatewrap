@@ -17,7 +17,7 @@ import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
 // pipeline, that is the defect to fix, not a reason to test the guard indirectly.
 import { checkBareCollisions, deriveAnthropicSets, orderNativePickerOptions,
          assertOptionsComplete, assertVouchedSetIsNarrower, assertRelayNameUnclaimed,
-         ROUTING_MAX_STALENESS_MS,
+         ROUTING_MAX_STALENESS_MS, shouldReportCollisions,
          routableCatalogIds } from "../keysync/run.mjs";
 
 test("importing run.mjs does not execute the keysync pipeline", () => {
@@ -434,47 +434,79 @@ test("--allow-bare-claude-names is a real escape hatch, so rule 1 is never viola
     "but it is still reported: the opt-out silences the exit, not the finding");
 });
 
-test("the guard covers fable, and D1 stops it at the RESERVED boundary class", () => {
-  // INVERTED BY D1, 3 of the 4 ids. This asserted that all of `fable`,
-  // `sonnet.1`, `haiku_2` and `claude` were fatal, because the guard classified
-  // anything RESERVED-SHAPED. D1 classifies `ANTHROPIC_ALIASES u (realIds ??
-  // ANTHROPIC_FULL)` instead, so only ids Anthropic actually publishes -- plus
-  // the four aliases Claude Code emits -- can reach a verdict.
+test("the guard covers fable, and the RESERVED boundary bites on ONE branch only", () => {
+  // REWRITTEN 2026-09-07, AND THE CATEGORY MATTERS. This is not a fixture that
+  // encoded a defect. It faithfully asserted D1 -- "only ids Anthropic actually
+  // publishes, plus the four aliases, can reach a verdict" -- and D1 was
+  // REVERSED on the null branch after measurement (see the null-branch note in
+  // run.mjs). The test was right; the decision under it moved.
   //
-  // `fable` SURVIVES, and it is the half that was worth having. The old inline
-  // regex was /^(claude|opus|sonnet|haiku)([-\d]|$)/ and omitted `fable`
-  // entirely; it is an alias Claude Code really does send, so a reseller
-  // sole-owning it is a real hijack on any branch.
+  // ITS SUBJECT IS NOW BRANCH-DEPENDENT, so both branches are asserted in one
+  // test. Pinning either alone would pin one side of a boundary whose LOCATION
+  // is the whole point: D1's narrowing survives where `realIds` exists, and
+  // stops where it does not.
+
+  // `fable` IS FATAL ON BOTH, and it is the half that was always worth having.
+  // The old inline regex was /^(claude|opus|sonnet|haiku)([-\d]|$)/ and omitted
+  // `fable` entirely; it is an alias Claude Code really does send, and the
+  // aliases are unioned into the selector set on both branches, so a reseller
+  // sole-owning it is a real hijack however the catalogue resolved.
   assert.equal(checkBareCollisions([P("evil", "fable")]).fatal, true,
-    "fable is an alias Claude Code emits, so this is a live hijack shape");
+    "fable is an alias Claude Code emits: a live hijack shape on the null branch");
+  assert.equal(checkBareCollisions([P("evil", "fable")], { realIds: PROD_REAL_IDS }).fatal,
+    true, "...and on the verified branch, where the aliases are unioned in too");
 
   // The other three are RESERVED-shaped strings Anthropic has never published.
-  // Nothing sends them bare, so a fatal on them was a false positive -- the
-  // class D1 exists to remove. `claude` is included deliberately: the bare
-  // vendor word is not a model id at all.
+  // `claude` is included deliberately: the bare vendor word is not a model id.
   for (const id of ["sonnet.1", "haiku_2", "claude"]) {
     assert.equal(isReserved(id), true, `${id} is still RESERVED-shaped`);
-    assert.equal(checkBareCollisions([P("evil", id)]).fatal, false,
-      `${id} is not a published Anthropic id, so D1 must not classify it`);
+
+    // VERIFIED BRANCH -- D1's narrowing, intact. `realIds` says what Anthropic
+    // publishes, nothing sends these bare, and a fatal on them would be a false
+    // positive the guard has the evidence to avoid.
+    assert.equal(checkBareCollisions([P("evil", id)], { realIds: PROD_REAL_IDS }).fatal,
+      false, `${id} is not a published Anthropic id, and with realIds the guard KNOWS that`);
+
+    // NULL BRANCH -- the boundary is where the narrowing stops. The selector set
+    // is built from the advertised RESERVED-shaped ids, so these classify and go
+    // fatal. That IS a false positive, and it is the accepted cost of the
+    // breadth: the guard has no catalogue to rule them out with, and the
+    // alternative measured 7 of 15 published Anthropic ids going silent. The
+    // operator can see it and override it with --allow-bare-claude-names; the
+    // alternative is a silent misroute. See the cost note in run.mjs, which
+    // carries both denominators.
+    assert.equal(checkBareCollisions([P("evil", id)]).fatal, true,
+      `${id} is RESERVED-shaped and advertised, so the null branch classifies it`);
   }
 });
 
-test("DRIFT DETECTOR: every classifiable id matches RESERVED, so the pre-filter is a no-op", () => {
-  // REPURPOSED BY D1. This test's original subject is gone: it asserted that
-  // `sonnet.1` and `haiku_2` were fatal, proving the guard read RESERVED rather
-  // than a hand-copied sibling regex. D1 stops classifying those, so the old
-  // body would have been testing a definition the guard no longer consults for
-  // a verdict.
+test("DRIFT DETECTOR, and the pre-filter: INERT where selectors are constants, DECISIVE where they are advertised", () => {
+  // RETITLED 2026-09-07, AND THE OLD TITLE IS WHY. It read "...so the pre-filter
+  // is a no-op", which was true at R6 on both branches and is now true on one.
+  // Every assertion below held throughout the reversal, which is exactly how the
+  // false title survived a green suite: the test proved the PREMISE (all eight
+  // classifiable ids match RESERVED) and never touched the CLAIM (that the filter
+  // is therefore inert). Those were the same statement at R6; they are not any
+  // more, and a maintainer reading the old title would conclude that widening or
+  // narrowing RESERVED is free.
   //
-  // WHAT REPLACES IT IS THE INVARIANT THAT MAKES THAT SAFE. `RESERVED.test(id)`
-  // still runs as a pre-filter over every advertised id in checkBareCollisions,
-  // and it can no longer reject anything the classification set accepts --
-  // ownership iterates `ANTHROPIC_ALIASES u (realIds ?? ANTHROPIC_FULL)`, and
-  // every id in `ANTHROPIC_ALIASES u ANTHROPIC_FULL` matches RESERVED. A no-op
-  // gate is only safe while that premise holds, so it is asserted here instead
-  // of assumed. The failure it catches: someone adds an id to ANTHROPIC_FULL
-  // that RESERVED does not match, the pre-filter drops it before classification,
-  // and the guard goes SILENT on a real published Anthropic id.
+  // MEASURED: disabling `if (!RESERVED.test(id)) continue;` killed 0 of 494 tests
+  // at R6 and kills 8 of 502 now. The line went from provably dead to
+  // load-bearing without its own diff.
+  //
+  //   realIds !== null  -- INERT. Ownership iterates `ANTHROPIC_ALIASES u
+  //     realIds`, both constants, so the pre-filter cannot reject anything the
+  //     selector set would have accepted.
+  //   realIds === null  -- DECISIVE. The selector set is built FROM the ids this
+  //     filter admits, so what it rejects is not merely unclassified: it is never
+  //     a selector at all.
+
+  // ---- the drift detector, unchanged in force ------------------------------
+  // A no-op gate on the verified branch is only safe while this premise holds,
+  // so it is asserted rather than assumed. The failure it catches is unchanged
+  // by the reversal: someone adds an id to ANTHROPIC_FULL that RESERVED does not
+  // match, the pre-filter drops it before classification, and the guard goes
+  // SILENT on a real published Anthropic id.
   const classifiable = [...ANTHROPIC_ALIASES, ...ANTHROPIC_FULL];
   assert.equal(classifiable.length, 8,
     "4 aliases + 4 curated ids; if this changes, re-read the premise above");
@@ -491,11 +523,33 @@ test("DRIFT DETECTOR: every classifiable id matches RESERVED, so the pre-filter 
   // original test was protecting. `isReserved` composes RESERVED with UW_ALIAS,
   // so this keeps the guard's notion of Claude-shaped tied to the denylist's.
   for (const id of classifiable) assert.equal(isReserved(id), true);
-  for (const id of ["opusculum", "hakuna-matata", "uwot"]) {
+
+  // ---- what the old title stood in for, now asserted ------------------------
+  // THE ASSERTION THE TITLE REPLACED. Proving the premise is not proving the
+  // claim, and only one of the two was ever executed here. A non-Claude-shaped
+  // id, ADVERTISED and SOLE-OWNED, is the case where the branches part: on the
+  // null path it is non-fatal BECAUSE THE PRE-FILTER DROPPED IT before it could
+  // become a selector, and deleting that line makes it a selector and this
+  // assertion fail. On the verified path the same id is non-fatal for an
+  // unrelated reason -- it is simply not in `ANTHROPIC_ALIASES u realIds` -- and
+  // deleting the line changes nothing. That asymmetry IS the retitle.
+  for (const id of ["opusculum", "hakuna-matata", "uwot", "qwen3-max"]) {
     assert.equal(isReserved(id), false,
       `${id} is not Claude-shaped by either definition`);
+
+    // NULL BRANCH -- the pre-filter is the only thing standing between this id
+    // and a fatal verdict. This is the assertion that dies if it is removed.
     assert.equal(checkBareCollisions([P("evil", id)]).fatal, false,
-      `${id} is not Claude-shaped and must not trip the guard`);
+      `${id} must be dropped by the pre-filter before the null branch can make ` +
+      `it a selector -- without that line, an advertised sole-owned non-Claude ` +
+      `id goes FATAL`);
+    assert.deepEqual(checkBareCollisions([P("evil", id)]).hijackable, [],
+      `${id} must not even be a candidate on the null branch`);
+
+    // VERIFIED BRANCH -- non-fatal for a different reason, and inert either way.
+    assert.equal(checkBareCollisions([P("evil", id)], { realIds: PROD_REAL_IDS }).fatal,
+      false, `${id} is not in ANTHROPIC_ALIASES u realIds, so the pre-filter ` +
+      `decides nothing here`);
   }
 });
 
@@ -612,27 +666,50 @@ test("the relay keeps its own Anthropic names on the routing path too", () => {
 // is only a hijack candidate if it is a REAL Anthropic id, because Claude Code
 // can never emit a bare name Anthropic has not published.
 
-test("realIds omitted (default null) falls back to the CURATED set, not to RESERVED", () => {
-  // RETITLED AND INVERTED BY D1, and the title had to move because it pinned the
-  // removed behaviour: it read "keeps the old broad RESERVED-only behaviour",
-  // which is precisely what D1 removes. The null default now means
-  // ANTHROPIC_ALIASES u ANTHROPIC_FULL.
+test("realIds omitted (default null) falls back to the ADVERTISED RESERVED-shaped set", () => {
+  // RETITLED TWICE, AND THE TITLE IS THE ASSERTION HERE. It first read "keeps the
+  // old broad RESERVED-only behaviour"; D1 made it "falls back to the CURATED
+  // set, not to RESERVED"; D1 was then REVERSED on this branch, which made that
+  // second title literally false. What the null default means now is
+  // `ANTHROPIC_ALIASES u (the RESERVED-shaped ids the config advertises)`.
   //
   // WHY THE NULL PATH MATTERS. realIds is null only when the relay is
   // unreachable AND there is no cache -- the run prints
-  // `UNAVAILABLE (relay down and no cache)` on exactly that path. A NETWORK
-  // failure must not silently widen the guard to every Claude-shaped string in
-  // the config, which is what the old fallback did.
+  // `UNAVAILABLE (relay down and no cache)` on exactly that path. It is the path
+  // with the LEAST evidence, so it is the path that must not go quiet: the
+  // curated fallback measured 7 of 15 published Anthropic ids silently
+  // unclassified there (see the THREAT SET tests below).
+  //
+  // THE FALLBACK IS THE ADVERTISED SET, DEMONSTRATED BY AN ID NO CONSTANT IN THIS
+  // REPO CARRIES. `claude-opus-5-thinking` is in neither ANTHROPIC_FULL nor
+  // ANTHROPIC_ALIASES, so a curated fallback cannot classify it and an advertised
+  // one must.
+  assert.equal(new Set([...ANTHROPIC_FULL, ...ANTHROPIC_ALIASES]).has("claude-opus-5-thinking"),
+    false, "the fixture's premise: no constant here carries this id");
   const invented = checkBareCollisions([P("tabiai", "claude-opus-5-thinking")]);
-  assert.equal(invented.fatal, false,
-    "extended thinking is a request parameter, not a model: nothing sends this bare");
-  assert.deepEqual(invented.hijackable, []);
+  assert.equal(invented.fatal, true,
+    "advertised and RESERVED-shaped, so the null branch classifies it -- and with " +
+    "no catalogue the guard cannot know that nothing sends it bare");
+  assert.deepEqual(invented.hijackable.map((h) => h.id), ["claude-opus-5-thinking"]);
 
-  // NARROWED, NOT DISARMED -- both retained protections, on the same null default.
+  // THE ACCEPTED COST, STATED AS A CONTRAST RATHER THAN LEFT IMPLICIT. The same
+  // id is NOT a finding the moment there is evidence to rule it out, so the
+  // false positive is confined to the no-evidence path and is not a permanent
+  // property of the guard.
+  assert.equal(checkBareCollisions([P("tabiai", "claude-opus-5-thinking")],
+    { realIds: PROD_REAL_IDS }).fatal, false,
+    "with realIds the guard knows Anthropic never published it: D1's narrowing, intact");
+
+  // BROAD, NOT INDISCRIMINATE -- the two retained protections, on the same null
+  // default. These held under D1 too and must keep holding: the reversal widened
+  // the fallback, it did not change what the aliases or the curated ids mean.
   const alias = checkBareCollisions([P("tabiai", "opus")]);
   assert.equal(alias.fatal, true, "a bare alias is what Claude Code actually sends");
   const curated = checkBareCollisions([P("tabiai", "claude-opus-5")]);
   assert.equal(curated.fatal, true, "a curated id is still a real hijack shape");
+
+  // ...and the pre-filter still gates: not Claude-shaped, never a selector.
+  assert.equal(checkBareCollisions([P("tabiai", "qwen3-max")]).fatal, false);
 });
 
 test("a reseller-invented id is not hijackable once realIds says it is not real", () => {
@@ -663,6 +740,162 @@ test("realIds narrows both hijackable AND shadowed classification", () => {
     { realIds });
   assert.deepEqual(r.hijackable, []);
   assert.deepEqual(r.shadowed, []);
+});
+
+// ---- the null path: breadth, and what it may not claim ---------------------
+// The `realIds === null` branch is the relay-down, no-cache path. Two properties
+// are asserted here and neither is asserted anywhere above: that the branch is
+// BROAD enough to catch a real Anthropic id no constant in this repo carries, and
+// that it does not report an all-clear it did not earn.
+
+// AN INDEPENDENT THREAT SET, AND THE INDEPENDENCE IS THE POINT. Every set above
+// is built from ANTHROPIC_FULL / ANTHROPIC_ALIASES -- the guard's own selector
+// source on the narrow branch -- so a test written from them validates the guard
+// against the set it defines, and passes however narrow that set becomes. That is
+// exactly how a regression reached 496 green tests.
+//
+// PROVENANCE: `ANTHROPIC_ALIASES` unioned with Anthropic's live /v1/models as
+// captured in `state/anthropic-ids-cache.json`. The dated ids are LITERAL rather
+// than read from that file on purpose -- the file is untracked runtime state, and
+// a test that reads it would silently weaken to whatever the cache last held.
+// The four aliases are re-typed for the same reason.
+const LIVE_ANTHROPIC_IDS = [
+  "claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+  "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-opus-4-6",
+  "claude-opus-4-5-20251101", "claude-haiku-4-5-20251001",
+  "claude-sonnet-4-5-20250929",
+];
+const THREAT_IDS = [...LIVE_ANTHROPIC_IDS, "opus", "sonnet", "haiku", "fable"];
+
+test("THREAT SET: with the relay DOWN, every id Anthropic publishes is still caught", () => {
+  // What D1 gave up, driven through the guard. A reseller sole-owning any name
+  // Anthropic publishes is report 08 F1: Claude Code can send that name bare,
+  // CCR's resolve() binds the single owner, and the full system prompt, tool
+  // definitions and file contents go to that host. Nothing about the relay being
+  // unreachable makes that less true, so nothing about it may make the guard
+  // quieter.
+  //
+  // MEASURED at the time of writing: 15 of 15 caught under the broad null branch,
+  // 8 of 15 under D1's ANTHROPIC_FULL fallback -- ANTHROPIC_FULL carries 4 of the
+  // 11 live ids, and the 7 that went silent were claude-fable-5, claude-opus-4-8,
+  // claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6, claude-opus-4-5-20251101
+  // and claude-sonnet-4-5-20250929.
+  assert.equal(THREAT_IDS.length, 15, "11 live ids + 4 aliases");
+
+  // ANTI-TAUTOLOGY. If every threat id were inside the repo's own constants this
+  // test could not tell the broad rule from the narrow one, and it would keep
+  // passing through the exact reversion it exists to catch. Asserted, not assumed
+  // -- and asserted as non-empty rather than as a fixed count, so a legitimate
+  // curation edit that adds an id to ANTHROPIC_FULL narrows the gap without
+  // failing the suite.
+  const narrow = new Set([...ANTHROPIC_ALIASES, ...ANTHROPIC_FULL]);
+  const outsideNarrow = THREAT_IDS.filter((id) => !narrow.has(id));
+  assert.ok(outsideNarrow.length > 0,
+    `${outsideNarrow.length} of ${THREAT_IDS.length} threat ids lie outside ` +
+    `ANTHROPIC_ALIASES u ANTHROPIC_FULL; at zero this test can no longer ` +
+    `distinguish the broad null branch from D1's narrow one`);
+
+  for (const id of THREAT_IDS) {
+    // realIds OMITTED: this is the null branch and nothing else.
+    const r = checkBareCollisions([P("tokenrouter", id, "qwen3-max")]);
+    assert.equal(r.fatal, true,
+      `${id} is published by Anthropic, so Claude Code can send it bare and ` +
+      `resolve() would bind tokenrouter -- the relay being down does not change that`);
+    assert.deepEqual(r.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+      [{ id, owner: "tokenrouter" }],
+      `${id} must be reported against the selector CCR would send, and its owner named`);
+  }
+});
+
+test("THREAT SET: the shipped two-owner row goes FATAL the moment one owner drops it", () => {
+  // REACHABLE ON REAL DATA, which is what makes the breadth load-bearing rather
+  // than theoretical. The built config carries exactly two RESERVED-shaped bare
+  // ids, both `claude-opus-4-8` (tabiai and gorouter). Two owners is `shadowed`
+  // -- resolve() returns undefined, a clean failure. One owner is the hijack.
+  const both = checkBareCollisions([
+    P("tabiai", "claude-opus-4-8"), P("gorouter", "claude-opus-4-8"),
+  ]);
+  assert.equal(both.fatal, false, "two matching entries: resolve() binds nothing");
+  assert.deepEqual(both.shadowed.map((s) => s.id), ["claude-opus-4-8"]);
+
+  const one = checkBareCollisions([P("tabiai", "claude-opus-4-8")]);
+  assert.equal(one.fatal, true,
+    "one owner left, and it is not ours: this is the bind D1 reported as safe");
+  assert.deepEqual(one.hijackable.map((h) => h.owner), ["tabiai"]);
+});
+
+test("the null path does not report a verified all-clear", () => {
+  // THE DISCLOSURE, and the claim it replaces. "no bare Claude-shaped collisions"
+  // is a statement about Anthropic's published ids; on the null path the guard
+  // never saw them. Plan §2.6's principle for a refusal path, applied to a
+  // silent-PROCEED path: an outcome that rests on something the run could not do
+  // must say so.
+  const clean = checkBareCollisions([P("tokenrouter", "qwen3-max")]);
+  assert.deepEqual(clean.hijackable, []);
+  assert.deepEqual(clean.shadowed, []);
+  assert.equal(clean.catalogVerified, false, "realIds was null: nothing was verified");
+  assert.notEqual(clean.message, "no bare Claude-shaped collisions",
+    "the unqualified all-clear is a claim this run cannot make");
+  assert.match(clean.message, /UNVERIFIED/);
+  assert.match(clean.message, /relay down and no cache/,
+    "and it names the condition, so the operator knows what to fix");
+});
+
+test("a VERIFIED run with nothing to report still says exactly that", () => {
+  // The other half of the distinction: "checked, nothing found" must remain
+  // available and must remain unqualified, or the disclosure degrades into noise
+  // printed on every run.
+  const r = checkBareCollisions([P("tokenrouter", "qwen3-max")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(r.catalogVerified, true);
+  assert.equal(r.message, "no bare Claude-shaped collisions");
+  assert.doesNotMatch(r.message, /UNVERIFIED/);
+});
+
+test("the disclosure rides on findings too, and gates nothing", () => {
+  // NOT ONLY THE EMPTY BRANCH. A `shadowed` note classified by shape alone is as
+  // much a claim about Anthropic's catalogue as an all-clear is -- and it is the
+  // branch today's real config actually reaches.
+  const sh = checkBareCollisions([P("a", "opus"), P("b", "opus")]);
+  assert.equal(sh.fatal, false);
+  assert.match(sh.message, /more than one match/);
+  assert.match(sh.message, /UNVERIFIED/, "the shape-only basis is disclosed here too");
+
+  // AND IT CHANGES NO VERDICT. `fatal` is still exactly "a hijackable finding,
+  // not opted out of": the disclosure neither adds a fatal nor removes one, and
+  // --allow-bare-claude-names silences the exit without silencing the disclosure.
+  const fatal = checkBareCollisions([P("tokenrouter", "opus")]);
+  assert.equal(fatal.fatal, true);
+  assert.match(fatal.message, /UNVERIFIED/);
+  const opted = checkBareCollisions([P("tokenrouter", "opus")], { allowBare: true });
+  assert.equal(opted.fatal, false, "the opt-out still works, unchanged");
+  assert.deepEqual(opted.hijackable.map((h) => h.id), ["opus"]);
+  assert.match(opted.message, /UNVERIFIED/,
+    "the opt-out silences the exit, never the disclosure");
+});
+
+test("a message nobody prints is not disclosure: the report condition covers it", () => {
+  // THE OTHER HALF OF THE CONTROL. `checkBareCollisions` composing an honest
+  // message is worthless if the call site never prints it -- and that is exactly
+  // what happened: the inline condition was `hijackable.length || shadowed.length`,
+  // so a findings-free unverified run reached the operator as NOTHING. The
+  // condition is exported precisely because the entry-point block cannot be run
+  // from a test.
+  const cleanUnverified = checkBareCollisions([P("tokenrouter", "qwen3-max")]);
+  assert.equal(shouldReportCollisions(cleanUnverified), true,
+    "no findings, but the guard could not check: the operator must be told");
+
+  const cleanVerified = checkBareCollisions([P("tokenrouter", "qwen3-max")],
+    { realIds: PROD_REAL_IDS });
+  assert.equal(shouldReportCollisions(cleanVerified), false,
+    "a verified run with nothing to say stays quiet");
+
+  // Findings still print on either path, which is the behaviour that predates
+  // this change and must survive it.
+  assert.equal(shouldReportCollisions(
+    checkBareCollisions([P("tokenrouter", "claude-opus-5")], { realIds: PROD_REAL_IDS })), true);
+  assert.equal(shouldReportCollisions(
+    checkBareCollisions([P("a", "opus"), P("b", "opus")], { realIds: PROD_REAL_IDS })), true);
 });
 
 // ---- #53: the guard must model resolve()'s TWO-STAGE match -----------------

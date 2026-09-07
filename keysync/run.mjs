@@ -57,8 +57,9 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  * @param {Set<string>|null} [opts.realIds=null]  ids Anthropic actually publishes
  *   (from anthropic-catalog.mjs's live /v1/models, unioned with ANTHROPIC_FULL by
  *   the caller). null means "could not be determined" (relay down AND no cache)
- *   and the guard falls back to ANTHROPIC_FULL -- see the D1 note below for why
- *   a NETWORK failure must not widen the classification set.
+ *   and the guard falls back to the BROAD set -- every RESERVED-shaped id the
+ *   config advertises, plus the aliases -- see the null-branch note below for
+ *   the measurement that reverted D1's narrowing.
  * @param {Set<string>|null} [opts.relayOwned=null]  the CURATED ids the relay
  *   vouches for. See the vouching block in the classification loop -- this is
  *   the parameter that keeps routing auto-add from disarming the guard. null
@@ -67,7 +68,12 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  * @param {Set<string>|null} [opts.relayRouting=null]  what the relay serves or
  *   WOULD serve if started; used only to keep the remedy wording honest.
  *   Defaults to the static ANTHROPIC_RELAY.routing.
- * @returns {{hijackable: object[], shadowed: object[], fatal: boolean, message: string}}
+ * @returns {{hijackable: object[], shadowed: object[], fatal: boolean,
+ *            message: string, catalogVerified: boolean}}
+ *   `catalogVerified` is false on exactly the `realIds === null` path and is
+ *   DISCLOSURE, never a verdict: `fatal` does not read it, and `message` carries
+ *   the same fact in prose so a caller that prints only the message still tells
+ *   the operator. See the disclosure block above the return.
  */
 export function checkBareCollisions(providers, {
   relay = ANTHROPIC_RELAY.name, allowBare = false, realIds = null,
@@ -87,9 +93,14 @@ export function checkBareCollisions(providers, {
   // (two matching ENTRIES against one selector -- see the entry-counting note at
   // `matchingEntries`). Both are the FAITHFUL readings, since CCR compares the
   // trimmed forms, and stating only the matching fidelity while leaving the
-  // gating effect unsaid is this file's named failure mode. The effect is
-  // uniform across both selector sources: D1 gave the fallback branch a constant
-  // set too, so there is no longer a branch on which the trim behaves differently.
+  // gating effect unsaid is this file's named failure mode.
+  //
+  // THE EFFECT IS NOT UNIFORM ACROSS THE TWO BRANCHES, and R6 briefly said it
+  // was. On the non-null branch the selectors are constants, so this trim only
+  // decides ADMISSION. On the null branch these same trimmed ids ARE the
+  // selectors, so the trim decides admission and the selector set together --
+  // `" opus"` is admitted here and then folds onto the alias `opus` that the
+  // union below contributes anyway.
   //
   // NOT LIVE, AND PERMANENTLY SO RATHER THAN PENDING. `admitId(" opus")`
   // returns null, so no such id reaches the built config.
@@ -131,21 +142,27 @@ export function checkBareCollisions(providers, {
       // its boundary class was narrower than the denylist's, so `sonnet.1` and
       // `haiku_2` were reserved by one definition and invisible to the other.
       //
-      // THIS TEST CAN NO LONGER REJECT ANYTHING THE SELECTOR SET ACCEPTS, AND
-      // THAT IS A DECISION RATHER THAN AN OVERSIGHT. Ownership below iterates
-      // `ANTHROPIC_ALIASES u (realIds ?? ANTHROPIC_FULL)`, so every candidate is
-      // already in the classification set; and every id in
-      // `ANTHROPIC_ALIASES u ANTHROPIC_FULL` matches RESERVED. The selector-keyed
-      // ownership made that true on the live branch; D1 extends it to the
-      // fallback branch. KEPT for two reasons: it is the one place the guard's
-      // definition of Claude-shaped is compared against the denylist's (removing
-      // it leaves `isReserved` with a single consumer and loses the comparison),
-      // and it stays a cheap pre-filter over every advertised id. The drift it
-      // still catches is an id added to ANTHROPIC_FULL that RESERVED does NOT
-      // match: this line would drop it before classification and the guard would
-      // go silent on a real id. The drift detector in denylist.test.mjs asserts
-      // the eight-id premise rather than trusting it, which is what makes a
-      // no-op safe to keep.
+      // THIS LINE IS DEAD ON ONE BRANCH AND LIVE ON THE OTHER, AND R6 DOCUMENTED
+      // IT AS DEAD ON BOTH. That was true only while D1 held.
+      //
+      //   realIds !== null  -- DEAD. Ownership iterates
+      //     `ANTHROPIC_ALIASES u realIds`, so every candidate is already in the
+      //     classification set, and every id in
+      //     `ANTHROPIC_ALIASES u ANTHROPIC_FULL` matches RESERVED. Nothing this
+      //     rejects could have reached a verdict. Kept as the one place the
+      //     guard's definition of Claude-shaped is compared against the
+      //     denylist's (removing it leaves `isReserved` with a single consumer),
+      //     and as a cheap pre-filter. The drift it still catches is an id added
+      //     to ANTHROPIC_FULL that RESERVED does NOT match: this line would drop
+      //     it before classification and the guard would go silent on a real id.
+      //     The drift detector in denylist.test.mjs asserts that premise rather
+      //     than trusting it, which is what makes a no-op safe to keep.
+      //
+      //   realIds === null  -- LIVE, and decisive. The selector set below is
+      //     built FROM `ids`, so this test IS the definition of Claude-shaped on
+      //     that branch: an id it rejects is not merely unclassified, it is never
+      //     a selector at all. Widening or narrowing RESERVED changes the null
+      //     path's verdicts directly.
       if (!RESERVED.test(id)) continue;
       ids.push(id);
     }
@@ -166,31 +183,52 @@ export function checkBareCollisions(providers, {
   //
   // realIds === null means "could not be determined": the relay was unreachable
   // AND there was no cache. That is the one path the call site below reports as
-  // `UNAVAILABLE (relay down and no cache)`. D1: it falls back to
-  // ANTHROPIC_FULL, the static curated set, NOT to the broad set of
-  // RESERVED-shaped ids the providers happen to advertise.
+  // `UNAVAILABLE (relay down and no cache)`. On it the guard falls back to the
+  // BROAD set -- the aliases unioned with every RESERVED-shaped id the config
+  // advertises -- because the narrowing premise is unavailable exactly there.
   //
-  // THE FALLBACK'S TRIGGER IS A NETWORK FAILURE, WHICH IS PRECISELY WHY IT MUST
-  // NOT WIDEN. Under the old fallback, 23 reseller inventions --
-  // `claude-opus-4-8-think`, `claude-opus-4.6`, `claude-opus-5-fast` and
-  // siblings across aihubmix, bai, veniceai, tabiai, tokenrouter, opencode --
-  // classified as hijackable and keysync exited. Nothing ever sends those bare,
-  // so all 23 were false positives, and what produced them was losing the
-  // network rather than any change in the config's actual risk. ANTHROPIC_FULL
-  // is in source and needs no network, so the uncertain path now answers with
-  // four reviewed ids instead of with every Claude-SHAPED string in the config.
+  // D1 NARROWED THIS TO ANTHROPIC_FULL AND IS REVERTED, ON MEASUREMENT. The
+  // narrowing's justification was that widening on a network failure produced
+  // "23 reseller inventions, all false positives". THOSE 23 DO NOT EXIST IN THIS
+  // GUARD'S INPUT. It reads `built.providers`, and that set -- measured through
+  // `buildProviders` on the real vault -- is 83 model entries across 44
+  // providers, of which exactly 2 are RESERVED-shaped bare ids: `tabiai ->
+  // claude-opus-4-8` and `gorouter -> claude-opus-4-8`. Not 23. The 23 were
+  // counted over the full bundled catalogue, which the guard never sees.
   //
-  // IT NARROWS; IT DOES NOT DISARM. The aliases are unioned in on BOTH branches,
-  // so a reseller sole-owning bare `opus` with the relay down is still FATAL,
-  // as is one sole-owning a curated id such as `claude-opus-5`. What the
-  // fallback gives up is flagging a REAL but UNCURATED Anthropic id while the
-  // network is down; with the network up, `realIds` carries exactly those.
+  // WHAT THE NARROWING COST, MEASURED AGAINST AN INDEPENDENT THREAT SET.
+  // `ANTHROPIC_ALIASES u Anthropic's live /v1/models` is 15 ids. With the relay
+  // down, a reseller sole-owning one of them was caught for 15 of 15 before D1
+  // and for 8 of 15 after it: `claude-fable-5`, `claude-opus-4-8`,
+  // `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-opus-4-6`,
+  // `claude-opus-4-5-20251101` and `claude-sonnet-4-5-20250929` went SILENT.
+  // Every one is published by Anthropic and so is a name Claude Code can send;
+  // ANTHROPIC_FULL carries 4 of the 11 live ids, which is the whole of the gap.
+  // Reachable on shipped data: if either owner drops `claude-opus-4-8`, the
+  // broad rule returns `fatal: true, owner: tabiai` and the narrow one returns
+  // `fatal: false, "no bare Claude-shaped collisions"`.
   //
-  // The advertised-side trim still runs before RESERVED and still decides which
-  // ids are ADMITTED (see the gating note there); what is no longer true is that
-  // the two branches differ in where their selectors come from. Both now read
-  // constants, so `" opus"` is admitted and folded onto the alias `opus` on
-  // either branch rather than only on one.
+  // THE COST OF THE BREADTH IS REAL, ACCEPTED KNOWINGLY, AND NAMED HERE SO THE
+  // NEXT PERSON TO CONSIDER RE-NARROWING HAS THE NUMBER THAT MATTERS. On the
+  // null path a reseller invention -- `claude-opus-5-thinking`, `claude-opus-4.6`
+  // and their kind, where extended thinking is a request PARAMETER rather than a
+  // model -- is fatal when sole-owned, and nothing sends those bare. Those are
+  // false positives and this branch will produce them.
+  //
+  // THE TWO DENOMINATORS ARE WHAT DECIDE IT, and they are not the same
+  // denominator D1 used. Over the full bundled catalogue there are 23 such
+  // inventions; over `built.providers`, which is the ONLY thing this guard ever
+  // reads, there are 2 RESERVED-shaped bare ids in 83 model entries, and both
+  // are `claude-opus-4-8`. So the breadth's realised cost on shipped data is at
+  // most those 2 rows, on a path the operator can see and override with
+  // `--allow-bare-claude-names`; the narrowing's cost is 7 of 15 published
+  // Anthropic ids silently misrouting the full system prompt. Those are not
+  // symmetric, and a re-narrowing argued from the 23 would be argued from a set
+  // this function is never handed.
+  //
+  // THE TWO BRANCHES NOW DIFFER IN WHERE THEIR SELECTORS COME FROM, and the
+  // advertised-side trim is what the null branch reads (see the gating note
+  // there). `" opus"` is admitted, trimmed, and folds onto the alias `opus`.
   //
   // THE ALIASES ARE EXEMPT, and leaving them out was a live hijack hole from
   // eeea057 until 2026-09-06. The premise above -- "Claude Code never emits a
@@ -222,12 +260,14 @@ export function checkBareCollisions(providers, {
   // dist/main/cli.js, `let t=e?.trim()` -- cited by minified name AND version
   // because that name is an allocation-order artifact one `npm i` can rename),
   // so this is faithful. But no PRODUCTION-SHAPED fixture can kill it: neither
-  // ANTHROPIC_ALIASES, nor ANTHROPIC_FULL, nor a `realIds` built at the call
-  // site below (live /v1/models u ANTHROPIC_FULL) can carry whitespace. A
-  // hand-built `realIds: new Set([" claude-opus-5 "])` does kill it. It guards
-  // only the case where Anthropic's own API returns a padded id.
+  // ANTHROPIC_ALIASES, nor a `realIds` built at the call site below (live
+  // /v1/models u ANTHROPIC_FULL), nor the null branch's `a.ids` (already trimmed
+  // above) can carry whitespace. A hand-built
+  // `realIds: new Set([" claude-opus-5 "])` does kill it. It guards only the
+  // case where Anthropic's own API returns a padded id.
   const selectors = new Set(
-    [...ANTHROPIC_ALIASES, ...(realIds ?? ANTHROPIC_FULL)].map((s) => String(s).trim())
+    [...ANTHROPIC_ALIASES, ...(realIds ?? advertised.flatMap((a) => a.ids))]
+      .map((s) => String(s).trim())
   );
 
   // OWNERSHIP THE WAY `resolve()` COMPUTES IT: the exact match list, and the
@@ -348,6 +388,11 @@ export function checkBareCollisions(providers, {
   hijackable.sort((a, b) => a.id.localeCompare(b.id));
   shadowed.sort((a, b) => a.id.localeCompare(b.id));
 
+  // Whether the classification above could consult Anthropic's published ids at
+  // all. Derived from the one input that decides it, and read ONLY by the
+  // reporting below -- see the disclosure block after the message branches.
+  const catalogVerified = realIds !== null;
+
   // THE REMEDY WORDING IS LOAD-BEARING, and a test asserts it. An error that
   // tells the operator to remove a provider's model is an error that teaches a
   // rule-2 violation, and it would send them to delete the very models tabiai
@@ -425,7 +470,31 @@ export function checkBareCollisions(providers, {
       `resolve() returns undefined on an ambiguous match, so this is a clean ` +
       `failure, not a misroute.`;
   } else {
-    message = "no bare Claude-shaped collisions";
+    // TWO DIFFERENT CLAIMS, AND ONLY ONE OF THEM WAS BEING MADE. "Checked,
+    // nothing found" is a statement about Anthropic's published ids; on the null
+    // path the guard never saw them, so the honest all-clear is scoped to what
+    // it did read -- the ids this config advertises.
+    message = catalogVerified
+      ? "no bare Claude-shaped collisions"
+      : "no bare Claude-shaped collisions among the ids this config advertises";
+  }
+  // DISCLOSURE ON THE UNVERIFIED PATH. Plan §2.6 establishes the principle for a
+  // keysync run that REFUSED to write: a run whose outcome rests on something it
+  // could not do must say so rather than let silence read as success. The same
+  // principle applies to a silent PROCEED, and this is the path that had it
+  // backwards -- with both lists empty the caller's `console.warn` never fired
+  // at all, so an unverified all-clear reached the operator as nothing at all.
+  //
+  // IT CHANGES NO VERDICT. `fatal` below does not read `catalogVerified`, no new
+  // severity is introduced and no exit path is added; `shouldReportCollisions`
+  // only decides whether the message is PRINTED. Appended to every branch, not
+  // only the empty one: a `shadowed` finding classified by shape alone is as
+  // much a claim about Anthropic's catalogue as an all-clear is, and today's
+  // real config reaches exactly that branch (`claude-opus-4-8`, two owners).
+  if (!catalogVerified) {
+    message += `\nUNVERIFIED: Anthropic's live model ids could not be fetched ` +
+      `(relay down and no cache), so this run classified by SHAPE against what ` +
+      `the config advertises rather than against Anthropic's published catalogue.`;
   }
 
   // `fatal` IS COMPUTED FROM THE UNSTRIPPED OWNER SET (A2). The expression here
@@ -434,7 +503,37 @@ export function checkBareCollisions(providers, {
   // because this is the line a reader checks when asking what makes keysync exit,
   // and the answer -- "exactly when CCR's resolve() would bind a bare Claude
   // selector to a single non-relay host" -- is decided fifty lines up.
-  return { hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message };
+  return {
+    hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message,
+    catalogVerified,
+  };
+}
+
+/**
+ * Whether `checkBareCollisions`' message must reach the operator.
+ *
+ * EXTRACTED SO IT CAN BE ASSERTED. The condition used to be an inline
+ * `if (c.hijackable.length || c.shadowed.length)` inside the entry-point block,
+ * which no test can run -- and that is precisely where the disclosure would fail
+ * silently. A guard that composes an honest message nobody prints has not
+ * disclosed anything, so the printing condition is part of the control and is
+ * held to the same standard as the rest of it (same reason `deriveAnthropicSets`
+ * is exported: logic left inline down there is logic nothing can assert on).
+ *
+ * NOT A VERDICT. This decides visibility only; `fatal` is computed in the guard
+ * and neither reads this nor is read by it.
+ *
+ * @param {{hijackable: object[], shadowed: object[], catalogVerified?: boolean}} collisions
+ * @returns {boolean}
+ */
+export function shouldReportCollisions(collisions) {
+  return Boolean(
+    collisions?.hijackable?.length ||
+    collisions?.shadowed?.length ||
+    // The findings-free unverified run. Without this disjunct the operator sees
+    // NOTHING on exactly the path where the guard verified least.
+    collisions?.catalogVerified === false
+  );
 }
 
 // How stale the catalog may be and still decide what we ROUTE. The fetch's own
@@ -996,7 +1095,12 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
   // FATAL path could never fire. See the vouching block in checkBareCollisions.
   const collisions = checkBareCollisions(built.providers,
     { allowBare: has("--allow-bare-claude-names"), realIds, relayOwned, relayRouting: routingIds });
-  if (collisions.hijackable.length || collisions.shadowed.length) {
+  // Printed on findings AND on a findings-free run that could not reach
+  // Anthropic's catalogue -- that second case used to print nothing at all,
+  // which made an unverified all-clear indistinguishable from a verified one.
+  // The condition lives in an exported predicate because nothing can run this
+  // block; see `shouldReportCollisions`.
+  if (shouldReportCollisions(collisions)) {
     console.warn(collisions.message);
   }
   // Fatal BEFORE any write, and before --dry returns, so a dry run reports the
