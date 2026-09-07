@@ -52,7 +52,7 @@
 // sanitise every id and to show the answering hostname on every row -- not a
 // reason to refuse the models they sell.
 
-import { admitId } from "./sanitize.mjs";
+import { admitId, sanitizeDisplay } from "./sanitize.mjs";
 
 // Anchored. The trailing group means "opus" and "opus-4-8" match while
 // "opusculum" and "hakuna" do not -- the boundary must be a separator, a digit,
@@ -122,19 +122,44 @@ export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.te
  *                  rejections across all 4,298 bundled ids today, so this is
  *                  latent -- but it goes live with Task B6, where discovery
  *                  returns raw provider strings instead of a curated bundle.
- * @returns {{kept: string[], rejected: string[]}}
+ * @returns {{kept: string[], rejected: string[]}} `rejected` holds the
+ *                  DISPLAY-SAFE form of each refused name, never the raw one.
  */
 export function admitRemoteModels(providerName, ids, { trusted = "anthropic", warn = true } = {}) {
   const kept = [], rejected = [];
   const exempt = providerName === trusted;
   for (const raw of ids ?? []) {
     const id = admitId(raw);
-    if (!id) { rejected.push(String(raw)); continue; }
+    // SANITISED AT THE PRODUCER, NOT AT THE CONSUMER (#52). The obvious place
+    // for this is the console.warn below, and it is the wrong place: it leaves
+    // the raw string sitting in `rejected` for any future reader to print, and
+    // the whole finding is that a refused name reaches a terminal.
+    //
+    // WHY THIS CHANNEL IS NOW HOSTILE-ONLY. Before the denylist inversion, a
+    // rejection was dominated by benign real ids the allowlist happened to
+    // refuse -- 16 of them, measured, mostly leading-`~` aliases. After the
+    // inversion an id can only be refused by one of the named rules in
+    // `admitId`, and three of those -- ESC_SEQ, CTRL, INVISIBLE -- ARE the
+    // terminal-attack classes. So "this string was rejected" went from weak
+    // evidence of hostility to strong evidence of it, and it is printed
+    // verbatim on ordinary stderr by the routing path in `keysync.mjs`.
+    //
+    // MEASURED: `admitRemoteModels("tabiai", ["evil\x1b[2J\x1b]52;c;aGk=\x07"])`
+    // put 2 ESC and 1 BEL into the warn line, and `\x1b]52;c;<base64>\x07` is
+    // OSC 52 -- a clipboard write. A provider listing could put content into
+    // the operator's clipboard THROUGH the warning that refused it.
+    //
+    // Both branches sanitise, so the invariant is a property of the array
+    // rather than of the caller's discipline. `sanitizeDisplay`'s 80-code-point
+    // cap is accepted here: a rejected name is by definition not a routing
+    // selector, so its exact length is not load-bearing, and an unbounded
+    // provider string in a security line is itself a way to flood a terminal.
+    if (!id) { rejected.push(sanitizeDisplay(raw)); continue; }
     // RULE 2. This line was `if (!exempt && isReserved(id))`. `isReserved` is
     // still exported and still true for Claude names -- it is now consumed by
     // the collision guard, which can see the ownership this loop cannot. Do not
     // reinstate it here: doing so drops every model tabiai and gorouter sell.
-    if (!exempt && UW_ALIAS.test(id)) { rejected.push(id); continue; }
+    if (!exempt && UW_ALIAS.test(id)) { rejected.push(sanitizeDisplay(id)); continue; }
     kept.push(id);
   }
   if (warn && rejected.length) {

@@ -162,13 +162,20 @@ export function inferTier(entry, providerName = null) {
  * Sits beside `inferTier` for locality -- the other entry-to-label function over
  * the catalogue -- but the rule it follows is `makeRoutableOf`'s
  * (`menu/catalog.mjs:143`), not `inferTier`'s. It is also, now, a SORT TERM
- * AHEAD OF `inferTier`'s on the routing path (see `buildProviders`): repairing
- * the free-first term turned it on for the first time, and rerankers and music
- * generators are disproportionately free, so free-first alone promotes
- * non-chat rows over paid chat models.
+ * AHEAD OF `inferTier`'s on the routing path (see `buildProviders`).
  *
- * *(Until 2026-09-07 this paragraph recorded the opposite: `inferTier` read
- * `pricing.inputPerMillion` while this schema stores
+ * WHAT THAT ORDER IS AND IS NOT DEFENDING AGAINST. This paragraph used to say
+ * that repairing #10 turned free-first on and that "rerankers and music
+ * generators are disproportionately free, so free-first alone promotes non-chat
+ * rows over paid chat models". #55 shipped alongside #10, so that is false as
+ * shipped: an all-zero-offer row is `"unknown"`, not `"free"`, and MEASURED
+ * over the live bundle exactly ONE of 4,298 entries is free. `hasPricedOffer`
+ * is what holds the media generators back; this term demotes only rows that
+ * DECLARE themselves non-text. The full correction, with the google
+ * measurement, is at the sort in `buildProviders`.
+ *
+ * *(Until 2026-09-07 this paragraph also recorded the opposite of #10:
+ * `inferTier` read `pricing.inputPerMillion` while this schema stores
  * `pricing.offers[].per1MTokens`, so it yielded a usable value for 0 of 4,298
  * entries and the free-first sort was a no-op. That is #10, fixed above.)*
  *
@@ -619,17 +626,38 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // Curate rather than dump: the picker is a flat list and 44 providers x
       // full catalogs is unusable. Prefer chat, then free-tier, then shortest id.
       //
-      // `kind` IS THE FIRST TERM, AHEAD OF FREE-FIRST, AND THAT ORDER IS THE
-      // POINT. Free-first was a no-op until #10 was fixed, because `inferTier`
-      // read a path this schema does not have; repairing it turns the term on
-      // for the first time, which changes WHICH ROWS SHIP and not merely how
-      // they are labelled. Rerankers, embedders and media generators are
-      // disproportionately free, so free-first alone promotes them over paid
-      // chat models -- measured on cohere, where the repair alone replaces
-      // `command | command-a | command-r` with two rerankers. Sorting non-text
-      // last is what keeps a free non-chat model from outranking a paid chat
-      // model. The data costs nothing to obtain: `outputKind(entry)` is called a
-      // few lines below in `normalizeModel`, on the same entry.
+      // `kind` IS THE FIRST TERM, AHEAD OF FREE-FIRST. The ORDER is free; what
+      // this comment used to claim about the free-first term was not.
+      //
+      // CORRECTED 2026-09-07. It read: "repairing #10 turns the term on for the
+      // first time... measured on cohere, where the repair alone replaces
+      // `command | command-a | command-r` with two rerankers", and, below, that
+      // free-first promotes Lyria back into google's top-3. BOTH ARE FALSE AS
+      // SHIPPED, and the reason is mechanical: #55 landed with #10. `inferTier`
+      // classifies an all-zero-offer row as `"unknown"`, not `"free"`, so
+      // MEASURED over the live bundle there is EXACTLY ONE free row in all
+      // 4,298 entries (`mistral/labs-devstral-small-2512`). A free-first term
+      // with one free row catalogue-wide evaluates `1 - 1 = 0` for essentially
+      // every pair and cannot promote a CLASS of anything.
+      //
+      // SO NAME THE GUARD THAT IS ACTUALLY DOING THE WORK: `hasPricedOffer`
+      // (#55), inside `inferTier`, not the `kind` term here. MEASURED on
+      // google's 185 entries: with #55, the top-3 is
+      // `gemma-3 | gemma-2-9b | gemma-4-31b`; with #55 removed and the `kind`
+      // term left exactly as it is, it becomes
+      // `lyria-3-pro-preview | lyria-3-clip-preview | gemma-3` -- two music
+      // generators. The `kind` term does not stop them, because they declare
+      // `["audio", "text"]` and `outputKind` therefore reads them as text.
+      //
+      // That matters to whoever edits this next: removing #55 as "R5b's
+      // labelling fix" while keeping the `kind` term reinstates two music
+      // generators into a provider's routing set. The previous wording told
+      // them the opposite.
+      //
+      // The `kind` term stays, on its own merit: it is the only term that
+      // demotes a DECLARED non-chat row, and the data costs nothing to obtain
+      // -- `outputKind(entry)` is called a few lines below in `normalizeModel`,
+      // on the same entry.
       //
       // `=== "nontext"`, NOT `!== "text"`. `outputKind` answers `null` for
       // absence of signal (`menu/catalog.mjs`'s `isTextOut` agrees), and a
@@ -638,13 +666,27 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // refuses everywhere else.
       //
       // THIS GUARD IS PROVISIONAL AND IS KNOWN INSUFFICIENT (plan R3). It
-      // demotes only what DECLARES itself non-text, and google's Lyria previews
-      // declare `["audio", "text"]` -- so `outputKind` reads them as text, and
-      // free-first promotes two music generators straight back into google's
-      // top-3. R11 retires this with the live `capability` field from discovery,
-      // where those rows are `image_gen`/`audio`. Until then the boolean gate
-      // "no provider's top-3 acquires a row whose `modalities.output` contains a
-      // modality other than text" is the only thing that says so, and it fires.
+      // demotes only what DECLARES itself non-text, so google's Lyria previews
+      // (`["audio", "text"]`) read as text here and are held out by
+      // `hasPricedOffer` instead -- see the correction above. R11 retires this
+      // with the live `capability` field from discovery, where those rows are
+      // `image_gen`/`audio`.
+      //
+      // THE STATED GATE DOES NOT PASS, and saying it does was the second false
+      // claim in this block. The boolean "no provider's top-3 acquires a row
+      // whose `modalities.output` contains a modality other than text" is
+      // FALSE against the real `buildProviders`: MEASURED, 4 of 44 built
+      // providers and 5 of 83 picker rows carry such a row --
+      // `openrouter/auto` and `kilo/auto` (`["image","text"]`),
+      // `openai/gpt-5-nano` (`["image","text"]`), and `nscale/flux.1-schnell`
+      // and `nscale/stable-diffusion-xl-base-1.0` (`["image"]`).
+      //
+      // It is the OBSERVABLE that is mis-specified, not the code, and it must
+      // not be "fixed" by making the gate pass: nscale's entire catalogue is
+      // image models, so its top-3 is non-text by construction, and rule 1
+      // (never prune a responding provider) keeps those rows. Correcting the
+      // observable belongs to the plan, not here; what this comment owes the
+      // next reader is the number with its denominator rather than a pass.
       const ranked = safeEntries
         .map((m) => ({ m, kind: outputKind(m), tier: inferTier(m, reg.provider) }))
         .sort((a, b) => (a.kind === "nontext" ? 1 : 0) - (b.kind === "nontext" ? 1 : 0) ||
@@ -945,33 +987,47 @@ export function validate({ providers, picker }, expectedCount, table = {}) {
   // make that comparison equal, so duplicate names are exactly the case it
   // cannot see (#25).
   //
-  // IDENTITY IS THE BASE URL, NOT THE NAME. That is the same distinction
-  // buildProviders already draws when it puts the answering hostname in a picker
-  // row's description: a vault nickname is user-chosen and can be made to read
-  // as official, a hostname cannot. An entry declaring NO base url is not a
-  // finding here -- buildProviders sets one on every vault entry it emits, so a
-  // built impostor always takes the declared branch, and an entry with no base
-  // url answers nothing. The residual is an entry that both takes the name and
-  // points at the relay's own address while the relay is down: it is unreachable
-  // by construction, so it owns nothing.
+  // IDENTITY IS PROVEN BY THE BASE URL MATCHING THE RELAY'S, NOT BY ONE BEING
+  // DECLARED. That is the same distinction buildProviders already draws when it
+  // puts the answering hostname in a picker row's description: a vault nickname
+  // is user-chosen and can be made to read as official, a hostname cannot.
+  //
+  // SO THE TEST IS `!==`, NOT `declared && !==`, AND AN ABSENT URL FAILS IT.
+  // Until 2026-09-07 the guard read `claimants[0].api_base_url && ... !== ...`,
+  // defended by a comment claiming "buildProviders sets one on every vault entry
+  // it emits, so a built impostor always takes the declared branch". That is
+  // FALSE: `resolveProtocol` returns `baseUrl: vaultProvider.baseUrl` unguarded,
+  // so a vault entry with `protocol: "openai"` and no `baseUrl` reaches
+  // `api_base_url: undefined` and the `&&` short-circuited the whole rule away.
+  // MEASURED: an impostor named `anthropic` with no base url produced 0 problems
+  // from V10 and 0 findings from checkBareCollisions — in exactly the relay-down
+  // configuration V10 exists for.
+  //
+  // "An entry with no base url answers nothing" was the other half of the same
+  // mistake. It does not need to answer: the harm is the NAME, and the four
+  // privileges below are granted on the name alone, before any request is made.
   const relayName = ANTHROPIC_RELAY.name.toLowerCase();
   const claimants = providers.filter((p) =>
     String(p?.name ?? "").toLowerCase() === relayName);
   // Named in full because "reserved name" alone tells an operator nothing about
-  // why renaming their provider is not optional -- the same three dependents
-  // assertRelayNameUnclaimed names.
+  // why renaming their provider is not optional -- the three dependents
+  // assertRelayNameUnclaimed names, plus the admission exemption it omits.
   const reservedWhy = `checkBareCollisions keys owners by provider name and would collapse ` +
     `it into the relay's identity (reporting no collisions while it sole-owns a Claude id), ` +
-    `orderNativePickerOptions would hoist its rows to the head of the /model menu, and ` +
+    `orderNativePickerOptions would hoist its rows to the head of the /model menu, ` +
     `validate()'s V3 exemption would excuse those rows from declaring behavesAs — which ` +
-    `lH() resolves to the maximal assumption set. Rename it in providers.json.`;
+    `lH() resolves to the maximal assumption set — and admitRemoteModels treats the name ` +
+    `as its \`trusted\` relay, exempting every id it advertises from the UW_ALIAS check, ` +
+    `so it alone could squat uw/ routing slots. Rename it in providers.json.`;
   if (claimants.length > 1) {
     problems.push(`${claimants.length} providers are named "${ANTHROPIC_RELAY.name}", ` +
       `a name reserved for the relay: ${reservedWhy}`);
-  } else if (claimants.length === 1 && claimants[0].api_base_url &&
+  } else if (claimants.length === 1 &&
              claimants[0].api_base_url !== ANTHROPIC_RELAY.api_base_url) {
+    const answersAt = claimants[0].api_base_url
+      ? `"${claimants[0].api_base_url}"` : `no declared base url`;
     problems.push(`the provider named "${ANTHROPIC_RELAY.name}" answers at ` +
-      `"${claimants[0].api_base_url}", not at the relay's ` +
+      `${answersAt}, not at the relay's ` +
       `"${ANTHROPIC_RELAY.api_base_url}", and that name is reserved for the relay: ` +
       `${reservedWhy}`);
   }

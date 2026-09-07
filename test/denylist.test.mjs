@@ -103,6 +103,65 @@ test("admitRemoteModels also drops ids that fail admitId", () => {
   assert.equal(r.rejected.length, 2);
 });
 
+// Every code point that is an attack on a terminal rather than a character in a
+// name: C0 (incl. ESC 0x1b and BEL 0x07), DEL, C1, and the zero-width/bidi class
+// menu/sanitize.mjs enumerates. Written out here rather than imported so this
+// test states its own subject and cannot be weakened by an edit to that module.
+const TERMINAL_HOSTILE =
+  /[\x00-\x1f\x7f-\x9f\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF]/;
+
+test("#52: a refused id reaches neither `rejected` nor the SECURITY line raw", () => {
+  // MEASURED BEFORE THE FIX: admitRemoteModels("tabiai", [the first fixture])
+  // put 2 ESC and 1 BEL into the warn line, on ordinary stderr, during a normal
+  // keysync run. `\x1b]52;c;<base64>\x07` is OSC 52 -- a CLIPBOARD WRITE. A
+  // provider listing could put content into the operator's clipboard through
+  // the security warning that refused it.
+  //
+  // WHY THIS CHANNEL IS NOW HOSTILE-ONLY, which is what makes it this ship's
+  // problem rather than a latent one. Before the denylist inversion a rejection
+  // was dominated by benign real ids the allowlist happened to refuse. After
+  // it, an id can only be refused by one of admitId's named rules, and three of
+  // them -- ESC_SEQ, CTRL, INVISIBLE -- ARE these attack classes.
+  //
+  // The assertion is on `rejected` AND on the warn line, deliberately.
+  // Sanitising only at the console.warn would leave the raw string in the array
+  // for the next reader to print; the producer must never hold the raw form.
+  const hostile = [
+    "evil\x1b[2J\x1b]52;c;aGk=\x07",  // CSI erase-display + OSC 52 clipboard write
+    "bell\x07",                        // BEL alone
+    "null\x00byte",                    // C0
+    "del\x7fchar",                     // DEL, and the C1 range beyond it
+    "\u202Eexe.gnp",                   // U+202E RLO: renders as a different name
+    "\u200Bzero-width",
+    "uw/fast",                         // the OTHER push, via the UW_ALIAS branch
+  ];
+  const warnings = [];
+  const realWarn = console.warn;
+  let r;
+  console.warn = (m) => warnings.push(String(m));
+  try { r = admitRemoteModels("tabiai", hostile); } finally { console.warn = realWarn; }
+
+  assert.deepEqual(r.kept, [], "every fixture must actually be refused, or this proves nothing");
+  assert.equal(r.rejected.length, hostile.length);
+  for (const id of r.rejected) {
+    assert.equal(TERMINAL_HOSTILE.test(id), false,
+      `rejected[] holds a terminal-hostile code point: ${JSON.stringify(id)}`);
+  }
+  // `uw/fast` is the one fixture admitId ADMITS, so it exercises the second
+  // push. Its input carries no attack class by construction -- admitId already
+  // denies all three -- so sanitising there is structural rather than
+  // load-bearing, and this asserts the name survives intact rather than that
+  // anything was stripped from it.
+  assert.ok(r.rejected.includes("uw/fast"), "the UW_ALIAS branch still reports its id in full");
+
+  assert.equal(warnings.length, 1, "one SECURITY line for the batch");
+  assert.equal(TERMINAL_HOSTILE.test(warnings[0]), false,
+    `the SECURITY line itself is an attack surface: ${JSON.stringify(warnings[0])}`);
+  assert.equal(warnings[0].includes("\x1b"), false, "no ESC");
+  assert.equal(warnings[0].includes("\x07"), false, "no BEL");
+  assert.match(warnings[0], /SECURITY: provider "tabiai" advertised 7 rejected model name/);
+});
+
 test("a provider with no testModel produces no SECURITY warning", () => {
   // A security channel that fires on benign configuration stops being read.
   // `admitId(undefined)` returns null and the rejection path stringifies it, so
@@ -593,12 +652,23 @@ test("#53: the EXACT owner wins when exact and fold disagree", () => {
 });
 
 test("#53/A1: leading whitespace does not hide a sole claim", () => {
-  // OBSERVABLE (3) -- the two-ship hazard, asserted before it is reachable.
+  // OBSERVABLE (3), and what it guards has CHANGED SHAPE since it was written.
   // `providerModelMatches` does `let a = s.trim()`, so CCR binds ` opus` to the
-  // selector `opus`. This id cannot reach the guard on main -- `admitId` still
-  // rejects it, because the ALLOWLIST anchors on an alphanumeric -- and it goes
-  // live the moment R2 inverts that allowlist. CTRL is [\x00-\x1f\x7f-\x9f];
-  // space is 0x20, outside it, so nothing else denies it.
+  // selector `opus`, and the guard must trim before it compares.
+  //
+  // CORRECTED 2026-09-07. This said the id "cannot reach the guard on main --
+  // `admitId` still rejects it, because the ALLOWLIST anchors on an
+  // alphanumeric -- and it goes live the moment R2 inverts that allowlist".
+  // R2 landed and there is no allowlist. `admitId` still rejects ` opus`, but
+  // now by the `WHITESPACE` rule in `menu/sanitize.mjs`, added by name for
+  // exactly this reason -- so the hazard is PERMANENTLY not live rather than
+  // pending a ship. CTRL is [\x00-\x1f\x7f-\x9f] and space is 0x20, outside
+  // it, so `WHITESPACE` is the only thing denying it.
+  //
+  // That is a different and still-good reason to keep this test: it is the
+  // assertion that fails if the guard stops trimming, and the thing standing
+  // between it and reality is one named rule that someone could relax as
+  // over-strict. Delete `WHITESPACE` and this becomes live immediately.
   const r = checkBareCollisions([P("tokenrouter", " opus")],
     { realIds: PROD_REAL_IDS });
   assert.equal(r.fatal, true,
@@ -841,8 +911,17 @@ test("an empty realIds set narrows everything away, rather than matching everyth
 // it. Without this, removing the [1m]-stripping tolerance in validate() (the
 // fix that makes ANTHROPIC_PICKER's suffix safe to ship) breaks nothing here.
 
+// FIXTURE NOTE, 2026-09-07. The four fixtures below and the V3 one further down
+// name themselves `anthropic` and previously omitted `api_base_url`. That was
+// never a production shape -- run.mjs spreads ANTHROPIC_RELAY, which carries the
+// field, and buildProviders sets `api_base_url: baseUrl` on every entry it emits
+// -- and V10 only tolerated it because its guard short-circuited on an absent
+// url, which is #79. With that inverted, an absent url is the impostor shape, so
+// these fixtures declare the relay's own url. Not one assertion below changed:
+// each still asserts exactly what its title says, about [1m] and V3.
 test("validate() accepts a [1m]-suffixed picker row against a bare models[] entry", () => {
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       api_base_url: ANTHROPIC_RELAY.api_base_url,
                        autoFetchModels: false, models: ["claude-opus-5"] }];
   const picker = [{ model: "anthropic/claude-opus-5[1m]", label: "x" }];
   assert.deepEqual(validate({ providers, picker }, 1), []);
@@ -852,6 +931,7 @@ test("validate() still rejects a picker row with no corresponding models[] entry
   // The tolerance must be narrow: stripping [1m] must not become "any string
   // is close enough". A genuinely absent id is still a real problem.
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       api_base_url: ANTHROPIC_RELAY.api_base_url,
                        autoFetchModels: false, models: ["claude-opus-5"] }];
   const picker = [{ model: "anthropic/claude-sonnet-5[1m]", label: "x" }];
   const problems = validate({ providers, picker }, 1);
@@ -863,6 +943,7 @@ test("validate() accepts the real ANTHROPIC_RELAY picker against its own models"
   // The actual shapes this fix exists for, exercised together rather than each
   // asserted on in isolation.
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       api_base_url: ANTHROPIC_RELAY.api_base_url,
                        autoFetchModels: false, models: [...ANTHROPIC_RELAY.models] }];
   const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);
@@ -1008,6 +1089,7 @@ test("dynamically tagged rows still pass validate() against bare routing ids", (
   const rows = buildAnthropicPickerRows(ANTHROPIC_FULL,
     CTX({ "claude-opus-5": 1000000, "claude-haiku-4-5-20251001": 200000 }));
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       api_base_url: ANTHROPIC_RELAY.api_base_url,
                        autoFetchModels: false, models: [...ANTHROPIC_FULL] }];
   const picker = rows.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);
@@ -1893,6 +1975,7 @@ test("V3: relay rows are exempt BY CONSTRUCTION, not by oversight", () => {
   // ids; a declaration there would be borrowed from the model itself. If this
   // exemption were dropped, every healthy live run would fail validation.
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
+                       api_base_url: ANTHROPIC_RELAY.api_base_url,
                        autoFetchModels: false, models: [...ANTHROPIC_RELAY.models] }];
   const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);

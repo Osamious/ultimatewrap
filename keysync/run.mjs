@@ -88,9 +88,18 @@ export function checkBareCollisions(providers, {
   // the narrowed one, and stating only the matching fidelity while leaving the
   // gating effect unsaid is this file's named failure mode.
   //
-  // NOT LIVE TODAY: `admitId(" opus")` returns null, because the allowlist
-  // anchors on an alphanumeric, so no such id reaches the built config. It goes
-  // live the moment R2 inverts that allowlist to a denylist.
+  // NOT LIVE, AND PERMANENTLY SO RATHER THAN PENDING. `admitId(" opus")`
+  // returns null, so no such id reaches the built config.
+  //
+  // CORRECTED 2026-09-07. This said the rejection came from "the allowlist
+  // anchor[ing] on an alphanumeric" and that it "goes live the moment R2
+  // inverts that allowlist to a denylist". R2 landed: there is no allowlist any
+  // more. The rejection now comes from the `WHITESPACE` rule in
+  // `menu/sanitize.mjs`, which denies whitespace BY NAME precisely so the
+  // inversion did not open this hole -- that module's own comment states the
+  // correct reading and cites `#53/A1`, and this line was simply never brought
+  // into agreement with it. The trim below therefore stays a guard against a
+  // future relaxation of that rule, not a wire waiting to be energised.
   const advertised = [];
   for (const p of providers ?? []) {
     // CCR's own gate. `providerModelMatches` checks the provider is enabled before

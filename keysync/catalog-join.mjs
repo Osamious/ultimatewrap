@@ -170,11 +170,23 @@ function tail(index, provider, key, ci) {
  *   2. normalisation  `models/`, `:free`/`:batch`, `.`->`-`      45%
  *   3. case-insensitive                                          47%
  *   4. vendor-qualified tail                                     65%
- *   5. `accounts/…/models/`, leading `~`, `[…]` suffix           70.9%
+ *   5. `accounts/…/models/`, leading `~`, `[…]` suffix           ≤65.3%
  *
  * Those cumulative figures are per distinct live ID STRING (2,136 of them).
- * The per-(provider, model) PAIR figure is higher -- 80% of 3,784 -- because the
- * unjoinable residual concentrates in a few providers listing many ids each.
+ *
+ * TWO FIGURES CORRECTED 2026-09-07, both of which this docstring carried after
+ * the decisions doc had retired them:
+ *
+ *   * Rung 5 was stated as 70.9%. The decisions doc retires that as
+ *     "arithmetically impossible" and corrects the ceiling to ≤65.3%; over the
+ *     2,136 distinct live id strings the shape rung contributes +1, not +125.
+ *   * "The per-(provider, model) PAIR figure is higher -- 80% of 3,784" was the
+ *     LOOSE matcher's rate attributed to `joinCatalogEntry`, which is guarded
+ *     and measures 65.0% of those same 3,784 pairs. The decisions doc says the
+ *     80% "must never be cited as an acceptance threshold for a §4.3-compliant
+ *     join", and this docstring was citing it as exactly that. The guard is not
+ *     a shortfall against the 80%: the difference IS the cross-provider false
+ *     positives §4.3 exists to refuse.
  *
  * `null` is a real answer and the honest one. D3 §4.2: a miss yields
  * `reason: null` and no `contextTokens`, `bucketFor` returns `"unknown"`, and

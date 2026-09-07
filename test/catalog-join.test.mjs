@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { buildJoinIndex, joinCatalogEntry, priceOf,
          hasPricedOffer } from "../keysync/catalog-join.mjs";
 import { priceOf as priceOfViaMenu } from "../menu/catalog.mjs";
+// The REAL bundle reader. Every other test in this file feeds `buildJoinIndex` a
+// hand-built fixture, which is why nothing here could see whether production
+// builds the index those fixtures assume -- see the byAlias test at the bottom.
+import { loadCatalog } from "../keysync/keysync.mjs";
 
 // A hand-written bundle in the real schema's shape. Every `id` is
 // `${provider}/${model}` because that holds for 4,298 of 4,298 live entries, and
@@ -171,6 +175,47 @@ test("junk input yields null rather than throwing", () => {
 
 // --------------------------------------------------------------- the index
 
+test("loadCatalog really BUILDS the byAlias index, over the live bundle", () => {
+  // THE GAP THIS CLOSES, MEASURED. Deleting the alias-indexing line in
+  // `loadCatalog` -- the `for (const a of m.aliases ?? [])` loop that fills
+  // `byAlias` -- left all 491 tests green while `byAlias` went from 10,184
+  // entries to 0 and the guarded join dropped from 2,460 to 2,346 of 3,784
+  // pairs, 65.0% to 62.0%, silently.
+  //
+  // The cause is structural and would recur: `catalogOf` above RE-IMPLEMENTS the
+  // grouping in its own fixture builder, so the rung-1 alias test proves the
+  // LADDER consumes aliases and nothing proves PRODUCTION builds the index. The
+  // only fix is to call the real reader, which is what this does.
+  const catalog = loadCatalog();
+  assert.ok(catalog.byAlias instanceof Map, "loadCatalog must return a byAlias Map");
+  assert.ok(catalog.byAlias.size > 0,
+    "the bundle declares aliases[] and loadCatalog dropped every one of them");
+
+  // Each key must really be a declared alias of the entry it maps to -- a Map
+  // that is merely non-empty could be indexed on the wrong field.
+  let checked = 0;
+  for (const [alias, e] of catalog.byAlias) {
+    assert.ok(e?.aliases?.includes(alias), `${alias} maps to an entry that does not declare it`);
+    if (++checked >= 200) break;
+  }
+
+  // ...and it is LOAD-BEARING, not merely present: at least one live alias must
+  // resolve to a row that an otherwise-identical index without the alias map
+  // cannot reach. 59 such aliases exist in today's bundle; asserting the
+  // property rather than the count keeps this from breaking on a bundle refresh.
+  const withAlias = buildJoinIndex(catalog);
+  const withoutAlias = buildJoinIndex({ byProvider: catalog.byProvider,
+                                        generatedAt: catalog.generatedAt });
+  let decided = null;
+  for (const [alias, e] of catalog.byAlias) {
+    if (withAlias.byId.has(alias)) continue;           // an id, so not alias-decided
+    const hit = joinCatalogEntry(withAlias, e.provider, alias);
+    const miss = joinCatalogEntry(withoutAlias, e.provider, alias);
+    if (hit && (!miss || miss.id !== hit.id)) { decided = { alias, provider: e.provider }; break; }
+  }
+  assert.ok(decided, "no live alias changes the join's answer, so the index is doing nothing");
+});
+
 test("buildJoinIndex tolerates a catalog with no alias index", () => {
   // menu/catalog.mjs's tests construct `{byProvider, generatedAt}` by hand. The
   // join must degrade to id-and-tail matching rather than throwing on them.
@@ -310,11 +355,67 @@ test("hasPricedOffer: no offers at all is false, and never throws", () => {
   assert.equal(hasPricedOffer({ pricing: { offers: "nope" } }), false);
 });
 
-test("hasPricedOffer honours priceOf's `usable` rule: an unparseable offer is not a price", () => {
-  // The two copies of that rule must agree (the module comment says so). A
-  // non-numeric or half-present `per1MTokens` is not evidence of pricing, so a
-  // row carrying only such offers stays false -- otherwise junk in the bundle
-  // would resurrect the FREE? badge this guard exists to withhold.
+// THE AGREEMENT GUARD (rewritten 2026-09-07). The module comment says the two
+// copies of the `usable` rule "must be changed together" and nothing enforced
+// it: the test below this one is titled as an agreement test but never calls
+// `priceOf` -- every expectation in it is hardcoded against `hasPricedOffer`
+// alone. The rules DO agree today, coercion edges included, so this is a missing
+// guard rather than a live defect; it exists so a change to one copy fails.
+//
+// `priceOf`'s `usable` is not exported, and it does not need to be: it is
+// observable. An offer is usable exactly when `priceOf`, given an entry holding
+// only that offer, returns a price rather than null. Each offer is evaluated in
+// ISOLATION on purpose -- `usable` is a per-offer predicate, and putting two
+// usable offers in one entry would make `priceOf` answer null for a reason
+// (`.find()` ambiguity, #69) that has nothing to do with the rule under test.
+const OFFER_SHAPES = [
+  { why: "a real price", offer: { provider: "p", per1MTokens: { input: 0.1, output: 0.3 } } },
+  { why: "a genuine zero", offer: { provider: "p", per1MTokens: { input: 0, output: 0 } } },
+  { why: "numeric strings, non-zero", offer: { provider: "p", per1MTokens: { input: "0", output: "0.3" } } },
+  { why: "numeric strings, both zero", offer: { provider: "p", per1MTokens: { input: "0", output: "0" } } },
+  { why: "unparseable", offer: { provider: "p", per1MTokens: { input: "n/a", output: "n/a" } } },
+  { why: "output missing", offer: { provider: "p", per1MTokens: { input: 3 } } },
+  { why: "input missing", offer: { provider: "p", per1MTokens: { output: 3 } } },
+  { why: "no per1MTokens at all", offer: { provider: "p" } },
+  { why: "a null offer", offer: null },
+  { why: "a foreign host's price", offer: { provider: "other", per1MTokens: { input: 5, output: 5 } } },
+  { why: "no provider named", offer: { per1MTokens: { input: 1, output: 2 } } },
+];
+
+// priceOf's own verdict on one offer: usable AND carrying a non-zero value.
+const pricedByPriceOf = (offer) => {
+  const p = priceOf({ pricing: { offers: [offer] } }, offer?.provider ?? null);
+  return !!p && (p.in !== 0 || p.out !== 0);
+};
+
+test("hasPricedOffer agrees with priceOf's `usable` rule, shape by shape and pairwise", () => {
+  // Singly: the two copies must classify every offer shape identically.
+  for (const { why, offer } of OFFER_SHAPES) {
+    assert.equal(hasPricedOffer({ pricing: { offers: [offer] } }), pricedByPriceOf(offer), why);
+  }
+  // Pairwise: `hasPricedOffer` is array-wide, so it must be true exactly when AT
+  // LEAST ONE offer satisfies priceOf's rule with a non-zero value. This is the
+  // half that catches an `every`-for-`some` slip as well as a rule divergence.
+  for (const a of OFFER_SHAPES) {
+    for (const b of OFFER_SHAPES) {
+      assert.equal(
+        hasPricedOffer({ pricing: { offers: [a.offer, b.offer] } }),
+        pricedByPriceOf(a.offer) || pricedByPriceOf(b.offer),
+        `${a.why} + ${b.why}`);
+    }
+  }
+  // The table must actually contain both verdicts, or the loops above are
+  // asserting a constant.
+  const verdicts = new Set(OFFER_SHAPES.map((s) => pricedByPriceOf(s.offer)));
+  assert.deepEqual([...verdicts].sort(), [false, true]);
+});
+
+test("hasPricedOffer's absolute verdicts, pinned: an unparseable offer is not a price", () => {
+  // The agreement test above cannot catch an IDENTICAL change to both copies,
+  // so these stay as hardcoded expectations. A non-numeric or half-present
+  // `per1MTokens` is not evidence of pricing, so a row carrying only such
+  // offers stays false -- otherwise junk in the bundle would resurrect the
+  // FREE? badge this guard exists to withhold.
   assert.equal(hasPricedOffer({ pricing: { offers: [
     { provider: "x", per1MTokens: { input: "n/a", output: "n/a" } } ] } }), false);
   assert.equal(hasPricedOffer({ pricing: { offers: [
