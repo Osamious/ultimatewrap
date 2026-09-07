@@ -941,12 +941,36 @@ inks 2 of its 8 columns, and my trailing-space trim counted the other 6 as spare
 is valid at level 1 only because TVR always inks its full 3 — which is why that 68-of-75 figure
 stands and this one did not.
 
-So `W.refused = 3` plus a one-column gap after `health` lands at **74 of 75, with 1 spare** — it
-still fits, but the headroom is a quarter of what revision 2 claimed, and §2.3 reserves two columns
-at level 1 deliberately while this leaves one. Implementers should treat level 0 as effectively full.
-**Blank when zero**, so the column is quiet on a clean provider — positive-signal-only, the same
-discipline `capsOf` and `makeRoutableOf` already follow. The header gains `refused` derived from the
-same `W` constants as the row, as `menu-layout`'s derived-offset test requires.
+~~So `W.refused = 3` plus a one-column gap after `health` lands at **74 of 75, with 1 spare**~~ — that
+was revision 10's form, and it left level 0 effectively full with a single spare column against §2.3's
+two at level 1.
+
+**Revision 11 — no new column. The two counts share the existing one.** Instead of allocating
+`W.refused`, the existing **`W.count = 7`** cell renders `#MODELS/#WITHHELD` — `343/200` is exactly
+seven characters, so the count of what a provider offers and the count of what is being held back
+arrive in the space already reserved for the first. **Verified against `menu/style.mjs`:** `W.count`
+is 7 today, the level-0 row allocates `2 + 30 + 7 + 3 + 6 + 1 + 11 + 1 + 1 + 8 = 70 of 75`, and this
+change adds nothing to that sum. **Level 0 stays at 70 of 75 with 5 spare** rather than going to 74
+with 1, so §2.3's two-column reserve at level 1 is no longer the tighter of the two. The header cell
+still derives from the same `W` constants as the row, as `menu-layout`'s derived-offset test requires
+— but it now renames one existing cell rather than adding one, which is strictly less that test can
+disagree about.
+
+**Overflow is a real hazard here and must be guarded explicitly.** `rpad` runs `sanitizeDisplay(s, 7)`
+first, which **truncates from the right without any ellipsis**: measured,
+`sanitizeDisplay("1501/1501", 7)` returns **`"1501/15"`**. That does not look clipped — it reads as a
+plausible, wrong pair, which is precisely the failure
+[[uwpick-shows-latest-functional-state]] forbids, and it is worse than the blank cell it would
+replace. Any pair that cannot fit seven columns must be **abbreviated deliberately** (`1.5k/1.5k`
+does not fit either; `1k+/1k+` does) rather than left to the truncating pad. **Observable:** a
+fixture provider whose counts exceed seven columns renders a form that is either correct or visibly
+abbreviated, and **never a truncated number** — assert on the rendered string, since this is exactly
+the case a width-only assertion passes.
+
+**Blank when zero** is retained but changes shape with it: a provider withholding nothing renders the
+bare model count (`343`), not `343/0`. Positive-signal-only, the same discipline `capsOf` and
+`makeRoutableOf` already follow — the separator itself is the signal that something is being held
+back.
 
 **(b) A drill-in from inside the menu.** **ctrl+r (`c0 === 18`)** on a focused provider row.
 *(measured: bound control codes are 3, 6, 8/10/13/27/127 — 18 is free.)* A plain letter cannot be
@@ -956,6 +980,25 @@ already renders one modal from `v.legend`, dismissed by any key, and reusing tha
 new interaction model. Windowed with the existing `… N more` line if a provider ever exceeds the
 frame.
 
+**Revision 11 — the keystroke is kept and a visible entry point is added beside it.** The modal and
+the rejection of a third navigation level both stand; what does not stand is making the keystroke the
+*only* way in. **#51 exists because refusals are invisible, and an undiscoverable keybinding is not a
+fix for invisibility** — a user who never learns ctrl+r is in exactly the position the finding
+describes. So the **model level gains a `WITHHELD LIST` first row** which opens the same overlay. One
+overlay, two doors: a visible row for discovery and ctrl+r for speed, the same relationship the
+favourite toggle already has with its own control key.
+
+**Placement is at the model level deliberately**, and it is the same reasoning H3 used to extend
+ctrl+r there: a user who notices models missing is looking at a provider's model list, not at the
+provider index. The row sits **first**, above the model rows, where a reader scanning for "why is
+this list short" meets it before concluding the list is complete.
+
+**Vocabulary: `WITHHELD`, not `BLOCKED`.** See (c) below — the list is no longer predominantly a
+security-refusal log, and `BLOCKED` would misdescribe the 1,501-row population that now dominates it.
+The row is **suppressed entirely when the provider withholds nothing**, so it never appears as an
+empty promise; this is the same blank-when-zero discipline the count cell in (a) follows, and it is
+what keeps the addition positive-signal-only.
+
 **(c) Per refused id: the id as advertised, and the specific reason.**
 
 **Reasons have to be produced — `admitId` returns bare `null` for every failure.** A classifier is
@@ -963,6 +1006,47 @@ needed, and **this is where D2's inversion pays a second time**: R2 replaces an 
 *named rules*, so each refusal has a natural reason string (`escape-sequence`, `control-char`,
 `invisible`, `traversal`, `backslash`, `too-long`, `leading-separator`, `uw-namespace`), where an
 allowlist could only ever say "did not match". **R2 must land first**, and it does — Ship A.
+
+**Revision 11 — `refused[]` widens from "refused by `admitId`" to "withheld, with a reason", and
+this is the substantive change of the three.** As specified through revision 10 the list carries
+`admitId` refusals only. **R2 took that population to ~0 of 1,588 uwpick rows**: the 14 ids it was
+built to disclose are exactly the 14 R2 now admits. Shipped as written, the count cell in (a) would
+read blank on every provider, the overlay in (b) would open on nothing, and #51 would be closed by a
+feature that displays nothing. The fix is not to revert R2 — it is that the population was drawn too
+narrowly.
+
+**Measured populations, each with its denominator:**
+
+| class | population | shown today as |
+|---|--:|---|
+| refused by `admitId` | **~0 of 1,588** rows, after R2 | nothing |
+| **not routable / capped out** | **~1,501 of 1,588** rows *(~1,498 of these overlap the ~1,505 absent from `Providers[]`)* | dimmed, with no reason given |
+| listing-absent | unknown until R10 reports | nothing |
+
+**The middle row is the real population, and it is the one a user actually hits.** Its reason string
+is *"not in the routing table: provider capped at 3 models"*. A row that is dimmed with no
+explanation is the same defect as a row that is missing with no explanation — the user learns that
+they cannot have it and not why — so it belongs in this list on #51's own logic.
+
+**The reason must be able to change, because R11 largely eliminates this one.** Retiring the cap
+moves most of those ~1,501 rows into `Providers[]` and they stop being withheld at all. That is the
+point of R11 and is not a problem for this feature, but it does constrain the design: **the reason is
+data, not a fixed vocabulary of security codes**, and the feature has to stay meaningful when its
+largest current class empties out. After R11 the surviving classes are the `admitId` refusals, the
+listing-absent rows, and whatever cap or filter remains — smaller, and still the honest answer to the
+question the overlay exists to answer.
+
+**This reframes the feature, and the framing should be recorded rather than left implicit.** It is
+less a *security-refusal log* than a **"why can't I use this row" explanation**. That is why the
+user-facing wording is **withheld** rather than *blocked*: `blocked` implies a defensive judgement
+about a hostile id, which is accurate for ~0 of the rows and misleading for ~1,501 of them.
+Internal identifiers may keep whatever names they already have; this constrains what the user reads.
+
+**`fatal` collisions are explicitly NOT part of this list, and must not be folded in later.** A
+bare-id collision **halts the entire run** — it does not hide one model from one provider. It
+therefore belongs in the run's own output, where it already is, and putting it in a per-provider
+withheld list would misrepresent a whole-config abort as one provider's missing row. This paragraph
+exists so the question is answered before someone reasonably asks it.
 
 **Revision 2 called the detail view "the one place in the product that renders a hostile string".
 That was wrong, and the older egress is already open** *(G1, now #52)*. `menu/denylist.mjs:132`
@@ -1206,10 +1290,25 @@ The three `#53` observables:
   exact match. A case-insensitive-only implementation reports a safe ambiguity here and passes
   observable (1).
 - **(3) the whitespace case (A1)** — relay absent, a lone reseller advertising `" opus"`, production
-  `realIds` → `fatal: true`. This one **cannot fail on `main`**, because `admitId` still rejects the
+  `realIds` → `fatal: true`. ~~This one **cannot fail on `main`**, because `admitId` still rejects the
   id there; it becomes reachable only once R2 inverts the allowlist. Assert it in Ship 0 anyway —
   Ship 0 is where the guard is made faithful to `resolve()`, and a test that goes live when a later
-  ship lands is the only kind that can catch a two-ship hazard.
+  ship lands is the only kind that can catch a two-ship hazard.~~
+
+  **Corrected, revision 11 (#78) — this was filed as a wrong *prediction*, and R2 has since landed,
+  so it is now a wrong *description of shipped code*.** Observable (3) does **not** become reachable
+  when R2 inverts the allowlist, and it never will: R2 denies **whitespace anywhere** by name,
+  precisely because inverting to a denylist would otherwise have dropped that protection silently.
+  Measured against shipped source: `admitId(" opus")`, `admitId("opus ")` and `admitId("o pus")` all
+  return `null`. A whitespace-bearing id cannot reach the collision guard at all, so observable (3)
+  is **permanently unreachable, not merely deferred**.
+
+  **What to do with the test.** Keeping it as written yields an assertion that can never fail — the
+  species this plan's own rule 15a forbids, since a test that cannot fail makes a real regression
+  indistinguishable from a passing suite. Re-point it at the boundary that actually holds the
+  property: assert that **`admitId` rejects the whitespace id**, which is where the defence now
+  lives, rather than that the guard fires on an id that can never arrive. The two-ship hazard the
+  original bullet worried about is closed by construction, not by a deferred test.
 
 **Re-derived after the B1 fix, and every row below was run** *(measured at implementation; the table
 this replaces was written before entry-counting existed and had two rows that were one program)*:
@@ -1380,8 +1479,15 @@ legal mid-id (`groq/openai/gpt-oss-20b`). Keep `admitId`'s contract (reject, nev
 `CTRL` is `[\x00-\x1f\x7f-\x9f]`; space is `0x20`, outside it. `admitId(" opus")` returns `null`
 today only because the *allowlist* anchors on an alphanumeric — so inverting to a denylist **removes
 that protection silently** unless whitespace is denied by name. Zero real ids carry whitespace, and
-Ship 0's observable (3) is the test that goes live the moment this task lands. This is the one row in
-the table whose omission is a security regression rather than a reach cost.
+~~Ship 0's observable (3) is the test that goes live the moment this task lands.~~ This is the one row
+in the table whose omission is a security regression rather than a reach cost.
+
+*(Corrected, revision 11 (#78). The struck sentence is the inverse of what this row does. Denying
+whitespace is what makes Ship 0's observable (3) **permanently unreachable** — a whitespace-bearing
+id is refused at admission and never reaches the collision guard, so the guard can never be observed
+firing on one. Measured on shipped source: `admitId(" opus")` returns `null`. The correct reading is
+that this row **retires** observable (3) rather than arming it; see the corrected bullet in the `#53`
+observables above for what that test should assert instead.)*
 
 *(Correction carried from review: `CLAUDE` resolves to `~/.local/bin/claude.exe`, a real executable
 spawned `shell: false` — there is no `.cmd` shim, so the shell-metacharacter half of the original
@@ -1503,16 +1609,48 @@ a label histogram is satisfied by relabelling alone while the top-3 silently mov
   can only shed such rows, never gain them (measured: 0 gain, 25 lose). It was also self-referential —
   written in terms of the function whose blind spot decides the answer. **Replaced by:**
 
-  > **No provider's top-3 acquires a row whose `modalities.output` contains any modality other than
-  > `"text"`.**
+  > ~~**No provider's top-3 acquires a row whose `modalities.output` contains any modality other than
+  > `"text"`.**~~ **Withdrawn — revision 11. See below.**
 
-  Verified against the real bundle *(measured this session)*: **fires on google only** —
-  `lyria-3-pro-preview` and `lyria-3-clip-preview` — with **zero false positives**. It works because
-  it never decides what a model *is*; it asks only whether R3 made a provider worse, which the schema
-  can answer. **`acquires`, not `contains`**: providers whose entire catalogue is generators
-  (aws-polly, elevenlabs, voyage, fal-ai, and the `auto` routers) have a top-3 that cannot avoid them,
-  and that is not R3's doing. *(I count 33 such providers ignored; the team lead counted 25 — a
-  definitional difference in "pre-existing", not in what the gate fires on.)*
+  **Revision 11 — the replacement above is itself mis-specified, and the defect is in the
+  observable, not in the code.** Three problems, all measured, and the second is the one that makes it
+  unusable:
+
+  - **It is ambiguous.** *"Acquires"* reads two ways — absolute (any such row is present in a top-3)
+    or delta (a row present now that was not before). The two readings disagree, and only the
+    delta reading was intended.
+  - **Under the absolute reading it can never pass.** `nscale`'s entire catalogue is image models;
+    `aws-polly`, `voyage`, `elevenlabs`, `fal-ai` and `fireworks-ai-embedding-models` likewise hold
+    no text-output row anywhere. Their top-3 is non-text **by construction**, and rule 1 — never
+    prune a responding provider — keeps those rows deliberately. A gate that fails on them is
+    measuring the catalogue, not the change.
+  - **The strict predicate — "contains any modality other than text" — flags a model it must not.**
+    `openai/gpt-5-nano` declares `["image", "text"]`: a text model that also emits images. Demoting
+    it would be a straightforward reach loss.
+
+  **The corrected observable, and the one to implement:**
+
+  > **A loose predicate — `modalities.output` lacks `"text"` entirely — evaluated only over
+  > providers that hold at least one text-output row.**
+
+  Both halves earn their place. **Loose, not strict**, so a multi-modal text model like
+  `openai/gpt-5-nano` is not flagged for emitting images alongside text. **Scoped to text-holding
+  providers**, so a provider with no text models anywhere is out of scope rather than a permanent
+  failure. The gate then fails **exactly when ranking is at fault** and not when a provider simply
+  has nothing text-shaped to rank — which is what a gate on R3 is for.
+
+  **The measured state today, every number with its denominator** *(this is the count
+  `keysync/keysync.mjs`'s `buildProviders` comment also carries; the two must not drift)*: **4 of 44
+  built providers and 5 of 83 picker rows** carry a row whose `modalities.output` holds a modality
+  other than text — `openrouter/auto` and `kilo/auto` (`["image", "text"]`), `openai/gpt-5-nano`
+  (`["image", "text"]`), and `nscale/flux.1-schnell` and `nscale/stable-diffusion-xl-base-1.0`
+  (`["image"]`). Under the **corrected** predicate the first three carry `"text"` and are not
+  flagged, and the two `nscale` rows fall outside the scope because `nscale` holds no text-output row
+  — so the corrected gate is **satisfiable on today's data**, which the strict one was not.
+
+  **This must not be "fixed" by making the old gate pass.** Pruning `nscale`'s rows to turn the
+  number green would violate [[responding-provider-never-pruned]] for a metric's sake. The number
+  above is the honest reading; the gate is what changes.
 
 - **The failure it exists to catch, which revision 4's criterion reported as clean:**
 
@@ -2488,6 +2626,32 @@ third, the `discovery` candidates. All three are collected onto the provider row
 unchanged. `buildFrom` does not re-sanitise and does not reconstruct the shape: there is one safe form
 and this consumes it (§2.5, G1/#52).
 
+**Revision 11 — this task is the producer for the widened population, and those three sites are no
+longer the whole of it.** Per §2.5(c), `refused[]` now means **withheld with a reason**, not
+`admitId`-refused. The three `admitRemoteModels` sites above contribute **~0 of 1,588 rows** after R2
+and remain correct as far as they go; the class that actually populates the list is the **~1,501
+rows that are not routable because the provider is capped**, carrying the reason *"not in the routing
+table: provider capped at 3 models"*. `buildFrom` is where both are known — it is the function that
+decides which candidates become `models[]` — so it emits both into the same array, in the same
+`{id, reason, removed}` shape. `removed` is `0` for a withheld-but-unsanitised row; the field means
+"code points stripped", and nothing was stripped from an id that was simply not selected.
+
+**The complementarity property is what makes the count in §2.5(a) meaningful and it must hold across
+the widening:** every candidate ends up in exactly one of `models[]` or `refused[]`, never both and
+never neither. That is a stronger statement than revision 10's and it is the one to assert.
+
+**Observables for the widened list** *(revision 11)*:
+
+- a provider capped at 3 with more candidates emits the surplus into `refused[]` with the **cap
+  reason**, and `models.length + refused.length` equals the candidate count — the complementarity
+  property stated directly;
+- an id refused by `admitRemoteModels` still appears with its **own** reason, not the cap reason —
+  the discriminator that fails if the widening flattens every reason to one string;
+- a provider withholding nothing emits `refused: []`, not a missing key;
+- **the reason is carried as data, not matched against a closed set** — assert that a reason string
+  this task does not itself produce survives to the row unchanged, because R11 retires the cap reason
+  and the feature must outlive it.
+
 *(Revision 2, C2. Revision 1 had this task carry provenance without anything computing it — see
 §1.5a.)* Two new inputs on `buildFrom`, both defaulted so every existing test keeps working:
 
@@ -2646,6 +2810,28 @@ migration, not two. It carries the same `?? null` / explicit-array discipline as
 absent-vs-empty distinction here would make "nothing was refused" indistinguishable from "nobody
 looked". Assert `Object.hasOwn(row, "refused")` on every serialized provider.
 
+**Revision 11 — the field is unchanged, its contents widen, and the vocabulary assertion has to be
+rewritten rather than dropped.** Per §2.5(c) and R14, `refused[]` now carries **withheld-with-a-reason**
+rows — dominated by the ~1,501 capped-out rows — not `admitId` refusals alone. The `2 → 3` bump is
+still one migration and the `Object.hasOwn` assertion still stands as written.
+
+**What changes is how the reason is checked, and this is the part that is easy to get wrong.** The
+provenance field beside it is asserted **as a closed set**, because its five values are the schema.
+`reason` is **not** a closed set: R11 retires the cap reason and later work may add others, so an
+accepted-set assertion over reasons would have to be edited on every such change and would fail for
+the wrong cause. Assert the **shape and the floor** instead, so the observable still fails if the
+vocabulary regresses:
+
+- every element of `refused[]` has **all three** of `id`, `reason`, `removed`, with `reason` a
+  **non-empty string** — the assertion that fails if a widened producer starts emitting bare ids, or
+  `null`, or `""` for the classes that have no security code;
+- `removed` is a **number** on every element, including the withheld-but-unsanitised rows where it is
+  `0` — so "nothing was stripped" stays distinguishable from "nobody counted";
+- **at least two distinct reason strings survive a round-trip** over a fixture holding both a capped
+  row and an `admitId`-refused row — the observable that fails if serialization flattens the widened
+  population back to a single reason, which is the specific regression the widening invites;
+- `refused[]` round-trips **`[]` as `[]`**, never as absent and never as `null`.
+
 **A third field rides the same migration: the real modality** *(B3, #43 + #38)*. R14 introduces the
 listing's `capability` — which **is** the per-model modality #43 asks for — and revision 3 spent it
 only on overriding a three-valued `outputKind`, so the `ctx` cell keeps rendering `"nochat"` for
@@ -2718,14 +2904,34 @@ observables:
   **39 blind today**) and `thinking` (62 rows, **22 blind today**) yields zero blind rows, with a
   match inside the elided middle signalled by colouring the marker.
 
-**#51 addition — the persistent provider-level indicator (§2.5(a)).** `W.refused = 3` plus a
+**#51 addition — the persistent provider-level indicator (§2.5(a)).** ~~`W.refused = 3` plus a
 one-column gap after `health`. The level-0 row **allocates 70 of 75**, so this lands at **74 with 1
-spare** (G4/M12 — not the 68-of-75 revision 2 claimed). **Blank when the count is zero.** The header
-cell derives from the same `W` constants as the row — `menu-layout`'s derived-offset test asserts
-they agree rather than trusting it, which is the test that caught the previous off-by-one.
+spare** (G4/M12 — not the 68-of-75 revision 2 claimed).~~
 
-Extra observables: a provider with zero refusals renders a **blank** cell, not `0`; a provider with
-refusals renders the count; and the level-0 frame still measures exactly 78 in both glyph sets.
+**Revision 11 — no new column; the existing `W.count` cell carries both numbers.** Per §2.5(a), the
+seven-column model-count cell renders `#MODELS/#WITHHELD` — `343/200` is exactly seven characters.
+`W.refused` is **not** added and no gap is opened after `health`. **The level-0 row stays at its
+current 70 of 75, with 5 spare**, so this task no longer consumes the level-0 headroom at all. The
+header cell still derives from the same `W` constants as the row — `menu-layout`'s derived-offset
+test asserts they agree rather than trusting it, which is the test that caught the previous
+off-by-one — but it now **renames** one cell rather than adding one.
+
+**#51 addition — the visible entry point (§2.5(b)).** The model level gains a **`WITHHELD LIST`
+first row**, above the model rows, opening the same overlay ctrl+r opens. Suppressed entirely when
+the provider withholds nothing. The wording is **`WITHHELD`, not `BLOCKED`** — §2.5(c) records why:
+the population is dominated by capped-out rows, not hostile ids.
+
+Extra observables *(revision 11)*:
+
+- a provider withholding nothing renders the **bare model count** (`343`), not `343/0` and not a
+  blank cell — the count itself is never suppressed, only the second half;
+- a provider withholding rows renders **both numbers with the separator**;
+- **counts that exceed seven columns render correct-or-visibly-abbreviated, never truncated** —
+  measured, `sanitizeDisplay("1501/1501", 7)` returns `"1501/15"`, a plausible wrong pair rather than
+  a visibly clipped one, so this must be asserted **on the rendered string** and not on width alone;
+- the `WITHHELD LIST` row is **absent** on a provider withholding nothing and **present and focusable**
+  on one that withholds;
+- the level-0 frame still measures exactly 78 in both glyph sets.
 
 ---
 
@@ -2756,6 +2962,42 @@ refusals renders the count; and the level-0 frame still measures exactly 78 in b
   placed after the esc ladder, esc falls through and clears the filter instead of closing the
   overlay;
 - **one projection**, `refusals` into the view object beside `legend`.
+
+**Revision 11 — a second door onto the same overlay, and the reducer does not grow to carry it.**
+Per §2.5(b), the model level gains a visible **`WITHHELD LIST`** first row. Selecting it sets the
+**same `state.refusals` field** the ctrl+r binding sets, so this is a second *entry point*, not a
+second mechanism: no new nullable field, no new modal rule, no new projection. The four-part budget
+above is unchanged, and that is the reason to build it this way rather than as its own view.
+
+- **The row is not a model row and must not be treated as one.** It cannot be favourited, cannot be
+  selected as a model, and does not enter the filter's match set — a filter that hides it while
+  models remain is fine, but a filter that *matches* it as though it were a model id is a defect.
+- **It is suppressed entirely when the provider withholds nothing**, which keeps ctrl+r's existing
+  "no-op when the count is zero" rule and the row's presence saying the same thing. An overlay that
+  cannot open and a row that opens it must never disagree.
+- **Wording is `WITHHELD`, not `BLOCKED`** *(§2.5(c))*, and the overlay's own heading matches it.
+
+**The overlay's contents widen with `refused[]`** — it now lists withheld rows of every class, each
+with its reason, not `admitId` refusals alone. Two consequences for this task: the reason column must
+render an **arbitrary reason string** rather than switch on a known set, and the overlay must **stay
+correct when its dominant class empties** — R11 retires the cap reason that supplies ~1,501 of the
+rows, and an overlay written around that one string breaks when it goes.
+
+**`fatal` collisions never appear here** *(§2.5(c))*. They abort the run rather than hide a model, and
+they belong in the run's output. This is stated in the task, not only in §2.5, because the overlay is
+where someone would most plausibly add them.
+
+**Revision 11 observables** *(in addition to those below)*:
+
+- the `WITHHELD LIST` row opens the overlay on the provider being viewed, and the resulting
+  `state.refusals` is **indistinguishable from** the one ctrl+r produces for the same provider — the
+  assertion that fails if the two doors diverge into two mechanisms;
+- the row is **absent** when the provider withholds nothing, and ctrl+r is a no-op on that same
+  provider — asserted together, since they are one fact;
+- the row is **not selectable as a model** and does not appear in the filter's match set;
+- an overlay row carrying a reason string **the reducer does not know** renders that string
+  unchanged — the observable that fails if the renderer switches on a closed vocabulary, and the one
+  that keeps this working after R11.
 
 That is the whole of it: **one nullable object, one binding, one modal rule, one projection.** No new
 level, no change to the esc ladder, no change to filtering.

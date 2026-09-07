@@ -23,7 +23,7 @@ numbers since re-measured. They are recorded here only so a planner recognises a
 | "~0 capable / 3,720 weak" | ~80% classified, ~20% weak | that was the live-only scenario, which D3 rejects |
 | "the other 23 providers hold one model each" | **22 providers, 1,374 live models, 77% join** | the "one row" described UW's current *output* under bundle-only discovery, not those providers' inventory. `nousresearch` alone lists 390 |
 | "1,281 phantoms" | ~738 unjoined of 3,784; phantom count is a separate quantity not re-measured | different denominators; the phantom set is bundle-rows-absent-from-live, measured per provider in the discovery pass |
-| "`MAX_MODELS_PER_PROVIDER` bounds reach" | contributes **0 to uwpick**, but is the **sole size control on `built.picker`** *(measured; row corrected 2026-09-06)* | `menu/catalog.mjs:buildFrom` emits every catalogue entry uncapped, so uwpick's 1,588 rows are unaffected. But the same constant at `keysync.mjs:553` caps `built.picker` at 3/provider — 83 rows, 44 providers, **18 of them exactly at the cap**. See §6 |
+| "`MAX_MODELS_PER_PROVIDER` bounds reach" | contributes **0 to uwpick**, but is the **sole size control on `built.picker`** *(measured; row corrected 2026-09-06)* | `menu/catalog.mjs:buildFrom` emits every catalogue entry uncapped, so uwpick's 1,588 rows are unaffected. But the same constant — `keysync.mjs`'s `MAX_MODELS_PER_PROVIDER` — caps `built.picker` at 3/provider — 83 rows, 44 providers, **18 of them exactly at the cap**. See §6 |
 
 ---
 
@@ -245,9 +245,17 @@ demands it in its own voice. Both attribute it — [[route-max-working-models]] 
 **recommends** replacing the bundled catalogue …"* — and that same pillar bounds it in the next
 breath: *"Blocking, capping, hiding and pruning all need affirmative justification and irrefutable
 evidence."* The load-bearing one: read as a candidate **rule**, "the candidate source is the live
-listing" **prunes** a provider whose listing returns empty — `keysync/keysync.mjs:558-564`'s
-`!models.length` skip `continue`s before the `out.push` — which is precisely what the two bullets
-above forbid.
+listing" **prunes** a provider whose listing returns empty — the `!models.length` skip in
+`keysync/keysync.mjs`'s `buildProviders` `continue`s before that function's `out.push` — which is
+precisely what the two bullets above forbid.
+
+*(Citation form, revision 11. Every reference to this skip below names the **symbol**, not a line
+range. The three sites that carried `keysync.mjs:558-564` were correct when written at `78c0990` and
+were broken by R3 and R4 in this same branch, which added ~110 lines above them and moved the skip to
+`:709`; a reader following the old number landed in `normalizeModel`'s JSDoc and found no `continue`
+at all. Four more tasks write this file before the branch ends, so re-numbering buys one ship's
+accuracy and re-breaks immediately. This follows the precedent commit `5f7c851` already set for this
+repo — "cite symbols, because these line numbers were stale on arrival".)*
 
 **The heading asserted one rule while the body specified another, and D5's routing clause inherited
 the heading's framing** rather than the body's. That is the path by which #58's pruning defect
@@ -339,9 +347,9 @@ proxy can **promote a row to the capable target**. A reader taking the three row
 believe an absent `reasoning` can only ever yield the weak target. It cannot only ever.
 
 **Footprint today: 3 of 83 rows**, and they are the same three the source comment at
-`keysync/keysync.mjs:207-213` already enumerates when it justifies `>=` over `>` at the boundary —
-`cerebras/llama3.1-8b` (exactly 128000), `cloudflare/granite-4.0-h-micro` (131000),
-`sambanova/gemma-4-31b-it` (131072). The classifier itself is `keysync/keysync.mjs:234-241`.
+`keysync/keysync.mjs`'s `CTX_CAPABLE_MIN` already enumerates when it justifies `>=` over `>` at the
+boundary — `cerebras/llama3.1-8b` (exactly 128000), `cloudflare/granite-4.0-h-micro` (131000),
+`sambanova/gemma-4-31b-it` (131072). The classifier itself is that file's `bucketFor`.
 
 **This is not the id-string inference this section forbids.** `contextTokens` is a *measured field* on a
 joined row, and it is used only where `reasoning` is absent. The prohibition below is on reading
@@ -399,7 +407,7 @@ mode before the join's ceiling is known.
 *(measured)* 3,720 models across
 45 providers is 100 KB minified; CCR builds no index over `Providers[].models` at startup
 (`gatewayModels` comes from `Sd()`, virtual profiles only), so startup cost is zero. It breaks
-nothing on the 15-site consumer list — `validate()`'s tie at `keysync.mjs:724-729` is a **subset**
+nothing on the 15-site consumer list — `keysync.mjs`'s `validate` ties them with a **subset**
 assertion (`picker ⊆ models`), which widening *relaxes*. Independently shippable.
 
 This is the B2 fix: ~1,501 rows currently resolve to `undefined` and fall through CCR policy 7 to
@@ -422,14 +430,15 @@ This amends a locked decision, so it is recorded rather than edited silently.
 **What step 1 used to say, and why it was wrong.** It read *"widen `Providers[].models` to **every
 discovered model**."* The intent — stop sizing routing from a cap of 3 — was right and is untouched.
 But taken as the candidate **rule**, it removes a provider whose listing returns empty: in
-`keysync/keysync.mjs:558-564` the `!models.length` skip does a `continue` **before** the `out.push`,
-so an empty candidate list drops the provider from `Providers[]` **entirely** rather than dimming it.
+`keysync/keysync.mjs`'s `buildProviders` the `!models.length` skip does a `continue` **before** that
+function's `out.push`, so an empty candidate list drops the provider from `Providers[]` **entirely**
+rather than dimming it.
 Four providers fall in on this branch's own data — `tabiai` and `gorouter` (HTTP **200** with
 `data: []`), `youcom` and `githubcopilot` (`listing: null`). Two of them answer.
 
 *(Consistency note, 2026-09-06. Those four are the four **discovery** outcomes. Only `tabiai` and
-`gorouter` can reach `buildProviders` at all: `filterRegistry` — `keysync/keysync.mjs:31-37`, the
-generic exclusion at `:36` — drops `youcom` and `githubcopilot` on `protocol: "generic"` first, as D6
+`gorouter` can reach `buildProviders` at all: `keysync/keysync.mjs`'s `filterRegistry`, on its
+`protocol: "generic"` exclusion, drops `youcom` and `githubcopilot` first, as D6
 already records. **The amendment above is unaffected**; the candidate rule is still the union, and it
 would still prune two live, responding providers. This note exists so a test written from this
 paragraph asserts the two providers that can actually be lost rather than four.)*
@@ -441,7 +450,7 @@ surface, never a reason to stop routing. The union is the same candidate rule D3
 implies and the same one the display path builds, so routing and display now agree by construction.
 
 **Nothing else about step 1 moves.** The measured figures, the zero startup cost, the `subset`
-argument at `keysync.mjs:724-729`, the B2 fix above, and step 1's independent shippability are all
+argument in `keysync.mjs`'s `validate`, the B2 fix above, and step 1's independent shippability are all
 unchanged: a union is a superset of the discovered set, so every consequence measured for the wider
 set still holds.
 
@@ -452,11 +461,11 @@ a separate risk profile:
 
 | site | why it breaks on a narrower picker |
 |---|---|
-| `keysync.mjs:811 reconcileUserModelPin` | deletes the user's saved pin if absent — must be fed the **routable** set |
-| `run.mjs:583-586 --verified-only` | filters `providers[].models` *by* surviving picker rows — backwards coupling, must be inverted |
-| `run.mjs:885-891 anchorModel` | falls back to `built.picker[0]`, silently repointing all six CCR profile tiers |
-| `run.mjs:1087 assertOptionsComplete` | V7 forbids dropping a row at the write site — `options[]` is the only `behavesAs` channel, so curation must happen upstream of `built.picker` |
-| `keysync.mjs:724-729` / `phase5-statics.mjs:73` | subset assertions; safe in this direction but must be re-read |
+| `keysync.mjs` `reconcileUserModelPin` | deletes the user's saved pin if absent — must be fed the **routable** set |
+| `run.mjs` `--verified-only` | filters `providers[].models` *by* surviving picker rows — backwards coupling, must be inverted |
+| `run.mjs` `anchorModel` | falls back to `built.picker[0]`, silently repointing all six CCR profile tiers |
+| `run.mjs` `assertOptionsComplete` | V7 forbids dropping a row at the write site — `options[]` is the only `behavesAs` channel, so curation must happen upstream of `built.picker` |
+| `keysync.mjs` `validate` / `phase5-statics.mjs` T1.3 | subset assertions; safe in this direction but must be re-read |
 
 **B4/B5 ambiguity blocks nothing** *(measured)*. Every UW-written selector is `provider/model` and
 resolves at B2. At width, 667 bare ids are ambiguous and **all fail closed**; Claude-shaped
@@ -480,8 +489,9 @@ error in this document that a task inherited.** The word "picker" names two diff
 | **uwpick** | `menu/catalog.mjs:buildFrom` → `menu/snapshot.mjs` | 1,588 | **no** |
 | **native `/model`** — `built.picker` → `modelPicker.options[]` | `keysync.mjs:buildProviders` | 83 | **yes, by this constant** |
 
-`keysync.mjs:532-618` builds **one** array: `models` is capped at `:553`, then feeds routing at
-`:570` *and* one picker row each at `:575-618`. Measured against `keysync/built-rows.json`: **83
+`keysync.mjs`'s `buildProviders` builds **one** array: `models` is capped by
+`MAX_MODELS_PER_PROVIDER`, then feeds **both** the routing entry *and* one picker row each, in the
+same pass. Measured against `keysync/built-rows.json`: **83
 rows, 44 providers, max 3 per provider, 18 of the 44 sitting exactly at the cap**, and those 18
 hold 1,555 catalogue entries between them. The cap site's own comment states the purpose the
 original wording denied: *"Curate rather than dump: the picker is a flat list and 44 providers x
@@ -515,9 +525,9 @@ This amends a locked decision, so it is recorded rather than edited silently.
 
 **What the amended decision used to say, and why it was wrong.** The routing clause read *"routing
 takes the uncapped **discovered set**."* Retiring the cap is right and is untouched. But "the
-discovered set" is a candidate **rule**, and as a rule it prunes: in `keysync/keysync.mjs:558-564`
-the `!models.length` skip does a `continue` **before** the `out.push`, so a provider whose listing
-returns empty leaves `Providers[]` **entirely** instead of being dimmed. That is the identical defect
+discovered set" is a candidate **rule**, and as a rule it prunes: in `keysync/keysync.mjs`'s
+`buildProviders` the `!models.length` skip does a `continue` **before** that function's `out.push`,
+so a provider whose listing returns empty leaves `Providers[]` **entirely** instead of being dimmed. That is the identical defect
 corrected in D4 step 1 above, and a direct [[responding-provider-never-pruned]] violation — a
 listing, auth or billing failure is state to surface, never a reason to stop routing. The two
 providers it reaches are `tabiai` and `gorouter`, both of which answer with HTTP **200**.
