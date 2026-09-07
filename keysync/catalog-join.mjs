@@ -261,3 +261,54 @@ export function priceOf(entry, providerName = null) {
   const usables = offers.filter(usable);
   return usables.length === 1 ? take(usables[0]) : null;
 }
+
+// ----------------------------------------------- is there a price at all (#55)
+//
+// ADDED BY R5b, BESIDE `priceOf` AND DELIBERATELY NOT INSIDE IT. `priceOf`
+// reports the bundle faithfully -- a `0/0` offer is a `0/0` offer -- and whether
+// that zero means "free" or "no price was recorded" is the CALLER's question.
+// Two callers ask it: keysync's `inferTier` and the menu's `badgeOf`. They share
+// this predicate so #55 is implemented once rather than twice.
+//
+// THE FINDING (#55). The bundle encodes "not priced per token" as
+// `{input: 0, output: 0}` under a token `sourceUnit` -- shape-identical to a
+// genuine free tier. The only discriminator the record carries is CONTRAST:
+// another offer on the same entry naming a real price proves the bundle does
+// hold pricing for this model, which makes the zero a fact about the model
+// rather than a hole in the data.
+//
+// THE WHOLE ARRAY, NOT THE MATCHED OFFER, and that is load-bearing rather than
+// incidental. `priceOf` picks one offer with `.find()`, so on
+// `mistral/labs-devstral-small-2512` -- offers `[mistral 0/0, mistral 0.1/0.3]`,
+// MEASURED against the live bundle 2026-09-07 -- the matched offer IS 0/0 while
+// the entry is genuinely priced. A predicate reading only the matched offer
+// would blank the single row (1 of the 124 `FREE?` in the picker's 1,588-row
+// corpus) that must keep its badge.
+//
+// WHAT A `false` DOES NOT MEAN. `true` is proof of pricing. `false` is EVIDENCE
+// OF ABSENCE AND NOT PROOF OF IT, because an entry with no non-zero offer has
+// nothing to contrast against. The measured exception is a provider's `auto`
+// routing mode, which may be offered free of charge -- then `0/0` is a true
+// statement about the product rather than missing data. MEASURED 2026-09-07:
+// `kilo/auto`, `llmgateway/auto` and `orcarouter/auto` each carry exactly one
+// `0/0` offer, and nothing in the record distinguishes them from a moderation
+// endpoint the bundle never priced; `morph/auto` proves the same shape can be
+// genuinely priced (0.85/1.55). Deciding between the two needs row-type
+// information this entry does not carry -- that is #75's territory and is NOT
+// settled here. So a caller may use `false` to WITHHOLD a claim, never to make
+// the opposite one.
+//
+// The `usable` rule below RESTATES `priceOf`'s instead of sharing it: R5
+// relocated `priceOf` byte-for-byte and its body is frozen by that contract, so
+// the duplication is deliberate. The two copies must be changed together.
+export function hasPricedOffer(entry) {
+  const offers = entry?.pricing?.offers;
+  if (!Array.isArray(offers)) return false;
+  return offers.some((o) => {
+    const p = o?.per1MTokens;
+    if (!p) return false;
+    const inn = Number(p.input), out = Number(p.output);
+    if (!Number.isFinite(inn) || !Number.isFinite(out)) return false;
+    return inn !== 0 || out !== 0;
+  });
+}

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildJoinIndex, joinCatalogEntry, priceOf } from "../keysync/catalog-join.mjs";
+import { buildJoinIndex, joinCatalogEntry, priceOf,
+         hasPricedOffer } from "../keysync/catalog-join.mjs";
 import { priceOf as priceOfViaMenu } from "../menu/catalog.mjs";
 
 // A hand-written bundle in the real schema's shape. Every `id` is
@@ -225,4 +226,104 @@ test("a same-provider offer pair resolves by array order, and must keep doing so
   assert.deepEqual(priceOf(row, "mistral"), { in: 0, out: 0 });
   // No provider named: two usable offers cannot be told apart, so null.
   assert.equal(priceOf(row), null);
+});
+
+// ------------------------------------------------ hasPricedOffer (R5b, #55/#67)
+//
+// The predicate both #55 callers share. Every fixture below is a real live shape
+// rather than an invented one, and each names the row it was copied from --
+// MEASURED against the bundle (`generatedAt` 2026-08-24T12:22:28.162Z) on
+// 2026-09-07, the same read the module comment cites.
+
+test("hasPricedOffer: every offer zero is the #55 price-absence shape, so false", () => {
+  // The 123-row majority. `openai/omni-moderation-latest` is priced per request,
+  // not per token, and the bundle records that as a token price of zero -- the
+  // exact shape a genuine free tier has.
+  assert.equal(hasPricedOffer({ pricing: { offers: [
+    { provider: "openai", per1MTokens: { input: 0, output: 0 },
+      sourceUnit: "usd_per_1m_tokens" },
+  ] } }), false);
+});
+
+test("hasPricedOffer reads the WHOLE array, not the offer priceOf matched", () => {
+  // THE DISCRIMINATOR, and the task fails without it. `mistral/labs-devstral-
+  // small-2512` carries [mistral 0/0, mistral 0.1/0.3]; `priceOf` returns the
+  // FIRST by `.find()`, so the matched offer is 0/0 while the entry is genuinely
+  // priced. A predicate reading only the matched offer answers `false` here and
+  // blanks the one row in the live corpus that must keep its badge.
+  const genuine = { pricing: { offers: [
+    { provider: "mistral", per1MTokens: { input: 0, output: 0 },
+      sourceUnit: "usd_per_1m_tokens" },
+    { provider: "mistral", per1MTokens: { input: 0.1, output: 0.3 },
+      sourceUnit: "usd_per_token_for_token_fields" },
+  ] } };
+  assert.equal(hasPricedOffer(genuine), true);
+  assert.deepEqual(priceOf(genuine, "mistral"), { in: 0, out: 0 },
+    "the matched offer really is the zero one -- that is what makes this a discriminator");
+});
+
+test("hasPricedOffer is array-wide, not provider-scoped: a foreign price still counts", () => {
+  // A non-zero offer ANYWHERE proves the bundle holds pricing for this model, so
+  // my provider's zero is a fact about the model rather than a hole in the data.
+  // Whether that zero is MINE to pay is priceOf's question, and it stays there.
+  assert.equal(hasPricedOffer({ pricing: { offers: [
+    { provider: "mine", per1MTokens: { input: 0, output: 0 } },
+    { provider: "someone-else", per1MTokens: { input: 5, output: 5 } },
+  ] } }), true);
+});
+
+test("hasPricedOffer: a free routing mode is INDISTINGUISHABLE here, and that is the known limit", () => {
+  // The exception the predicate cannot see, pinned in the source so it is visible
+  // rather than folded away. Providers may offer an `auto` routing mode free of
+  // charge; then `0/0` is a true statement about the product, not missing data.
+  // But a free mode has no non-zero offer to contrast against, so #55's
+  // discriminator reads it exactly like an unpriced row.
+  //
+  // MEASURED 2026-09-07: `kilo/auto`, `llmgateway/auto` and `orcarouter/auto`
+  // each carry one 0/0 offer; `morph/auto` carries 0.85/1.55. The record does not
+  // say which of the first three are free of charge and which are simply
+  // unpriced -- this asserts what the predicate ANSWERS, and deliberately does
+  // not assert that the answer is the truth about the product. Deciding that
+  // needs row-type information the entry does not carry (#75).
+  const kiloAuto = { id: "kilo/auto", pricing: { offers: [
+    { provider: "kilo", per1MTokens: { input: 0, output: 0 },
+      sourceUnit: "usd_per_1m_tokens" } ] } };
+  const morphAuto = { id: "morph/auto", pricing: { offers: [
+    { provider: "morph", per1MTokens: { input: 0.85, output: 1.55 },
+      sourceUnit: "usd_per_1m_tokens" } ] } };
+  assert.equal(hasPricedOffer(kiloAuto), false,
+    "a genuinely free mode and an unpriced row are the same shape to this predicate");
+  assert.equal(hasPricedOffer(morphAuto), true,
+    "the same `auto` shape carrying a real price answers true, so the false above is about the DATA");
+});
+
+test("hasPricedOffer: no offers at all is false, and never throws", () => {
+  // `model-oracle-ai/auto`, `pioneer/auto` and `trustedrouter/auto` carry an
+  // empty offers array (measured). Absent, empty and malformed all mean the same
+  // thing -- no evidence of a price -- and none of them may throw on the picker's
+  // build path.
+  assert.equal(hasPricedOffer({ pricing: { offers: [] } }), false);
+  assert.equal(hasPricedOffer({ pricing: {} }), false);
+  assert.equal(hasPricedOffer({}), false);
+  assert.equal(hasPricedOffer(undefined), false);
+  assert.equal(hasPricedOffer(null), false);
+  assert.equal(hasPricedOffer({ pricing: { offers: "nope" } }), false);
+});
+
+test("hasPricedOffer honours priceOf's `usable` rule: an unparseable offer is not a price", () => {
+  // The two copies of that rule must agree (the module comment says so). A
+  // non-numeric or half-present `per1MTokens` is not evidence of pricing, so a
+  // row carrying only such offers stays false -- otherwise junk in the bundle
+  // would resurrect the FREE? badge this guard exists to withhold.
+  assert.equal(hasPricedOffer({ pricing: { offers: [
+    { provider: "x", per1MTokens: { input: "n/a", output: "n/a" } } ] } }), false);
+  assert.equal(hasPricedOffer({ pricing: { offers: [
+    { provider: "x", per1MTokens: { input: 3 } } ] } }), false, "output missing");
+  assert.equal(hasPricedOffer({ pricing: { offers: [{ provider: "x" }] } }), false);
+  // Numeric strings ARE usable -- priceOf coerces with Number() and so does this.
+  assert.equal(hasPricedOffer({ pricing: { offers: [
+    { provider: "x", per1MTokens: { input: "0", output: "0" } } ] } }), false);
+  assert.equal(hasPricedOffer({ pricing: { offers: [
+    { provider: "x", per1MTokens: { input: "0", output: "0.3" } } ] } }), true,
+    "a non-zero OUTPUT alone is still a price");
 });

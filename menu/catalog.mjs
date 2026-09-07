@@ -31,7 +31,7 @@ import * as K from "../keysync/keysync.mjs";
 // drags `ccr-client.mjs`, `atomic.mjs` and their graph into keysync's. One owner
 // of the rule, reachable from both sides; the import path is incidental. The
 // reasoning about WHICH offer to trust moved with the function.
-import { priceOf } from "../keysync/catalog-join.mjs";
+import { priceOf, hasPricedOffer } from "../keysync/catalog-join.mjs";
 export { priceOf };
 
 export const SLOT = path.join(os.homedir(), ".uw", "state", "slot.json");
@@ -53,7 +53,7 @@ export function isTextOut(entry) {
 //   FREE?  price 0, cadence unknown -- honest, and this will be the common case
 //   PLAN   subscription-covered: marginal price 0 because a plan was paid for
 //   PAID   any non-zero token price
-//   ""     no evidence, guard G1, or price 0 with a ONE-TIME grant
+//   ""     no evidence, guard G1, guard G2, or price 0 with a ONE-TIME grant
 //
 // The last case deserves its own sentence: a one-time signup wallet is not free
 // under the governing definition, and it is not paid either, because the
@@ -64,6 +64,32 @@ export function badgeOf(entry, { cadence = "", planCovered = false, providerName
   if (!p) return "";
   if (p.in === 0 && p.out === 0) {
     if (!isTextOut(entry)) return "";        // G1
+    // GUARD G2 (#67): a zero the bundle never actually recorded. #55 found that
+    // "not priced per token" is stored as {input: 0, output: 0}, so on 123 of
+    // the picker's 124 FREE? rows this badge asserted a price the catalogue does
+    // not contain -- and "FREE?" reads as "probably free", the reassuring half
+    // of a cost decision. Blank is what "we hold no price for this" looks like.
+    // G1 already accepts that a zero price can be meaningless and must be gated;
+    // it gates on modality, and this is the missing half.
+    //
+    // BEFORE the cadence branches, deliberately. `recurring` returns the hard
+    // FREE claim, and a provider-level grant cadence says nothing about a model
+    // the bundle never priced. No measured row reaches that path today (zero
+    // FREE in the tally), so the ordering is reasoned rather than observed -- it
+    // is the branch that would make the defect worse the first time a profile
+    // gains a recurring cadence.
+    //
+    // WHAT THIS BLANK DOES NOT CLAIM. `hasPricedOffer` false is EVIDENCE the
+    // price is absent, not proof of it: a genuinely free routing mode carries no
+    // non-zero offer to contrast against, so it looks identical to missing data.
+    // MEASURED 2026-09-07: `kilo/auto`, `llmgateway/auto` and `orcarouter/auto`
+    // each carry one 0/0 offer and are blanked here, and the record does not say
+    // which of them are free of charge and which are simply unpriced
+    // (`morph/auto` shows the same shape can be genuinely priced, 0.85/1.55).
+    // Blank means "we are not telling you this is free", which is honest in both
+    // cases; it does not mean "this is not free". Telling them apart needs
+    // row-type information the entry does not carry -- #75, not this guard.
+    if (!hasPricedOffer(entry)) return "";   // G2
     if (cadence === "recurring") return "FREE";
     if (cadence === "one-time" || cadence === "none") return "";
     return "FREE?";
