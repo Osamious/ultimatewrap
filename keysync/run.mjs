@@ -22,7 +22,8 @@ import {
 } from "./keysync.mjs";
 import {
   snapshotConfigDb, deleteStaleWifToken, retainOnSuccess, capFailedSnapshots,
-  restoreSettings, restoreConfigDbHint, liveConfigDir, liveConfigDb,
+  restoreSettings, restoreConfigDbHint, assertSettingsInvariants, listSettingsBackups,
+  liveConfigDir, liveConfigDb,
   acquireLock, restartRelevantFingerprint, waitForGateway, otherClaudeSessions,
   atomicWriteJson
 } from "./safety.mjs";
@@ -1362,7 +1363,14 @@ if (!noProfileDone) {
   // ---- steps 2-4: re-read, merge, write ------------------------------------
   // MERGE into the file CCR just wrote — never construct it from scratch, or
   // every unrelated top-level key would be lost.
-  const settings = JSON.parse(fs.readFileSync(SETTINGS, "utf8").replace(/^﻿/, ""));
+  const settingsRaw = fs.readFileSync(SETTINGS, "utf8").replace(/^﻿/, "");
+  const settings = JSON.parse(settingsRaw);
+  // An INDEPENDENT copy, parsed from the same text: `settings` is mutated in
+  // place below, so holding a reference would compare the object against itself
+  // and assert nothing. Taken here rather than from the step-0 backup because
+  // CCR has legitimately rewritten apiKeyHelper and env by this point; this
+  // scopes the check to keysync's own merge, which is what it can be strict about.
+  const settingsBefore = JSON.parse(settingsRaw);
   const stripped = stripOneMSuffix(settings);
   if (stripped) console.log(`stripped [1m] suffix from ${stripped} third-party model env var(s)`);
 
@@ -1423,6 +1431,11 @@ if (!noProfileDone) {
 
   // ---- step 5: verify all three landed together ----------------------------
   const final = JSON.parse(fs.readFileSync(SETTINGS, "utf8").replace(/^﻿/, ""));
+  // #7 / report 08 F4. The presence check below covers three fields; settings.json
+  // carries twenty, and the ones whose loss has no visible symptom (permissions,
+  // hooks, autoMode) are not among the three. REJECT rather than warn: this throw
+  // lands in the catch above, which restores from the backup.
+  assertSettingsInvariants(settingsBefore, final);
   const ok = final.apiKeyHelper && final.env?.ANTHROPIC_BASE_URL && final.modelPicker?.options?.length;
   if (!ok) throw new Error("post-write verification failed: apiKeyHelper / ANTHROPIC_BASE_URL / modelPicker not all present");
   console.log(`verified: apiKeyHelper + ANTHROPIC_BASE_URL=${final.env.ANTHROPIC_BASE_URL} + ` +
@@ -1436,9 +1449,22 @@ if (!noProfileDone) {
   // settings.json is not. Restore it and leave both restore points in place.
   const restored = restoreSettings(backup, SETTINGS);
   console.error(`\nWRITE FAILED: ${err.message}`);
-  console.error(restored
-    ? `settings.json RESTORED from ${backup}`
-    : `settings.json NOT restored (no backup at ${backup}) — inspect it manually`);
+  // The two failure modes call for opposite responses, and the backup path is
+  // named ONLY in the mode where it exists. The previous single message reported
+  // "no backup at <path>" for both, sending an operator whose backup was intact
+  // to a file it claimed was missing — and, when settings.json had not existed
+  // at step 0, naming a backup path that was never written at all.
+  if (restored.ok) {
+    console.error(`settings.json RESTORED from ${backup}`);
+  } else if (restored.reason === "restore-failed") {
+    console.error(`settings.json NOT restored — the backup EXISTS and is your rollback point:\n` +
+      `  ${backup}\n  ${restored.detail}\n` +
+      `  Restore by hand: copy "${backup}" over "${SETTINGS}"`);
+  } else {
+    console.error(`settings.json NOT restored — no rollback point exists ` +
+      `(${restored.detail}). Nothing was written by the restore attempt; ` +
+      `inspect ${SETTINGS} manually`);
+  }
   if (dbSnapshot) console.error(`CCR config restore point kept: ${dbSnapshot}\n  ${restoreConfigDbHint(dbSnapshot)}`);
   const capped = capFailedSnapshots(2);
   if (capped.length) console.error(`pruned ${capped.length} older failed-run snapshot(s)`);
@@ -1450,7 +1476,10 @@ if (!noProfileDone) {
 if (writeVerified) {
   try {
     const removed = retainOnSuccess({ snapshot: dbSnapshot, settingsFile: SETTINGS });
-    if (removed.length) console.log(`cleaned ${removed.length} stale backup(s); kept the newest settings backup`);
+    const { dated } = listSettingsBackups(SETTINGS);
+    if (removed.length) {
+      console.log(`cleaned ${removed.length} stale backup(s); kept the newest ${dated.length} settings backup(s)`);
+    }
   } catch (e) {
     console.log(`WARNING: backup cleanup failed (${String(e.message).slice(0, 120)}); ` +
       `the write itself succeeded. Stale backups may remain in ${path.dirname(SETTINGS)}`);
