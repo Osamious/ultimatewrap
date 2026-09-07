@@ -18,6 +18,7 @@ import {
   proxyRefusal, readCacheRecord, resolveCacheDir, resolveListingUrl,
   scrubProxyEnv, writeCacheRecord, EXEC_ARGV_AT_LOAD, PROXY_ENV_AT_LOAD,
   MAX_ENTRIES, LAST_GOOD_KEYS, LAST_GOOD_MAX_BYTES, lastGoodOf, currentUserSid,
+  ICACLS, WHOAMI, SYSTEM32,
 } from "../refresh/discover.mjs";
 // cli.mjs runs its fan-out only when it is the process entry point, so importing
 // it here reads no vault and issues no request.
@@ -347,9 +348,12 @@ test("a runtime flag on the command line refuses the fan-out, as NODE_OPTIONS do
   // The over-refusal is deliberate and is asserted as such: enumerating the
   // three flags that load code today is a denylist the fourth one defeats.
   assert.notEqual(proxyRefusal({ atLoad: [], execArgv: ["--max-old-space-size=4096"] }), null);
-  // The environment snapshot is checked FIRST, so its message is the one a user
-  // acting on it sees when both are true.
+  // PRECEDENCE, both steps. All four checks refuse, so the order is not
+  // load-bearing for protection -- but it decides which REMEDY the operator is
+  // pointed at, and "globalThis.fetch was replaced" sends someone hunting for
+  // in-process code when the answer is a flag on their own command line.
   assert.match(proxyRefusal({ atLoad: ["NODE_OPTIONS"], execArgv: ["--require"] }), /NODE_OPTIONS/);
+  assert.match(proxyRefusal({ atLoad: [], execArgv: ["--require"], fetchNow: () => {} }), /runtime/);
 });
 
 test("the real process snapshots are frozen arrays, not a live view", () => {
@@ -359,6 +363,18 @@ test("the real process snapshots are frozen arrays, not a live view", () => {
   assert.ok(Object.isFrozen(PROXY_ENV_AT_LOAD));
   assert.ok(Object.isFrozen(EXEC_ARGV_AT_LOAD));
   assert.ok(Array.isArray(EXEC_ARGV_AT_LOAD));
+
+  // The CONTENTS, not only the shape. `Object.freeze([])` is a frozen array too,
+  // and zeroing this snapshot disables the flag refusal outright while leaving
+  // every shape assertion green. The test runner supplies its own flags, so this
+  // comparison is non-trivial here rather than a tautology on an empty list.
+  assert.deepEqual([...EXEC_ARGV_AT_LOAD], [...process.execArgv]);
+
+  // PROXY_ENV_AT_LOAD gets no analogous assertion, and that is a stated limit
+  // rather than an omission: in a clean test process PROXY_ENV filters to [], so
+  // a correct snapshot and a zeroed one are literally the same value and no
+  // in-process assertion can tell them apart. The child-process harness below is
+  // what covers it, by starting a process that actually has one of them set.
 });
 
 test("a patched globalThis.fetch refuses the fan-out and issues no request", async () => {
@@ -386,6 +402,98 @@ test("a patched globalThis.fetch refuses the fan-out and issues no request", asy
   }
   assert.equal(proxyRefusal({ atLoad: [], execArgv: [] }), null,
     "and the guard passes again once the patch is gone");
+});
+
+// The two load-time snapshots can only be observed from a process that actually
+// has something set at load, so these spawn one. The child reports what
+// `proxyRefusal()` decided and nothing else: the refusal is a pure function, so
+// observing it needs no fan-out, no credential and no socket.
+const GUARD_PROBE = path.join(SCRATCH, "guard-probe.mjs");
+function writeGuardProbe() {
+  fs.mkdirSync(path.dirname(GUARD_PROBE), { recursive: true });
+  fs.writeFileSync(GUARD_PROBE,
+    `import { proxyRefusal, PROXY_ENV_AT_LOAD, EXEC_ARGV_AT_LOAD } from ${
+      JSON.stringify(new URL("../refresh/discover.mjs", import.meta.url).href)};\n` +
+    "process.stdout.write(JSON.stringify({\n" +
+    "  refusal: proxyRefusal(),\n" +
+    "  atLoad: [...PROXY_ENV_AT_LOAD],\n" +
+    "  flags: EXEC_ARGV_AT_LOAD.length,\n" +
+    "}));\n");
+  return GUARD_PROBE;
+}
+
+/**
+ * A deliberately MINIMAL environment, built up rather than inherited, so the
+ * parent's own proxy settings cannot make this pass or fail. Node needs these
+ * few to start on Windows.
+ */
+function probeEnv(extra = {}) {
+  const base = {};
+  for (const k of ["SystemRoot", "windir", "PATH", "Path", "TEMP", "TMP",
+                   "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "SystemDrive"]) {
+    if (process.env[k] !== undefined) base[k] = process.env[k];
+  }
+  return { ...base, ...extra };
+}
+
+const runGuardProbe = (env, nodeFlags = []) => JSON.parse(execFileSync(
+  process.execPath, [...nodeFlags, writeGuardProbe()],
+  { encoding: "utf8", env, timeout: 60_000, windowsHide: true }));
+
+test("a child started with a clean environment and no flags does NOT refuse", () => {
+  // The discriminator. Without it the two tests below would pass against a guard
+  // that refuses unconditionally, which protects nothing and blocks everything.
+  const r = runGuardProbe(probeEnv());
+  assert.equal(r.refusal, null, "a clean process must be allowed to fan out");
+  assert.deepEqual(r.atLoad, []);
+  assert.equal(r.flags, 0);
+});
+
+test("a child started WITH a proxy variable refuses, which no in-process test can show", () => {
+  // PROXY_ENV_AT_LOAD = Object.freeze([]) disables the NODE_OPTIONS refusal and
+  // survives every in-process assertion, because in a clean test process the
+  // correct snapshot and the zeroed one are literally the same value. Only a
+  // process that genuinely has one set can tell them apart.
+  const values = {
+    CCR_UPSTREAM_PROXY_URL: "http://proxy.invalid:8080",
+    HTTPS_PROXY: "http://proxy.invalid:8080",
+    HTTP_PROXY: "http://proxy.invalid:8080",
+    NODE_OPTIONS: "--max-old-space-size=512",     // valid, so node still starts
+  };
+  for (const name of PROXY_ENV) {
+    if (!(name in values)) continue;             // NODE_EXTRA_CA_CERTS: see below
+    const r = runGuardProbe(probeEnv({ [name]: values[name] }));
+    assert.deepEqual(r.atLoad, [name], `${name} was not seen at load`);
+    assert.match(r.refusal, /refusing to fan out/, `${name} did not refuse`);
+    assert.ok(r.refusal.includes(name), `the refusal must name ${name}`);
+  }
+
+  // NODE_EXTRA_CA_CERTS is exercised through a real certificate file, because
+  // pointing it at a missing path makes node emit a startup warning that would
+  // make this test about node's warning behaviour instead of about the guard.
+  const pem = path.join(SCRATCH, "empty-bundle.pem");
+  fs.mkdirSync(path.dirname(pem), { recursive: true });
+  fs.writeFileSync(pem, "");
+  const ca = runGuardProbe(probeEnv({ NODE_EXTRA_CA_CERTS: pem }));
+  assert.deepEqual(ca.atLoad, ["NODE_EXTRA_CA_CERTS"]);
+  assert.match(ca.refusal, /NODE_EXTRA_CA_CERTS/);
+
+  // The lowercase spelling is a distinct slot off Windows and the same one on it;
+  // either way the variable is present at load and the answer must not change.
+  const lower = runGuardProbe(probeEnv({ https_proxy: "http://proxy.invalid:8080" }));
+  assert.match(lower.refusal, /refusing to fan out/);
+});
+
+test("a child started with a runtime flag refuses through the default binding", () => {
+  // `proxyRefusal()` is called with NO arguments here, so this covers the
+  // DEFAULT binding of `execArgv` -- which `execArgv = EXEC_ARGV_AT_LOAD -> []`
+  // silently disables while every call site that passes the option explicitly
+  // stays green.
+  const r = runGuardProbe(probeEnv(), ["--max-old-space-size=512"]);
+  assert.ok(r.flags > 0, "the child did not actually carry a runtime flag");
+  assert.match(r.refusal, /refusing to fan out/);
+  assert.match(r.refusal, /runtime/, "the flag branch, not the environment branch");
+  assert.deepEqual(r.atLoad, [], "and it refused on the flag alone, with a clean environment");
 });
 
 test("scrubProxyEnv names every variable it removed, in either case", () => {
@@ -857,24 +965,296 @@ test("a carried listing is bounded in BYTES, which no key allowlist can do", () 
   const byBytes = lastGoodOf(today, prior, { maxEntries: 20_000, maxBytes: 400 });
   assert.ok(byBytes.models.length >= 1 && byBytes.models.length <= 4,
     `${byBytes.models.length} models in a 400-byte budget`);
-  // The budget holds AT its stated number, with no allowance bolted on: it
-  // bounds the serialised array, separators and brackets included, and is
-  // checked before each model is kept rather than after the array is built.
-  assert.ok(Buffer.byteLength(JSON.stringify(byBytes.models), "utf8") <= 400,
-    `${Buffer.byteLength(JSON.stringify(byBytes.models), "utf8")} bytes over a 400-byte budget`);
   // A budget too small for even one model yields none rather than one.
   assert.deepEqual(lastGoodOf(today, prior, { maxBytes: 10 }).models, []);
+});
 
-  // And end to end, through the file that actually lands on disk.
+test("the byte budget holds at EVERY budget and id width, not at one fixture", () => {
+  // A single fixture cannot see a one-byte error, and this exact defect has
+  // already shipped once: the first version of the accounting counted element
+  // bytes only and overshot by one byte per model plus the two brackets. The
+  // fixture above lands at 341 bytes against a budget of 400 -- a 59-byte margin
+  // that an off-by-one passes straight through.
+  //
+  // The invariant is ONE-DIRECTIONAL: never exceeds. Carrying fewer models than
+  // would fit is conservative and permitted, so this asserts the ceiling only.
+  //
+  // Widths include multi-byte ids because the accounting is byte-accurate rather
+  // than character-accurate: a CJK id is 3 bytes per code point and an astral
+  // one is 4, so a length-based count would pass every ASCII fixture and
+  // overshoot on the first real Chinese model name.
+  const widths = [
+    "m",                                   // 1 byte
+    "gpt-4o",
+    "provider/family/model-variant-0000",
+    "a".repeat(100),
+    "中文",                        // CJK: 3 bytes per code point
+    "中文".repeat(20),
+    "\u{1F600}",                           // astral: 4 bytes per code point
+    "\u{1F600}".repeat(20),
+  ];
+  const today = { provider: "groq", at: "day-2", outcome: "auth", status: 403, models: [] };
+  let pairs = 0;
+
+  for (const id of widths) {
+    const prior = {
+      provider: "groq", at: "day-1", outcome: "ok", status: 200, count: 40,
+      models: Array.from({ length: 40 }, (_, i) => ({
+        id: `${id}${i}`, capabilityRaw: "chat", contextLength: 131072,
+        modalityHints: ["image", "text"],
+      })),
+    };
+    for (let maxBytes = 2; maxBytes <= 900; maxBytes += 1) {
+      const got = lastGoodOf(today, prior, { maxBytes, maxEntries: 40 });
+      const actual = Buffer.byteLength(JSON.stringify(got.models), "utf8");
+      assert.ok(actual <= maxBytes,
+        `budget ${maxBytes} produced ${actual} bytes at id width ` +
+        `${Buffer.byteLength(id, "utf8")} (${got.models.length} models carried)`);
+      pairs += 1;
+    }
+  }
+  assert.equal(pairs, widths.length * 899, `${pairs} budget/width pairs swept`);
+
+  // DELIBERATELY ONE-DIRECTIONAL, and nothing is added here to check the other
+  // way. An accounting that over-counts, or stops a model earlier than it had
+  // to, under-fills the budget -- that is conservative and correct, and a sweep
+  // that also demanded "fills as much as it could" would fail it. The property
+  // is NEVER EXCEEDS. That a budget with room does carry models is pinned by the
+  // neighbouring lastGood tests, on real records, where it belongs.
+});
+
+test("the byte bound reaches the file that actually lands on disk", () => {
+  // The unit sweep above proves the arithmetic; this proves the arithmetic is
+  // what `writeCacheRecord` uses, rather than a bound that exists only where a
+  // test calls it directly with explicit limits.
+  const huge = Array.from({ length: 20_000 }, (_, i) => ({
+    id: `provider/family/model-variant-${i}`, capabilityRaw: "chat",
+    contextLength: 131072, modalityHints: ["image", "text"],
+  }));
+  const prior = { provider: "groq", at: "day-1", outcome: "ok", status: 200, count: 20_000, models: huge };
+  const today = { provider: "groq", at: "day-2", outcome: "auth", status: 403, models: [] };
+
   const dir = path.join(SCRATCH, "lastgood-bytes");
   fs.rmSync(dir, { recursive: true, force: true });
   const acl = { run: (args) => (args.length > 1 ? "" : `${args[0]} HOST\\osami:(F)\r\n`) };
   const opts = { dir, user: "osami", acl };
   writeCacheRecord(prior, opts);
   writeCacheRecord(today, opts);
+
   const file = cacheFileFor("groq", dir);
   assert.ok(fs.statSync(file).size < 4 << 20, `the record on disk is ${fs.statSync(file).size} bytes`);
-  assert.equal(readCacheRecord("groq", opts).lastGood.models.length, real.models.length);
+  const onDisk = readCacheRecord("groq", opts);
+  assert.equal(onDisk.lastGood.models.length, lastGoodOf(today, prior).models.length,
+    "the write path used a different bound from lastGoodOf's own");
+  assert.ok(Buffer.byteLength(JSON.stringify(onDisk.lastGood.models), "utf8") <= LAST_GOOD_MAX_BYTES);
+  assert.equal(onDisk.lastGood.count, 20_000, "the prior listing's denominator survives on disk too");
+});
+
+test("a planted prior file cannot smuggle a value past lastGood's own checks", () => {
+  // This function's stated threat model is a FILE ON DISK, and every guard in it
+  // exists for that reason -- so each one is exercised here through a planted
+  // file rather than through a hand-built object, which is the only version that
+  // matches how the value would really arrive.
+  const dir = path.join(SCRATCH, "lastgood-planted");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  const acl = { run: (args) => (args.length > 1 ? "" : `${args[0]} HOST\\osami:(F)\r\n`) };
+  const opts = { dir, user: "osami", acl };
+  const today = () => ({ provider: "groq", at: "day-2", outcome: "auth", status: 403, models: [] });
+  const plant = (prior) => {
+    fs.writeFileSync(cacheFileFor("groq", dir), JSON.stringify(prior));
+    writeCacheRecord(today(), opts);
+    return readCacheRecord("groq", opts);
+  };
+
+  // A NEGATIVE count. `count` is the carried listing's denominator, and every
+  // percentage downstream divides by it: -5 unclamped makes a coverage figure
+  // negative, or infinite, or silently inverts a comparison.
+  for (const bad of [-5, -1, 1.5, "12", null, NaN, Infinity]) {
+    const r = plant({ provider: "groq", at: "day-1", outcome: "ok", count: bad, models: [{ id: "m1" }] });
+    assert.equal(r.lastGood.count, 0, `count ${JSON.stringify(bad)} was carried unclamped`);
+  }
+  // And a legitimate count still survives, so the clamp is not just zeroing.
+  assert.equal(plant({ provider: "groq", at: "day-1", outcome: "ok", count: 7, models: [{ id: "m1" }] })
+    .lastGood.count, 7);
+  assert.equal(plant({ provider: "groq", at: "day-1", outcome: "ok", count: 0, models: [] })
+    .lastGood.count, 0, "zero is a real count, not a rejected one");
+
+  // `models` that is NOT AN ARRAY. `?? []` would leave an object here, and
+  // `for...of` on an object throws -- outside writeCacheRecord's try, so the
+  // throw escapes and that provider's record is lost to a malformed prior file.
+  for (const bad of [{ 0: { id: "m1" } }, {}, "not-an-array", 42, true]) {
+    let r;
+    assert.doesNotThrow(() => {
+      r = plant({ provider: "groq", at: "day-1", outcome: "ok", count: 1, models: bad });
+    }, `models ${JSON.stringify(bad)} threw out of the write`);
+    assert.deepEqual(r.lastGood.models, [], `models ${JSON.stringify(bad)} was not discarded`);
+  }
+
+  // A `lastGood` that is not an object, on a prior that is itself a failure. The
+  // truthiness test alone admits a non-empty string, and the record synthesised
+  // from it -- {at: null, count: 0, models: []} -- reads as "this provider once
+  // served a listing of nothing", which is a statement the file never made.
+  for (const bad of ["a string", 42, true, "0"]) {
+    const r = plant({ provider: "groq", at: "day-1", outcome: "auth", status: 403, lastGood: bad });
+    assert.equal(r.lastGood, undefined, `lastGood ${JSON.stringify(bad)} was synthesised into a record`);
+    assert.equal("lastGood" in r, false, "the key is absent, not present and empty");
+  }
+  // A falsy non-object takes the same path, and a real one still carries.
+  assert.equal(plant({ provider: "groq", at: "d", outcome: "auth", lastGood: null }).lastGood, undefined);
+  assert.equal(
+    plant({ provider: "groq", outcome: "auth", lastGood: { at: "older", count: 2, models: [{ id: "m1" }] } })
+      .lastGood.at, "older");
+});
+
+test("a hostile timestamp in a prior record is sanitised before it is carried", () => {
+  // `lastGood.at` comes off a file on disk and is printed. Measured with the
+  // sanitiser removed: a CSI screen-clear and an OSC-52 clipboard write both
+  // survived into the record from a planted prior. Same class as the observed
+  // keys -- provider-controlled text reaching a terminal -- and the same answer.
+  const dir = path.join(SCRATCH, "lastgood-at");
+  fs.rmSync(dir, { recursive: true, force: true });
+  const acl = { run: (args) => (args.length > 1 ? "" : `${args[0]} HOST\\osami:(F)\r\n`) };
+  const opts = { dir, user: "osami", acl };
+
+  const hostile = "2026-01-01[2J]52;c;bWFsaWNl‮gnp.exe";
+  writeCacheRecord({ provider: "groq", at: hostile, outcome: "ok", status: 200,
+                     count: 1, models: [{ id: "m1" }] }, opts);
+  writeCacheRecord({ provider: "groq", at: "day-2", outcome: "auth", status: 403, models: [] }, opts);
+
+  const at = readCacheRecord("groq", opts).lastGood.at;
+  for (const bad of ["", "‮", "", "[2J", "]52;"]) {
+    assert.equal(at.includes(bad), false, `${JSON.stringify(bad)} survived into lastGood.at`);
+  }
+  assert.equal(at, "2026-01-01gnp.exe", "the escapes go; the surrounding text stays readable");
+  // Bounded too, so a prior file cannot carry a 100 KB timestamp.
+  assert.ok([...at].length <= 40);
+
+  writeCacheRecord({ provider: "groq", at: "x".repeat(500), outcome: "ok", status: 200,
+                     count: 1, models: [{ id: "m1" }] }, opts);
+  writeCacheRecord({ provider: "groq", at: "day-3", outcome: "auth", status: 403, models: [] }, opts);
+  assert.equal([...readCacheRecord("groq", opts).lastGood.at].length, 40, "40 code points of 500");
+
+  // A non-string `at` reads as absent rather than as whatever it was.
+  writeCacheRecord({ provider: "groq", at: { nested: true }, outcome: "ok", status: 200,
+                     count: 1, models: [{ id: "m1" }] }, opts);
+  writeCacheRecord({ provider: "groq", at: "day-4", outcome: "auth", status: 403, models: [] }, opts);
+  assert.equal(readCacheRecord("groq", opts).lastGood.at, null);
+});
+
+test("the shipped caps are the ones the findings were measured against", () => {
+  // Every other test passes these explicitly, so raising the constant itself --
+  // 5,000 to 500,000, say -- changes nothing any of them can see, while undoing
+  // the fix for the 45.7 MB record outright.
+  assert.equal(MAX_ENTRIES, 5_000);
+  assert.equal(LAST_GOOD_MAX_BYTES, 256 << 10);
+
+  // And the DEFAULT bites, not merely the injected value: one entry past the
+  // shipped cap must be dropped by a call that names no limit at all.
+  const entries = Array.from({ length: MAX_ENTRIES + 1 }, (_, i) => ({ id: `m${i}` }));
+  return run(PROF, one(200, { data: entries })).then((r) => {
+    assert.equal(r.count, MAX_ENTRIES + 1, "the raw denominator is untouched by the cap");
+    assert.equal(r.models.length, MAX_ENTRIES);
+    assert.equal(r.truncated, 1);
+  });
+});
+
+test("the system tools are resolved to absolute paths under System32", () => {
+  // A bare name is resolved through PATH by node's own search, which is how a
+  // bare `whoami` reaches Git's POSIX build on this host. The end-to-end proof
+  // is below; these assertions catch the constant being changed directly.
+  for (const [label, exe] of [["icacls", ICACLS], ["whoami", WHOAMI]]) {
+    assert.ok(path.isAbsolute(exe), `${label} is not an absolute path`);
+    assert.equal(path.basename(exe).toLowerCase(), `${label}.exe`);
+    assert.equal(path.dirname(exe).toLowerCase(), SYSTEM32.toLowerCase());
+    assert.ok(fs.existsSync(exe), `${exe} does not exist`);
+  }
+});
+
+test("the System32 root has a fallback, so an unset SystemRoot is not a bare name", async () => {
+  // Without the fallback, `path.join(undefined, "System32")` throws at MODULE
+  // LOAD -- so the failure is not a bad path, it is the module refusing to
+  // import at all, on a host where the variable is missing or a service account
+  // where the environment is stripped. Re-imported under a distinct URL so the
+  // top level genuinely re-runs; the fresh copy takes its own snapshots and
+  // spawns nothing.
+  const saved = {};
+  for (const k of Object.keys(process.env)) {
+    if (k.toLowerCase() === "systemroot") { saved[k] = process.env[k]; delete process.env[k]; }
+  }
+  try {
+    assert.equal(process.env.SystemRoot, undefined, "the variable was not actually unset");
+    const fresh = await import(new URL("../refresh/discover.mjs?no-systemroot", import.meta.url).href);
+    assert.ok(path.isAbsolute(fresh.SYSTEM32), `${fresh.SYSTEM32} is not absolute`);
+    assert.ok(path.isAbsolute(fresh.ICACLS));
+    assert.equal(path.basename(fresh.ICACLS).toLowerCase(), "icacls.exe");
+    assert.equal(path.basename(fresh.WHOAMI).toLowerCase(), "whoami.exe");
+  } finally {
+    for (const [k, v] of Object.entries(saved)) process.env[k] = v;
+  }
+  assert.notEqual(process.env.SystemRoot, undefined, "the variable was not restored");
+});
+
+test("the body ceiling is refused at exactly one byte over, on both read paths", () => {
+  // An off-by-one here is invisible to every fixture that overshoots by a
+  // comfortable margin: `n > max` relaxed to `n > max + 1` admits a body one
+  // byte past a ceiling that exists precisely to be a hard number.
+  const max = 200;
+  const bodyOf = (bytes) => {
+    const json = JSON.stringify({ data: [{ id: "m1" }] });
+    return json + " ".repeat(bytes - Buffer.byteLength(json, "utf8"));  // trailing space is valid JSON
+  };
+  assert.equal(Buffer.byteLength(bodyOf(max), "utf8"), max, "the fixture is not the size it claims");
+
+  return (async () => {
+    for (const [label, make] of [
+      ["streamed", (b) => stubFetch(() => ({ status: 200, stream: streamOf([b]).stream }))],
+      ["text fallback", (b) => stubFetch(() => ({ status: 200, body: b }))],
+    ]) {
+      const at = await run(PROF, make(bodyOf(max)), { maxBodyBytes: max });
+      assert.equal(at.outcome, "ok", `${label}: a body of exactly the ceiling must be read`);
+      assert.equal(at.models[0].id, "m1");
+
+      const over = await run(PROF, make(bodyOf(max + 1)), { maxBodyBytes: max });
+      assert.equal(over.outcome, "error", `${label}: one byte over must be refused`);
+      assert.equal(over.reason, REASONS.OVERSIZE, `${label}: one byte over`);
+    }
+
+    // Split across chunks, so the ceiling is enforced on the running total and
+    // not on any single chunk.
+    const halves = (b) => [b.slice(0, 100), b.slice(100)];
+    const split = await run(PROF, stubFetch(() => ({ status: 200, stream: streamOf(halves(bodyOf(max + 1))).stream })),
+                            { maxBodyBytes: max });
+    assert.equal(split.reason, REASONS.OVERSIZE, "the total across chunks is what is bounded");
+  })();
+});
+
+test("a shadowing icacls.exe earlier on PATH does not reach the cache write", () => {
+  // The end-to-end half, and the reason the constant assertions above are not
+  // sufficient: they do not see the CALL SITE reverting to a bare name. This
+  // does. A binary that is not icacls is placed under the name `icacls.exe`
+  // ahead of System32 on PATH; a bare-name call finds it, its output parses to
+  // no owner-only principal, and the write fails.
+  const shadow = path.join(SCRATCH, "shadow-bin");
+  fs.rmSync(shadow, { recursive: true, force: true });
+  fs.mkdirSync(shadow, { recursive: true });
+  fs.copyFileSync(WHOAMI, path.join(shadow, "icacls.exe"));
+
+  const dir = path.join(SCRATCH, "acl-shadowed");
+  fs.rmSync(dir, { recursive: true, force: true });
+  const savedPath = process.env.PATH;
+  const savedPathCase = process.env.Path;
+  try {
+    process.env.PATH = `${shadow}${path.delimiter}${savedPath ?? ""}`;
+    if (savedPathCase !== undefined) process.env.Path = process.env.PATH;
+    const file = writeCacheRecord({ provider: "groq", outcome: "empty", status: 200, models: [] },
+                                  { dir, user: os.userInfo().username });
+    assert.equal(fs.existsSync(file), true, "the real icacls was not reached");
+    assert.equal(readCacheRecord("groq", { dir, user: os.userInfo().username }).outcome, "empty");
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH; else process.env.PATH = savedPath;
+    if (savedPathCase === undefined) delete process.env.Path; else process.env.Path = savedPathCase;
+  }
 });
 
 test("a planted prior record cannot widen the shape of what gets written back", () => {

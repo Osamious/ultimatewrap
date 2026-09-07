@@ -321,6 +321,16 @@ export const PROXY_ENV_AT_LOAD = Object.freeze(
  * authenticated requests that need explicit authorization anyway, so the cost of
  * the false refusal is re-running one command without a flag, and the cost of
  * the false admission is 44 credentials through somebody else's transport.
+ *
+ * WHAT THE WHOLE GUARD COVERS, and where it stops. It covers interception
+ * installed through the ENVIRONMENT (the five variables above) and through
+ * RUNTIME FLAGS (this snapshot) -- the two channels by which code this process
+ * did not choose gets to run before it does. It does not cover a patch applied
+ * in-process by something that already `import`ed this module, and that is out
+ * of reach BY CONSTRUCTION rather than by omission: an attacker who is already
+ * executing in this process can equally well re-patch after any check, delete
+ * the check, or read the credentials directly. There is no in-process guard
+ * against in-process code, and pretending otherwise would be the overclaim.
  */
 export const EXEC_ARGV_AT_LOAD = Object.freeze([...process.execArgv]);
 
@@ -836,11 +846,14 @@ export function cacheFileFor(provider, dir) {
  * order, which is the same accident pointing the other way -- and it is the
  * command that decides whether a plaintext credential inventory is readable.
  */
-const SYSTEM32 = path.join(process.env.SystemRoot || "C:\\Windows", "System32");
+export const SYSTEM32 = path.join(process.env.SystemRoot || "C:\\Windows", "System32");
+
+/** Exported so the resolution itself is assertable, not only its side effects. */
+export const ICACLS = path.join(SYSTEM32, "icacls.exe");
+export const WHOAMI = path.join(SYSTEM32, "whoami.exe");
 
 const icacls = (args) =>
-  execFileSync(path.join(SYSTEM32, "icacls.exe"), args,
-               { encoding: "utf8", timeout: 30_000, windowsHide: true });
+  execFileSync(ICACLS, args, { encoding: "utf8", timeout: 30_000, windowsHide: true });
 
 /**
  * Parse the principals out of an `icacls` listing. Pure, so the owner-only
@@ -881,7 +894,7 @@ export function currentUserSid({ execFile = execFileSync } = {}) {
   // every subsequent cache write failing its own verification.
   if (cachedSid) return cachedSid;
   try {
-    const out = execFile(path.join(SYSTEM32, "whoami.exe"), ["/user", "/fo", "csv", "/nh"],
+    const out = execFile(WHOAMI, ["/user", "/fo", "csv", "/nh"],
                          { encoding: "utf8", timeout: 30_000, windowsHide: true });
     cachedSid = out.match(/S-1-(?:\d+-)+\d+/)?.[0] ?? "";
   } catch { cachedSid = ""; }              // unknown SID matches nothing: still closed
