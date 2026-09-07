@@ -20,6 +20,7 @@ import {
   ANTHROPIC_RELAY, ANTHROPIC_TIERS, ANTHROPIC_FULL, ANTHROPIC_FALLBACK_TAGS,
   ANTHROPIC_ALIASES, buildAnthropicPickerRows
 } from "./keysync.mjs";
+import { cacheRoot, readCacheRecord } from "../refresh/discover.mjs";
 import {
   snapshotConfigDb, deleteStaleWifToken, retainOnSuccess, capFailedSnapshots,
   restoreSettings, restoreConfigDbHint, assertSettingsInvariants, listSettingsBackups,
@@ -69,16 +70,31 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  * @param {Set<string>|null} [opts.relayRouting=null]  what the relay serves or
  *   WOULD serve if started; used only to keep the remedy wording honest.
  *   Defaults to the static ANTHROPIC_RELAY.routing.
- * @returns {{hijackable: object[], shadowed: object[], fatal: boolean,
- *            message: string, catalogVerified: boolean}}
+ * @param {Set<string>} [opts.vouchedProviders=new Set()]  provider NAMES whose
+ *   sole ownership of a bare Claude-shaped id the operator has accepted, from
+ *   the `vouchedBareClaude` field in providers.json. A DIFFERENT QUESTION FROM
+ *   `relayOwned`, at a different granularity, and the two must not be merged:
+ *   `relayOwned` is id-level and asks "does OUR relay curate this id"; this is
+ *   provider-level and asks "do we trust this RESELLER to sole-own a
+ *   Claude-shaped name". Empty by default, and that default reproduces the
+ *   pre-vouch `fatal` computation exactly -- the mechanism ADDS a way to
+ *   reclassify a finding, it never widens what is classified.
+ * @returns {{hijackable: object[], shadowed: object[], vouchedHijacks: object[],
+ *            fatal: boolean, message: string, catalogVerified: boolean}}
  *   `catalogVerified` is false on exactly the `realIds === null` path and is
  *   DISCLOSURE, never a verdict: `fatal` does not read it, and `message` carries
  *   the same fact in prose so a caller that prints only the message still tells
  *   the operator. See the disclosure block above the return.
+ *
+ *   `vouchedHijacks` is ALWAYS PRESENT, empty array included. It carries the
+ *   findings that WOULD have been fatal but for the operator's vouch, each with
+ *   its id, owner and the reason it was spared -- never a bare count, because a
+ *   count cannot be reviewed. It is what makes vouching an accepted risk on the
+ *   record rather than a silent exemption.
  */
 export function checkBareCollisions(providers, {
   relay = ANTHROPIC_RELAY.name, allowBare = false, realIds = null,
-  relayOwned = null, relayRouting = null,
+  relayOwned = null, relayRouting = null, vouchedProviders = new Set(),
 } = {}) {
   // WHAT EACH PROVIDER ADVERTISES, TRIMMED. Ownership is NOT keyed on these --
   // see the selector set below. This is only the raw material both match stages
@@ -211,21 +227,37 @@ export function checkBareCollisions(providers, {
   // the bare-id set. That is a property of THESE 44 providers on THIS bundle,
   // contingent on both, and no longer a structural guarantee about the input.
   //
-  // THE NEXT TASK TO WIRE R10'S DISCOVERY CACHE INTO THIS PATH MUST RE-MEASURE
-  // BEFORE IT SHIPS. run.mjs passes no `discovery` argument to `buildProviders`
-  // today, so the 1,584 above is the no-discovery set and it is the only set
-  // this verdict has been checked against. Discovery only ADDS ids -- a
-  // provider's own listing of what this key can call -- and a reseller's own
-  // listing is precisely where a bare `claude-*` id appears. For scale: run the
-  // same count over the bundled catalogue's 217 providers instead of this
-  // vault's 44 and it becomes 240 bare ids / 185 sole-owned, at which point the
-  // `realIds === null` verdict flips from `fatal: false` to `fatal: true` with
-  // 33 hijackable and 25 shadowed. Whoever passes a cache here (R13/R19-adjacent
-  // work, not R11) MUST re-run `checkBareCollisions` against the widened
-  // `built.providers` and read `fatal` first. A pipeline that starts exiting 1
-  // whenever Anthropic's catalogue is unreachable is a broken pipeline, and
-  // `--allow-bare-claude-names` is not an escape hatch to discover in
-  // production.
+  // THAT WARNING WAS DISCHARGED BY R13c, AND ITS PREDICTION HELD. It read "the
+  // next task to wire R10's discovery cache into this path must re-measure
+  // before it ships", because run.mjs passed no `discovery` argument and 1,584
+  // was therefore the only set this verdict had been checked against. run.mjs
+  // now passes one (`loadDiscoveryCache`), so the numbers above are no longer
+  // this pipeline's, and the re-measurement is recorded here rather than left to
+  // be re-derived.
+  //
+  // RE-MEASURED 2026-09-08 ON THE REAL VAULT, both branches, through the same
+  // `buildProviders` the pipeline calls. Routing entries 1,584 -> 5,026 across
+  // the same 44 providers; distinct bare ids 1,451 -> 3,159; ambiguous 106 ->
+  // 857; sole-owned 1,345 -> 2,302.
+  //
+  //   realIds NON-NULL (the live path, Anthropic reachable): hijackable 0 -> 0,
+  //     shadowed 1 -> 9, fatal FALSE either way. The narrow selector set is what
+  //     holds it: ownership iterates `ANTHROPIC_ALIASES u realIds`, and the ids
+  //     the resellers invent are not in it.
+  //   realIds NULL (relay down AND no cache): hijackable 0 -> 22, shadowed
+  //     1 -> 15, and fatal flips FALSE -> TRUE. The 22 are sole-owned by five
+  //     providers, not two: aihubmix 13, bai 5, veniceai 2, tokenrouter 1,
+  //     opencode 1.
+  //
+  // So the widening did NOT make the guard fire on the path this pipeline
+  // normally takes; it armed the fallback path, which is the path a network
+  // failure selects. That is the pipeline-exits-1-when-Anthropic-is-unreachable
+  // shape this comment warned against, and it is REAL TODAY -- not fixed by
+  // R13c, which ships the per-provider vouch that lets an operator accept a
+  // named reseller instead of reaching for `--allow-bare-claude-names`, which
+  // accepts all of them and is still not an escape hatch to discover in
+  // production. For scale, the old comparison stands: the same count over the
+  // bundled catalogue's 217 providers is 240 bare ids / 185 sole-owned.
   //
   // WHAT THE NARROWING COST, MEASURED AGAINST AN INDEPENDENT THREAT SET.
   // `ANTHROPIC_ALIASES u Anthropic's live /v1/models` is 15 ids. With the relay
@@ -373,7 +405,14 @@ export function checkBareCollisions(providers, {
   // would let CCR discover models past `admitRemoteModels` and invisibly to this
   // guard, so validate()'s V9 rule is load-bearing under A2 (#44).
   const vouched = (id) => relayOwned === null || relayOwned.has(id);
-  const hijackable = [], shadowed = [];
+  // TWO VOUCHES, TWO QUESTIONS, DELIBERATELY NOT UNIFIED. `vouched(id)` above is
+  // id-level and relay-only ("does our relay curate this id"); `isVouchedOwner`
+  // is provider-level and reseller-facing ("do we accept THIS host sole-owning a
+  // Claude-shaped name"). They read different inputs, answer to different
+  // operators, and collapsing them would let a relay-curation fact silence a
+  // reseller finding, or the reverse.
+  const isVouchedOwner = (name) => vouchedProviders.has(name);
+  const hijackable = [], shadowed = [], vouchedHijacks = [];
   for (const [id, owners] of byBare) {
     const relayRoutes = owners.includes(relay);
     // NOTHING TO PROTECT AGAINST. Under #53's selector-keyed ownership this is
@@ -402,7 +441,21 @@ export function checkBareCollisions(providers, {
       // never carry it. `denylist.test.mjs` pins the emptiness with a COVERAGE
       // assertion over the reachable owner domain, not a behavioural one -- a
       // branch that cannot be entered cannot be observed failing.
-      hijackable.push({ id, owner: owners[0], relayRoutes });
+      //
+      // THE VOUCH REROUTES THE FINDING, IT DOES NOT SUPPRESS IT. A vouched sole
+      // owner is still exactly as bindable by CCR as an unvouched one -- nothing
+      // about the routing changes. What changes is whether the run STOPS, and
+      // that is the operator's call to have already made in providers.json. The
+      // finding keeps its id, its owner and gains the reason it was spared, so a
+      // reader of the output can audit the decision rather than infer it.
+      if (isVouchedOwner(owners[0])) {
+        vouchedHijacks.push({
+          id, owner: owners[0], relayRoutes,
+          reason: `vouchedBareClaude is set for ${owners[0]} in providers.json`,
+        });
+      } else {
+        hijackable.push({ id, owner: owners[0], relayRoutes });
+      }
     } else if (owners.length > 1) {
       // The TRUE owner list is reported, relay included -- a message that hid a
       // real co-owner would describe a config the operator does not have.
@@ -422,6 +475,7 @@ export function checkBareCollisions(providers, {
   }
   hijackable.sort((a, b) => a.id.localeCompare(b.id));
   shadowed.sort((a, b) => a.id.localeCompare(b.id));
+  vouchedHijacks.sort((a, b) => a.id.localeCompare(b.id));
 
   // Whether the classification above could consult Anthropic's published ids at
   // all. Derived from the one input that decides it, and read ONLY by the
@@ -509,9 +563,26 @@ export function checkBareCollisions(providers, {
     // nothing found" is a statement about Anthropic's published ids; on the null
     // path the guard never saw them, so the honest all-clear is scoped to what
     // it did read -- the ids this config advertises.
-    message = catalogVerified
-      ? "no bare Claude-shaped collisions"
-      : "no bare Claude-shaped collisions among the ids this config advertises";
+    //
+    // "NO COLLISIONS" WOULD BE FALSE WITH A VOUCH IN HAND, and this is the one
+    // branch a vouch can reach on its own: reclassify the only finding and both
+    // lists empty out. Saying "none" there is the confident-wrong message this
+    // file has a standing rule against -- there WERE collisions, and a human
+    // decided to accept them. The qualifier is the whole difference, so the
+    // unvouched wording below is preserved byte for byte.
+    const scope = catalogVerified ? "" : " among the ids this config advertises";
+    message = `no ${vouchedHijacks.length ? "unvouched " : ""}bare Claude-shaped collisions${scope}`;
+  }
+  // APPENDED TO EVERY BRANCH, not only the empty one. A run can carry a vouched
+  // finding alongside a fatal one or a shadowed one, and the operator reviewing
+  // either needs the accepted risk in front of them at the same time. Named in
+  // full -- id, owner, reason -- because a count is not something anyone can
+  // check against providers.json.
+  if (vouchedHijacks.length) {
+    message += `\nvouched (reported, not blocking): ` +
+      vouchedHijacks.map((v) => `${v.id}  <-  sole owner: ${v.owner} (${v.reason})`).join("\n") +
+      `\nThese ids are still uniquely owned and CCR would still bind them there; ` +
+      `the vouch records that this was accepted, it does not change the routing.`;
   }
   // DISCLOSURE ON THE UNVERIFIED PATH. Plan §2.6 establishes the principle for a
   // keysync run that REFUSED to write: a run whose outcome rests on something it
@@ -538,8 +609,15 @@ export function checkBareCollisions(providers, {
   // because this is the line a reader checks when asking what makes keysync exit,
   // and the answer -- "exactly when CCR's resolve() would bind a bare Claude
   // selector to a single non-relay host" -- is decided fifty lines up.
+  //
+  // `vouchedHijacks` IS NOT IN THE EXPRESSION, and that is the point. `fatal`
+  // reads `hijackable` alone, exactly as it did before the vouch existed -- with
+  // an empty `vouchedProviders` nothing is ever moved out of `hijackable`, so
+  // the computation is the same program on the same input. The vouch changes
+  // which list a finding lands in, never how the list is scored.
   return {
-    hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message,
+    hijackable, shadowed, vouchedHijacks,
+    fatal: hijackable.length > 0 && !allowBare, message,
     catalogVerified,
   };
 }
@@ -558,13 +636,18 @@ export function checkBareCollisions(providers, {
  * NOT A VERDICT. This decides visibility only; `fatal` is computed in the guard
  * and neither reads this nor is read by it.
  *
- * @param {{hijackable: object[], shadowed: object[], catalogVerified?: boolean}} collisions
+ * @param {{hijackable: object[], shadowed: object[], vouchedHijacks?: object[],
+ *          catalogVerified?: boolean}} collisions
  * @returns {boolean}
  */
 export function shouldReportCollisions(collisions) {
   return Boolean(
     collisions?.hijackable?.length ||
     collisions?.shadowed?.length ||
+    // A run whose ONLY finding was vouched away. Without this disjunct the
+    // accepted risk is named in a message nothing prints, which is the same
+    // silence the unverified all-clear disjunct below was added to fix.
+    collisions?.vouchedHijacks?.length ||
     // The findings-free unverified run. Without this disjunct the operator sees
     // NOTHING on exactly the path where the guard verified least.
     collisions?.catalogVerified === false
@@ -1041,6 +1124,71 @@ export function bareIdCensus(providers) {
   };
 }
 
+/**
+ * R10's per-provider discovery cache, in the shape `buildProviders` wants.
+ *
+ * `discoveryIndex` accepts `provider -> record` where the record is either the
+ * raw cache record (`{outcome, models}`) or a bare array -- NOT a `{byProvider}`
+ * wrapper, which is `catalog`'s shape and a mistake easy to make here because
+ * the two are joined together downstream.
+ *
+ * EVERY FAILURE DEGRADES, NONE THROWS, AND NONE IS SILENT. `cacheRoot` throws
+ * when the local app-data root is unset and `readCacheRecord` throws when a
+ * record is not owner-only -- both are real conditions on a machine that has
+ * never run `refresh`, and neither is a reason to stop a keysync that worked
+ * fine without discovery for its whole life. Discovery only ever ADDS candidate
+ * ids, so the degraded path is exactly the pre-R13c build rather than a
+ * truncated one. The returned `note` is what keeps the degradation visible: a
+ * silently empty cache would shrink routing by ~3,400 entries and read as
+ * success.
+ *
+ * @param {string[]} names  provider names to look for, normally `chosen`'s
+ * @param {object} [opts]
+ * @param {() => string} [opts.root=cacheRoot]
+ * @param {(p: string, o: object) => object|null} [opts.read=readCacheRecord]
+ * @returns {{discovery: Map<string, object>|null, note: string}}
+ *   `discovery` is null ONLY when no cache directory could be resolved at all;
+ *   an empty Map means the directory exists and held nothing for these
+ *   providers, which is a different fact and reads differently downstream.
+ */
+export function loadDiscoveryCache(names, { root = cacheRoot, read = readCacheRecord } = {}) {
+  let dir;
+  try { dir = root(); } catch (e) {
+    return { discovery: null, note: `discovery: no cache directory (${e.message}); ` +
+      `routing falls back to catalogue u testModel` };
+  }
+  const discovery = new Map();
+  const unreadable = [];
+  for (const name of names) {
+    let record = null;
+    try { record = read(name, { dir }); } catch (e) { unreadable.push(`${name}: ${e.message}`); continue; }
+    if (record) discovery.set(name, record);
+  }
+  const note = `discovery: ${discovery.size} of ${names.length} provider(s) have a cache record` +
+    (unreadable.length ? `; ${unreadable.length} unreadable (${unreadable.join("; ")})` : "");
+  return { discovery, note };
+}
+
+/**
+ * The provider names the operator has vouched to sole-own a Claude-shaped id.
+ *
+ * STRICT `=== true`, NOT TRUTHINESS. This field decides whether a fatal security
+ * finding is downgraded, so `"false"`, `"no"`, `0` and `1` must all fail to
+ * vouch -- a hand-edited JSON file is exactly where a string lands in a boolean
+ * slot, and a typo that accidentally disarms a guard is the failure this rules
+ * out.
+ *
+ * @param {Map<string, object>} providers  the vault profiles from `loadVault`
+ * @returns {Set<string>}
+ */
+export function vouchedBareClaudeProviders(providers) {
+  const out = new Set();
+  for (const [name, profile] of providers ?? []) {
+    if (profile?.vouchedBareClaude === true) out.add(name);
+  }
+  return out;
+}
+
 // ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
 // writes built-rows.json, and on the dry path calls process.exit(0). Without
 // this check, `import { checkBareCollisions } from "./run.mjs"` would run all of
@@ -1085,7 +1233,18 @@ const readKey = (id) => {
   return key;
 };
 
-const built = buildProviders(chosen, providers, catalog, dry ? () => "dry-run-placeholder" : readKey);
+// R13c: R10's cache reaches routing here, and this is the line the comment above
+// `checkBareCollisions` warned about ("the next task to wire R10's discovery
+// cache into this path must re-measure before it ships"). Re-measured
+// 2026-09-08 on the real vault: routing entries 1,584 -> 5,026 and, on the
+// `realIds === null` branch, hijackable 0 -> 22 with fatal flipping to true.
+// That verdict is REAL and is not softened here -- see the vouch mechanism in
+// `checkBareCollisions`, which gives the operator a per-provider way to accept a
+// specific reseller rather than a flag that accepts all of them.
+const { discovery, note: discoveryNote } = loadDiscoveryCache(chosen.map((c) => c.provider));
+console.log(discoveryNote);
+const built = buildProviders(chosen, providers, catalog,
+  dry ? () => "dry-run-placeholder" : readKey, discovery);
 for (const n of built.notes) console.log(`  note: ${n}`);
 
 // --verified-only: keep only PICKER rows a live probe confirmed serve
@@ -1293,8 +1452,23 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
   // Collapsing them is the regression this branch shipped and had to fix: with
   // routing auto-add, the relay owns everything `realIds` considers, so the
   // FATAL path could never fire. See the vouching block in checkBareCollisions.
+  // A THIRD SET, AND IT ANSWERS A THIRD QUESTION. `realIds` is what the analysis
+  // considers, `relayOwned` is which ids OUR relay curates, and this is which
+  // RESELLERS the operator has accepted as sole owners. It comes from the vault
+  // rather than from source: vouching a host is a configuration decision about
+  // that host's business, the same shape as the `listing` block, and a source
+  // allowlist would put it beyond the reach of the person who has to make it.
+  const vouchedProviders = vouchedBareClaudeProviders(providers);
   const collisions = checkBareCollisions(built.providers,
-    { allowBare: has("--allow-bare-claude-names"), realIds, relayOwned, relayRouting: routingIds });
+    { allowBare: has("--allow-bare-claude-names"), realIds, relayOwned, relayRouting: routingIds,
+      vouchedProviders });
+  // UNCONDITIONAL, and it prints `0 vouched` rather than nothing. A vouch is an
+  // accepted risk, and the run where none is in force is exactly the run whose
+  // silence would later be read as "there was nothing to accept". The count of
+  // unvouched findings is carried alongside it so the line states the verdict's
+  // input, not just its aftermath; `collisions.message` names each finding.
+  console.log(`bare-Claude collisions: ${collisions.hijackable.length} unvouched (fatal if >0), ` +
+    `${collisions.vouchedHijacks.length} vouched (reported, not blocking)`);
   // Printed on findings AND on a findings-free run that could not reach
   // Anthropic's catalogue -- that second case used to print nothing at all,
   // which made an unverified all-clear indistinguishable from a verified one.

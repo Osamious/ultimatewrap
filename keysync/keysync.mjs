@@ -26,6 +26,25 @@ import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry } from "./cat
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
 const readJson = (f) => JSON.parse(fs.readFileSync(f, "utf8").replace(/^\uFEFF/, ""));
 
+/**
+ * The vault, verbatim. Profiles are passed through WHOLE rather than projected
+ * onto a known field list, which is what lets optional per-provider settings be
+ * added in `providers.json` alone. Two are read outside this file today:
+ *
+ *   `listing`             (R9, `refresh/discover.mjs:listingProfileFor`) -- how
+ *                         to ask this host what models a key can call.
+ *   `vouchedBareClaude`   (R13c, `run.mjs:vouchedBareClaudeProviders`) -- the
+ *                         operator accepts this provider sole-owning a bare
+ *                         Claude-shaped id, so `checkBareCollisions` reports the
+ *                         finding instead of stopping the run. Absent or false
+ *                         on every entry as shipped; setting it is a deliberate
+ *                         config decision about a specific reseller's business,
+ *                         never a source-level default, and its reader requires
+ *                         `=== true` so a stray string cannot disarm the guard.
+ *
+ * Listed here because a field that exists only at its distant reader is a field
+ * the next person edits `providers.json` without knowing about.
+ */
 export function loadVault() {
   const registry = readJson(path.join(LLMKEYS, "registry.json"));
   const providers = readJson(path.join(LLMKEYS, "providers.json"));

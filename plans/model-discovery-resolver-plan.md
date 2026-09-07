@@ -2924,6 +2924,93 @@ grow.
 
 ---
 
+**R13c — Wire R10's discovery cache into routing, with an explicit per-provider bare-Claude vouch.**
+*(Inserted 2026-09-08, at the user's direction, after R13b shipped and before R14 — the gap this
+closes: R14 wires `discovery` into `menu/catalog.mjs`'s DISPLAY snapshot only; nothing wires it into
+`keysync.mjs`'s ROUTING build. Left unaddressed, uwpick would display ~2,161 discovery-only ids
+(models existing only in R10's cache, not in the catalogue or any `testModel`) that `Providers[]`
+cannot route — a user selecting one via uwpick's emitted `/model provider/id` would hit CCR with a
+selector bound to nothing. That is a worse failure than #91's undeclared-but-routable population:
+this is unroutable-and-displayed.)*
+
+**WRITES:** `keysync/run.mjs`, `keysync/keysync.mjs`, `test/denylist.test.mjs`,
+`test/routing-split.test.mjs`.
+
+**Serial after:** R13b. **Serial before:** R14 (closes the gap R14 would otherwise ship into).
+**Hard gate, measured 2026-09-08 before this task was written, not assumed:** wiring `discovery`
+directly into `buildProviders(..., discovery)` with no other change makes `checkBareCollisions`
+**`fatal: true` on the real vault, today** — not the vault-dependent, not-proven-live caveat R11's
+review carried. Measured: routing entries 1,584 → 5,026; `hijackable: 22`; `shadowed: 15`. `aihubmix`
+alone sole-owns 20 of the 22 bare-Claude-shaped ids, including real Anthropic ids
+(`claude-opus-4-1`, `claude-3-7-sonnet`, `claude-3-haiku-20240229`, `anthropic-opus-4-6`, others);
+`bai` sole-owns `claude-haiku-4.5`. `run.mjs:1105-1110`'s `process.exit(1)` fires before any write —
+naive wiring makes keysync unable to write config for ANY of the 44 providers, not just the two
+resellers.
+
+**This is the guard doing its job, not a defect in it.** It exists to catch a reseller advertising a
+Claude-shaped bare name that could be silently bound to instead of the real relay if anything ever
+resolves a bare selector. That risk is real regardless of whether these two resellers are genuinely
+proxying Anthropic's models (plausible — this is aihubmix's known business) or squatting. The guard
+cannot tell the difference from the id alone, and this task does not ask it to.
+
+**The decision, made by the user 2026-09-08: vouch specific resellers, not a broad allowlist and not
+leaving discovery unwired.** Three shapes were considered — (1) exclude only the colliding ids from
+routing while keeping the provider, (2) an explicit per-provider vouch, (3) leave the run-wide fatal
+in place and block this task entirely. (2) was chosen.
+
+**Mechanism, following this branch's own precedent (R9's `listing` field) rather than a source-level
+allowlist:**
+
+1. **New optional per-provider field in `~/.llmkeys/providers.json`**: `"vouchedBareClaude": true`.
+   Absent or `false` on every entry today — this task adds the FIELD, not any vouched entries. Whether
+   `aihubmix`/`bai` get vouched is a config edit the user makes afterward, exactly as the cloudflare
+   `listing` block was — never a source-level decision, and never made by an executor.
+2. **`checkBareCollisions` gains `vouchedProviders = new Set()`** (provider NAMES, not ids). In the
+   classification loop, a hijackable id whose sole owner is IN `vouchedProviders` moves to a NEW
+   returned array — `vouchedHijacks` — instead of `hijackable`. `fatal` is computed from `hijackable`
+   ONLY (unvouched). `vouchedHijacks` is never silent: it is always present in the return value and
+   always printed at run time, even when empty-vs-populated is the only thing that changed. Default
+   `vouchedProviders` empty Set reproduces today's `fatal` computation byte-for-byte — **this is the
+   assertion that proves the mechanism is additive, not a loosening of the existing guard.**
+3. **`run.mjs` reads the new field and builds the Set**, passing it alongside `realIds`/`relayOwned`.
+4. **Disclosure line, unconditional**: `--dry` and the real write both print
+   `bare-Claude collisions: N unvouched (fatal if >0), M vouched (reported, not blocking)` — a run
+   with zero vouched providers prints `M: 0` explicitly, not a blank line, per
+   [[uwpick-shows-latest-functional-state]]'s standing rule that a true-and-boring state is still
+   stated.
+
+**What this task does NOT do.** It does not decide whether `aihubmix` or `bai` should be vouched —
+that is a follow-up config edit, named as such in this task's output, never made by the executor. It
+does not touch `ANTHROPIC_ALIASES`, `ANTHROPIC_FULL`, or the existing `relayOwned`/`vouched(id)`
+mechanism at `run.mjs:375` — that function answers "does the relay curate this id", a different
+question at a different granularity (id-level, relay-only) from this task's provider-level reseller
+trust. Do not merge the two.
+
+**Verify:**
+- `node --test "test/denylist.test.mjs" "test/routing-split.test.mjs"`.
+- Real-vault regression test, fixture-based (not live): with the field wired but an empty vouch set,
+  `checkBareCollisions` against a discovery-shaped fixture reproducing the 22/15/fatal-true shape
+  above must still return `fatal: true` — the mechanism must not accidentally soften the default.
+- With one fixture provider added to `vouchedProviders`, its sole-owned collision moves from
+  `hijackable` to `vouchedHijacks`, `fatal` recomputes correctly (false if that was the only
+  collision, true if others remain unvouched), and `vouchedHijacks` still names the id, owner, and
+  reason — never just a count.
+- `node keysync/run.mjs --dry` against the real vault with `providers.json` unedited (zero vouches):
+  confirm `fatal: true`, `hijackable: 22`, `vouchedHijacks: []`, and that the disclosure line prints
+  `0` explicitly. This is the honest, correct, currently-still-broken state this task ships with —
+  landing the mechanism does not itself resolve the real vault's fatal condition; a human vouching
+  `aihubmix`/`bai` (or narrowing what routes from them) is a separate, later action.
+- Re-run R13's bare-id census with discovery wired: report the real numbers (routing entries,
+  ambiguous count, hijackable, shadowed) — do not assume they match any number from a no-discovery
+  run.
+
+**Named follow-up, not this task's job:** once this lands, someone (the user, reviewing aihubmix's and
+bai's actual listings) decides whether to set `vouchedBareClaude: true` on either. Until that happens,
+`node keysync/run.mjs --target live` **will exit 1 and write nothing** if discovery is passed in with
+today's real vault — file that as the honest state, not a bug in this task.
+
+---
+
 **R14 — Give provenance a producer: `discovery` and `provenanceOf` into `buildFrom`; wire the join;
 live `capability` overrides `outputKind`; carry `rejected` onto the row.**
 

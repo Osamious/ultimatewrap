@@ -1141,3 +1141,107 @@ test("R13b: provenance cannot change WHICH ids route, only their order", () => {
   assert.deepEqual(bareIdCensus(ranked.providers).ambiguous,
     bareIdCensus(plain.providers).ambiguous, "census is unaffected by ordering");
 });
+
+// ------------------------------------------- R13c: discovery reaches ROUTING
+//
+// R14 wires R10's cache into the DISPLAY snapshot; without this task nothing
+// wired it into the routing build, and uwpick would have offered rows that
+// `Providers[].models` could not route. These assert the wiring itself, because
+// the entry-point block that performs it is behind a guard no test may run --
+// the same standard `assertOptionsComplete`'s call site is held to below.
+
+const RUN_SRC = fs.readFileSync(new URL("../keysync/run.mjs", import.meta.url), "utf8");
+
+test("run.mjs passes a discovery cache to buildProviders, not nothing", () => {
+  // The forward-warning above `checkBareCollisions` named this exact line as the
+  // thing that did not exist yet ("run.mjs passes no `discovery` argument to
+  // `buildProviders` today"). A regression here is silent: routing simply gets
+  // smaller, every test still passes, and the picker starts offering ids that
+  // route nowhere.
+  const load = RUN_SRC.indexOf("loadDiscoveryCache(chosen.map((c) => c.provider))");
+  const call = RUN_SRC.indexOf("const built = buildProviders(chosen, providers, catalog,");
+  assert.ok(load > 0, "the cache is loaded at the entry point");
+  assert.ok(call > load, "and loaded before the build that consumes it");
+  assert.match(RUN_SRC.slice(call, call + 200), /readKey, discovery\)/,
+    "and it is actually passed as the discovery argument");
+  assert.equal(RUN_SRC.includes("buildProviders(chosen, providers, catalog, dry ?"), false,
+    "the old no-discovery call must not survive alongside the new one");
+});
+
+test("run.mjs passes the vault's vouch set to the collision guard", () => {
+  const derive = RUN_SRC.indexOf("const vouchedProviders = vouchedBareClaudeProviders(providers)");
+  const call = RUN_SRC.indexOf("const collisions = checkBareCollisions(built.providers,");
+  assert.ok(derive > 0 && call > derive, "derived from the vault, then passed");
+  assert.match(RUN_SRC.slice(call, call + 300), /vouchedProviders/);
+});
+
+test("the bare-Claude disclosure line is unconditional at the call site", () => {
+  // A DISCLOSURE INSIDE AN `if` IS NOT A DISCLOSURE. The run with nothing vouched
+  // is exactly the run whose silence would later read as "there was nothing to
+  // accept", so the line must print `0 vouched` rather than not print.
+  const line = RUN_SRC.indexOf("console.log(`bare-Claude collisions:");
+  assert.ok(line > 0, "the line exists");
+  // Nothing between the guard call and this line may open a conditional block.
+  const call = RUN_SRC.indexOf("const collisions = checkBareCollisions(built.providers,");
+  const between = RUN_SRC.slice(call, line);
+  assert.doesNotMatch(between, /\n\s*if\s*\(/,
+    "no branch stands between computing the verdict and stating it");
+  assert.match(RUN_SRC.slice(line, line + 300), /unvouched \(fatal if >0\)/);
+  assert.match(RUN_SRC.slice(line, line + 300), /vouched \(reported, not blocking\)/);
+});
+
+test("discovery widens routing, and the fail-closed property survives the widening", () => {
+  // THE CENSUS PROPERTY IS NOT A PROPERTY OF THE OLD WIDTH. Discovery roughly
+  // triples the routing table on the real vault, which triples the number of
+  // bare ids `resolveBare` has to get right -- so the ambiguity-fails-closed
+  // pairing is re-asserted over a discovery-widened build rather than assumed to
+  // carry over.
+  const withoutDiscovery = build(fixture()).providers;
+  // One shared id across two providers (must stay unbindable) and one unique to
+  // each (must bind), all reachable ONLY through discovery.
+  const providers = build(fixture({ discovery: {
+    tabiai: { outcome: "ok", models: [{ id: "shared-disc-1" }, { id: "tabiai-disc-1" }] },
+    gorouter: { outcome: "ok", models: [{ id: "shared-disc-1" }, { id: "gorouter-disc-1" }] },
+  } })).providers;
+
+  const before = withoutDiscovery.reduce((n, p) => n + p.models.length, 0);
+  const after = providers.reduce((n, p) => n + p.models.length, 0);
+  assert.ok(after > before, `discovery must ADD routing entries (${before} -> ${after})`);
+
+  const census = bareIdCensus(providers);
+  assert.deepEqual(census.owners.get("shared-disc-1"), ["gorouter", "tabiai"]);
+  assert.equal(resolveBare(providers, "shared-disc-1"), undefined,
+    "a discovered id claimed by two hosts still binds nothing");
+  assert.equal(resolveBare(providers, "tabiai-disc-1")?.provider, "tabiai",
+    "and a uniquely discovered one still routes");
+
+  // The complementarity the pair is asserted on, re-checked at the new width.
+  for (const id of census.ambiguous) {
+    assert.equal(resolveBare(providers, id), undefined, `"${id}" must bind nothing`);
+  }
+  assert.equal(census.ambiguous.length + census.soleOwned.length, census.owners.size);
+});
+
+test("a discovered Claude-shaped id from a reseller is caught, and a vouch reclassifies it", () => {
+  // THE WHOLE REASON R13c NEEDED A VOUCH AT ALL. Discovery is a provider's own
+  // listing of what a key can call, and a reseller's listing is precisely where a
+  // bare `claude-*` name appears -- so wiring discovery is what arms this guard.
+  const providers = build(fixture({ discovery: {
+    tabiai: { outcome: "ok", models: [{ id: "claude-opus-4-1" }] },
+  } })).providers;
+  assert.ok(providers.find((p) => p.name === "tabiai").models.includes("claude-opus-4-1"),
+    "the discovered id really reached routing, or the rest of this proves nothing");
+
+  const caught = checkBareCollisions(providers, { realIds: null });
+  assert.equal(caught.hijackable.some((h) => h.id === "claude-opus-4-1" && h.owner === "tabiai"),
+    true);
+  assert.equal(caught.fatal, true);
+
+  const accepted = checkBareCollisions(providers,
+    { realIds: null, vouchedProviders: new Set(["tabiai"]) });
+  assert.equal(accepted.hijackable.some((h) => h.id === "claude-opus-4-1"), false);
+  assert.equal(accepted.vouchedHijacks.some((v) => v.id === "claude-opus-4-1"), true,
+    "moved, not dropped -- the accepted risk stays on the record");
+  assert.equal(accepted.shadowed.map((s) => s.id).includes("claude-opus-4-8"), true,
+    "and the pre-existing shared claim is untouched by the vouch");
+});
