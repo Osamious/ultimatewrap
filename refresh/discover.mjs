@@ -100,6 +100,13 @@ export const REASONS = Object.freeze({
   TIMEOUT: "timeout",
   NETWORK: "network",
   AUTH_BUDGET: "auth-budget",
+  OVERSIZE: "oversize-body",
+  // 402 and 429 are ALIVE-BUT-UNAVAILABLE, and a consumer that cannot tell them
+  // from a DNS failure or a 500 will prune a working provider on a transient
+  // rate limit. 429 in particular is likely across a 44-host sweep. The outcome
+  // set stays at six; these ride on the `reason` sub-code that already exists.
+  PAYMENT: "payment-required",
+  RATE_LIMIT: "rate-limited",
 });
 
 /**
@@ -238,10 +245,11 @@ export function headersFor(prof, key) {
 // ------------------------------------------------------ the scrubbed environ
 
 /**
- * Deleted before the fan-out (F6). If this process were started as a child of
- * the CCR gateway, or with its environment, all 44 authenticated requests would
- * silently traverse whatever `CCR_UPSTREAM_PROXY_URL` names -- the gateway's
- * proxy preload patches `globalThis.fetch` on exactly these variables.
+ * The five variables that can put something between this process and a provider
+ * (F6). If this process were started as a child of the CCR gateway, or with its
+ * environment, all 44 authenticated requests could silently traverse whatever
+ * `CCR_UPSTREAM_PROXY_URL` names -- the gateway's proxy preload patches
+ * `globalThis.fetch` on exactly these variables.
  */
 export const PROXY_ENV = Object.freeze([
   "CCR_UPSTREAM_PROXY_URL",
@@ -252,6 +260,23 @@ export const PROXY_ENV = Object.freeze([
 ]);
 
 /**
+ * Removes them from an environment OBJECT. Corrected claim, because the previous
+ * comment here said this prevented the interception and it does not:
+ *
+ *   - `NODE_OPTIONS` is consumed by the runtime before any user code runs, so a
+ *     `--require` preload that replaced `globalThis.fetch` is already installed
+ *     and deleting the variable changes nothing in THIS process. Demonstrated:
+ *     the variable was deleted and the very next request still came back from
+ *     the preload.
+ *   - `NODE_EXTRA_CA_CERTS` is read when the first secure context is created.
+ *   - undici, which backs `globalThis.fetch`, ignores `HTTPS_PROXY`/`HTTP_PROXY`
+ *     outright; only an explicit dispatcher routes through a proxy.
+ *
+ * What it IS still good for, and the only thing claimed for it now: a child
+ * process spawned after this call inherits the scrubbed copy, so the deletion
+ * does work in the direction it can work. The protection for this process is
+ * `proxyRefusal` below -- a refusal, not a repair.
+ *
  * @returns {string[]} the names actually removed. On Windows the environment is
  * case-insensitive, so deleting `HTTPS_PROXY` also clears `https_proxy` and the
  * lowercase pass finds nothing; the pass is kept so the function is correct off
@@ -265,6 +290,46 @@ export function scrubProxyEnv(env = process.env) {
     }
   }
   return removed;
+}
+
+/**
+ * Snapshotted at MODULE LOAD, because that is the last moment at which the
+ * answer is still knowable: by the time `discoverAll` runs, anything these
+ * variables set up is in place and the variables themselves may already have
+ * been scrubbed by someone else.
+ */
+export const PROXY_ENV_AT_LOAD = Object.freeze(
+  PROXY_ENV.filter((n) => n in process.env || n.toLowerCase() in process.env));
+
+const FETCH_AT_LOAD = globalThis.fetch;
+
+// Node's own `fetch` is a named function declaration. The ordinary interception
+// -- an arrow function or an anonymous wrapper assigned over the global -- does
+// not match. STATED LIMIT, not overclaimed: a wrapper that reproduces the name
+// and parameter list defeats this check, and the environment snapshot above is
+// what actually covers the mechanism CCR uses. Neither is a proof of identity.
+const NATIVE_FETCH_SHAPE = /^(?:async\s+)?function fetch\s*\(/;
+
+/**
+ * REFUSE, DO NOT REPAIR -- the same shape `resolveListingUrl` uses for a URL it
+ * will not send. A credential is about to leave this process 44 times; if
+ * anything could be sitting in the path, the correct move is to not go, not to
+ * try to dismantle it from inside.
+ *
+ * @returns {string|null} the refusal, or null when the fan-out may proceed.
+ */
+export function proxyRefusal({ atLoad = PROXY_ENV_AT_LOAD, fetchNow = globalThis.fetch } = {}) {
+  if (atLoad.length) {
+    return `refusing to fan out: ${atLoad.join(", ")} was set when this process started, ` +
+           "and an interception installed that way cannot be undone from here";
+  }
+  if (fetchNow !== FETCH_AT_LOAD) {
+    return "refusing to fan out: globalThis.fetch was replaced after this module loaded";
+  }
+  if (!NATIVE_FETCH_SHAPE.test(String(fetchNow))) {
+    return "refusing to fan out: globalThis.fetch is not the runtime's own implementation";
+  }
+  return null;
 }
 
 // ------------------------------------------------------------ the projection
@@ -284,17 +349,33 @@ const CAPABILITY_MAX = 64;
 
 const capAt = (s, n) => [...String(s)].slice(0, n).join("");
 
+/**
+ * FIRST USABLE WINS, not first present. The distinction is the whole of this
+ * function, and getting it wrong destroys data we already hold: an entry
+ * carrying `{context_length: "128k", max_input_tokens: 131072}` read the string
+ * first, refused it, and reported `null` -- discarding a perfectly good integer
+ * sitting in the next candidate field.
+ *
+ * The REFUSAL of the unusable value stands, and is not softened: "128k" is never
+ * coerced into a number, an escape-carrying capability token is never stored.
+ * The bug was skipping the valid sibling, never the refusal itself.
+ */
 function capabilityOf(entry, fields) {
   for (const f of fields) {
     const v = entry[f];
-    if (typeof v !== "string" || v === "") continue;
-    // Reuse admitId rather than write a second token rule. It already rejects
-    // escapes, control characters, invisibles, whitespace, backslashes and `..`,
-    // and two definitions of "safe provider-controlled token" is how they drift.
-    // A present-but-refused field yields null; it does not fall through to the
-    // next candidate, because the provider did answer -- with something unsafe.
-    const admitted = admitId(v);
-    return admitted ? capAt(admitted, CAPABILITY_MAX) : null;
+    // Arrays for the same reason `modalityHintsOf` takes them: providers send
+    // `capabilities: ["chat", "vision"]`, and the projection that handled arrays
+    // in one place and dropped them in another produced `null` for a field the
+    // provider had answered plainly.
+    for (const cand of Array.isArray(v) ? v : [v]) {
+      if (typeof cand !== "string" || cand === "") continue;
+      // Reuse admitId rather than write a second token rule. It already rejects
+      // escapes, control characters, invisibles, whitespace, backslashes and
+      // `..`, and two definitions of "safe provider-controlled token" is how
+      // they drift.
+      const admitted = admitId(cand);
+      if (admitted) return capAt(admitted, CAPABILITY_MAX);
+    }
   }
   return null;
 }
@@ -305,8 +386,15 @@ function contextOf(entry, fields) {
     if (v === undefined || v === null) continue;
     // Deliberately NOT coerced from a string: `admitCatalogEntry` does not
     // coerce either, and a provider sending "128k" must read as "unknown"
-    // rather than as some number this parser invented.
-    return Number.isInteger(v) && v > 0 && v <= CTX_MAX ? v : null;
+    // rather than as some number this parser invented. Unusable is SKIPPED
+    // rather than fatal, so the sibling integer field survives.
+    //
+    // Arrays are NOT unwrapped here, and that asymmetry with `capabilityOf` is
+    // deliberate rather than an oversight: `capabilities` is a set and its first
+    // element is a real answer, whereas a context length arriving as an array is
+    // a shape nobody has observed and picking an element would be a guess about
+    // which token count it is. Unknown reads as unknown.
+    if (Number.isInteger(v) && v > 0 && v <= CTX_MAX) return v;
   }
   return null;
 }
@@ -385,6 +473,11 @@ export function classifyOutcome({ status, json, listing }) {
   // observable here instead of silently re-issuing the credential at whatever
   // host the Location header names.
   if (status >= 300 && status < 400) return { outcome: "error", status, reason: REASONS.REDIRECT };
+  // Alive but unavailable, told apart from broken. A consumer looking at bare
+  // `error{402}` beside `error{0}` cannot distinguish an unpaid account from a
+  // host that does not resolve, and 429 across a 44-host sweep is ordinary.
+  if (status === 402) return { outcome: "error", status, reason: REASONS.PAYMENT };
+  if (status === 429) return { outcome: "error", status, reason: REASONS.RATE_LIMIT };
   if (status < 200 || status >= 300) return { outcome: "error", status };
   if (json === null || typeof json !== "object") {
     return { outcome: "error", status, reason: REASONS.NON_JSON };
@@ -409,7 +502,53 @@ export const CONCURRENCY = 6;
 export const AUTH_BUDGET = 3;
 const TIMEOUT_MS = 45_000;
 
-const blank = (provider, at) => ({ provider, at, models: [], count: 0, rejected: 0 });
+/**
+ * A model listing is a few hundred short JSON objects. The largest real one in
+ * the set (openrouter, a few hundred models) is comfortably under 1 MB, so 8 MB
+ * is roughly a tenfold headroom over anything legitimate. It is a CEILING that
+ * no honest listing approaches, not a target: without it, `res.text()` is
+ * unbounded and one host streaming without end holds the whole fan-out open
+ * until the 45 s abort while its buffer grows in a process that is holding 44
+ * live credentials.
+ */
+export const MAX_BODY_BYTES = 8 << 20;
+
+/**
+ * `responded` is a first-class field and not an inference from the outcome enum.
+ * Without it `auth`, `empty`, `unsupported-shape` and an all-refused `ok` differ
+ * only by a string, and every one of them is a host that ANSWERED -- so a
+ * consumer reducing the record to `models.length` prunes a provider that is
+ * alive. It is false only where nothing was sent or nothing came back.
+ */
+const blank = (provider, at) =>
+  ({ provider, at, responded: false, models: [], count: 0, rejected: 0 });
+
+/**
+ * @returns {Promise<string|null>} the body, or null when it exceeded `max`.
+ *
+ * The stream path is the one that actually enforces the ceiling: it stops
+ * pulling the moment the count is exceeded, and abandoning the iterator cancels
+ * the underlying stream, so the socket goes with it. The `text()` fallback
+ * exists because a caller's stub need not carry a body stream; it can only
+ * refuse the record after the fact, not prevent the allocation, and that limit
+ * is stated rather than implied.
+ */
+async function readCapped(res, max) {
+  const body = res.body;
+  if (body && typeof body[Symbol.asyncIterator] === "function") {
+    const chunks = [];
+    let n = 0;
+    for await (const chunk of body) {
+      const buf = Buffer.from(chunk);
+      n += buf.length;
+      if (n > max) return null;
+      chunks.push(buf);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
+  const text = await res.text();
+  return Buffer.byteLength(text, "utf8") > max ? null : text;
+}
 
 /**
  * One provider, one request. Returns a cache-shaped record and never the body.
@@ -421,6 +560,7 @@ export async function discoverProvider(target, opts = {}) {
   const {
     fetchImpl = globalThis.fetch,
     timeoutMs = TIMEOUT_MS,
+    maxBodyBytes = MAX_BODY_BYTES,
     now = () => new Date().toISOString(),
   } = opts;
   const { provider, profile = {}, key } = target;
@@ -438,6 +578,7 @@ export async function discoverProvider(target, opts = {}) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let status = 0;
   let json = null;
+  let oversize = false;
   try {
     const res = await fetchImpl(resolved.url, {
       method: listing.method ?? "GET",
@@ -447,8 +588,16 @@ export async function discoverProvider(target, opts = {}) {
     });
     status = Number(res.status);
     if (status >= 200 && status < 300) {
-      const text = await res.text();
-      try { json = JSON.parse(text); } catch { json = null; }
+      // The declared length first, so an oversized body costs zero bytes read.
+      // A host that lies or omits it is caught by the ceiling in readCapped.
+      const declared = Number(res.headers?.get?.("content-length"));
+      if (Number.isFinite(declared) && declared > maxBodyBytes) {
+        oversize = true;
+      } else {
+        const text = await readCapped(res, maxBodyBytes);
+        if (text === null) oversize = true;
+        else { try { json = JSON.parse(text); } catch { json = null; } }
+      }
     }
   } catch (e) {
     return {
@@ -460,7 +609,13 @@ export async function discoverProvider(target, opts = {}) {
   }
 
   const c = classifyOutcome({ status, json, listing });
-  const base = { ...blank(provider, at), status, hostPinned: resolved.hostPinned };
+  // `responded: true` from here down: the host answered, whatever it said.
+  const base = { ...blank(provider, at), responded: true, status, hostPinned: resolved.hostPinned };
+
+  // One hostile body is ONE provider's error and never the run's. Before the
+  // per-record write in cli.mjs this could not have been contained anyway --
+  // nothing was persisted until every provider had resolved.
+  if (oversize) return { ...base, outcome: "error", reason: REASONS.OVERSIZE };
 
   if (c.outcome === "ok") {
     const models = [];
@@ -491,9 +646,18 @@ export async function discoverProvider(target, opts = {}) {
  * all 44 -- an auth failure is account state to surface, not a reason to stop
  * reaching everybody else.
  *
- * LATENT TODAY, and stated rather than implied: `refresh/cli.mjs` emits one
- * target per provider, so no provider can reach three consecutive failures. The
- * budget goes live the moment a provider carries more than one credential.
+ * LATENT TODAY, and the threshold stated correctly rather than by a factor of
+ * three: `refresh/cli.mjs` emits one target per provider, so the budget bites
+ * only when one provider carries MORE THAN `authBudget` (3) targets. The vault's
+ * densest provider carries 2 (groq and deepseek, of 46 eligible credentials
+ * across the 44 probed providers), so it stays latent.
+ *
+ * It was previously unreachable below SEVEN targets for one provider, not four,
+ * because every worker read `spent` in the same synchronous window before any
+ * await resolved -- so the budget could not bite until there were more targets
+ * than workers. The reservation below is the fix, and the control is kept rather
+ * than deleted for being currently latent: a stated safety property removed
+ * because nothing exercises it today is how safety properties rot.
  */
 export async function discoverAll(targets, opts = {}) {
   const {
@@ -501,27 +665,48 @@ export async function discoverAll(targets, opts = {}) {
     authBudget = AUTH_BUDGET,
     scrub = true,
     env = process.env,
+    onResult = null,
     now = () => new Date().toISOString(),
   } = opts;
-  if (scrub) scrubProxyEnv(env);
+
+  // The guard covers the AMBIENT transport, which is the only one a preload can
+  // reach. A caller supplying its own `fetchImpl` has declared it owns that
+  // transport, and a stub makes no connection for a proxy to sit in front of.
+  if (opts.fetchImpl === undefined || opts.fetchImpl === globalThis.fetch) {
+    const refusal = proxyRefusal();
+    if (refusal) throw new Error(refusal);
+  }
+  if (scrub) scrubProxyEnv(env);           // for children we spawn, not for us
 
   const queue = [...targets];
   const consecutiveAuth = new Map();       // provider -> count. PER PROVIDER.
   const results = [];
+
+  const record = (r) => {
+    results.push(r);
+    // Guarded: a caller whose per-record write throws must lose that record, not
+    // this worker and with it every provider still queued behind it.
+    if (onResult) { try { onResult(r); } catch { /* the caller owns reporting */ } }
+  };
 
   const worker = async () => {
     while (queue.length) {
       const t = queue.shift();
       const spent = consecutiveAuth.get(t.provider) ?? 0;
       if (spent >= authBudget) {
-        results.push({
+        record({
           ...blank(t.provider, now()), outcome: "error", status: 0, reason: REASONS.AUTH_BUDGET,
         });
         continue;
       }
+      // RESERVE before the await, pessimistically. Every worker otherwise reads
+      // the same `spent` in one synchronous window and none of them sees another
+      // worker's increment, which is what made the budget unreachable.
+      consecutiveAuth.set(t.provider, spent + 1);
       const r = await discoverProvider(t, opts);
-      consecutiveAuth.set(t.provider, r.outcome === "auth" ? spent + 1 : 0);
-      results.push(r);
+      // Released on any non-auth outcome: the counter is CONSECUTIVE failures.
+      if (r.outcome !== "auth") consecutiveAuth.set(t.provider, 0);
+      record(r);
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker));
@@ -585,11 +770,42 @@ export function aclPrincipals(output, filePath = "") {
   return names;
 }
 
-/** Exactly one principal, and it is this user. Anything else is not owner-only. */
-export function isOwnerOnly(output, username, filePath = "") {
+/**
+ * `icacls` prints a principal it cannot resolve to a name as a BARE SID, with no
+ * `DOMAIN\` part -- an account on a machine that is off its domain, or one whose
+ * reverse lookup is unavailable. `.split("\\").pop()` returns the whole SID and
+ * matches no username, so without this branch every write fails its own
+ * verification and the run ends with zero records after spending all 44
+ * authenticated requests. It fails CLOSED, so nothing leaks; it still burns the
+ * entire authorization for nothing, which is what makes it a blocker.
+ */
+const SID_FORM = /^S-1-(?:\d+-)+\d+$/i;
+
+let cachedSid;
+function currentUserSid() {
+  if (cachedSid !== undefined) return cachedSid;
+  try {
+    const out = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"],
+                             { encoding: "utf8", timeout: 30_000, windowsHide: true });
+    cachedSid = out.match(/S-1-(?:\d+-)+\d+/)?.[0] ?? "";
+  } catch { cachedSid = ""; }              // unknown SID matches nothing: still closed
+  return cachedSid;
+}
+
+/**
+ * Exactly one principal, and it is this user. Anything else is not owner-only.
+ * `sid` is a RESOLVER rather than a value so the lookup costs a child process
+ * only on the branch that needs one, which is the rare one.
+ */
+export function isOwnerOnly(output, username, filePath = "", { sid = currentUserSid } = {}) {
   const names = aclPrincipals(output, filePath);
   if (names.length !== 1) return false;
-  return names[0].split("\\").pop().toLowerCase() === String(username).toLowerCase();
+  const who = names[0];
+  if (SID_FORM.test(who)) {
+    const mine = (sid ?? currentUserSid)();
+    return mine !== "" && who.toLowerCase() === String(mine).toLowerCase();
+  }
+  return who.split("\\").pop().toLowerCase() === String(username).toLowerCase();
 }
 
 /**
@@ -604,9 +820,68 @@ export function isOwnerOnly(output, username, filePath = "") {
 function enforceOwnerOnly(target, user, { inherit = false, acl = { run: icacls } } = {}) {
   acl.run([target, "/inheritance:r", "/grant:r", `${user}:${inherit ? "(OI)(CI)(F)" : "(F)"}`]);
   const listed = acl.run([target]);
-  if (!isOwnerOnly(listed, user, target)) {
+  if (!isOwnerOnly(listed, user, target, { sid: acl.sid })) {
     throw new Error(`refusing to leave ${path.basename(target)} readable beyond its owner`);
   }
+}
+
+/** A record this tool wrote, by filename shape, including a leftover temp name. */
+const RECORD_NAME = /^[0-9a-f]{32}\.json(?:\.tmp-\d+)?$/;
+
+/**
+ * `--out` reaches `icacls /inheritance:r /grant:r`, which REWRITES a directory's
+ * DACL and strips its inheritance. `--out .` would therefore relock the
+ * repository root, and every file under it, on a typo.
+ *
+ * REFUSE rather than repair, the same shape `resolveListingUrl` uses: the
+ * directory must be absent -- in which case this tool creates it and owns it --
+ * or hold nothing but records this tool wrote. Anything else is somebody's
+ * directory and its permissions are not ours to rewrite.
+ */
+export function resolveCacheDir(given, opts = {}) {
+  const { fsImpl = fs, env = process.env } = opts;
+  if (given === null || given === undefined || given === "") return cacheRoot(env);
+
+  const dir = path.resolve(String(given));
+  if (!fsImpl.existsSync(dir)) return dir;
+  if (!fsImpl.statSync(dir).isDirectory()) {
+    throw new Error(`refusing to use ${dir} as a cache directory: it is not a directory`);
+  }
+  const foreign = fsImpl.readdirSync(dir).filter((n) => !RECORD_NAME.test(n));
+  if (foreign.length) {
+    throw new Error(
+      `refusing to rewrite the permissions of ${dir}: it holds ${foreign.length} entr` +
+      `${foreign.length === 1 ? "y" : "ies"} this tool did not write`);
+  }
+  return dir;
+}
+
+/**
+ * The prior record at this path, or null. Best effort by design: a prior record
+ * that cannot be read is not a reason to lose today's.
+ */
+function priorRecord(file, user, acl) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    if (!isOwnerOnly(acl.run([file]), user, file, { sid: acl.sid })) return null;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch { return null; }
+}
+
+/**
+ * One 403 must not destroy a cached 120-model listing. The new record still
+ * states today's truth -- the outcome, the status, the reason -- and carries the
+ * last listing that actually worked alongside it, so a consumer has both "this
+ * provider failed to answer today" and "here is what it last served".
+ *
+ * The carried models are already-projected records, so this discloses nothing
+ * the file did not already hold.
+ */
+function lastGoodOf(record, prior) {
+  if (record.outcome === "ok") return undefined;      // today's listing IS the good one
+  if (!prior) return undefined;
+  if (prior.outcome === "ok") return { at: prior.at, count: prior.count, models: prior.models };
+  return prior.lastGood;                              // carry an older one forward
 }
 
 /**
@@ -620,21 +895,32 @@ export function writeCacheRecord(record, opts = {}) {
   enforceOwnerOnly(dir, user, { inherit: true, acl });
 
   const file = cacheFileFor(record.provider, dir);
+  const carried = lastGoodOf(record, priorRecord(file, user, acl));
+  const payload = carried ? { ...record, lastGood: carried } : record;
+
   const tmp = `${file}.tmp-${process.pid}`;
+  let renamed = false;
   try {
-    fs.writeFileSync(tmp, JSON.stringify(record, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2));
     // Locked down BEFORE it takes its final name, so the record never exists at
     // a readable path in a readable state.
     enforceOwnerOnly(tmp, user, { acl });
     fs.renameSync(tmp, file);
+    renamed = true;
+    // INSIDE the try, which is the whole of this fix. Outside it, a genuine
+    // non-zero icacls exit -- a locked file, the 30 s timeout -- threw past the
+    // cleanup below and left the record sitting on disk while the caller printed
+    // "cache write failed" and moved on.
+    if (!isOwnerOnly(acl.run([file]), user, file, { sid: acl.sid })) {
+      throw new Error(`refusing to keep ${path.basename(file)}: it is not owner-only after the write`);
+    }
   } catch (e) {
     fs.rmSync(tmp, { force: true });
+    // This costs the prior record when the failure lands after the rename. That
+    // is the correct trade: a file whose DACL could not be verified must not
+    // remain, and the failure is loud rather than silent.
+    if (renamed) fs.rmSync(file, { force: true });
     throw e;
-  }
-  const listed = acl.run([file]);
-  if (!isOwnerOnly(listed, user, file)) {
-    fs.rmSync(file, { force: true });
-    throw new Error(`refusing to keep ${path.basename(file)}: it is not owner-only after the write`);
   }
   return file;
 }
@@ -645,7 +931,7 @@ export function readCacheRecord(provider, opts = {}) {
   const file = cacheFileFor(provider, dir);
   if (!fs.existsSync(file)) return null;
   const listed = acl.run([file]);
-  if (!isOwnerOnly(listed, user, file)) {
+  if (!isOwnerOnly(listed, user, file, { sid: acl.sid })) {
     throw new Error(`refusing to read the discovery cache for ${provider}: it is not owner-only`);
   }
   return JSON.parse(fs.readFileSync(file, "utf8"));

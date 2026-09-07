@@ -19,10 +19,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import {
   discoverAll, resolveListingUrl, listingProfileFor, writeCacheRecord,
-  cacheRoot, coverageOf, PINNED_HOSTS,
+  resolveCacheDir, coverageOf, PINNED_HOSTS,
 } from "./discover.mjs";
 
 const VAULT = path.join(os.homedir(), ".llmkeys");
@@ -72,95 +73,134 @@ function chooseCredential(creds) {
 }
 
 /**
- * Batch-load, use, then zero and drop (F5). One PowerShell session for every id:
- * a shell per key costs about 45 seconds across the set. Key values are never
- * printed, never written, and never returned past this function.
+ * Batch-load, use, then drop (F5). One PowerShell session for every id: a shell
+ * per key costs about 45 seconds across the set. Key values are never printed,
+ * never written, and never returned past this function.
+ *
+ * WHAT THE TEARDOWN ACTUALLY DOES, corrected: it drops every reference this
+ * process holds to a key. It does NOT overwrite the bytes -- JS strings are
+ * immutable, so assigning NULs to `cache[k]` allocates a NEW string and leaves
+ * the original for the collector, and `raw` (the whole map, as one string) is
+ * never cleared at all. Overwriting a JS string in place is not something this
+ * language offers; claiming it did was the defect.
  */
-async function withKeys(ids, fn) {
+export async function withKeys(ids, fn, { execFile = execFileSync } = {}) {
   const list = ids.map((i) => `'${String(i).replace(/'/g, "''")}'`).join(",");
   const script =
     `. '${path.join(VAULT, "ApiKeyVault.ps1").replace(/'/g, "''")}'; ` +
     `$out=@{}; foreach($id in @(${list})){ $v = Get-ApiKeyValue -Id $id; if($v){ $out[$id]=$v } }; ` +
     `$out | ConvertTo-Json -Compress -Depth 3`;
-  const raw = execFileSync("powershell", ["-NoProfile", "-Command", script],
-    { encoding: "utf8", maxBuffer: 16 << 20, timeout: 90_000 });
-  const cache = JSON.parse(raw.trim());
+
+  let cache;
+  try {
+    const raw = execFile("powershell", ["-NoProfile", "-Command", script],
+      { encoding: "utf8", maxBuffer: 16 << 20, timeout: 90_000 });
+    cache = JSON.parse(raw.trim());
+  } catch (e) {
+    // THE ORIGINAL ERROR IS NEVER RETHROWN, and never inspected beyond a status.
+    // The child's stdout is the id-to-key map for every selected provider, and
+    // on a non-zero exit, the 90 s timeout or a maxBuffer overflow `execFileSync`
+    // throws an Error carrying that stdout on `.stdout` and on `.output[1]`.
+    // Node prints an uncaught error's own enumerable properties, so rethrowing
+    // publishes the whole map to stderr. A future runtime may attach more
+    // fields, so a fresh Error carrying one number is the only safe shape.
+    throw new Error(`the vault read failed (${e?.status ?? e?.code ?? "no status"}); no key was read`);
+  }
+
   try {
     return await fn((id) => cache[id]);
   } finally {
-    for (const k of Object.keys(cache)) cache[k] = "\0".repeat(String(cache[k]).length);
     for (const k of Object.keys(cache)) delete cache[k];
   }
 }
 
 // ------------------------------------------------------------------- the run
 
-const profiles = new Map(readJson(path.join(VAULT, "providers.json")).map((p) => [p.provider, p]));
-const registry = readJson(path.join(VAULT, "registry.json"));
+async function main() {
+  const profiles = new Map(readJson(path.join(VAULT, "providers.json")).map((p) => [p.provider, p]));
+  const registry = readJson(path.join(VAULT, "registry.json"));
 
-const only = valueOf("--only");
-const wanted = only ? new Set(only.split(",").map((s) => s.trim()).filter(Boolean)) : null;
+  const only = valueOf("--only");
+  const wanted = only ? new Set(only.split(",").map((s) => s.trim()).filter(Boolean)) : null;
 
-let chosen = chooseCredential(eligibleCredentials(registry, profiles));
-if (wanted) chosen = chosen.filter((c) => wanted.has(c.provider));
-chosen.sort((a, b) => a.provider.localeCompare(b.provider));
+  let chosen = chooseCredential(eligibleCredentials(registry, profiles));
+  if (wanted) chosen = chosen.filter((c) => wanted.has(c.provider));
+  chosen.sort((a, b) => a.provider.localeCompare(b.provider));
 
-if (!chosen.length) {
-  console.error("no eligible provider matched. --only takes provider names, not credential ids.");
-  process.exit(2);
+  if (!chosen.length) {
+    console.error("no eligible provider matched. --only takes provider names, not credential ids.");
+    process.exit(2);
+  }
+
+  const targets = chosen.map((c) => ({ provider: c.provider, credentialId: c.id, profile: profiles.get(c.provider) }));
+
+  // ---- the plan, printed either way, so a live run is never a surprise ------
+  console.log(`${targets.length} provider${targets.length === 1 ? "" : "s"} selected\n`);
+  for (const t of targets) {
+    const listing = listingProfileFor(t.profile);
+    if (listing === null) { console.log(`  ${t.provider.padEnd(16)} no-endpoint (listing: null)`); continue; }
+    const r = resolveListingUrl(t.provider, t.profile);
+    const pin = PINNED_HOSTS.has(t.provider) ? "" : "  [host not pinned]";
+    console.log(`  ${t.provider.padEnd(16)} ${r.refusal ? `REFUSED ${r.refusal}` : r.url}${pin}`);
+  }
+
+  if (!has("--live")) {
+    console.log(`\nno request was made. Re-run with --live to fan out (${targets.length} authenticated requests).`);
+    process.exit(0);
+  }
+
+  // Validated BEFORE a single request is spent: this path reaches an icacls DACL
+  // rewrite, and finding out it was `.` after 44 authenticated calls is the
+  // wrong order to discover it in.
+  const outDir = resolveCacheDir(valueOf("--out"));
+
+  // A partial or failed run RETAINS its cache, and each record is written THE
+  // MOMENT ITS PROVIDER RESOLVES rather than after the fan-out. Writing at the
+  // end meant a single unhandled failure anywhere in the fan-out discarded every
+  // completed record and forced a re-authorized re-run of all 44 calls.
+  const writeFailure = new Map();          // provider -> message, or null on success
+  const onResult = (r) => {
+    try { writeCacheRecord(r, { dir: outDir }); writeFailure.set(r.provider, null); }
+    catch (e) { writeFailure.set(r.provider, String(e.message).slice(0, 120)); }
+  };
+
+  const results = await withKeys(targets.map((t) => t.credentialId), (keyOf) =>
+    discoverAll(targets.map((t) => ({ ...t, key: keyOf(t.credentialId) })), { onResult }));
+
+  results.sort((a, b) => a.provider.localeCompare(b.provider));
+
+  // ---- the report: providers by name, never a key, never a response body ----
+  console.log("");
+  for (const r of results) {
+    const tail =
+      r.outcome === "ok" ? `${r.models.length} kept of ${r.count} listed${r.rejected ? `, ${r.rejected} refused` : ""}` :
+      r.outcome === "unsupported-shape" ? `top-level keys: ${r.keys.join(", ") || "(none)"}` :
+      r.outcome === "error" ? `${r.status || ""} ${r.reason ?? ""}`.trim() :
+      r.outcome === "auth" ? String(r.status) : "";
+    console.log(`  ${r.outcome.padEnd(18)} ${r.provider.padEnd(16)} ${tail}`);
+  }
+
+  for (const [provider, failure] of writeFailure) {
+    if (failure) console.error(`  cache write failed for ${provider}: ${failure}`);
+  }
+  const written = [...writeFailure.values()].filter((v) => v === null).length;
+
+  const cov = coverageOf(results);
+  const pct = cov.eligible ? Math.round((cov.ok / cov.eligible) * 1000) / 10 : 0;
+  console.log(`\ncoverage ${cov.ok} of ${cov.eligible} eligible (${pct}%), ${cov.total} attempted, ${written} of ${results.length} records cached`);
+  console.log(Object.entries(cov.by).map(([k, v]) => `${k} ${v}`).join("  "));
+
+  const shapes = cov.by["unsupported-shape"] ?? 0;
+  if (shapes) {
+    console.log(`\n${shapes} of ${results.length} providers returned a shape this parser does not read.`);
+    console.log("Re-run ONLY those providers after adding an envelope candidate; the other records stand.");
+  }
 }
 
-const targets = chosen.map((c) => ({ provider: c.provider, credentialId: c.id, profile: profiles.get(c.provider) }));
-
-// ---- the plan, printed either way, so a live run is never a surprise --------
-console.log(`${targets.length} provider${targets.length === 1 ? "" : "s"} selected\n`);
-for (const t of targets) {
-  const listing = listingProfileFor(t.profile);
-  if (listing === null) { console.log(`  ${t.provider.padEnd(16)} no-endpoint (listing: null)`); continue; }
-  const r = resolveListingUrl(t.provider, t.profile);
-  const pin = PINNED_HOSTS.has(t.provider) ? "" : "  [host not pinned]";
-  console.log(`  ${t.provider.padEnd(16)} ${r.refusal ? `REFUSED ${r.refusal}` : r.url}${pin}`);
-}
-
-if (!has("--live")) {
-  console.log(`\nno request was made. Re-run with --live to fan out (${targets.length} authenticated requests).`);
-  process.exit(0);
-}
-
-const outDir = valueOf("--out") ?? cacheRoot();
-const results = await withKeys(targets.map((t) => t.credentialId), (keyOf) =>
-  discoverAll(targets.map((t) => ({ ...t, key: keyOf(t.credentialId) }))));
-
-results.sort((a, b) => a.provider.localeCompare(b.provider));
-
-// ---- the report: providers by name, never a key, never a response body ------
-console.log("");
-for (const r of results) {
-  const tail =
-    r.outcome === "ok" ? `${r.models.length} kept of ${r.count} listed${r.rejected ? `, ${r.rejected} refused` : ""}` :
-    r.outcome === "unsupported-shape" ? `top-level keys: ${r.keys.join(", ") || "(none)"}` :
-    r.outcome === "error" ? `${r.status || ""} ${r.reason ?? ""}`.trim() :
-    r.outcome === "auth" ? String(r.status) : "";
-  console.log(`  ${r.outcome.padEnd(18)} ${r.provider.padEnd(16)} ${tail}`);
-}
-
-// A partial or failed run RETAINS its cache, and retention is the default: one
-// provider's unrecognised envelope must not discard the other results and force
-// a re-authorized re-run of every authenticated call. Each provider's record is
-// written on its own.
-let written = 0;
-for (const r of results) {
-  try { writeCacheRecord(r, { dir: outDir }); written += 1; }
-  catch (e) { console.error(`  cache write failed for ${r.provider}: ${String(e.message).slice(0, 120)}`); }
-}
-
-const cov = coverageOf(results);
-const pct = cov.eligible ? Math.round((cov.ok / cov.eligible) * 1000) / 10 : 0;
-console.log(`\ncoverage ${cov.ok} of ${cov.eligible} eligible (${pct}%), ${cov.total} attempted, ${written} of ${results.length} records cached`);
-console.log(Object.entries(cov.by).map(([k, v]) => `${k} ${v}`).join("  "));
-
-const shapes = cov.by["unsupported-shape"] ?? 0;
-if (shapes) {
-  console.log(`\n${shapes} of ${results.length} providers returned a shape this parser does not read.`);
-  console.log("Re-run ONLY those providers after adding an envelope candidate; the other records stand.");
+// Run only when invoked as the entry point, so the two functions above are
+// reachable from a test without the vault read and the fan-out running on
+// import. Compared by resolved path rather than `import.meta.main`, which only
+// exists from Node 24 and would silently make this file a no-op below it.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
 }
