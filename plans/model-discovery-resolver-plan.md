@@ -2256,6 +2256,18 @@ Build `plans/phase6-discovery-design.md` §1 as specified; do not redesign it. R
 - Transport rules, non-negotiable: **direct fetch, never through the CCR gateway** (F2);
   `redirect: "manual"`; refuse non-https; refuse a query string on a listing URL; bounded concurrency
   6; **a failure budget stopping after 3 consecutive auth failures — per-provider, and never global**
+  *(**RESTATED 2026-09-07.** "Stopping after 3 consecutive auth failures" is not achievable under
+  concurrent dispatch and therefore not testable: by the time a third failure is observed, siblings
+  are already in flight and cannot be recalled. The achievable promise, and the one the code now
+  keeps, is: **stop DISPATCHING once 3 consecutive auth failures have been observed; up to
+  `concurrency` requests may already be in flight**, bounding a provider's spend at
+  `authBudget - 1 + concurrency`. Measured at the shipped defaults: 12 targets all returning 401 →
+  8 requests, 4 refused. "Per-provider, never global" is unaffected and stands exactly as written.
+  Two wrong implementations preceded this one — a reservation taken before the await counted requests
+  in flight rather than auth failures, firing 3 spurious refusals on a run where every response was
+  200 OK; and the original counted from a value captured before the await, losing updates when two
+  auth failures resolved concurrently. Neither was visible to a test that only exercised the failing
+  direction.)*
   *(#61: revision 5's phrasing was ambiguous, and only one reading is permitted. The counter is keyed
   by provider and resets per provider; an exhausted budget stops **that** provider's requests and no
   one else's. A **global** budget would let three unrelated expired keys curtail the fan-out for all
@@ -2356,6 +2368,53 @@ absent from the listing corpus.
 if any entry in the curated exception list lacks a `listing` key, and passes once the four blocks are
 present.
 
+> **AMENDED 2026-09-07 — R9 RUNS AFTER R10, NOT BEFORE IT, AND IS ONE ENTRY RATHER THAN FOUR.**
+>
+> **The ordering was wrong.** R9 is specified as serial after R8 and before R10, but nothing in it
+> that changes behaviour can be known before a live run. Measured against the vault before R10:
+> **all 44 eligible providers resolved a listing URL under `LISTING_DEFAULTS` alone, with zero
+> providers carrying an explicit `listing` key.** The envelope and `idField` predictions are claims
+> about response *shape* — unknowable without fetching. A paste-in table written before the sweep
+> would have been guesses.
+>
+> **What the four predicted entries actually turned out to be:**
+>
+> | entry | predicted | measured |
+> |---|---|---|
+> | `cloudflare` | absolute URL override + `result` + `["name","id"]` | **envelope and `idField` correct; the URL prediction was the wrong problem.** `GET …/ai/v1/models` returns **405** — that path is the OpenAI-compat *chat* prefix and does not implement a listing. The vault's own `notes` already recorded this. |
+> | `youcom`, `githubcopilot` | `listing: null` | `protocol: "generic"` — dropped by `eligibleCredentials` before discovery, so they never reach the fetcher. A `null` would document, not enforce. |
+> | `anthropic` | `listing: null` | `protocol: "anthropic"` — same. |
+> | `commandcode` | probe | **resolved: `ok`, 67 models.** `GET /provider/v1/models` works as-is. |
+> | `xai` | probe | **resolved: `403`.** Not absent from the corpus by accident — the credential is refused at the listing endpoint. Routable but not discoverable; see #89. |
+>
+> **So R9's real content is one vault entry.** Landed 2026-09-07:
+>
+> ```json
+> "listing": {
+>   "url": "https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/models/search",
+>   "envelope": ["result"],
+>   "idField": ["name", "id"]
+> }
+> ```
+>
+> Verified by `node refresh/cli.mjs --only cloudflare --live` → **`ok, 65 kept of 65 listed`**, ids
+> resolving as `@cf/openai/gpt-oss-120b` and siblings, confirming `name` before `id` was the right
+> order. Note `contextLength` is `null` on all 65 — Cloudflare's search endpoint exposes no field the
+> profile recognises, and `null` is the honest answer rather than an invented default.
+>
+> **The `?task=Text%20Generation` filter the vault notes document was dropped**, because transport
+> rule 4 refuses query strings and that rule exists to stop a credential-bearing URL reaching a cache
+> record. Cloudflare works without it. A provider whose listing *requires* a parameter is currently
+> unreachable — filed as #88.
+>
+> **The pillar-5 cost this task was recorded as carrying is smaller than stated.** One hand-edited
+> entry of 47, not a migration, and it is the first `listing` key in the file. The named successor in
+> §8.1 stands.
+>
+> **The general lesson, which outlives this task:** a plan step whose content is a claim about an
+> external system's response cannot be authored before that system is asked. It can only be authored
+> from the measurement, and scheduling it earlier converts documentation into guesswork.
+
 ---
 
 **R10 — First live discovery run. GATED: requires the user's explicit authorization.**
@@ -2440,6 +2499,31 @@ recoverable backup before Ship D's apply is authorised.
 ---
 
 **R11 — Decouple routing from picker; retire the cap and `UW_MAX_MODELS` (D4 step 1, D5, #2, #5).**
+
+> **THREE DECISIONS R11 INHERITS FROM SHIP C, added 2026-09-07.** Two reviewers reached the first
+> independently from opposite directions, and it is a decision rather than a defect — no R8 change
+> can settle it.
+>
+> **1. `lastGood` has no age bound, and whether that is honest is R11's call.** A cache record whose
+> provider later fails carries the last successful listing forward, bounded in entries (`MAX_ENTRIES`,
+> 5,000) and in bytes (`LAST_GOOD_MAX_BYTES`, 256 KB) but **not in time**. It carries its own `at`
+> timestamp, so staleness is computable — but only if R11 reads it. A carried listing presented
+> without reference to its age is precisely the misleading label
+> [[uwpick-shows-latest-functional-state]] forbids. Either honour `at` with a staleness budget, or
+> decline to carry it; do not present it as current.
+>
+> **2. `count` is the raw envelope count, NOT the number of routable models.** An `ok` record whose
+> every id was refused reads `count: 42, models: [], rejected: 42` — deliberately, so `empty` stays a
+> true statement about the provider. `count` is also preserved across truncation, so a 400,000-entry
+> listing capped to 5,000 still reports `count: 400000, truncated: 395000`. **Never read `count` as
+> "models we can route."**
+>
+> **3. Never key on `models.length`.** Every non-`ok` record carries `models: []` by construction, so
+> `auth`, `empty`, `unsupported-shape` and an all-refused `ok` are indistinguishable by length alone.
+> `keysync/keysync.mjs`'s `if (!models.length) { … continue; }` is recorded in the decisions doc as a
+> twice-corrected violation of [[responding-provider-never-pruned]], and R10's live sweep produced
+> **two real instances**: `xai` (403) and `indeedwebid` (401), both routable, both with empty
+> `models`. Key on `responded` and `outcome`, which exist for exactly this. See #89.
 
 **WRITES:** `keysync/keysync.mjs`, `test/routing-split.test.mjs` (new), `test/denylist.test.mjs`.
 **Serial after:** R4, R5, **R10**. *(Revision 2 omitted R10 while the body claimed routing takes "the
