@@ -448,10 +448,17 @@ export function provenanceRank(label) {
  * site's `if` order.
  *
  * Every set is optional and a missing one contributes nothing rather than
- * throwing: this is enrichment over inputs that may legitimately be absent (see
- * `buildProviders` -- run.mjs passes neither a discovery cache nor probe
- * results today), and an absent input must degrade to a lower rung, never stop
- * a build.
+ * throwing: this is enrichment over inputs that may legitimately be absent, and
+ * an absent input must degrade to a lower rung, never stop a build.
+ *
+ * CORRECTED AT R13c. This used to read "run.mjs passes neither a discovery cache
+ * nor probe results today" and treat the whole function as latent. HALF OF THAT
+ * IS NOW FALSE: run.mjs calls `loadDiscoveryCache` and passes the result to
+ * `buildProviders`, so `listed` is populated on the production build and
+ * discovered ids resolve to `listing-verified` rather than falling through to
+ * `catalogue-only`. `verified` is still unpassed -- probe results reach
+ * `applyVerifiedOnly`, not this -- so `call-verified` remains the one rung
+ * nothing in the pipeline reaches.
  *
  * @param {string} id                     the model id as the provider spells it
  * @param {object} [sets]
@@ -1147,12 +1154,20 @@ export function buildProviders(chosen, providers, catalog, keyReader, discovery 
       // `testModel` stops being special-cased upstream, this sort must already
       // rank it second rather than dropping it to `catalogue-only`.
       //
-      // MEASURED 2026-09-08: run.mjs passes NEITHER `discovery` NOR `verified`,
-      // so on today's production build every extra resolves to `catalogue-only`,
+      // THIS TERM IS LIVE ON THE PRODUCTION BUILD AS OF R13c, and the note it
+      // replaces said the opposite. That note read "run.mjs passes NEITHER
+      // `discovery` NOR `verified`, so every extra resolves to `catalogue-only`,
       // the term evaluates 3 - 3 = 0 for every pair, and the ordering is exactly
-      // what it was before this change. That is the honest state of it: the
-      // ranking is correct and tested, and it moves nothing until a caller wires
-      // the inputs in. The same shape as R11's `discovery` parameter.
+      // what it was" -- true when written, false the moment run.mjs began
+      // calling `loadDiscoveryCache`. `discoveredKept` now feeds `listed` above,
+      // so a discovered extra ranks 2 against an undiscovered one's 3 and SORTS
+      // AHEAD OF IT. R13b's provenance term is doing real work here, and a reader
+      // reasoning about ordering from the old note would have reasoned about a
+      // build that no longer exists.
+      //
+      // `verified` IS still unpassed -- probe results reach `applyVerifiedOnly`,
+      // not this sort -- so `call-verified` stays the one rung the pipeline
+      // cannot reach. It is passed anyway, for the same reason `asserted` is.
       const provSets = {
         verified: verifiedBy.get(reg.provider),
         asserted: safeTestModel ? new Set([safeTestModel]) : undefined,

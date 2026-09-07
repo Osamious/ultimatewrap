@@ -1186,8 +1186,29 @@ test("the bare-Claude disclosure line is unconditional at the call site", () => 
   const between = RUN_SRC.slice(call, line);
   assert.doesNotMatch(between, /\n\s*if\s*\(/,
     "no branch stands between computing the verdict and stating it");
-  assert.match(RUN_SRC.slice(line, line + 300), /unvouched \(fatal if >0\)/);
-  assert.match(RUN_SRC.slice(line, line + 300), /vouched \(reported, not blocking\)/);
+  const stmt = RUN_SRC.slice(line, line + 300);
+  assert.match(stmt, /unvouched \(fatal if >0\)/);
+  assert.match(stmt, /vouched \(reported, not blocking\)/);
+  // THE LABELS ARE NOT THE DISCLOSURE -- THE NUMBERS ARE. Asserting only the
+  // prose leaves three mutants alive: a hardcoded `0 vouched`, and the two lists
+  // printed into each other's slot. This is the single number the whole vouch
+  // mechanism exists to put in front of an operator, so it is pinned to the
+  // expression that produces it and to the side of the line it belongs on.
+  assert.match(stmt, /\$\{collisions\.hijackable\.length\} unvouched/,
+    "the unvouched count is the unvouched list's length, not a literal or the other list");
+  assert.match(stmt, /\$\{collisions\.vouchedHijacks\.length\} vouched/,
+    "and the vouched count is the vouched list's length");
+});
+
+test("the discovery note is printed, not merely computed", () => {
+  // A MUTANT THAT DELETES THE PRINT SURVIVES EVERY BEHAVIOURAL TEST. The note's
+  // content is well covered by `loadDiscoveryCache`'s own tests; that it ever
+  // reaches an operator is a property of this call site alone, and losing it
+  // returns discovery to the silent degradation the note was added to prevent.
+  const load = RUN_SRC.indexOf("const { discovery, note: discoveryNote } = loadDiscoveryCache(");
+  assert.ok(load > 0, "the note is destructured off the load");
+  assert.match(RUN_SRC.slice(load, load + 300), /\n\s*console\.log\(discoveryNote\);/,
+    "and printed on the statement after it, unconditionally");
 });
 
 test("discovery widens routing, and the fail-closed property survives the widening", () => {
@@ -1238,7 +1259,7 @@ test("a discovered Claude-shaped id from a reseller is caught, and a vouch recla
   assert.equal(caught.fatal, true);
 
   const accepted = checkBareCollisions(providers,
-    { realIds: null, vouchedProviders: new Set(["tabiai"]) });
+    { realIds: null, vouchedProviders: new Map([["tabiai", new Set(["claude-opus-4-1"])]]) });
   assert.equal(accepted.hijackable.some((h) => h.id === "claude-opus-4-1"), false);
   assert.equal(accepted.vouchedHijacks.some((v) => v.id === "claude-opus-4-1"), true,
     "moved, not dropped -- the accepted risk stays on the record");

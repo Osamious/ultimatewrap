@@ -2714,6 +2714,12 @@ const R13C_MULTI_OWNED = [
   ["claude-sonnet-4-5", 3], ["claude-sonnet-4-6", 6], ["claude-sonnet-5", 9],
 ];
 
+/** The five ids `bai` sole-owns in the measurement above, in R13C_SOLE_OWNED order. */
+const BAI_SOLE_OWNED = R13C_SOLE_OWNED.filter(([, o]) => o === "bai").map(([id]) => id);
+
+/** The vouch input's shape: provider name -> the SPECIFIC ids vouched for it. */
+const vouch = (entries) => new Map(entries.map(([name, ids]) => [name, new Set(ids)]));
+
 /** The measured shape as a `Providers[]` array, one entry per owning provider. */
 function r13cFixture() {
   const byProvider = new Map();
@@ -2730,13 +2736,25 @@ function r13cFixture() {
 
 test("the measured real-vault shape is reproduced, and an empty vouch set leaves it fatal", () => {
   // THE SAFETY PROPERTY, ASSERTED DIRECTLY: R13c is additive. Not passing the
-  // parameter and passing an empty Set must be the same program on the same
-  // input, and both must still stop the run. If either loosens, a mechanism
-  // meant to give the operator ONE named exemption has quietly given them a
-  // blanket one.
+  // parameter, passing an empty Map, and passing null must all be the same
+  // program on the same input, and all must still stop the run. If any loosens,
+  // a mechanism meant to give the operator ONE reviewed exemption has quietly
+  // given them a blanket one.
   const providers = r13cFixture();
   const absent = checkBareCollisions(providers, { realIds: null });
-  const empty = checkBareCollisions(providers, { realIds: null, vouchedProviders: new Set() });
+  const empty = checkBareCollisions(providers, { realIds: null, vouchedProviders: new Map() });
+  // Null-tolerant like `realIds` and `relayOwned`, which both take null for
+  // "not supplied" -- a caller that threads an absent vault through must not
+  // get a TypeError where its siblings give it the safe default.
+  const nulled = checkBareCollisions(providers, { realIds: null, vouchedProviders: null });
+  assert.equal(nulled.message, absent.message, "null vouches for nobody rather than throwing");
+  assert.equal(nulled.fatal, true);
+  // A provider PRESENT in the map with an empty id list vouches for nothing,
+  // which is the shape `vouchedBareClaude: []` produces.
+  const blank = checkBareCollisions(providers,
+    { realIds: null, vouchedProviders: vouch([["bai", []]]) });
+  assert.equal(blank.message, absent.message, "an empty id list is not a vouch");
+  assert.deepEqual(blank.vouchedHijacks, []);
 
   assert.equal(absent.hijackable.length, 22, "the measured sole-owned count");
   assert.equal(absent.shadowed.length, 15, "the measured multi-owned count");
@@ -2765,21 +2783,68 @@ test("vouchedHijacks is present on every return, findings or none", () => {
   }
 });
 
-test("vouching one provider moves only its findings, and fatal recomputes", () => {
+test("vouching every id of one provider moves only its findings, and fatal recomputes", () => {
   const providers = r13cFixture();
   const vouched = checkBareCollisions(providers,
-    { realIds: null, vouchedProviders: new Set(["bai"]) });
+    { realIds: null, vouchedProviders: vouch([["bai", BAI_SOLE_OWNED]]) });
 
-  // bai sole-owns 5 of the 22 in the measurement. They move; nothing else does.
+  // bai sole-owns 5 of the 22 in the measurement. Listing all five moves all
+  // five; nothing else does.
+  assert.equal(BAI_SOLE_OWNED.length, 5, "the fixture still has the measured five");
   assert.equal(vouched.vouchedHijacks.length, 5);
   assert.deepEqual([...new Set(vouched.vouchedHijacks.map((v) => v.owner))], ["bai"]);
   assert.equal(vouched.hijackable.length, 17);
   assert.equal(vouched.hijackable.some((h) => h.owner === "bai"), false,
-    "a vouched owner is absent from the fatal list entirely");
+    "every listed id moved, so bai is absent from the fatal list entirely");
   assert.equal(vouched.fatal, true,
     "17 unvouched findings remain, so vouching one reseller does not clear the run");
   assert.equal(vouched.shadowed.length, 15,
     "the vouch touches sole ownership only -- ambiguity is a different classification");
+});
+
+test("a vouch covers the ids it lists and NOT the others that provider sole-owns", () => {
+  // THE ATTACK THE BOOLEAN SHAPE ALLOWED, RUN AS A TEST. Under a per-provider
+  // flag, accepting one retired 2024 name granted that host every bare
+  // Claude-shaped id it would ever sole-own -- including ones it had not
+  // published yet, added later by its own listing edit, with no second review.
+  // Here the operator reviews exactly one id, and the other four stay fatal.
+  const providers = r13cFixture();
+  const [reviewed, ...unreviewed] = BAI_SOLE_OWNED;
+  const r = checkBareCollisions(providers,
+    { realIds: null, vouchedProviders: vouch([["bai", [reviewed]]]) });
+
+  assert.deepEqual(r.vouchedHijacks.map((v) => v.id), [reviewed],
+    "exactly the reviewed id moved");
+  for (const id of unreviewed) {
+    assert.equal(r.hijackable.some((h) => h.id === id && h.owner === "bai"), true,
+      `${id} was never reviewed, so it is still a fatal finding at the same owner`);
+  }
+  assert.equal(r.hijackable.length, 21, "22 findings minus the one reviewed");
+  assert.equal(r.fatal, true);
+});
+
+test("a vouch is keyed on the OWNER too -- listing an id does not free it at another host", () => {
+  // The mirror of the test above. `(owner, id)` is the unit; dropping either
+  // half widens the grant, so both are pinned. Here `bai` is vouched for an id
+  // that `veniceai` sole-owns, and the finding against veniceai must survive.
+  const r = checkBareCollisions(
+    [P("veniceai", "claude-opus-5-fast"), P("bai", "claude-opus-4.5")],
+    { realIds: null, vouchedProviders: vouch([["bai", ["claude-opus-5-fast"]]]) });
+  assert.deepEqual(r.vouchedHijacks, [],
+    "bai does not own the id it was vouched for, so nothing was accepted");
+  assert.equal(r.hijackable.length, 2, "both findings stand");
+  assert.equal(r.fatal, true);
+});
+
+test("an id vouched at one provider is still fatal when a second provider sole-owns it", () => {
+  // A reseller's listing is not a stable input. Vouching `bai:claude-opus-4.5`
+  // must not pre-accept the day some OTHER host starts sole-owning that name --
+  // that is a new claim by a party nobody reviewed.
+  const r = checkBareCollisions([P("aihubmix", "claude-opus-4.5")],
+    { realIds: null, vouchedProviders: vouch([["bai", ["claude-opus-4.5"]]]) });
+  assert.equal(r.hijackable.length, 1);
+  assert.equal(r.hijackable[0].owner, "aihubmix");
+  assert.equal(r.fatal, true);
 });
 
 test("vouching every owner clears fatal, and the message stops claiming there was nothing", () => {
@@ -2791,7 +2856,8 @@ test("vouching every owner clears fatal, and the message stops claiming there wa
   const unvouched = checkBareCollisions(solo, { realIds: null });
   assert.equal(unvouched.fatal, true);
 
-  const r = checkBareCollisions(solo, { realIds: null, vouchedProviders: new Set(["bai"]) });
+  const r = checkBareCollisions(solo,
+    { realIds: null, vouchedProviders: vouch([["bai", ["claude-opus-4.5"]]]) });
   assert.equal(r.fatal, false, "the last unvouched finding is gone, so nothing stops the run");
   assert.deepEqual(r.hijackable, []);
   assert.equal(r.vouchedHijacks.length, 1);
@@ -2801,16 +2867,28 @@ test("vouching every owner clears fatal, and the message stops claiming there wa
   assert.match(r.message, /vouched \(reported, not blocking\)/);
 });
 
-test("a vouched finding names its id, owner and reason -- never just a count", () => {
+test("a vouched finding names its id, owner, reason and relay fact -- never just a count", () => {
   const r = checkBareCollisions([P("bai", "claude-opus-4.5")],
-    { realIds: null, vouchedProviders: new Set(["bai"]) });
+    { realIds: null, vouchedProviders: vouch([["bai", ["claude-opus-4.5"]]]) });
   const [v] = r.vouchedHijacks;
   assert.equal(v.id, "claude-opus-4.5");
   assert.equal(v.owner, "bai");
+  // FIELD PARITY WITH `hijackable`. These two lists hold the same finding under
+  // two verdicts; a consumer rendering per-finding provenance (§6.6) reads the
+  // same key off both, and a missing key here would make the vouched branch the
+  // one that throws.
+  assert.equal(v.relayRoutes, false,
+    "a sole non-relay owner means the relay does not route it, computed not assumed");
+  const unvouched = checkBareCollisions([P("bai", "claude-opus-4.5")], { realIds: null });
+  assert.deepEqual(Object.keys(v).filter((k) => k !== "reason").sort(),
+    Object.keys(unvouched.hijackable[0]).sort(),
+    "the same fields the fatal list carries, plus the reason it was spared");
   assert.equal(typeof v.reason, "string");
   assert.match(v.reason, /vouchedBareClaude/,
     "the reason names the field an operator would have to edit to undo it");
   assert.match(v.reason, /bai/, "and the provider it was set on");
+  assert.match(v.reason, /claude-opus-4\.5/,
+    "and the specific id, since the field is a per-id list an operator must check against");
   // The message carries the same three facts, because a caller that prints only
   // the message must still be able to audit the decision.
   assert.match(r.message, /claude-opus-4\.5/);
@@ -2823,7 +2901,7 @@ test("the vouch is reported alongside a fatal, not instead of it", () => {
   // A run can carry both. The operator reviewing the fatal needs the accepted
   // risk in the same output, or the two get reviewed in different sittings.
   const r = checkBareCollisions([P("bai", "claude-opus-4.5"), P("veniceai", "claude-opus-5-fast")],
-    { realIds: null, vouchedProviders: new Set(["bai"]) });
+    { realIds: null, vouchedProviders: vouch([["bai", ["claude-opus-4.5"]]]) });
   assert.equal(r.fatal, true);
   assert.equal(r.hijackable.length, 1);
   assert.equal(r.vouchedHijacks.length, 1);
@@ -2834,8 +2912,8 @@ test("the vouch is reported alongside a fatal, not instead of it", () => {
 test("vouching a provider that owns nothing changes nothing at all", () => {
   const providers = r13cFixture();
   const base = checkBareCollisions(providers, { realIds: null });
-  const noop = checkBareCollisions(providers,
-    { realIds: null, vouchedProviders: new Set(["a-provider-not-in-this-config"]) });
+  const noop = checkBareCollisions(providers, { realIds: null,
+    vouchedProviders: vouch([["a-provider-not-in-this-config", ["claude-opus-4.5"]]]) });
   assert.deepEqual(noop.hijackable, base.hijackable);
   assert.deepEqual(noop.vouchedHijacks, []);
   assert.equal(noop.message, base.message);
@@ -2846,7 +2924,7 @@ test("a vouch cannot silence a shadowed finding or an ambiguous one", () => {
   // nothing, which is already a clean failure; moving it would be a change to
   // reporting the operator never asked for.
   const r = checkBareCollisions([P("bai", "opus"), P("nararouter", "opus")],
-    { realIds: null, vouchedProviders: new Set(["bai", "nararouter"]) });
+    { realIds: null, vouchedProviders: vouch([["bai", ["opus"]], ["nararouter", ["opus"]]]) });
   assert.equal(r.shadowed.length, 1);
   assert.deepEqual(r.vouchedHijacks, []);
   assert.equal(r.fatal, false);
@@ -2854,7 +2932,7 @@ test("a vouch cannot silence a shadowed finding or an ambiguous one", () => {
 
 test("--allow-bare-claude-names and the vouch are independent controls", () => {
   // The flag accepts EVERY sole owner for one run; the vouch accepts ONE named
-  // provider until the config is edited back. Neither implies the other, and the
+  // id at ONE named provider until the config is edited back. Neither implies the other, and the
   // flag must not start populating `vouchedHijacks` -- a blanket override is not
   // a reviewed exemption and must not be recorded as one.
   const r = checkBareCollisions([P("bai", "claude-opus-4.5")],
@@ -2869,7 +2947,7 @@ test("shouldReportCollisions fires when the only finding was vouched away", () =
   // one Anthropic really publishes, so this runs on the VERIFIED branch and
   // `catalogVerified` cannot be the disjunct doing the work.
   const r = checkBareCollisions([P("bai", "claude-opus-5")],
-    { realIds: PROD_REAL_IDS, vouchedProviders: new Set(["bai"]) });
+    { realIds: PROD_REAL_IDS, vouchedProviders: vouch([["bai", ["claude-opus-5"]]]) });
   assert.deepEqual(r.hijackable, []);
   assert.deepEqual(r.shadowed, []);
   assert.equal(r.catalogVerified, true, "so no other disjunct can be doing the work");
@@ -2877,35 +2955,63 @@ test("shouldReportCollisions fires when the only finding was vouched away", () =
   assert.equal(shouldReportCollisions(r), true);
 });
 
-test("vouchedBareClaudeProviders requires === true, not truthiness", () => {
-  // A HAND-EDITED JSON FILE IS WHERE A STRING LANDS IN A BOOLEAN SLOT, and this
-  // field downgrades a fatal security finding. `"false"` is truthy; if it
-  // vouched, a typo would disarm the guard silently.
+test("vouchedBareClaudeProviders reads a LIST of ids, and `true` is not a vouch", () => {
+  // `true` WAS THE ORIGINAL SHAPE AND IS NOW REJECTED OUTRIGHT. It granted its
+  // holder every bare Claude-shaped id it would ever sole-own, extendable by the
+  // reseller's own listing edits with no second review. Reading it as "vouch
+  // everything" is the one interpretation that must never return: an operator
+  // who wrote it gets the same verdict as one who wrote nothing, which is fatal,
+  // which is the safe direction to be wrong in.
   const vault = new Map([
-    ["yes", { provider: "yes", vouchedBareClaude: true }],
+    ["listed", { provider: "listed", vouchedBareClaude: ["claude-3-haiku-20240229", " opus "] }],
+    ["blanket", { provider: "blanket", vouchedBareClaude: true }],
     ["str-true", { provider: "str-true", vouchedBareClaude: "true" }],
-    ["str-false", { provider: "str-false", vouchedBareClaude: "false" }],
     ["one", { provider: "one", vouchedBareClaude: 1 }],
     ["no", { provider: "no", vouchedBareClaude: false }],
+    // A bare string is the near-miss a hand edit produces; iterating its
+    // characters would vouch for "c", "l", "a"... so it must not be Array-like.
+    ["bare-string", { provider: "bare-string", vouchedBareClaude: "claude-opus-5" }],
+    ["obj", { provider: "obj", vouchedBareClaude: { "claude-opus-5": true } }],
+    ["empty", { provider: "empty", vouchedBareClaude: [] }],
+    ["junk-entries", { provider: "junk-entries", vouchedBareClaude: [null, 7, "", "  ", {}] }],
     ["absent", { provider: "absent" }],
   ]);
-  assert.deepEqual([...vouchedBareClaudeProviders(vault)], ["yes"]);
-  assert.deepEqual([...vouchedBareClaudeProviders(new Map())], []);
-  assert.deepEqual([...vouchedBareClaudeProviders(null)], [],
+  const got = vouchedBareClaudeProviders(vault);
+  assert.deepEqual([...got.keys()], ["listed"],
+    "only the array shape vouches; every other shape is absence, `true` included");
+  // Trimmed, because `checkBareCollisions` keys ownership on trimmed selectors
+  // and an untrimmed entry would silently never match.
+  assert.deepEqual([...got.get("listed")].sort(), ["claude-3-haiku-20240229", "opus"]);
+  assert.equal(got.get("blanket"), undefined, "`true` vouches for nothing at all");
+  assert.equal(got.get("empty"), undefined, "an empty list is omitted, not an empty set");
+  assert.equal(got.get("junk-entries"), undefined,
+    "a list whose entries are all unusable vouches for nothing");
+  assert.equal(vouchedBareClaudeProviders(new Map()).size, 0);
+  assert.equal(vouchedBareClaudeProviders(null).size, 0,
     "a missing vault vouches for nobody rather than throwing");
 });
 
-test("the real vault ships with nobody vouched", () => {
-  // R13c lands the MECHANISM. Whether aihubmix or bai is trusted is a config
-  // decision about a specific reseller's business, made by the operator in
-  // providers.json -- never by this branch. This asserts the shipped state, and
-  // it is expected to fail the day someone deliberately vouches a provider, at
-  // which point the failure is the record that the decision was made.
-  const raw = fs.readFileSync(
-    path.join(os.homedir(), ".llmkeys", "providers.json"), "utf8").replace(/^\uFEFF/, "");
+test("the real vault ships with nobody vouched", (t) => {
+  // R13c lands the MECHANISM. Whether aihubmix or bai is trusted for a given id
+  // is a config decision about a specific reseller's listing, made by the
+  // operator in providers.json -- never by this branch. This asserts the shipped
+  // state, and it is expected to fail the day someone deliberately vouches an
+  // id, at which point the failure is the record that the decision was made.
+  //
+  // THE ONE TEST IN THIS FILE THAT READS THE REAL VAULT, AND ONLY BECAUSE ITS
+  // SUBJECT IS THE REAL VAULT -- a fixture cannot carry the tripwire property.
+  // Guarded rather than left bare: on a fresh clone or CI the file is absent, an
+  // unguarded read throws ENOENT at module scope of the test body, and every
+  // other test in this 300+ test file fails alongside it. Absence SKIPS.
+  const vaultFile = path.join(os.homedir(), ".llmkeys", "providers.json");
+  if (!fs.existsSync(vaultFile)) {
+    t.skip(`no vault at ${vaultFile}; the shipped-state tripwire needs the real file`);
+    return;
+  }
+  const raw = fs.readFileSync(vaultFile, "utf8").replace(/^\uFEFF/, "");
   const vault = new Map(JSON.parse(raw).map((p) => [p.provider, p]));
-  assert.deepEqual([...vouchedBareClaudeProviders(vault)], [],
-    "no provider in the real vault sets vouchedBareClaude");
+  assert.deepEqual([...vouchedBareClaudeProviders(vault).keys()], [],
+    "no provider in the real vault lists a vouchedBareClaude id");
 });
 
 test("loadDiscoveryCache degrades to null with a note when no cache root resolves", () => {
@@ -2921,21 +3027,84 @@ test("loadDiscoveryCache degrades to null with a note when no cache root resolve
     "the note names the condition, so a silent degrade is not possible");
 });
 
+/** A cache record stamped `ms` milliseconds before `NOW`. `at` is an ISO STRING. */
+const NOW = Date.parse("2026-09-08T12:00:00.000Z");
+const aged = (ms, models) =>
+  ({ outcome: "ok", at: new Date(NOW - ms).toISOString(), models });
+const FRESH = 60 * 60 * 1000;
+
 test("loadDiscoveryCache skips an unreadable record and says which", () => {
   // `readCacheRecord` throws when a record is not owner-only. One bad file must
   // not cost the other 43 providers their listings, and must not pass unnamed.
   const r = loadDiscoveryCache(["ok", "locked", "missing"], {
+    now: NOW,
     root: () => "C:\\nowhere",
     read: (name) => {
       if (name === "locked") throw new Error("refusing to read: it is not owner-only");
-      return name === "ok" ? { outcome: "ok", models: [{ id: "m-1" }] } : null;
+      return name === "ok" ? aged(FRESH, [{ id: "m-1" }]) : null;
     },
   });
   assert.equal(r.discovery.size, 1);
-  assert.deepEqual(r.discovery.get("ok"), { outcome: "ok", models: [{ id: "m-1" }] });
-  assert.match(r.note, /1 of 3 provider\(s\) have a cache record/);
+  assert.deepEqual(r.discovery.get("ok").models, [{ id: "m-1" }]);
+  assert.match(r.note, /1 of 3 provider\(s\) contribute ids/);
   assert.match(r.note, /locked/, "the unreadable one is named");
   assert.match(r.note, /not owner-only/, "with the reason it was skipped");
+});
+
+test("a discovery record past the routing ceiling contributes no ids, and says so", () => {
+  // THE BOUND `routableCatalogIds` ENFORCES ON THE CATALOGUE, ON THE LARGER
+  // SOURCE. Discovery is ~3,400 of the 5,026 routing entries on the real vault,
+  // so an unbounded cache reopens through the bigger door exactly what the
+  // ceiling closes: a reseller retires a model, nobody re-runs refresh, and
+  // keysync advertises the dead id forever as a picker row that 404s.
+  const r = loadDiscoveryCache(["fresh", "stale"], {
+    now: NOW,
+    root: () => "C:\\d",
+    read: (name) => name === "fresh"
+      ? aged(ROUTING_MAX_STALENESS_MS - 1000, [{ id: "live-1" }])
+      : aged(ROUTING_MAX_STALENESS_MS + 1000, [{ id: "retired-1" }]),
+  });
+  assert.deepEqual([...r.discovery.keys()], ["fresh"]);
+  assert.deepEqual(r.discovery.get("fresh").models, [{ id: "live-1" }],
+    "the fresh record's ids still reach routing");
+  assert.equal(r.discovery.has("stale"), false, "the stale record's ids do not");
+  assert.match(r.note, /1 of 2 provider\(s\) contribute ids/);
+  assert.match(r.note, /1 past the 7d routing ceiling and not routed \(stale\)/,
+    "and the drop is named rather than read as an absent cache");
+});
+
+test("exactly at the ceiling still routes, and an unstamped record never does", () => {
+  // `<=`, not `<` -- the same boundary `routableCatalogIds` holds. And a record
+  // with no parseable `at` is MAXIMALLY stale, not fresh: unknown age must fail
+  // the ceiling, or the legacy shape becomes the way around it.
+  const read = (rec) => loadDiscoveryCache(["p"], { now: NOW, root: () => "C:\\d", read: () => rec });
+  assert.equal(read(aged(ROUTING_MAX_STALENESS_MS, [{ id: "a" }])).discovery.size, 1,
+    "exactly at the ceiling is still routable");
+  for (const at of [undefined, null, "", "not-a-date", 0]) {
+    const r = read({ outcome: "ok", at, models: [{ id: "a" }] });
+    assert.equal(r.discovery.size, 0, `at: ${JSON.stringify(at)} must not route`);
+    assert.match(r.note, /past the 7d routing ceiling/);
+  }
+});
+
+test("a fresh record contributing no usable id is counted as such, not as coverage", () => {
+  // `discoveryIndex` drops a record whose `models` is not an array of `{id}`, so
+  // counting file presence reports coverage the build does not have -- and reads
+  // as success on exactly the runs that lost the most.
+  const r = loadDiscoveryCache(["good", "wrong-type", "wrapper", "empty", "blank-ids"], {
+    now: NOW,
+    root: () => "C:\\d",
+    read: (name) => ({
+      good: aged(FRESH, [{ id: "g-1" }]),
+      "wrong-type": { outcome: "ok", at: aged(FRESH, []).at, models: "a string" },
+      wrapper: { outcome: "ok", at: aged(FRESH, []).at, byProvider: { p: [{ id: "x" }] } },
+      empty: aged(FRESH, []),
+      "blank-ids": aged(FRESH, [{ id: "" }, { nope: 1 }]),
+    })[name],
+  });
+  assert.deepEqual([...r.discovery.keys()], ["good"]);
+  assert.match(r.note, /1 of 5 provider\(s\) contribute ids/);
+  assert.match(r.note, /4 fresh but contributed no usable id/);
 });
 
 test("loadDiscoveryCache returns records in the shape buildProviders consumes", () => {
@@ -2943,8 +3112,9 @@ test("loadDiscoveryCache returns records in the shape buildProviders consumes", 
   // downstream, which is what makes the confusion easy. `discoveryIndex` wants
   // provider -> record directly, so a wrapper here would silently contribute no
   // candidates and the only symptom would be a smaller routing table.
-  const record = { outcome: "ok", models: [{ id: "x-1" }, { id: "x-2" }] };
-  const { discovery } = loadDiscoveryCache(["p"], { root: () => "C:\\d", read: () => record });
+  const record = aged(FRESH, [{ id: "x-1" }, { id: "x-2" }]);
+  const { discovery } = loadDiscoveryCache(["p"],
+    { now: NOW, root: () => "C:\\d", read: () => record });
   const built = buildProviders(
     [{ provider: "p", id: "p.key" }],
     new Map([["p", { protocol: "openai", baseUrl: "https://p.example/v1", testModel: "x-1" }]]),

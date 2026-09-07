@@ -70,15 +70,24 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  * @param {Set<string>|null} [opts.relayRouting=null]  what the relay serves or
  *   WOULD serve if started; used only to keep the remedy wording honest.
  *   Defaults to the static ANTHROPIC_RELAY.routing.
- * @param {Set<string>} [opts.vouchedProviders=new Set()]  provider NAMES whose
- *   sole ownership of a bare Claude-shaped id the operator has accepted, from
- *   the `vouchedBareClaude` field in providers.json. A DIFFERENT QUESTION FROM
- *   `relayOwned`, at a different granularity, and the two must not be merged:
- *   `relayOwned` is id-level and asks "does OUR relay curate this id"; this is
- *   provider-level and asks "do we trust this RESELLER to sole-own a
- *   Claude-shaped name". Empty by default, and that default reproduces the
- *   pre-vouch `fatal` computation exactly -- the mechanism ADDS a way to
- *   reclassify a finding, it never widens what is classified.
+ * @param {Map<string, Set<string>>|null} [opts.vouchedProviders=new Map()]  the
+ *   SPECIFIC ids, per provider name, whose sole ownership by that provider the
+ *   operator has reviewed and accepted, from the `vouchedBareClaude` field in
+ *   providers.json. A DIFFERENT QUESTION FROM `relayOwned`, and the two must not
+ *   be merged: `relayOwned` is "does OUR relay curate this id"; this is "do we
+ *   accept THIS RESELLER sole-owning THIS Claude-shaped name". Empty by default,
+ *   and that default reproduces the pre-vouch `fatal` computation exactly -- the
+ *   mechanism ADDS a way to reclassify a finding, it never widens what is
+ *   classified.
+ *
+ *   PER-ID, NOT PER-PROVIDER, AND THAT IS THE WHOLE POINT. A provider-level
+ *   boolean would grant its holder blanket authority over every bare
+ *   Claude-shaped id it EVER sole-owns -- authority the reseller then extends
+ *   unilaterally by editing its own listing. Vouching two retired 2024 names
+ *   would silently pre-accept the day that host starts advertising bare `opus`,
+ *   the highest-traffic alias Claude Code emits. An id absent from the list
+ *   stays `hijackable` and stays fatal, which is the correct verdict for
+ *   anything nobody reviewed.
  * @returns {{hijackable: object[], shadowed: object[], vouchedHijacks: object[],
  *            fatal: boolean, message: string, catalogVerified: boolean}}
  *   `catalogVerified` is false on exactly the `realIds === null` path and is
@@ -94,7 +103,7 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  */
 export function checkBareCollisions(providers, {
   relay = ANTHROPIC_RELAY.name, allowBare = false, realIds = null,
-  relayOwned = null, relayRouting = null, vouchedProviders = new Set(),
+  relayOwned = null, relayRouting = null, vouchedProviders = new Map(),
 } = {}) {
   // WHAT EACH PROVIDER ADVERTISES, TRIMMED. Ownership is NOT keyed on these --
   // see the selector set below. This is only the raw material both match stages
@@ -253,10 +262,14 @@ export function checkBareCollisions(providers, {
   // normally takes; it armed the fallback path, which is the path a network
   // failure selects. That is the pipeline-exits-1-when-Anthropic-is-unreachable
   // shape this comment warned against, and it is REAL TODAY -- not fixed by
-  // R13c, which ships the per-provider vouch that lets an operator accept a
-  // named reseller instead of reaching for `--allow-bare-claude-names`, which
-  // accepts all of them and is still not an escape hatch to discover in
-  // production. For scale, the old comparison stands: the same count over the
+  // R13c, which ships the per-id vouch that lets an operator accept a named
+  // reseller's claim on a NAMED id instead of reaching for
+  // `--allow-bare-claude-names`, which accepts all of them and is still not an
+  // escape hatch to discover in production. The remedy for these 22 is
+  // therefore "review the 22 ids and list the ones you accept", never "trust
+  // these five hosts" -- the distinction matters most under exactly the outage
+  // pressure that produced the finding, which is when nobody wants to read a
+  // list. For scale, the old comparison stands: the same count over the
   // bundled catalogue's 217 providers is 240 bare ids / 185 sole-owned.
   //
   // WHAT THE NARROWING COST, MEASURED AGAINST AN INDEPENDENT THREAT SET.
@@ -406,12 +419,22 @@ export function checkBareCollisions(providers, {
   // guard, so validate()'s V9 rule is load-bearing under A2 (#44).
   const vouched = (id) => relayOwned === null || relayOwned.has(id);
   // TWO VOUCHES, TWO QUESTIONS, DELIBERATELY NOT UNIFIED. `vouched(id)` above is
-  // id-level and relay-only ("does our relay curate this id"); `isVouchedOwner`
-  // is provider-level and reseller-facing ("do we accept THIS host sole-owning a
-  // Claude-shaped name"). They read different inputs, answer to different
-  // operators, and collapsing them would let a relay-curation fact silence a
-  // reseller finding, or the reverse.
-  const isVouchedOwner = (name) => vouchedProviders.has(name);
+  // relay-only ("does our relay curate this id"); `isVouchedOwner` is
+  // reseller-facing ("do we accept THIS host sole-owning THIS Claude-shaped
+  // name"). They read different inputs, answer to different operators, and
+  // collapsing them would let a relay-curation fact silence a reseller finding,
+  // or the reverse.
+  //
+  // BOTH ARGUMENTS ARE LOAD-BEARING, and dropping either widens the grant. On
+  // `(owner)` alone a vouch spreads to every id that owner ever sole-owns; on
+  // `(id)` alone it spreads to every host that later claims the id. The pair is
+  // the only form that means what the operator reviewed.
+  //
+  // NULL-TOLERANT LIKE ITS SIBLINGS. `realIds` and `relayOwned` both accept
+  // null for "not supplied"; a caller passing `vouchedProviders: null` gets the
+  // same no-vouch behaviour rather than a throw, and a provider present in the
+  // map with an empty set vouches for nothing.
+  const isVouchedOwner = (owner, id) => vouchedProviders?.get(owner)?.has(id) === true;
   const hijackable = [], shadowed = [], vouchedHijacks = [];
   for (const [id, owners] of byBare) {
     const relayRoutes = owners.includes(relay);
@@ -448,10 +471,13 @@ export function checkBareCollisions(providers, {
       // that is the operator's call to have already made in providers.json. The
       // finding keeps its id, its owner and gains the reason it was spared, so a
       // reader of the output can audit the decision rather than infer it.
-      if (isVouchedOwner(owners[0])) {
+      if (isVouchedOwner(owners[0], id)) {
         vouchedHijacks.push({
           id, owner: owners[0], relayRoutes,
-          reason: `vouchedBareClaude is set for ${owners[0]} in providers.json`,
+          // NAMES THE ID, NOT JUST THE FIELD. The list in providers.json is
+          // per-id, so a reader can check this exact string against that file
+          // and see the entry the operator actually reviewed.
+          reason: `vouchedBareClaude for ${owners[0]} lists ${id} in providers.json`,
         });
       } else {
         hijackable.push({ id, owner: owners[0], relayRoutes });
@@ -1142,49 +1168,123 @@ export function bareIdCensus(providers) {
  * silently empty cache would shrink routing by ~3,400 entries and read as
  * success.
  *
+ * BOUNDED BY `ROUTING_MAX_STALENESS_MS`, THE SAME CEILING `routableCatalogIds`
+ * ENFORCES ON THE CATALOGUE. This is the LARGER of the two routing-candidate
+ * sources (~3,400 of 5,026 entries on the real vault), so leaving it unbounded
+ * would reopen through the bigger door exactly what that ceiling was written to
+ * close: a reseller retires a model, nobody re-runs `refresh/cli.mjs`, and
+ * keysync keeps advertising the dead id forever as a picker row that 404s.
+ * A record with no parseable `at` fails the ceiling -- unknown age is not fresh,
+ * the same default the catalogue's unstamped legacy shape gets.
+ *
+ * FILTERED HERE RATHER THAN AT THE ROUTING SPLIT, so the collision guard and
+ * `Providers[].models` see the SAME id set. The ceiling's own comment carves the
+ * guard out of the catalogue's bound -- there, the alternative to a stale id is
+ * `null`, which widens the guard back to every Claude-SHAPED name. That reasoning
+ * does not transfer: a discovery id dropped here is never WRITTEN either, and an
+ * id CCR cannot route is an id no reseller can hijack. Analysing rows the build
+ * does not emit would only manufacture findings about a config nobody has.
+ *
  * @param {string[]} names  provider names to look for, normally `chosen`'s
  * @param {object} [opts]
  * @param {() => string} [opts.root=cacheRoot]
  * @param {(p: string, o: object) => object|null} [opts.read=readCacheRecord]
+ * @param {number} [opts.now=Date.now()]
+ * @param {number} [opts.maxAgeMs=ROUTING_MAX_STALENESS_MS]
  * @returns {{discovery: Map<string, object>|null, note: string}}
  *   `discovery` is null ONLY when no cache directory could be resolved at all;
- *   an empty Map means the directory exists and held nothing for these
+ *   an empty Map means the directory exists and held nothing USABLE for these
  *   providers, which is a different fact and reads differently downstream.
  */
-export function loadDiscoveryCache(names, { root = cacheRoot, read = readCacheRecord } = {}) {
+export function loadDiscoveryCache(names, {
+  root = cacheRoot, read = readCacheRecord,
+  now = Date.now(), maxAgeMs = ROUTING_MAX_STALENESS_MS,
+} = {}) {
   let dir;
   try { dir = root(); } catch (e) {
     return { discovery: null, note: `discovery: no cache directory (${e.message}); ` +
       `routing falls back to catalogue u testModel` };
   }
   const discovery = new Map();
-  const unreadable = [];
+  const unreadable = [], stale = [];
+  let barren = 0;
   for (const name of names) {
     let record = null;
     try { record = read(name, { dir }); } catch (e) { unreadable.push(`${name}: ${e.message}`); continue; }
-    if (record) discovery.set(name, record);
+    if (!record) continue;
+    // `at` is an ISO STRING in the record (`discoverProvider`'s `now()`), not a
+    // millisecond number like the catalogue's. `Date.parse` of a missing or
+    // malformed stamp is NaN, and `!(NaN <= n)` is true, so the unstamped record
+    // takes the stale branch rather than sliding through a comparison that
+    // silently answers false.
+    if (!(now - Date.parse(record.at ?? "") <= maxAgeMs)) { stale.push(name); continue; }
+    if (!contributesIds(record)) { barren++; continue; }
+    discovery.set(name, record);
   }
-  const note = `discovery: ${discovery.size} of ${names.length} provider(s) have a cache record` +
-    (unreadable.length ? `; ${unreadable.length} unreadable (${unreadable.join("; ")})` : "");
+  // COUNTS WHAT CONTRIBUTES, NOT WHAT EXISTS ON DISK. A record that survives the
+  // ceiling but carries `models: "a string"`, a `{byProvider}` wrapper, or an
+  // empty listing is dropped to nothing by `discoveryIndex` downstream; counting
+  // it as a provider that "has a cache record" reports coverage the build does
+  // not have, and reads as success on exactly the runs that lost the most.
+  const segments = [];
+  if (stale.length) {
+    segments.push(`${stale.length} past the ${Math.round(maxAgeMs / 86_400_000)}d routing ` +
+      `ceiling and not routed (${stale.join(", ")})`);
+  }
+  if (unreadable.length) segments.push(`${unreadable.length} unreadable (${unreadable.join("; ")})`);
+  if (barren) segments.push(`${barren} fresh but contributed no usable id`);
+  const note = `discovery: ${discovery.size} of ${names.length} provider(s) contribute ids ` +
+    `from a fresh cache record` + (segments.length ? `; ${segments.join("; ")}` : "");
   return { discovery, note };
 }
 
 /**
- * The provider names the operator has vouched to sole-own a Claude-shaped id.
+ * Whether a cache record would yield at least one id downstream.
  *
- * STRICT `=== true`, NOT TRUTHINESS. This field decides whether a fatal security
- * finding is downgraded, so `"false"`, `"no"`, `0` and `1` must all fail to
- * vouch -- a hand-edited JSON file is exactly where a string lands in a boolean
- * slot, and a typo that accidentally disarms a guard is the failure this rules
- * out.
+ * DELIBERATELY MIRRORS `discoveryIndex` (keysync.mjs), which is the function that
+ * actually projects these records and is not exported. The two must agree or the
+ * note above lies in one direction or the other; the shapes are pinned by test so
+ * a change to either side that is not made to both fails rather than drifts.
+ */
+function contributesIds(record) {
+  const models = Array.isArray(record) ? record
+    : (Array.isArray(record?.models) ? record.models : null);
+  return models?.some((m) => typeof m?.id === "string" && m.id !== "") === true;
+}
+
+/**
+ * The specific Claude-shaped ids the operator has vouched, per provider name.
+ *
+ * STRICT `Array.isArray`, AND `true` IS NOT A VOUCH. The field was once a
+ * boolean, and that shape granted its holder authority over every bare
+ * Claude-shaped id it would EVER sole-own -- a scope the reseller then widened
+ * unilaterally by editing its own listing. A boolean here is therefore REJECTED
+ * rather than read as "vouch everything": an operator who wrote `true` gets the
+ * same verdict as one who wrote nothing, which is fatal, which is the safe
+ * direction to be wrong in. So must `"true"`, `1`, `{}` and every other shape a
+ * hand-edited JSON file puts in a slot that downgrades a security finding.
+ *
+ * IDS ARE TRIMMED, NOT FOLDED. `checkBareCollisions` keys ownership on trimmed
+ * selectors, so trimming here makes the two comparable; case is left alone
+ * because the vouch is a review of the exact id the guard reported, and
+ * widening the match is how a review of one name comes to cover another.
+ *
+ * A provider whose list survives to nothing (absent, empty, or all entries
+ * unusable) is omitted entirely, so `map.get(name)` is either a non-empty set
+ * or undefined.
  *
  * @param {Map<string, object>} providers  the vault profiles from `loadVault`
- * @returns {Set<string>}
+ * @returns {Map<string, Set<string>>}  provider name -> the ids vouched for it
  */
 export function vouchedBareClaudeProviders(providers) {
-  const out = new Set();
+  const out = new Map();
   for (const [name, profile] of providers ?? []) {
-    if (profile?.vouchedBareClaude === true) out.add(name);
+    const listed = profile?.vouchedBareClaude;
+    if (!Array.isArray(listed)) continue;
+    const ids = new Set(listed
+      .filter((id) => typeof id === "string" && id.trim() !== "")
+      .map((id) => id.trim()));
+    if (ids.size) out.set(name, ids);
   }
   return out;
 }
@@ -1239,8 +1339,8 @@ const readKey = (id) => {
 // 2026-09-08 on the real vault: routing entries 1,584 -> 5,026 and, on the
 // `realIds === null` branch, hijackable 0 -> 22 with fatal flipping to true.
 // That verdict is REAL and is not softened here -- see the vouch mechanism in
-// `checkBareCollisions`, which gives the operator a per-provider way to accept a
-// specific reseller rather than a flag that accepts all of them.
+// `checkBareCollisions`, which gives the operator a way to accept a NAMED id at
+// a NAMED reseller rather than a flag that accepts all of them.
 const { discovery, note: discoveryNote } = loadDiscoveryCache(chosen.map((c) => c.provider));
 console.log(discoveryNote);
 const built = buildProviders(chosen, providers, catalog,
@@ -1454,10 +1554,11 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
   // FATAL path could never fire. See the vouching block in checkBareCollisions.
   // A THIRD SET, AND IT ANSWERS A THIRD QUESTION. `realIds` is what the analysis
   // considers, `relayOwned` is which ids OUR relay curates, and this is which
-  // RESELLERS the operator has accepted as sole owners. It comes from the vault
-  // rather than from source: vouching a host is a configuration decision about
-  // that host's business, the same shape as the `listing` block, and a source
-  // allowlist would put it beyond the reach of the person who has to make it.
+  // (RESELLER, ID) PAIRS the operator has accepted as sole ownership. It comes
+  // from the vault rather than from source: vouching is a configuration decision
+  // about a specific host's specific listing, the same shape as the `listing`
+  // block, and a source allowlist would put it beyond the reach of the person
+  // who has to make it.
   const vouchedProviders = vouchedBareClaudeProviders(providers);
   const collisions = checkBareCollisions(built.providers,
     { allowBare: has("--allow-bare-claude-names"), realIds, relayOwned, relayRouting: routingIds,
