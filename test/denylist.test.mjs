@@ -2199,7 +2199,17 @@ test("UW_BEHAVES_AS is retired: no env var can flatten the table", () => {
 // copied from the real catalogue (google/lyria's contextTokens 0, google/veo-2's
 // 480 video seconds, cerebras/llama3.1-8b's exact 128000); the counts are scaled
 // up by repetition, since three providers of three rows classify identically to
-// one provider of nine and MAX_MODELS_PER_PROVIDER caps each at three.
+// one provider of nine.
+//
+// CORRECTED BY R11, AND IT NAMED THE WRONG MECHANISM EVEN BEFORE R11. That last
+// clause used to end "...and MAX_MODELS_PER_PROVIDER caps each at three". No
+// provider in this fixture holds more than three catalogue entries, so the 83
+// below is a property of the FIXTURE and the cap was never reached by any row in
+// it. R11 split that constant in two -- routing is uncapped, and
+// `MAX_PICKER_MODELS_PER_PROVIDER` bounds the picker alone -- and this fixture's
+// counts are unchanged precisely because nothing here was being truncated. A
+// reader who believed the old sentence would expect these numbers to move under
+// R11, and would look for the bug in the wrong place when they did not.
 const E = (model, o) => ({ provider: o.provider, model, ...o.entry });
 function capabilityFixture() {
   const chosen = [];

@@ -20,7 +20,7 @@ import { admitRemoteModels } from "../menu/denylist.mjs";
 // dynamic), so importing back from it closes a circular import and drags
 // `ccr-client.mjs`/`atomic.mjs` into keysync's transitive graph. Both lanes
 // import from `keysync/catalog-join.mjs`, which imports neither.
-import { priceOf, hasPricedOffer } from "./catalog-join.mjs";
+import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry } from "./catalog-join.mjs";
 
 // ---------------------------------------------------------------- vault load
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -195,7 +195,74 @@ export function inferTier(entry, providerName = null) {
  * "model" | "provider" | "pinned", so the menu pipeline cannot reuse the bare
  * name without putting two vocabularies in one expression.
  */
-export function outputKind(entry) {
+/**
+ * The capability vocabulary, GROUNDED IN R10's SWEEP rather than invented.
+ *
+ * MEASURED over the 44 cached records (3,745 projected models, 349 carrying a
+ * capability at all), the whole observed vocabulary is:
+ *   tool_calling 132, text 115, base 46, chat 38, reasoning 7, video 6,
+ *   image 3, web_search 2.
+ *
+ * Only two of those eight are modality claims. `tool_calling`, `reasoning` and
+ * `web_search` are capability FLAGS -- a model that reasons still answers in
+ * text -- and `base` is a vendor tier word, not a modality: mistral labels its
+ * OCR, moderation, embedding and TTS models `base` alongside its chat models,
+ * so reading `base` as text would promote a TTS row. Those four are NO SIGNAL
+ * and fall through to the bundle, which is the same positive-signals-only
+ * doctrine the modality branch below already follows.
+ *
+ * The lists carry a few spellings beyond the eight (`audio`, `embedding`,
+ * `image_gen`, `speech`, `rerank`, `moderation`, `completion`) because
+ * `capabilityField` reads four different provider field names and the observed
+ * set is one sweep's worth, not the vocabulary's bound. Each added token is an
+ * unambiguous modality word in the same sense as the two measured ones; nothing
+ * ambiguous is added, and an unrecognised token stays no-signal.
+ */
+const CAPABILITY_NONTEXT = new Set([
+  "audio", "audio_gen", "embed", "embedding", "embeddings", "image", "image_gen",
+  "moderation", "rerank", "reranker", "speech", "stt", "transcription", "tts",
+  "video", "video_gen", "vision_gen",
+]);
+const CAPABILITY_TEXT = new Set(["chat", "completion", "completions", "text"]);
+
+/**
+ * A provider's own capability token -> "text" | "nontext" | null.
+ *
+ * `null` for anything outside both lists, which is most of what providers send.
+ * Separated from `outputKind` so the vocabulary is assertable on its own and so
+ * the precedence in `outputKind` reads as one line rather than as a branch.
+ */
+export function capabilityKind(capability) {
+  if (typeof capability !== "string" || !capability) return null;
+  const t = capability.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (CAPABILITY_NONTEXT.has(t)) return "nontext";
+  if (CAPABILITY_TEXT.has(t)) return "text";
+  return null;
+}
+
+/**
+ * `capability` OUTRANKS `modalities.output` (R11), and only where it speaks.
+ *
+ * The bundle is a periodic snapshot merged across hosts; a provider's own
+ * listing is what that provider says about the row it is serving today. Where
+ * the two disagree the listing wins -- which is what lets a live `image` or
+ * `video` demote a row whose bundle entry claims `["audio", "text"]` and
+ * therefore reads as text here.
+ *
+ * SAME PRECEDENCE ON BOTH PATHS. This value reaches the selection sort (which
+ * orders routing AND the picker) and `normalizeModel`'s `kind`, so the two
+ * cannot disagree about whether a row is a chat model.
+ *
+ * `bucketFor` DOES NOT READ `capability`, and that boundary is unchanged: it
+ * reads `kind`, which is this function's answer, and `reason`, which is the
+ * bundle's `capabilities.reasoning` and nothing else. A provider's `reasoning`
+ * capability token is deliberately NOT mapped onto `reason` -- it is
+ * no-signal above -- because `bucketFor`'s capable bucket is a claim about a
+ * client-side prompt profile, not about a marketing flag.
+ */
+export function outputKind(entry, capability = null) {
+  const declared = capabilityKind(capability);
+  if (declared) return declared;
   const out = entry?.modalities?.output;
   // An EMPTY array is absence of signal, exactly like a missing field, and the
   // doc above binds this function to answer `null` for absence. Falling through
@@ -228,7 +295,43 @@ export function resolveProtocol(vaultProvider) {
 }
 
 // --------------------------------------------------------------- build plan
-const MAX_MODELS_PER_PROVIDER = Number(process.env.UW_MAX_MODELS ?? 3);
+//
+// THE CAP IS THE PICKER'S ALONE (R11). It used to size BOTH `providers[].models`
+// -- what CCR routes on -- and `picker` -- the flat `/model` menu -- from one
+// array, so bounding a menu that is unusable at 44 providers x full catalogues
+// also bounded REACH: ~1,501 catalogue rows resolved to `undefined` and did not
+// route. The two have different constraints and now have different sizes. The
+// name says which one it governs; the old `MAX_MODELS_PER_PROVIDER` did not, and
+// that ambiguity is what let one number stand in for two decisions.
+//
+// This is the DEFAULT. `pickerCapFrom` resolves `UW_MAX_MODELS` against it.
+export const MAX_PICKER_MODELS_PER_PROVIDER = 3;
+
+/**
+ * `UW_MAX_MODELS` -> a usable positive integer, or the default.
+ *
+ * A VALIDATED PARSE, NEVER A BARE `Number()`, AND THAT IS THE WHOLE FUNCTION.
+ * The previous form was `Number(process.env.UW_MAX_MODELS ?? 3)` compared with
+ * `models.length >= MAX_MODELS_PER_PROVIDER`. `Number("x")` is `NaN`, and every
+ * comparison against `NaN` is false -- so `UW_MAX_MODELS=x` did not fall back to
+ * 3, it removed the cap entirely and silently. Renaming the constant while
+ * keeping the coercion reproduces that exactly: the rename passes every other
+ * check in this file and the picker goes unbounded on one typo'd env value,
+ * which is why this has its own test rather than riding on the rename's.
+ *
+ * `/^\d+$/` on the TRIMMED string, not `Number.isInteger(Number(s))`: the latter
+ * accepts `"3.0"`, `"0x3"`, `" 3 "`, `"3e0"` and `""` (which is 0). A cap is an
+ * operator-typed count, so the only spelling that means one is a run of digits.
+ * Zero falls back too -- a cap of zero is an empty menu, which is never what a
+ * count was typed to express, and rule 1 forbids reaching it by accident.
+ */
+export function pickerCapFrom(raw, fallback = MAX_PICKER_MODELS_PER_PROVIDER) {
+  if (typeof raw !== "string" && typeof raw !== "number") return fallback;
+  const s = String(raw).trim();
+  if (!/^\d+$/.test(s)) return fallback;
+  const n = Number.parseInt(s, 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
 
 // --------------------------------------------------- capability buckets (D4)
 //
@@ -567,20 +670,71 @@ export const ANCHOR_PREFERENCE = [
  * @param {object|null|undefined} entry   its bundled-catalogue entry, if any
  * @param {string|null} providerName      the provider whose key will pay
  */
-export function normalizeModel(id, entry, providerName = null) {
+export function normalizeModel(id, entry, providerName = null, capability = null) {
   return {
     id,
     tier: entry ? inferTier(entry, providerName) : "unknown",
     contextTokens: entry?.limits?.contextTokens,
     reason: entry?.capabilities?.reasoning ?? null,
-    kind: outputKind(entry)
+    kind: outputKind(entry, capability)
   };
 }
 
-export function buildProviders(chosen, providers, catalog, keyReader) {
+/**
+ * A discovery input -> `provider -> [{id, capabilityRaw, ...}]`.
+ *
+ * Accepts what R10's cache actually holds and what a caller is likely to have in
+ * hand: a Map or plain object of provider -> record, where a record is either
+ * the cache record (`{outcome, models: [...]}`) or the bare projected array.
+ * Anything else contributes nothing rather than throwing -- this is optional
+ * enrichment, and a malformed cache must degrade to the pre-R11 candidate set,
+ * never stop a build.
+ *
+ * `lastGood` IS NOT CONSULTED. A record carrying it says the provider failed
+ * TODAY, and the same failure that produced it is the reason its listing may be
+ * retired. Routing on it would advertise ids nothing has confirmed this run; the
+ * `testModel` half of the union is what keeps such a provider present.
+ */
+function discoveryIndex(discovery) {
+  const out = new Map();
+  if (!discovery) return out;
+  const pairs = discovery instanceof Map
+    ? discovery.entries()
+    : (typeof discovery === "object" ? Object.entries(discovery) : []);
+  for (const [provider, record] of pairs) {
+    const models = Array.isArray(record) ? record
+      : (Array.isArray(record?.models) ? record.models : null);
+    if (!models) continue;
+    out.set(provider, models.filter((m) => typeof m?.id === "string" && m.id !== ""));
+  }
+  return out;
+}
+
+/**
+ * @param {object[]} chosen        the vault registry entries, one per provider
+ * @param {Map} providers          provider name -> vault profile
+ * @param {object} catalog         from `loadCatalog`
+ * @param {(id: string) => string} keyReader
+ * @param {Map|object|null} [discovery]  R10's cache, provider -> record. Absent
+ *   or malformed leaves the candidate set at `testModel u catalogue`, which is
+ *   the pre-R11 set MINUS nothing -- discovery only ever ADDS ids, so a caller
+ *   with no cache loses no reach it had before.
+ */
+export function buildProviders(chosen, providers, catalog, keyReader, discovery = null) {
   const out = [];
   const picker = [];
   const notes = [];
+  const discoveredBy = discoveryIndex(discovery);
+  // READ PER CALL, NOT AT MODULE LOAD, so a test can set the variable and
+  // observe the bound it produces. Reading it once at import made the only
+  // assertable thing about the parse its return value, which is exactly the
+  // check the `NaN` bug slipped past.
+  const pickerCap = pickerCapFrom(process.env.UW_MAX_MODELS);
+  // LAZY, and built at most once per call. It is a full pass over the bundle
+  // (4,298 entries), which a run with no discovery has no use for -- and every
+  // such run is the one that must stay exactly as cheap as it was.
+  let joinIdx = null;
+  const joinIndex = () => (joinIdx ??= buildJoinIndex(catalog));
 
   for (const reg of chosen) {
     const vp = providers.get(reg.provider);
@@ -609,22 +763,86 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       ? (admitRemoteModels(reg.provider, [vp.testModel]).kept[0] ?? null)
       : null;
 
+    // DISCOVERY (R10's cache), the third source and the newest one. It is the
+    // provider's OWN listing -- what this key can call today -- where the bundle
+    // is a periodic snapshot merged across hosts. Admitted through the same gate
+    // as the other two, in ONE call, because a second per-provider
+    // `admitRemoteModels` would print a second SECURITY line for the same
+    // provider and split one finding across two messages.
+    const discovered = discoveredBy.get(reg.provider) ?? [];
+    const discoveredKept = discovered.length
+      ? new Set(admitRemoteModels(reg.provider, discovered.map((m) => m.id)).kept)
+      : new Set();
+    // Keyed by id so a CATALOGUE-sourced candidate picks up the live capability
+    // for the same id. Without this the precedence would apply only to rows
+    // discovery contributed on its own, which is the half where the bundle has
+    // nothing to be outranked.
+    const capabilityById = new Map();
+    for (const m of discovered) {
+      if (discoveredKept.has(m.id) && m.capabilityRaw) capabilityById.set(m.id, m.capabilityRaw);
+    }
+
     // MEASURED 2026-09-01: preferring catalog ids over the vault's testModel
     // dropped the live pass rate to 4/44 — the bundled catalog lists models a
     // given key/tier often cannot actually call (mostly upstream 404s). The
     // vault's testModel is the probe-verified known-good id for this key, so it
     // leads; catalog entries are appended as extras.
+    //
+    // `models` IS NOW THE UNION AND IS UNCAPPED (R11): testModel u discovery u
+    // catalogue, deduplicated, in that order of precedence. The picker takes a
+    // prefix of it; routing takes all of it.
+    //
+    // THE UNION IS WHAT KEEPS A RESPONDING PROVIDER IN THE CONFIG, and that is
+    // not a refinement of "the discovered set" -- it is the difference between
+    // this being safe and it deleting providers. The `!models.length` skip below
+    // PRECEDES the `out.push`, so a provider whose candidate set is empty is
+    // dropped from `Providers[]` entirely. MEASURED in R10's sweep: `tabiai` and
+    // `gorouter` both answered HTTP 200 with `data: []` (outcome `empty`) and
+    // both carry a real `testModel` -- so a discovered-set-only rule deletes two
+    // providers that ANSWERED, which rule 1 forbids. `testModel` leading the
+    // union is what makes that structurally impossible rather than merely
+    // unlikely.
     const models = [];
     const seen = new Set();
     if (safeTestModel) {
       // `cat` is undefined for 38 of the 83 rows — this is the no-signal case.
       const cat = safeEntries.find((m) => m.model === safeTestModel);
-      models.push(normalizeModel(safeTestModel, cat, reg.provider));
+      models.push(normalizeModel(safeTestModel, cat, reg.provider,
+        capabilityById.get(safeTestModel) ?? null));
       seen.add(safeTestModel);
     }
-    if (safeEntries.length) {
-      // Curate rather than dump: the picker is a flat list and 44 providers x
-      // full catalogs is unusable. Prefer chat, then free-tier, then shortest id.
+    // The two extra sources, gathered before the sort so ONE ordering governs
+    // both outputs. Catalogue first, then discovery-only ids: the sort is stable
+    // and carries NO provenance term, so insertion order is the only thing
+    // separating two otherwise-equal rows. Adding a provenance term is R13b's,
+    // deliberately not this task's -- ranking a live listing above the bundle is
+    // a decision with its own evidence, not a side effect of unioning them.
+    const extras = [];
+    const queued = new Set(seen);
+    for (const m of safeEntries) {
+      if (queued.has(m.model)) continue;
+      queued.add(m.model);
+      extras.push({ id: m.model, entry: m, capability: capabilityById.get(m.model) ?? null });
+    }
+    for (const d of discovered) {
+      if (!discoveredKept.has(d.id) || queued.has(d.id)) continue;
+      queued.add(d.id);
+      // The join is what turns a live id into capability signals: `reasoning`
+      // and `contextTokens` exist ONLY in the bundle, so an unjoined live id is
+      // an honest `unknown` rather than a guess. `null` is a real answer here.
+      extras.push({ id: d.id, entry: joinCatalogEntry(joinIndex(), reg.provider, d.id),
+                    capability: d.capabilityRaw ?? null });
+    }
+    if (extras.length) {
+      // ONE ORDERING, TWO CONSUMERS (R11). This sort used to decide membership:
+      // the loop below stopped at the cap, so a row past position 3 was not
+      // merely lower in the menu, it did not ROUTE. It now decides ORDER only --
+      // every extra joins `models`, and the picker takes a prefix. "Curate
+      // rather than dump" stays exactly true of the flat 44-provider menu and
+      // stops being true of the routing table, which has no display cost and
+      // whose bound was costing ~1,501 catalogue rows their ability to resolve.
+      //
+      // Prefer chat, then free-tier, then shortest id.
       //
       // `kind` IS THE FIRST TERM, AHEAD OF FREE-FIRST. The ORDER is free; what
       // this comment used to claim about the free-first term was not.
@@ -656,8 +874,8 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       //
       // The `kind` term stays, on its own merit: it is the only term that
       // demotes a DECLARED non-chat row, and the data costs nothing to obtain
-      // -- `outputKind(entry)` is called a few lines below in `normalizeModel`,
-      // on the same entry.
+      // -- `outputKind(entry, capability)` is called a few lines below in
+      // `normalizeModel`, on the same entry and the same capability.
       //
       // `=== "nontext"`, NOT `!== "text"`. `outputKind` answers `null` for
       // absence of signal (`menu/catalog.mjs`'s `isTextOut` agrees), and a
@@ -665,12 +883,23 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // demoting on absent evidence is the confident-wrong this codebase
       // refuses everywhere else.
       //
-      // THIS GUARD IS PROVISIONAL AND IS KNOWN INSUFFICIENT (plan R3). It
-      // demotes only what DECLARES itself non-text, so google's Lyria previews
-      // (`["audio", "text"]`) read as text here and are held out by
-      // `hasPricedOffer` instead -- see the correction above. R11 retires this
-      // with the live `capability` field from discovery, where those rows are
-      // `image_gen`/`audio`.
+      // THE GUARD IS NO LONGER BUNDLE-ONLY (R11), AND IT IS ALSO NOT RETIRED.
+      // `kind` is now `outputKind(entry, capability)`, so a provider's own
+      // capability token OUTRANKS the bundle's `modalities.output` -- which is
+      // what lets a live `image`/`video` demote a row the bundle calls text.
+      //
+      // WHAT THAT DOES NOT FIX, MEASURED AGAINST R10's ACTUAL CACHE. R11's brief
+      // said this retires the provisional guard for google's Lyria previews,
+      // "where those rows are `image_gen`/`audio`". They are not, in the cache
+      // that exists: all 55 of google's projected models carry
+      // `capabilityRaw: null`, Lyria included, because Google's listing states
+      // `supportedGenerationMethods` and none of `discover.mjs`'s four
+      // `capabilityField` candidates matches it. So Lyria is still read as text
+      // here and is still held out by `hasPricedOffer` alone. The precedence is
+      // real and fires -- MEASURED, llm7 supplies 9 `image`/`video` tokens via
+      // `model_type` -- but the named example is not one of them, and widening
+      // `capabilityField` to reach Google is a discovery-side change, not this
+      // one.
       //
       // THE STATED GATE DOES NOT PASS, and saying it does was the second false
       // claim in this block. The boolean "no provider's top-3 acquires a row
@@ -687,11 +916,17 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // (never prune a responding provider) keeps those rows. Correcting the
       // observable belongs to the plan, not here; what this comment owes the
       // next reader is the number with its denominator rather than a pass.
-      const ranked = safeEntries
-        .map((m) => ({ m, kind: outputKind(m), tier: inferTier(m, reg.provider) }))
+      // NO `localeCompare`. The third term is a length comparison and stays one:
+      // `localeCompare` is locale-dependent and ICU-build-dependent, so it would
+      // make the SAME vault and the SAME bundle produce a different top-3 on a
+      // different machine -- an ordering that cannot be reproduced from the
+      // inputs is not an ordering this config may be built on.
+      const ranked = extras
+        .map((e) => ({ e, kind: outputKind(e.entry, e.capability),
+                       tier: e.entry ? inferTier(e.entry, reg.provider) : "unknown" }))
         .sort((a, b) => (a.kind === "nontext" ? 1 : 0) - (b.kind === "nontext" ? 1 : 0) ||
           (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
-          a.m.model.length - b.m.model.length);
+          a.e.id.length - b.e.id.length);
       // The entry is in hand by construction, so the capability signals need no
       // lookup — which is what makes cross-provider name matching structurally
       // impossible here rather than merely discouraged. `ranked`'s `tier` is
@@ -700,16 +935,28 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // a second literal. That second clause is now load-bearing rather than
       // incidental -- `inferTier` is provider-matched, so recomputing it from a
       // different name would silently disagree with the sort that just ran.
-      for (const { m } of ranked) {
-        if (models.length >= MAX_MODELS_PER_PROVIDER || seen.has(m.model)) continue;
-        models.push(normalizeModel(m.model, m, reg.provider));
-        seen.add(m.model);
+      //
+      // NO CAP HERE ANY MORE. The `models.length >= MAX_MODELS_PER_PROVIDER`
+      // that stood in this condition is the whole of what R11 moved: it now
+      // bounds the picker slice below and nothing else. `seen` still guards the
+      // testModel, which `extras` already excludes -- kept because it is the
+      // dedup invariant this loop has always maintained, not because a duplicate
+      // can currently reach it.
+      for (const { e } of ranked) {
+        if (seen.has(e.id)) continue;
+        models.push(normalizeModel(e.id, e.entry, reg.provider, e.capability));
+        seen.add(e.id);
       }
     }
     if (!models.length) {
       notes.push(`${reg.provider}: no testModel and no catalog entry — skipped`);
       continue;
     }
+    // THE SPLIT. `models` routes in full; `pickerModels` is the prefix the flat
+    // `/model` menu can carry. Taking a PREFIX of one ordered list rather than
+    // re-ranking is what keeps the two from disagreeing about which rows a
+    // provider's best three are.
+    const pickerModels = models.slice(0, pickerCap);
 
     const name = reg.provider;
     out.push({
@@ -723,7 +970,7 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       enabled: true
     });
 
-    for (const m of models) {
+    for (const m of pickerModels) {
       const row = {
         model: `${name}/${m.id}`,
         label: `${name} > ${m.id}`
