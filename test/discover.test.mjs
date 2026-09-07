@@ -857,8 +857,13 @@ test("a carried listing is bounded in BYTES, which no key allowlist can do", () 
   const byBytes = lastGoodOf(today, prior, { maxEntries: 20_000, maxBytes: 400 });
   assert.ok(byBytes.models.length >= 1 && byBytes.models.length <= 4,
     `${byBytes.models.length} models in a 400-byte budget`);
-  assert.ok(Buffer.byteLength(JSON.stringify(byBytes.models), "utf8") <= 400 + 200,
-    "the budget is checked before the model is kept, not after the whole array is built");
+  // The budget holds AT its stated number, with no allowance bolted on: it
+  // bounds the serialised array, separators and brackets included, and is
+  // checked before each model is kept rather than after the array is built.
+  assert.ok(Buffer.byteLength(JSON.stringify(byBytes.models), "utf8") <= 400,
+    `${Buffer.byteLength(JSON.stringify(byBytes.models), "utf8")} bytes over a 400-byte budget`);
+  // A budget too small for even one model yields none rather than one.
+  assert.deepEqual(lastGoodOf(today, prior, { maxBytes: 10 }).models, []);
 
   // And end to end, through the file that actually lands on disk.
   const dir = path.join(SCRATCH, "lastgood-bytes");
