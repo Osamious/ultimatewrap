@@ -1433,10 +1433,28 @@ test("buildProviders plumbs reason and kind onto every model it builds", () => {
     ]]]) },
     () => "sk-test-not-a-real-key",
   );
-  // testModel first, then catalogue rank -- which today is shortest-id, since
-  // inferTier's free-first key is dead (0 of 4,298 entries yield a price).
+  // testModel first, then catalogue rank: `outputKind` (non-text last), then the
+  // repaired tier (free first), then shortest id. `acme-embed` declares
+  // `["embedding", "text"]`, so it is `nontext` and sorts last despite having the
+  // shorter id; nothing here is priced, so the tier term is a tie for all three
+  // and length decides between `probe-1` and `acme-vision`.
+  //
+  // AMENDED BY R3 (#10), AND RECORDED RATHER THAN CORRECTED SILENTLY. This
+  // assertion used to expect `[probe-1, acme-embed, acme-vision]` under the
+  // comment:
+  //
+  //   > testModel first, then catalogue rank -- which today is shortest-id, since
+  //   > inferTier's free-first key is dead (0 of 4,298 entries yield a price).
+  //
+  // That is not coverage of intended behaviour, it is a record of the defect R3
+  // exists to fix, and it says so in its own prose: `inferTier` read
+  // `pricing.inputPerMillion`, a path this schema does not have, so both ranking
+  // terms were dead and shortest-id-first was all that remained. Repairing the
+  // tier and adding the `outputKind` term ahead of it is what moves `acme-embed`
+  // to last. The row SET is unchanged -- three entries, cap of three -- so this
+  // is a reordering, not a prune.
   assert.deepEqual(built.picker.map((r) => r.model),
-    ["acme/probe-1", "acme/acme-embed", "acme/acme-vision"]);
+    ["acme/probe-1", "acme/acme-vision", "acme/acme-embed"]);
   // The picker rows carry no capability fields yet -- T7 adds `kind` and the
   // bucketed `behavesAs`. What T6 owns is that the SIGNALS exist by the time the
   // row builder runs, which the shared normalizer is the single owner of.
@@ -1453,7 +1471,15 @@ test("buildProviders plumbs reason and kind onto every model it builds", () => {
     "embedding+text is still not a chat model; image+text is");
   // contextTokens is the one signal already visible on the row, so it is the one
   // that proves the normalizer's output really is what the builder consumed.
-  assert.deepEqual(built.picker.map((r) => r.contextTokens), [200000, 8192, 4096]);
+  //
+  // AMENDED BY R3 alongside the order above, and it must be READ as the same
+  // reordering seen through a second field: `[200000, 8192, 4096]` before,
+  // `[200000, 4096, 8192]` now, because `acme-vision` (4096) and `acme-embed`
+  // (8192) swapped. It never ran under the old expectation once the order
+  // assertion started failing -- an assertion that would flip but never executes
+  // is green while testing nothing, so it is corrected here explicitly rather
+  // than left to be discovered when the first one is fixed.
+  assert.deepEqual(built.picker.map((r) => r.contextTokens), [200000, 4096, 8192]);
 });
 
 // ---- T7: the bucket table and the classifier ---------------------------------

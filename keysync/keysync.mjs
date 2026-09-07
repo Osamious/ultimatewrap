@@ -14,6 +14,13 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { admitRemoteModels } from "../menu/denylist.mjs";
+// The offer-matching rule and the has-a-price-at-all predicate, from the module
+// that owns them. NOT from `menu/catalog.mjs`: that file statically imports THIS
+// one (`menu/catalog.mjs:25`, deliberately, with a comment saying why it is not
+// dynamic), so importing back from it closes a circular import and drags
+// `ccr-client.mjs`/`atomic.mjs` into keysync's transitive graph. Both lanes
+// import from `keysync/catalog-join.mjs`, which imports neither.
+import { priceOf, hasPricedOffer } from "./catalog-join.mjs";
 
 // ---------------------------------------------------------------- vault load
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -99,14 +106,54 @@ export function loadCatalog() {
   return { generatedAt: doc.generatedAt, byProvider, byAlias };
 }
 
-/** free / paid / unknown — a guess is worse than no label, so default to unknown. */
-export function inferTier(entry) {
-  const p = entry.pricing ?? {};
-  const nums = [p.inputPerMillion, p.outputPerMillion, p.input, p.output]
-    .map((v) => (typeof v === "number" ? v : Number(v)))
-    .filter((v) => Number.isFinite(v));
-  if (!nums.length) return "unknown";
-  return nums.every((v) => v === 0) ? "free" : "paid";
+/**
+ * free / paid / unknown — a guess is worse than no label, so default to unknown.
+ *
+ * READS THE LIVE PRICING PATH (#10). This used to read
+ * `pricing.{inputPerMillion,outputPerMillion,input,output}`. None of those four
+ * fields exists in this schema, which stores prices at
+ * `pricing.offers[].per1MTokens` — so the function returned `"unknown"` for
+ * 4,298 of 4,298 catalogue entries, the free-first term in `buildProviders`'s
+ * sort evaluated `1 - 1 = 0` for every pair, and selection collapsed to
+ * shortest-id-first.
+ *
+ * PROVIDER-MATCHED, WHICH IS WHY THIS TAKES A SECOND ARGUMENT. `offers[]` is a
+ * merged array holding up to 16 elements, most of them pricing the model at a
+ * DIFFERENT host. Folding them answers "is this free anywhere"; taking
+ * `offers[0]` answers "is the first element of an arbitrarily ordered array
+ * free". The question a routing decision needs is "is it free on MY key", so the
+ * offer is matched to the provider the key belongs to and a non-matching offer
+ * yields `null` — blank — rather than falling back to offer 0. That whole rule
+ * lives in `priceOf` and is called here rather than restated: one owner.
+ *
+ * ALL-ZERO OFFERS ARE `"unknown"`, NOT `"free"` (#55). The bundle encodes "not
+ * priced per token" as `{input: 0, output: 0}` under a token `sourceUnit` —
+ * shape-identical to a genuine free tier. The only discriminator the record
+ * carries is CONTRAST: another offer on the same entry naming a real price
+ * proves the bundle does hold pricing for this model, which makes the zero a
+ * fact about the model rather than a hole in the data.
+ * `openai/gpt-5-5` (kenari 0/0 alongside frogbot 2.5/15) is a real free tier;
+ * `google/lyria-3-pro-preview`, every offer 0/0, is a missing price.
+ * `hasPricedOffer` is that contrast test, shared with `menu/catalog.mjs`'s
+ * `badgeOf` so #55 is implemented once — and it reads the WHOLE offers array,
+ * not the matched offer, which is load-bearing: on
+ * `mistral/labs-devstral-small-2512` the matched offer IS 0/0 while a second
+ * mistral offer prices it at 0.1/0.3.
+ *
+ * Under-classifying is the safe direction, and it is the only direction
+ * available: a `false` from `hasPricedOffer` is evidence of absence and not
+ * proof of it (a provider's `auto` mode may be genuinely free of charge), so it
+ * may withhold the `"free"` claim and must never make the opposite one. An
+ * unknown-tier row sorts after genuine free rows and ahead of nothing.
+ *
+ * @param {object} entry                     a bundled-catalogue entry
+ * @param {string|null} providerName         the provider whose key will pay
+ */
+export function inferTier(entry, providerName = null) {
+  const price = priceOf(entry, providerName);
+  if (!price) return "unknown";
+  if (price.in !== 0 || price.out !== 0) return "paid";
+  return hasPricedOffer(entry) ? "free" : "unknown";
 }
 
 /**
@@ -114,12 +161,16 @@ export function inferTier(entry) {
  *
  * Sits beside `inferTier` for locality -- the other entry-to-label function over
  * the catalogue -- but the rule it follows is `makeRoutableOf`'s
- * (`menu/catalog.mjs:143`), not `inferTier`'s. MEASURED 2026-09-06: `inferTier`
- * reads `pricing.inputPerMillion` while this schema stores
- * `pricing.offers[].per1MTokens`, so it yields a usable value for 0 of 4,298
- * entries and the free-first sort at :365 is a no-op (`menu/catalog.mjs:29-31`
- * documents the same, and it is OQ-5, not fixed here). A dead function is the
- * wrong exemplar for honest-unknown labelling.
+ * (`menu/catalog.mjs:143`), not `inferTier`'s. It is also, now, a SORT TERM
+ * AHEAD OF `inferTier`'s on the routing path (see `buildProviders`): repairing
+ * the free-first term turned it on for the first time, and rerankers and music
+ * generators are disproportionately free, so free-first alone promotes
+ * non-chat rows over paid chat models.
+ *
+ * *(Until 2026-09-07 this paragraph recorded the opposite: `inferTier` read
+ * `pricing.inputPerMillion` while this schema stores
+ * `pricing.offers[].per1MTokens`, so it yielded a usable value for 0 of 4,298
+ * entries and the free-first sort was a no-op. That is #10, fixed above.)*
  *
  * POSITIVE SIGNALS ONLY. Absence of `modalities.output` is `null` -- unknown,
  * which renders selectable -- never `"nontext"`. Wrongly hiding a real chat
@@ -494,13 +545,25 @@ export const ANCHOR_PREFERENCE = [
  * catalogue entry at all). Every derived field is then `null` or `"unknown"`:
  * no signal is not a small model.
  *
+ * `providerName` IS PASSED THROUGH, NOT DERIVED. `inferTier` matches the price
+ * offer to the provider whose key will pay, and this function is its only call
+ * site -- so a provider-matched `inferTier` cannot be fed unless the name
+ * arrives here. Deriving it from `entry.provider` instead would be wrong at the
+ * one call site that matters: `buildProviders` normalizes the vault's
+ * `testModel` against a catalogue entry looked up under the LIVE provider, and
+ * the price that governs is the live provider's, not the entry's bundle
+ * grouping. Absent (the 38 no-entry rows, and any caller with no key in hand) it
+ * falls through to `priceOf`'s no-provider rule, which answers only when exactly
+ * one usable offer exists.
+ *
  * @param {string} id                     the model id as the provider spells it
  * @param {object|null|undefined} entry   its bundled-catalogue entry, if any
+ * @param {string|null} providerName      the provider whose key will pay
  */
-export function normalizeModel(id, entry) {
+export function normalizeModel(id, entry, providerName = null) {
   return {
     id,
-    tier: entry ? inferTier(entry) : "unknown",
+    tier: entry ? inferTier(entry, providerName) : "unknown",
     contextTokens: entry?.limits?.contextTokens,
     reason: entry?.capabilities?.reasoning ?? null,
     kind: outputKind(entry)
@@ -549,24 +612,55 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
     if (safeTestModel) {
       // `cat` is undefined for 38 of the 83 rows — this is the no-signal case.
       const cat = safeEntries.find((m) => m.model === safeTestModel);
-      models.push(normalizeModel(safeTestModel, cat));
+      models.push(normalizeModel(safeTestModel, cat, reg.provider));
       seen.add(safeTestModel);
     }
     if (safeEntries.length) {
       // Curate rather than dump: the picker is a flat list and 44 providers x
-      // full catalogs is unusable. Prefer free-tier, then shortest id.
+      // full catalogs is unusable. Prefer chat, then free-tier, then shortest id.
+      //
+      // `kind` IS THE FIRST TERM, AHEAD OF FREE-FIRST, AND THAT ORDER IS THE
+      // POINT. Free-first was a no-op until #10 was fixed, because `inferTier`
+      // read a path this schema does not have; repairing it turns the term on
+      // for the first time, which changes WHICH ROWS SHIP and not merely how
+      // they are labelled. Rerankers, embedders and media generators are
+      // disproportionately free, so free-first alone promotes them over paid
+      // chat models -- measured on cohere, where the repair alone replaces
+      // `command | command-a | command-r` with two rerankers. Sorting non-text
+      // last is what keeps a free non-chat model from outranking a paid chat
+      // model. The data costs nothing to obtain: `outputKind(entry)` is called a
+      // few lines below in `normalizeModel`, on the same entry.
+      //
+      // `=== "nontext"`, NOT `!== "text"`. `outputKind` answers `null` for
+      // absence of signal (`menu/catalog.mjs`'s `isTextOut` agrees), and a
+      // no-signal row must rank WITH the text rows, not with the generators:
+      // demoting on absent evidence is the confident-wrong this codebase
+      // refuses everywhere else.
+      //
+      // THIS GUARD IS PROVISIONAL AND IS KNOWN INSUFFICIENT (plan R3). It
+      // demotes only what DECLARES itself non-text, and google's Lyria previews
+      // declare `["audio", "text"]` -- so `outputKind` reads them as text, and
+      // free-first promotes two music generators straight back into google's
+      // top-3. R11 retires this with the live `capability` field from discovery,
+      // where those rows are `image_gen`/`audio`. Until then the boolean gate
+      // "no provider's top-3 acquires a row whose `modalities.output` contains a
+      // modality other than text" is the only thing that says so, and it fires.
       const ranked = safeEntries
-        .map((m) => ({ m, tier: inferTier(m) }))
-        .sort((a, b) => (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
+        .map((m) => ({ m, kind: outputKind(m), tier: inferTier(m, reg.provider) }))
+        .sort((a, b) => (a.kind === "nontext" ? 1 : 0) - (b.kind === "nontext" ? 1 : 0) ||
+          (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
           a.m.model.length - b.m.model.length);
       // The entry is in hand by construction, so the capability signals need no
       // lookup — which is what makes cross-provider name matching structurally
       // impossible here rather than merely discouraged. `ranked`'s `tier` is
       // dropped in favour of normalizeModel recomputing it: same value from the
-      // same entry, and one owner of the shape beats a second literal.
+      // same entry AND the same provider name, and one owner of the shape beats
+      // a second literal. That second clause is now load-bearing rather than
+      // incidental -- `inferTier` is provider-matched, so recomputing it from a
+      // different name would silently disagree with the sort that just ran.
       for (const { m } of ranked) {
         if (models.length >= MAX_MODELS_PER_PROVIDER || seen.has(m.model)) continue;
-        models.push(normalizeModel(m.model, m));
+        models.push(normalizeModel(m.model, m, reg.provider));
         seen.add(m.model);
       }
     }
