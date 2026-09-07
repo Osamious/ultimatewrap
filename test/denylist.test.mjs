@@ -843,7 +843,7 @@ test("an empty realIds set narrows everything away, rather than matching everyth
 
 test("validate() accepts a [1m]-suffixed picker row against a bare models[] entry", () => {
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
-                       models: ["claude-opus-5"] }];
+                       autoFetchModels: false, models: ["claude-opus-5"] }];
   const picker = [{ model: "anthropic/claude-opus-5[1m]", label: "x" }];
   assert.deepEqual(validate({ providers, picker }, 1), []);
 });
@@ -852,7 +852,7 @@ test("validate() still rejects a picker row with no corresponding models[] entry
   // The tolerance must be narrow: stripping [1m] must not become "any string
   // is close enough". A genuinely absent id is still a real problem.
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
-                       models: ["claude-opus-5"] }];
+                       autoFetchModels: false, models: ["claude-opus-5"] }];
   const picker = [{ model: "anthropic/claude-sonnet-5[1m]", label: "x" }];
   const problems = validate({ providers, picker }, 1);
   assert.equal(problems.length, 1);
@@ -863,7 +863,7 @@ test("validate() accepts the real ANTHROPIC_RELAY picker against its own models"
   // The actual shapes this fix exists for, exercised together rather than each
   // asserted on in isolation.
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
-                       models: [...ANTHROPIC_RELAY.models] }];
+                       autoFetchModels: false, models: [...ANTHROPIC_RELAY.models] }];
   const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);
 });
@@ -1008,7 +1008,7 @@ test("dynamically tagged rows still pass validate() against bare routing ids", (
   const rows = buildAnthropicPickerRows(ANTHROPIC_FULL,
     CTX({ "claude-opus-5": 1000000, "claude-haiku-4-5-20251001": 200000 }));
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
-                       models: [...ANTHROPIC_FULL] }];
+                       autoFetchModels: false, models: [...ANTHROPIC_FULL] }];
   const picker = rows.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);
 });
@@ -1771,7 +1771,10 @@ test("run.mjs strips both UW-side fields, so a written row keeps four keys", () 
 // next reader has to re-derive, which is how one stops being read.
 
 // A minimal, otherwise-valid built set, so each rule below fails alone.
-const OK_PROVIDERS = [{ name: "acme", provider: "acme", api_key: "x", models: ["m1"] }];
+// `autoFetchModels: false` is part of "otherwise-valid" since V9: buildProviders
+// emits it on every entry, so a fixture without it models no build that exists.
+const OK_PROVIDERS = [{ name: "acme", provider: "acme", api_key: "x",
+                       autoFetchModels: false, models: ["m1"] }];
 const OK_ROW = (o) => ({ model: "acme/m1", label: "acme > m1",
                          behavesAs: BUCKET_TARGETS.capable, kind: "text", ...o });
 
@@ -1890,7 +1893,7 @@ test("V3: relay rows are exempt BY CONSTRUCTION, not by oversight", () => {
   // ids; a declaration there would be borrowed from the model itself. If this
   // exemption were dropped, every healthy live run would fail validation.
   const providers = [{ name: "anthropic", provider: "anthropic", api_key: "x",
-                       models: [...ANTHROPIC_RELAY.models] }];
+                       autoFetchModels: false, models: [...ANTHROPIC_RELAY.models] }];
   const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
   assert.deepEqual(validate({ providers, picker }, 1), []);
 });
@@ -1915,6 +1918,128 @@ test("V5: a non-chat row declaring the capable target names the maximal-set reas
   // ...and the same row declaring the weak target is fine.
   assert.deepEqual(validate({ providers: OK_PROVIDERS,
     picker: [OK_ROW({ kind: "nontext", behavesAs: BUCKET_TARGETS.weak })] }, 1), []);
+});
+
+// ---- V9 / V10: the two rules whose subject is the PROVIDER ENTRY -----------
+
+test("V9: one entry flipped to autoFetchModels:true is a problem naming it and the bypass", () => {
+  // The plan's stated observable. The message has to carry WHY, because
+  // `autoFetchModels: false` reads like a reach limitation and gets flipped on
+  // that reading -- it is actually the enforcement point for both model gates.
+  const flipped = [{ ...OK_PROVIDERS[0], autoFetchModels: true }];
+  const problems = validate({ providers: flipped, picker: [OK_ROW()] }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /provider "acme"/);
+  assert.match(problems[0], /autoFetchModels true/);
+  assert.match(problems[0], /admitRemoteModels and checkBareCollisions/);
+  assert.match(problems[0], /gateway start/);
+  assert.match(problems[0], /picker sanitiser/);
+});
+
+test("V9: an entry that OMITS the key fails too — the rule cannot lean on the builders", () => {
+  // THE DISTINCTION THAT IS THE FINDING. #44 is not "someone might write true",
+  // it is "the value is a literal at two construction sites and nothing checks
+  // it". A rule shaped `=== true` would pass this input and would still be
+  // relying on ANTHROPIC_RELAY and buildProviders to always set the field --
+  // exactly the reliance V9 replaces. Deleting `!== false` in favour of
+  // `=== true` fails here and nowhere else.
+  //
+  // AND THIS IS THE TEST THAT CLOSES A LIVE BYPASS, not only an invariant. CCR
+  // reads the field as `oM(r.autoFetchModels ?? r.auto_fetch_models ??
+  // r.autoRefreshModels ?? r.auto_refresh_models)` -- four spellings, nullish
+  // coalescing (verified byte-exact in the shipped bundle; see V9's comment).
+  // A PRESENT value short-circuits the chain; an ABSENT one falls through to
+  // three aliases, any of which set `true` is honoured. So the input below is
+  // not a pedantic omission -- it is the exact state in which a snake_case
+  // alias silently wins, and requiring the field present and `false` is what
+  // makes those three names unreachable.
+  const { autoFetchModels: _dropped, ...noKey } = OK_PROVIDERS[0];
+  const problems = validate({ providers: [noKey], picker: [OK_ROW()] }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /autoFetchModels undefined/);
+  // ...and a truthy-but-not-true value is not a loophole either: CCR's own gate
+  // is `Providers.some(t => t.autoFetchModels && ...)`, a truthiness test.
+  assert.equal(validate({ providers: [{ ...OK_PROVIDERS[0], autoFetchModels: 1 }],
+    picker: [OK_ROW()] }, 1).length, 1);
+  assert.deepEqual(validate({ providers: OK_PROVIDERS, picker: [OK_ROW()] }, 1), []);
+});
+
+test("V9 covers the RELAY entry too, driven through the real constant", () => {
+  // The relay is a provider entry like any other and CCR would auto-fetch it on
+  // the same timer. This is also the strongest available statement about
+  // ANTHROPIC_RELAY.autoFetchModels: not merely that the key is present (which
+  // is all the spread-completeness test above asserts), and not merely that its
+  // value is false, but that validate() CONSUMES the constant and accepts it.
+  const { picker: _p, routing: _r, ...relay } = ANTHROPIC_RELAY;
+  const providers = [{ ...relay, models: [...ANTHROPIC_RELAY.models] }];
+  const picker = ANTHROPIC_RELAY.picker.map((m) => ({ model: `anthropic/${m}`, label: m }));
+  assert.deepEqual(validate({ providers, picker }, 1), []);
+  // ...and the same constant with the field flipped is caught, so the pass above
+  // is the rule agreeing rather than the rule being absent.
+  assert.equal(validate({ providers: [{ ...providers[0], autoFetchModels: true }],
+    picker }, 1).length, 1);
+});
+
+test("V9 holds over a real buildProviders output, so both construction sites are covered", () => {
+  // The literal lives at two sites. This drives the second one -- the per-entry
+  // literal in buildProviders -- rather than asserting on a hand-written fixture
+  // that could agree with the rule while production disagreed.
+  const { chosen, vault, catalog } = capabilityFixture();
+  const built = buildProviders(chosen, vault, catalog, () => "k");
+  assert.ok(built.providers.length > 0, "the fixture must actually build entries");
+  for (const p of built.providers) {
+    assert.equal(p.autoFetchModels, false, `buildProviders left ${p.name} auto-fetching`);
+  }
+  assert.equal(validate(built, built.providers.length)
+    .filter((x) => /autoFetchModels/.test(x)).length, 0);
+});
+
+test("V10: an impostor named anthropic is caught with the relay DOWN, where run.mjs cannot", () => {
+  // THE GAP. assertRelayNameUnclaimed runs at the injection, inside
+  // `if (anthropicOn)`, so the one configuration where an impostor is most
+  // useful -- relay down or --no-anthropic -- is the one nothing checked. The
+  // collapse it enables is demonstrated on checkBareCollisions above ("the
+  // relay's provider name is reserved"): two owners, one name, guard silent.
+  // Note the row needs no behavesAs to pass V3 -- that exemption is the second
+  // of the three things the impostor inherits, not an oversight in this fixture.
+  const impostor = [{ name: "anthropic", provider: "anthropic", api_key: "k",
+                      api_base_url: "https://tabitoken.com/v1",
+                      autoFetchModels: false, models: ["claude-opus-5"] }];
+  const picker = [{ model: "anthropic/claude-opus-5", label: "x" }];
+  const problems = validate({ providers: impostor, picker }, 1);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /tabitoken\.com/, "the message must name who actually answers");
+  assert.match(problems[0], /checkBareCollisions[\s\S]*orderNativePickerOptions[\s\S]*behavesAs/,
+    "all three dependents, not just 'reserved' — same contract as assertRelayNameUnclaimed");
+  assert.match(problems[0], /Rename it in providers\.json/);
+});
+
+test("V10: the genuine relay entry passes, so the rule is not just refusing the name", () => {
+  // Identity is the BASE URL, not the name -- the same distinction buildProviders
+  // draws when it puts the answering hostname in a row's description. A rule that
+  // rejected the name outright would fail every healthy live run.
+  const relay = [{ name: "anthropic", provider: "anthropic", api_key: "k",
+                   api_base_url: ANTHROPIC_RELAY.api_base_url,
+                   autoFetchModels: false, models: ["claude-opus-5"] }];
+  const picker = [{ model: "anthropic/claude-opus-5", label: "x" }];
+  assert.deepEqual(validate({ providers: relay, picker }, 1), []);
+});
+
+test("V10: two entries claiming the reserved name is a problem the alias rule cannot see", () => {
+  // #25: the alias-collision rule above compares `aliases.get(k) !== p.name`,
+  // and two entries SHARING a name make that equal -- duplicate names are
+  // precisely its blind spot. Without this branch a duplicate pair whose second
+  // entry also points at the relay's own url would pass both rules.
+  const pair = [
+    { name: "anthropic", provider: "anthropic", api_key: "k",
+      api_base_url: ANTHROPIC_RELAY.api_base_url, autoFetchModels: false, models: ["m"] },
+    { name: "anthropic", provider: "anthropic", api_key: "k",
+      api_base_url: ANTHROPIC_RELAY.api_base_url, autoFetchModels: false, models: ["m"] },
+  ];
+  const problems = validate({ providers: pair, picker: [] }, 2);
+  assert.equal(problems.length, 1, "the alias rule stays silent; only V10 fires");
+  assert.match(problems[0], /2 providers are named "anthropic"/);
+  assert.match(problems[0], /checkBareCollisions[\s\S]*orderNativePickerOptions[\s\S]*behavesAs/);
 });
 
 test("V7: a filtered options[] throws, naming the count and the first lost row", () => {

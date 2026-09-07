@@ -881,6 +881,101 @@ export function validate({ providers, picker }, expectedCount, table = {}) {
     seenRows.add(row.model);
   }
 
+  // V9 -- `autoFetchModels` must be exactly `false` on every entry, the relay
+  // included. Report 12 §10, #44.
+  //
+  // THIS IS NOT A REACH LIMITATION, and reading it as one is how it gets
+  // flipped. It is the ENFORCEMENT POINT FOR BOTH MODEL GATES. `admitRemoteModels`
+  // and `checkBareCollisions` run here, at keysync time, over keysync's inputs.
+  // CCR's own discovery runs at gateway start and every 600s after, hits each
+  // provider's /v1/models itself, and APPENDS what it finds to
+  // `Providers[].models` -- after both gates have already run, and without
+  // re-entering either. So a hostile aggregator publishing a bare Claude-shaped
+  // id has it fetched and made routable while the guard never sees it, because
+  // the guard only ever inspects what keysync wrote. The picker sanitiser is
+  // bypassed on the same path unconditionally, so ids carrying ANSI escapes or
+  // U+202E reach the menu and are rendered. The rule is not "fewer models"; it
+  // is "every model passes our gate first".
+  //
+  // STRICT `!== false`, NOT `=== true`, and that distinction is the finding
+  // itself. The value is a literal at two construction sites -- ANTHROPIC_RELAY
+  // and buildProviders -- and #44 is precisely that nothing stops either from
+  // dropping it. A rule that only rejected an explicit `true` would still be
+  // relying on the construction sites to always set the field, which is the
+  // reliance this rule exists to replace.
+  //
+  // AND ABSENCE IS NOT NEUTRAL -- IT OPENS AN ALIAS CHAIN. Do not "simplify"
+  // this to `=== true`. CCR parses the field from FOUR spellings, coalescing on
+  // nullish (VERIFIED byte-exact in the shipped bundle,
+  // @musistudio/claude-code-router/dist/main/cli.js):
+  //
+  //   autoFetchModels:oM(r.autoFetchModels ?? r.auto_fetch_models
+  //                      ?? r.autoRefreshModels ?? r.auto_refresh_models)
+  //   function oM(e){return typeof e=="boolean"?e:void 0}
+  //
+  // `??` falls through only on null/undefined, so a PRESENT `autoFetchModels`
+  // short-circuits the whole chain and the three aliases become unreachable.
+  // An ABSENT one falls through to all three, and any of them set `true` is
+  // honoured. So `=== true` would permit the key to be absent -- which is
+  // exactly the state in which a snake_case alias silently wins. Requiring the
+  // field present AND false is what makes the alias chain unreachable by
+  // construction, which is the real reason this rule is strict.
+  for (const p of providers) {
+    if (p.autoFetchModels !== false) {
+      problems.push(`provider "${p.name}" has autoFetchModels ` +
+        `${JSON.stringify(p.autoFetchModels)}, which must be exactly false: CCR's own ` +
+        `discovery appends provider-declared ids to Providers[].models at gateway start, ` +
+        `after admitRemoteModels and checkBareCollisions have already run over keysync's ` +
+        `inputs — so every id it adds becomes a routing target that passed neither gate ` +
+        `nor the picker sanitiser`);
+    }
+  }
+
+  // V10 -- the relay's provider name is reserved, asserted HERE and not only
+  // inside run.mjs's relay branch. #23 + #25.
+  //
+  // `assertRelayNameUnclaimed` is the primary guard and still runs, but it runs
+  // AT THE INJECTION, inside `if (anthropicOn)`. So in the one configuration
+  // where an impostor is most useful -- the relay down, or `--no-anthropic` --
+  // nothing checks the name at all. `checkBareCollisions` keys owners by
+  // provider NAME, so an entry called `anthropic` collapses into the relay's
+  // identity and the guard reports no collision while the impostor sole-owns a
+  // Claude id. Nothing else here catches it either: the alias-collision rule
+  // above compares `aliases.get(k) !== p.name`, and two entries SHARING a name
+  // make that comparison equal, so duplicate names are exactly the case it
+  // cannot see (#25).
+  //
+  // IDENTITY IS THE BASE URL, NOT THE NAME. That is the same distinction
+  // buildProviders already draws when it puts the answering hostname in a picker
+  // row's description: a vault nickname is user-chosen and can be made to read
+  // as official, a hostname cannot. An entry declaring NO base url is not a
+  // finding here -- buildProviders sets one on every vault entry it emits, so a
+  // built impostor always takes the declared branch, and an entry with no base
+  // url answers nothing. The residual is an entry that both takes the name and
+  // points at the relay's own address while the relay is down: it is unreachable
+  // by construction, so it owns nothing.
+  const relayName = ANTHROPIC_RELAY.name.toLowerCase();
+  const claimants = providers.filter((p) =>
+    String(p?.name ?? "").toLowerCase() === relayName);
+  // Named in full because "reserved name" alone tells an operator nothing about
+  // why renaming their provider is not optional -- the same three dependents
+  // assertRelayNameUnclaimed names.
+  const reservedWhy = `checkBareCollisions keys owners by provider name and would collapse ` +
+    `it into the relay's identity (reporting no collisions while it sole-owns a Claude id), ` +
+    `orderNativePickerOptions would hoist its rows to the head of the /model menu, and ` +
+    `validate()'s V3 exemption would excuse those rows from declaring behavesAs — which ` +
+    `lH() resolves to the maximal assumption set. Rename it in providers.json.`;
+  if (claimants.length > 1) {
+    problems.push(`${claimants.length} providers are named "${ANTHROPIC_RELAY.name}", ` +
+      `a name reserved for the relay: ${reservedWhy}`);
+  } else if (claimants.length === 1 && claimants[0].api_base_url &&
+             claimants[0].api_base_url !== ANTHROPIC_RELAY.api_base_url) {
+    problems.push(`the provider named "${ANTHROPIC_RELAY.name}" answers at ` +
+      `"${claimants[0].api_base_url}", not at the relay's ` +
+      `"${ANTHROPIC_RELAY.api_base_url}", and that name is reserved for the relay: ` +
+      `${reservedWhy}`);
+  }
+
   return problems;
 }
 
