@@ -1043,10 +1043,16 @@ about a hostile id, which is accurate for ~0 of the rows and misleading for ~1,5
 Internal identifiers may keep whatever names they already have; this constrains what the user reads.
 
 **`fatal` collisions are explicitly NOT part of this list, and must not be folded in later.** A
-bare-id collision **halts the entire run** — it does not hide one model from one provider. It
-therefore belongs in the run's own output, where it already is, and putting it in a per-provider
-withheld list would misrepresent a whole-config abort as one provider's missing row. This paragraph
-exists so the question is answered before someone reasonably asks it.
+bare-id collision **halts the entire run** — it does not hide one model from one provider. Putting it
+in a per-provider withheld list would misrepresent a whole-config abort as one provider's missing row.
+This paragraph exists so the question is answered before someone reasonably asks it.
+
+**But excluding it from this list does not discharge the disclosure requirement, and §2.6 is where it
+is discharged.** A fatal is near-silent today — one stderr `console.warn` — so "not here" would
+otherwise read as "nowhere". §2.6 specifies the run-level record that covers it, along with the other
+three ways a run refuses to write. The two surfaces answer different questions and neither substitutes
+for the other: this list answers *"why can't I route to this row?"*, §2.6 answers *"was this
+configuration applied at all?"*
 
 **Revision 2 called the detail view "the one place in the product that renders a hostile string".
 That was wrong, and the older egress is already open** *(G1, now #52)*. `menu/denylist.mjs:132`
@@ -1083,6 +1089,124 @@ clock. It rides the **same 2 → 3 schema bump as provenance** rather than addin
 
 ---
 
+### 2.6 Run-level disclosure: a keysync that refused to write *(revision 11)*
+
+**The gap.** §2.5(c) excludes `fatal` collisions from the per-provider withheld list and that
+exclusion stands. But the standing requirement is that **nothing is dropped silently**, and a fatal
+today is near-silent: one `console.warn` on stderr during a run nobody need be watching. The
+exclusion says where it does *not* belong; it does not discharge the requirement. It needs a
+different surface.
+
+**Why it is not a per-provider row, recorded so it is not folded back in later:**
+
+1. **It is not a property of a model.** Every withheld class in §2.5 answers *"why can't I route to
+   this row?"* A fatal answers *"why was this configuration refused?"* — a property of a **run**.
+2. **A per-provider rendering understates the scope by a factor of 44.** A fatal blocks the entire
+   write. `tabiai: 1 withheld` says one provider lost one model when in fact **no provider updated at
+   all** — the other 43 did not either.
+3. **The remedy differs in kind.** Withheld → R11 widens routing, or the row is a mode, or the
+   provider stopped listing it. Fatal → remove the provider, or pass a run-wide flag that disarms the
+   guard for **every** id (#9).
+4. **The picker renders the last *successful* state.** A fatal means the current attempt was refused,
+   so any per-row label about it would describe a config **that was never applied** — a claim about a
+   hypothetical, which the staleness budget forbids.
+
+**A wrong reason that was proposed and must not be repeated:** *"a fatal prevents the snapshot
+existing."* It does not. `menu/snapshot.mjs` builds `catalog/snapshot.json` as a **separate command**,
+and `keysync/run.mjs` writes `built-rows.json` **before** the collision guard runs. Verified against
+shipped source, **citing symbols because five more tasks write this file** *(see the A1 note in the
+decisions doc)*: the unconditional `BUILT_ROWS` write executes at top level **before** the
+`checkBareCollisions` block, whose `collisions.fatal` exit precedes the `--target` dispatch where the
+config and settings writes begin. An artefact therefore **does** exist on the fatal path. The design
+rests on the four reasons above, not on that one.
+
+**A source comment is loose here and should be corrected by whichever task next opens the file.**
+The comment immediately above the `collisions.fatal` exit reads *"Fatal BEFORE any write"*. That is
+true of the **config** write and false of `built-rows.json`, which precedes it. A reader trusting it
+concludes nothing is on disk after a fatal, which is exactly the wrong belief for the requirement
+below.
+
+**`built-rows.json` is NOT the failure record and must not be repurposed as one.** It is written
+unconditionally on every run, before the verdict is known, and its content is the built picker rows —
+i.e. it looks like a *successful build product*. Reading it as evidence of a completed run inverts the
+signal. The record specified here is a distinct artefact.
+
+**What to specify.** A run-level record the picker can render — in substance *"last keysync refused
+to write — 2026-09-07, 1 collision"* — with a drill-in naming the provider, the id, and the remedy.
+Requirements, each from a standing pillar:
+
+- **It clears on the next successful run.** A resolved fatal must stop showing. This is what carries
+  it past the staleness budget: keysync writes **and** clears it, so it refreshes exactly when the
+  thing it describes changes — no probe, no cadence, no new clock, the same argument §2.5 makes for
+  `rejected`.
+- **Three states, honestly distinguished: refused / succeeded / never ran.** `absent` must not read
+  as `no collisions` — the same absent-vs-empty discipline R15 applies to `refused[]` and to the
+  `discovered` stamp.
+- **It is dated**, for the reason the `discovered <date>` stamp is dated: visibly old beats silently
+  wrong.
+- **It is unmistakably a failure record, not partial config.** See the `built-rows.json` note above.
+- **It gates and prunes nothing.** Disclosure only — [[responding-provider-never-pruned]] applies to
+  a refused run as much as to a refused provider.
+
+**Scope correction: collisions are not the only way a run refuses to write, and a record covering
+only collisions is silently wrong on the others** *(measured)*. `keysync/run.mjs` has at least four
+refusal exits before the `--target` dispatch: the `--verified-only` empty-picker floor (exit 2),
+**the `validate()` `VALIDATION FAILED` exit (exit 1)**, the `collisions.fatal` exit (exit 1), and the
+lock-acquisition refusal (exit 2). All four leave the config unwritten. If the record is written only on the
+collision path, then after a validation failure the picker keeps rendering the **previous run's
+success** — the precise failure mode this section exists to close, reintroduced through the back door.
+
+**So the record is written on any refusal-to-write, and the collision is one *reason* among several.**
+The reason is **data, not a closed vocabulary**, exactly as R14/R15 establish for `refused[]`; the
+four reasons above are all properties of *a refused run*, and none of them is specific to collisions.
+This is a widening of B4 as first stated, on the same evidence that motivated it.
+
+**This reverses a documented decision, and the reversal has to be argued rather than assumed.**
+`menu/uwpick.mjs`'s comment above `framesFor` states: *"NO keysync state file is read here, and that is the design rather
+than an omission"* — an earlier revision fed a picker banner from
+`~/.uw/state/new-anthropic-models.json` and the coupling **was deliberately removed**. Rendering a
+keysync run record re-introduces exactly that coupling. **It is still the right call, because the
+comment's own stated reason for removal does not transfer:** that banner was removed for being
+**vacuous** — *"the native picker now shows every live Anthropic id, so 'new id detected, not added'
+no longer describes anything"* — not for being coupled. A record of whether the config the picker
+reflects was **actually applied** is not vacuous; it is the one thing the snapshot cannot say about
+itself. Whichever task lands this must **update that comment in the same pass**, or the next reviewer
+will correctly cite it as a violation.
+
+**It cannot ride the snapshot, and this is the load-bearing constraint on where it lives.** The
+obvious economy — fold it into R15's `2 → 3` bump — **does not work**: the snapshot is built by
+`menu/snapshot.mjs` as a separate command, so a keysync run that refuses to write does not rebuild
+the snapshot. A record carried inside the snapshot would therefore be **stale exactly when it
+matters**, still reporting the last successful run. The record must be its own artefact, written by
+keysync and read by the picker alongside the snapshot. Sibling precedent already exists for the
+convention — `keysync/key-health-latest.json` and `keysync/last-test-results.json` are status files
+keysync writes and other tools read.
+
+**Ownership — contended, and flagged rather than resolved here.**
+
+| half | file | existing writers | earliest slot |
+|---|---|---|---|
+| producer | `keysync/run.mjs` | R0 *(Ship 0, committed)*, the Ship A fix pass *(committed)*, **R6 and R7 (Ship B)**, **R19, R12, R13 (Ship D)** | Ship B, serial after R7 |
+| consumer | `menu/style.mjs`, `menu/uwpick.mjs` | **R16** (render), **R18** (overlay) | Ship E, serial after R16 |
+| persistence | its own file — **not** R15's snapshot schema, per the constraint above | — | with the producer |
+
+**Recommendation: it needs its own task, split producer/consumer, not a fold into an existing one.**
+Three reasons. (1) **No existing task's WRITES spans both halves** — the producer is `run.mjs` in
+Ship B, the consumer is `style.mjs`/`uwpick.mjs` in Ship E, and nothing owns both. (2) **`run.mjs`
+already has five uncommitted writers** (R6, R7, R19, R12, R13); folding an unrelated concern into any
+of them couples it to that task's security review, and R7 in particular is a `fatal`-computation
+change that a reviewer must be able to assess alone. (3) The producer must land before the consumer,
+a serialization no existing pairing provides.
+
+**Proposed placement: producer as a new task at the end of Ship B (serial after R7, same
+security-review checkpoint, since it reads the same `fatal` the guard computes); consumer as a new
+task in Ship E, serial after R16 and parallel-safe with R18** *(different concern, but note both write
+`style.mjs` — if they land in either order they serialize on that file, so state it rather than
+discover it)*. The producer is inert until the consumer ships, which is a feature: it accumulates real
+records before anything renders them.
+
+---
+
 ## 3. Staging and review checkpoints
 
 **"Independently shippable" overstated it for Ship D, and the honest framing is review checkpoints
@@ -1097,10 +1221,10 @@ genuinely independent; **D is one landing with three internal checkpoints.**
 | **0 — the #53 guard fix** | **R0 alone** | **yes, and independently revertible** | **security review; lands before everything** |
 |---|---|---|---|
 | **A — additive** | R1 R2 R3 R4 R5 **R5b** | yes; nothing changes what routes — **R5b changes what one column *says*** on 123 rows, and routes nothing differently | ordinary review |
-| **B — the guard** | R6 R7 | yes; two edits to one function | **security review** |
+| **B — the guard** | R6 R7, **+ §2.6's producer half** *(proposed, revision 11 — serial after R7)* | yes; two edits to one function, plus a write-only failure record that nothing reads until Ship E | **security review** |
 | **C — discovery** | R8 R9 R10 | yes; cache-only, wired to nothing | **security review** + live-run authorization |
 | **D — widen routing (D4 step 1)** | R11 R12 R13, then **R13b** behind an internal gate | **no — one landing**, R11's intermediate state must not ship | **review + live-apply authorization**, and R13b reviewed separately |
-| **E — uwpick (D7) + refusal disclosure (#51)** | R17 R14 R15 R16 R18, in that order | yes; display and interaction only | ordinary review, **plus a security look at R18's hostile-string rendering** |
+| **E — uwpick (D7) + refusal disclosure (#51)** | R17 R14 R15 R16 R18, in that order, **+ §2.6's consumer half** *(proposed, revision 11 — serial after R16; serializes with R18 on `style.mjs`)* | yes; display and interaction only | ordinary review, **plus a security look at R18's hostile-string rendering** |
 
 **Hard ordering constraints** *(revised — F4; Ship 0 added in revision 3)*:
 
@@ -2861,6 +2985,12 @@ template exists at `test/snapshot.test.mjs:171` and `:186`.
 
 **WRITES:** `menu/style.mjs`, `menu/uwpick.mjs`, `test/style.test.mjs`, `test/menu-layout.test.mjs`,
 `test/uwpick.test.mjs`.
+
+*(Revision 11: **§2.6's consumer half is proposed as a separate task serial after this one**, on the
+same two source files. It is not folded in here — it renders a keysync **run** record, not catalogue
+data, and it reverses the decision recorded above `framesFor` in `menu/uwpick.mjs` that the picker reads no keysync state
+file, which is a change a reviewer must be able to assess on its own. Whichever of the two lands
+second serializes on `style.mjs` and `uwpick.mjs`.)*
 
 **`menu/uwpick.mjs` is on this list and nearly was not.** `frame()` renders `meta`, but `meta` is
 *built* at `uwpick.mjs:49-56` — a fixed literal of four fields. Adding a `discovered` stamp to the
