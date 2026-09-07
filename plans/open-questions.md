@@ -180,3 +180,64 @@ Unresolved items surfaced during planning. Append; do not rewrite history.
   `fix/model-capability-buckets`; surfaced there because T3 nearly cited `inferTier` as its exemplar
   for honest-unknown labelling, which would have been unfortunate in a plan whose first principle is
   exactly that.
+
+- [ ] **OQ-6: the #47 main-agent substitution is Claude Code's `env.ANTHROPIC_MODEL` winning over
+  `settings.model` — not CCR's built-in Claude Code route. R1's prediction did not hold.**
+  Measured 2026-09-06 against the live gateway (CCR on `:3456`), read-only: two probe requests
+  (`max_tokens: 1`) plus the 25-row `request_logs` retention window, 18:43:06Z–19:53:28Z. No config
+  was written and `keysync/run.mjs --target live` was not run.
+
+  **The two declarations at measurement time.** `~/.claude/settings.json` was last written 18:27:56Z
+  — *before* the whole window, so the pin was in force throughout — and no project-level or
+  `.local` file overrides either field:
+
+  | declaration | value |
+  |---|---|
+  | `settings.model` (the pin uwpick writes) | `anthropic/claude-haiku-4-5-20251001` |
+  | `settings.env.ANTHROPIC_MODEL` (the anchor keysync writes) | `anthropic/claude-opus-5[1m]` |
+
+  **What CCR actually received.** Of the 25 rows, 23 are `client: "Profile: Claude Code"` (the other
+  2 are this task's own probes). Their distinct `requestedModel` set is exactly
+  `["anthropic/claude-opus-5", "anthropic/claude-sonnet-5"]`. **`anthropic/claude-haiku-4-5-20251001`
+  appears in zero rows.** The pin never reaches CCR, so CCR cannot be the layer that replaced it.
+
+  **CCR rewrote nothing.** On all 25 rows — both probes included — `x-ccr-routed-model` equals
+  `requestedModel`; the count of rows where they differ is **0**. `x-ccr-route-reason` is only ever
+  `default` or `custom-router`. There is no row in this window in which CCR substituted a model id.
+
+  **This falsifies the conditional, not merely the layer.** §1.2/§1.6 read the vendor routing docs as
+  saying the built-in Claude Code route substitutes *"when the client has not selected a recognized
+  model."* `anthropic/claude-haiku-4-5-20251001` **is** recognized and routable — it is in the
+  `anthropic` provider's allowed list, which the gateway itself enumerates in its 400 body — and it
+  was overridden anyway. The override is unconditional env precedence applied client-side, before
+  the request leaves Claude Code. That is also why #47 observed "responded normally" instead of an
+  error: the unroutable id was never put on the wire at all.
+
+  **Against R1's expected observable, item by item:**
+
+  | predicted | measured |
+  |---|---|
+  | the model selected differs from the model that answered | **holds** — but only by comparing `settings.model` against what arrives at CCR. Within any single row, requested == routed == answered. |
+  | `target_provider_names` is empty on that row | **no such row exists.** The substituted traffic is `200 OK` with no error body, so the field is *absent*, not empty. `[]` reproduced only on this task's direct probes, which are ordinary resolution failures. #47's distinction between resolution failure and provider rejection stands, but it does not mark the substitution. |
+  | the substituted model is the Agent Config model | **value coincides, mechanism differs.** `profile.claudeCode.model` is `anthropic/claude-opus-5`, equal to what answered — but the id arrives from `env.ANTHROPIC_MODEL` with `[1m]` stripped upstream (f2ff7ca), not from CCR's route. |
+
+  **Direct-probe control, and its limitation stated rather than glossed.** One request carrying the
+  unroutable `alibaba/deepseek-v4-pro` — #47's own selection, still unroutable (`alibaba` lists only
+  `qwen3.8-27b`, `glm-5`, `glm-5.2`) — returned `400`, `target_provider_names: []`, with
+  `stage: model_resolution` against all three targets. CCR did **not** rewrite it to the Agent Config
+  model. A second probe adding the non-credential headers that mark Claude Code traffic (`x-app`,
+  `x-claude-code-session-id`, `x-stainless-*`) was still logged `client: "Local Gateway"`, so profile
+  attribution is not header-derived and **neither probe entered the built-in Claude Code route.** The
+  control therefore shows only that CCR does not substitute for un-attributed requests; it does not
+  by itself exclude a substitution inside the profile route. The 23 in-profile rows do that, and they
+  are the load-bearing evidence here.
+
+  **Consequence for the plan.** Pre-mortem scenario 3 rests on the substituting layer being CCR's,
+  and it is not. A remedy aimed at `Router.builtInRules["claude-code"]` would miss entirely: the
+  divergence is between two fields of `settings.json` that keysync itself writes, and it is resolved
+  before any request is made. Not fixed here — R1 is read-only and confirmation-only.
+
+  **Out of scope and deliberately not chased** (decisions doc §9): #47's Q2 (`hud-shim.mjs` context
+  reporting, §9.1), Q3 (reopening D9, #48), and policy 2 / `builtInClaudeCodeSubagent` /
+  per-agent-type routing (§9.2). #47's title says "Subagent requests"; this is main-agent
+  substitution, as the user corrected.
