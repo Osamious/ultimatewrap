@@ -280,10 +280,37 @@ must be modelled, in order, because that is what `resolve()` does.
 
 **What is kept, and what A2 strands** *(H5)*. Revision 2 claimed *"the stripping still computes the
 reported distinction, so the finding can still say the relay routes this id but does not curate it."*
-**That is false as written**, and I should have checked it: `hijackable` fires only when the relay is
-**absent** from the owner set, so `h.relayRoutes` is structurally always `false`, the
+**That is false as written**, and I should have checked it.
+
+**Corrected — the replacement below was itself wrong, in tense** *(revision 12)*. **What this
+paragraph used to say**, immediately after the sentence above: *"`hijackable` fires only when the
+relay is **absent** from the owner set, so `h.relayRoutes` is structurally always `false`, the
 routes-but-does-not-curate suffix at `run.mjs:216` is unreachable, `routedNotVouched` at `:198` is
-always empty, and the third remedy branch at `:204-209` is dead code.
+always empty, and the third remedy branch at `:204-209` is dead code."* That is a true statement
+about the **destination** and a false one about the **origin**: at `65fd58a`, pre-R7, all three paths
+were **live**. `effective = owners \ {relay}` let an unvouched `{relay, tabiai}` reach `hijackable`
+carrying `relayRoutes: true` and `fatal: true`. Read as present tense it authorises deleting a
+reachable branch. The corrected wording:
+
+> **`hijackable` fires only when the relay is absent from the owner set — but only once `fatal` reads
+> `owners`.** Today the unvouched branch classifies from `owners \ {relay}`, so `{relay, tabiai}`
+> reaches `hijackable` carrying `relayRoutes: true`: the routes-but-does-not-curate suffix,
+> `routedNotVouched`, and the third branch of the `remedy` ternary are all **live on `main`**, and the
+> stripped verdict is precisely what keeps them reachable. Change 1 is what makes `h.relayRoutes`
+> structurally false and strands all three. **They must therefore land in one commit.** Deleting the
+> branch alone removes a reachable path — the only message that tells an operator why the relay's
+> ownership did not count — and pushes those findings onto the "the relay does not serve this id"
+> fallback, which would then be a false statement about a relay that does serve it. No test in the
+> suite covers that, because the branch's own test asserts on message content that silently relocates
+> rather than disappearing.
+
+**That last clause generalises and is the reason this correction is worth its space: a deleted branch
+whose output migrates to a fallback leaves message assertions green while the meaning inverts.** The
+suite goes on matching the string; the string has stopped being true. A test asserting on message
+*content* cannot distinguish "this branch fired" from "some other branch produced the same words", so
+deleting a branch whose wording survives elsewhere is invisible to it. Coverage, not message
+matching, is what catches this class — as R7's own mutation note already concedes for the reverse
+direction.
 
 **Resolution: move the distinction to where it is now true.** A relay that routes an id it does not
 curate produces a **`shadowed`** finding, not a hijackable one — so the note belongs on the shadowed
@@ -1089,7 +1116,7 @@ clock. It rides the **same 2 → 3 schema bump as provenance** rather than addin
 
 ---
 
-### 2.6 Run-level disclosure: a keysync that refused to write *(revision 11)*
+### 2.6 Run-level disclosure: a keysync that refused to write, or wrote with reduced scope *(revision 11; widened, revision 12)*
 
 **The gap.** §2.5(c) excludes `fatal` collisions from the per-provider withheld list and that
 exclusion stands. But the standing requirement is that **nothing is dropped silently**, and a fatal
@@ -1160,6 +1187,43 @@ success** — the precise failure mode this section exists to close, reintroduce
 The reason is **data, not a closed vocabulary**, exactly as R14/R15 establish for `refused[]`; the
 four reasons above are all properties of *a refused run*, and none of them is specific to collisions.
 This is a widening of B4 as first stated, on the same evidence that motivated it.
+
+**Second scope correction: the principle is not about refusal. A run that PROCEEDS with silently
+reduced scope owes the same disclosure** *(revision 12, #81)*.
+
+Everything above is written around a run that **stops**. R6 created the other shape and this section
+did not cover it: the run **proceeds**, writes the config, exits zero — and the guard's own scope has
+silently shrunk underneath it, because `realIds` came back `null` and the classification set narrowed
+with it. Worse than quiet: with `hijackable` and `shadowed` both empty the caller's `console.warn`
+**never fired**, so the operator saw **nothing at all** — not a reduced verdict, not a weaker one, no
+line. An all-clear that is really "no findings among a set I could not verify" is a **claim about
+Anthropic's catalogue made by a run that failed to reach it**.
+
+**Generalise the principle accordingly: a control that narrows its own scope must say so, whether the
+run stops or continues.** Refusal is one trigger, not the definition. The test is whether the artefact
+a reader will act on still describes the thing they think it describes.
+
+**And the corollary that made this reachable at all: a message nobody prints is not disclosure.** The
+gap was not only missing text — the print condition itself was gated on there being findings, so the
+one path that most needed a line was the one path structurally unable to emit it. A disclosure whose
+emission is conditional on the very thing it exists to report the absence of is not a control.
+
+**What shipped for this, at `7dae67e`**, recorded as the worked instance rather than as new
+specification:
+
+- a **`catalogVerified`** flag on the guard's return, false on exactly the `realIds === null` path;
+- the empty branch's message **scoped** — "…among the ids this config advertises" — so it stops
+  reading as an affirmative all-clear;
+- an **`UNVERIFIED:`** line appended on **every** branch when unverified, not only the empty one: a
+  shape-only `shadowed` note is as much a catalogue claim as an all-clear, and it is the branch
+  today's config actually reaches;
+- the print condition **moved out of the un-runnable entry block** into an exported
+  **`shouldReportCollisions`**, with an unverified disjunct — this is the fix for the corollary above.
+
+**It changes no verdict, and that boundary is load-bearing.** `fatal` does not read
+`catalogVerified`; no new severity, no new exit path, nothing pruned. Disclosure only —
+[[responding-provider-never-pruned]] applies to a run with reduced confidence exactly as it applies to
+a refused one.
 
 **This reverses a documented decision, and the reversal has to be argued rather than assumed.**
 `menu/uwpick.mjs`'s comment above `framesFor` states: *"NO keysync state file is read here, and that is the design rather
@@ -2040,47 +2104,74 @@ pinned rather than discovered later at the picker.
 
 ---
 
-**R6 — D1: the classification set becomes `ANTHROPIC_ALIASES ∪ (realIds ?? ANTHROPIC_FULL)`.**
+**R6 — D1: the classification set is `ANTHROPIC_ALIASES ∪ (realIds ?? advertised RESERVED-shaped ids)`.**
 
 **WRITES:** `keysync/run.mjs`, `test/denylist.test.mjs`.
 **Serial before:** R7, R12, R13.
 
 **Serial after R0**, which is the first writer of `keysync/run.mjs`.
 
-Change the null-fallback at `run.mjs:126` from broad `RESERVED` to the curated set. Nothing else in
-the guard changes. **R0 has already restructured ownership around the selector set**, so this task
-swaps only what populates that set's null branch — from "the advertised RESERVED-shaped ids" to
-`ANTHROPIC_FULL`. The two changes were built to compose in this order.
+**This section describes what shipped, which is not what it specified** *(revision 12, #81)*. R6
+landed the narrow form at `65fd58a`; Ship B's review measured it; the user **reversed the null
+branch** at `7dae67e`. **What this section used to say**, in the heading and first paragraph: *"the
+classification set becomes `ANTHROPIC_ALIASES ∪ (realIds ?? ANTHROPIC_FULL)`. … Change the
+null-fallback at `run.mjs:126` from broad `RESERVED` to the curated set."* The decision moved under
+the task; the rewrite below is the task as it now stands. The full measurement and the reasoning are
+in decisions §2 amendment 1 and are not restated here.
+
+**The shipped change.** Nothing else in the guard changes. **R0 has already restructured ownership
+around the selector set**, so this task touches only what populates that set — and after the reversal
+the null branch populates it from **the advertised `RESERVED`-shaped ids**, as it did before R6, while
+the non-null branch is `realIds` unchanged. Both sides are trimmed. Net of the reversal, R6's surviving
+substance is the disclosure work (§2.6) and the test rewrites, not a narrowing.
 
 **Revision 1 said "`realIds` effectively never goes null", and that was self-cancelling** *(M6)*.
 `run.mjs:762` sets it to `null` whenever `liveCatalog` is falsy, and `:626` prints
-`UNAVAILABLE (relay down and no cache)` on exactly that path. **That path is the reason D1 exists** —
-a *network failure* must not silently widen the guard to every Claude-shaped string. Stating it as
-near-unreachable undercut the whole rationale.
+`UNAVAILABLE (relay down and no cache)` on exactly that path. **That path is the reason D1 was
+argued** — and, after the reversal, it is the reason the branch is broad: the narrowing premise
+("Claude Code never emits a name Anthropic has not published, so the curated set suffices") is
+**unavailable exactly there**, because the thing that would establish it is the fetch that just
+failed. A network failure is not evidence about the config's risk in either direction; the branch
+resolves that by classifying widely and **disclosing** the reduced confidence (§2.6).
 
-**`RESERVED` becomes a no-op inside this function, and that is a decision, not a side effect**
-*(H3)*. **R0, not R6, is what makes it a no-op on the production branch** — once ownership is computed
-by iterating `ANTHROPIC_ALIASES ∪ realIds`, every candidate is already in the classification set and
-`RESERVED.test()` cannot reject any of them. R6 then extends that to the null branch by replacing the
-broad fallback. **Both tasks are named because the drift detector below has to survive both.** After
-D1 the narrowing always runs, and
-every id in `ANTHROPIC_ALIASES ∪ ANTHROPIC_FULL` matches `RESERVED` *(verified by inspection: all
-eight)*. So `RESERVED.test()` can no longer reject anything the second gate accepts.
+**`RESERVED`'s status differs by branch, and the earlier write-up was true of only one of them**
+*(H3, corrected revision 12)*. This section used to state flatly that `RESERVED` *"becomes a no-op
+inside this function"*. That holds on the **non-null** branch only:
 
-**Settled: keep it as a documented fast-path pre-filter, and add the drift detector that makes the
-no-op safe.** Removing it would leave `isReserved` with a single consumer and lose the one place the
-two definitions are compared; keeping it silently would leave a reader unable to tell a live gate
-from a dead one. The new test asserts that **every id in `ANTHROPIC_ALIASES ∪ ANTHROPIC_FULL`
-matches `RESERVED`** — so if someone adds an id to `ANTHROPIC_FULL` that `RESERVED` does not match,
-the pre-filter drops it before classification and the guard goes silent on a real id. That is
-precisely the drift `denylist.test.mjs:375` was written to catch, preserved after its original
-subject disappears.
+- **Non-null branch — inert.** Ownership is computed by iterating `ANTHROPIC_ALIASES ∪ realIds`;
+  every candidate is already in the classification set and `RESERVED.test()` cannot reject any of
+  them. **R0, not R6, is what makes it inert there.**
+- **Null branch — live and decisive. `RESERVED`'s output *is* the selector set.** The fallback is
+  "every `RESERVED`-shaped id the config advertises", so the regex is not filtering a set someone
+  else chose — it **constitutes** the set. Widening or narrowing `RESERVED` moves the guard's scope
+  on this branch directly.
+
+**Measured, and the swing is the point** *(#81)*: deleting the pre-filter killed **0 of 494** tests
+under D1 and kills **8 of 502** now. A line went from provably dead to load-bearing without a diff of
+its own. Any future task that touches `RESERVED` must read this distinction first — "it's a no-op"
+was true when written and is now false on the branch that reaches production during an outage.
+
+**Keep it, and keep the drift detector that makes the inert branch safe.** Removing it would leave
+`isReserved` with a single consumer, lose the one place the two definitions are compared, and — after
+the reversal — delete the null branch's selector source outright. The drift test asserts that **every
+id in `ANTHROPIC_ALIASES ∪ ANTHROPIC_FULL` matches `RESERVED`**: if someone adds an id to
+`ANTHROPIC_FULL` that `RESERVED` does not match, the pre-filter drops it before classification and the
+guard goes silent on a real id. That is precisely the drift `denylist.test.mjs:375` was written to
+catch, preserved after its original subject disappears. **The test must assert the claim, not only its
+premise** — as shipped it now covers both branches (inert where selectors are constants, decisive
+where they are advertised), because the earlier version proved the premise, never touched the claim,
+and passed under a title that stood in for an assertion it did not make.
 
 **Verify:** `node --test "test/denylist.test.mjs"`, plus a census over a synthetic widened config
-built from the listing corpus. Expected observables: the 23 reseller-invention false-positive fatals
-(`claude-opus-4-8-think`, `claude-opus-4.6`, `claude-opus-5-fast`, …) no longer classify; a reseller
-sole-owning bare `opus` with the relay down is still `fatal: true`; a reseller sole-owning a real
-uncurated Anthropic id is still `fatal: true`; and the drift detector passes over the live constants.
+built from the listing corpus. Expected observables: a reseller sole-owning bare `opus` with the relay
+down is `fatal: true`; a reseller sole-owning a real uncurated Anthropic id is `fatal: true`; **a
+reseller sole-owning any of the 15 ids in `ANTHROPIC_ALIASES ∪ Anthropic's live /v1/models` is
+`fatal: true` with the relay down** — the independent threat set, sourced outside the guard per
+decisions §10; the null path emits no affirmative all-clear and carries its `UNVERIFIED:` line; and
+the drift detector passes over the live constants on both branches. **The "23 reseller inventions no
+longer classify" observable is withdrawn**: those 23 were counted over the full bundled catalogue,
+which this guard is never handed, and on the null path the shipped guard **does** flag inventions of
+that kind when sole-owned — the accepted cost, not a regression.
 
 **Every new guard test passes `realIds` as a non-null Set and `relayOwned` as the curated set** —
 the production shape. #22 is the standing proof that a test omitting them is not a guard test.

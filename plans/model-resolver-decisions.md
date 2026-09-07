@@ -121,7 +121,14 @@ withhold routing — but no artifact may claim "3,784 working models".
 
 ## 2. D1 — `checkBareCollisions` classification set
 
-**Locked.** The null-fallback becomes the static curated set, not broad `RESERVED`:
+**REVERSED ON ITS NULL BRANCH, 2026-09-07 — read amendment 1 below before citing anything in this
+section.** The rule stated here was locked, implemented in R6 (`65fd58a`), measured in Ship B's
+review, and **the user reversed the null branch on that measurement** (`7dae67e`). The non-null
+branch is unchanged and still stands as written. Everything down to amendment 1 is kept as the
+record of what was locked and why, not as a description of shipped behaviour.
+
+**Locked** *(superseded on the null branch — amendment 1)*. The null-fallback becomes the static
+curated set, not broad `RESERVED`:
 
 ```
 classify id  ⟺  ANTHROPIC_ALIASES.includes(id) || (realIds ?? ANTHROPIC_FULL).has(id)
@@ -149,6 +156,72 @@ Every real protection is retained: a reseller sole-owning bare `opus` still exit
 **Out of scope here**, deliberately: the per-id vouch for legitimate Anthropic resellers (#9,
 BACKLOG item 2). D1 removes the false-positive class; it does not give a resller sole-owning a
 *real* published Anthropic id a path past the guard. That remains open and is listed below.
+
+**Amendment 1, 2026-09-07 — the null branch is reversed, on measurement** *(revision 12, #81)*.
+
+This is **a decision changed because it was measured, not implementation drift**. R6 implemented D1
+exactly as locked (`65fd58a`); nothing was mis-built. Ship B's security review then measured what the
+narrowing cost, and the user reversed it (`7dae67e`).
+
+**What ships.** The non-null branch is untouched; only the fallback moves back:
+
+```
+classify id  ⟺  ANTHROPIC_ALIASES.includes(id) || (realIds ?? advertised RESERVED-shaped ids).has(id)
+```
+
+i.e. `ANTHROPIC_ALIASES ∪ (realIds ?? advertised RESERVED-shaped ids)`, trimmed on both sides. Where
+D1 read `ANTHROPIC_FULL` on the `realIds === null` path, the shipped guard reads every
+`RESERVED`-shaped id the config advertises — the broad set that was live before R6.
+
+**The measurement, with its denominators.** Taken against an **independent** threat set —
+`ANTHROPIC_ALIASES ∪ Anthropic's live /v1/models`, **15 ids** from `state/anthropic-ids-cache.json`,
+deliberately *not* the guard's own selectors. A reseller sole-owning one of those 15 with the relay
+down went silent for:
+
+| build | silent |
+|---|--:|
+| pre-R6 (`5eba892`) | **0 of 15** |
+| under D1 (`b6f4fc1`) | **7 of 15** |
+| after the reversal (`7dae67e`) | **0 of 15** |
+
+The seven that went silent: `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`,
+`claude-sonnet-4-6`, `claude-opus-4-6`, `claude-opus-4-5-20251101`, `claude-sonnet-4-5-20250929`.
+Every one is published by Anthropic, so every one is a name Claude Code can send. `ANTHROPIC_FULL`
+carries 4 of the 11 live ids, and that shortfall is the whole of the gap.
+
+**Reachable on shipped data, not a constructed scenario.** `built.providers` holds
+`tabiai → claude-opus-4-8` and `gorouter → claude-opus-4-8`. With both owners it is `shadowed` today.
+If **either** drops the id, that shape was **FATAL** pre-R6 and **SILENT** under D1 — while CCR binds
+`tabiai`.
+
+**D1's own justification was counted on the wrong population, and that is the core error.** D1 cited
+*"23 ids classify as hijackable … All 23 are false positives"*. `checkBareCollisions` is only ever
+handed **`built.providers`** — each provider's `testModel` plus up to 3 catalogue rows — which holds
+**2** `RESERVED`-shaped bare ids in **83** model entries across 44 providers, both
+`claude-opus-4-8`. The 23 were counted over the **full bundled catalogue, which the guard never
+sees**. D1 therefore traded 7 real detections against false positives measured on a set that is not
+its input.
+
+**A future re-narrowing argued from the 23 would be argued from a set the guard is never handed.**
+Stated here so the number is not re-cited without its denominator.
+
+**The accepted cost, stated because it is real and was taken knowingly.** On the null path a reseller
+invention — `claude-opus-5-thinking`, `claude-opus-4.6` and their kind, where extended thinking is a
+request *parameter* rather than a model — is `fatal` when sole-owned, and nothing ever sends those
+bare. This branch will produce those false positives. Measured on shipped data the realised cost is
+at most the 2 rows above, on a path the operator can see and override with
+`--allow-bare-claude-names`; the narrowing's cost was 7 of 15 published Anthropic ids silently
+misrouting the full system prompt. The user took that trade with both denominators in view.
+
+**Why D1's error survived review, and the general rule it yields.** R6 was measured **against its own
+selector set** — the very set the change narrowed. Every figure R6 reported was internally
+consistent, and every one of them was silent about coverage: a set cannot report the ids it has just
+stopped containing. **A guard cannot be validated against the set it defines.** See §10, where this
+is recorded as a standing methodological constraint rather than a fact about this one decision.
+
+**What is unchanged by the reversal.** `RESERVED`'s status flips with the branch and is written up in
+the plan's R6 section; the per-id vouch for legitimate Anthropic resellers (#9, BACKLOG item 2)
+remains open exactly as the paragraph above leaves it — the reversal neither closes it nor widens it.
 
 ## 3. D2 — `MODEL_ID_OK` inverts from allowlist to denylist
 
@@ -837,3 +910,17 @@ itself."* Fixing main-agent resolution is in; changing subagent model assignment
   `deriveAnthropicSets`, `orderNativePickerOptions`) and new boundary logic is mutation-tested —
   that practice found real gaps twice, and #22 is the standing proof that a guard test omitting the
   production configuration is not a guard test.
+- **A guard cannot be validated against the set it defines** *(revision 12, #81)*. When a change
+  moves a control's own selector set, every measurement taken over that set is internally consistent
+  by construction and says **nothing** about coverage — a set cannot report the ids it has just
+  stopped containing. D1 is the worked instance: R6 measured the narrowing against the narrowed set,
+  reported clean figures, and passed review while going silent on 7 of 15 published Anthropic ids
+  (§2 amendment 1). **The threat set must be sourced independently of the control** — for that guard,
+  `ANTHROPIC_ALIASES ∪ Anthropic's live /v1/models` from `state/anthropic-ids-cache.json`, which the
+  change does not touch. This binds any future edit to `checkBareCollisions`, `RESERVED`,
+  `ANTHROPIC_FULL`, `MODEL_ID_OK` or `admitId`.
+- **Every count carries the population it was counted over** *(revision 12, #81)*. D1's "23 false
+  positives" was true of the full bundled catalogue and false of `built.providers` — the only input
+  the guard receives — where the same measurement yields 2 in 83. A figure restated about a
+  different population is the recurring failure mode on this branch; cite the denominator or do not
+  cite the number.
