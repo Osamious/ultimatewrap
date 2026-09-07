@@ -24,44 +24,22 @@ import * as CCR from "./ccr-client.mjs";
 // path, which has a 300 ms budget.
 import * as K from "../keysync/keysync.mjs";
 
+// `priceOf` moved OUT of this file (R5) and is re-exported unchanged, so every
+// existing importer of `menu/catalog.mjs` keeps working. It had to move because
+// `keysync.mjs` needs the same offer-matching rule and cannot import it from
+// here: the static import above means the reverse direction closes a cycle and
+// drags `ccr-client.mjs`, `atomic.mjs` and their graph into keysync's. One owner
+// of the rule, reachable from both sides; the import path is incidental. The
+// reasoning about WHICH offer to trust moved with the function.
+import { priceOf } from "../keysync/catalog-join.mjs";
+export { priceOf };
+
 export const SLOT = path.join(os.homedir(), ".uw", "state", "slot.json");
 
-// The catalogue's real pricing path. keysync's own inferTier reads
-// `pricing.inputPerMillion`, which does not exist in this schema -- it returns
-// "unknown" for all 4,298 models, which is why its free-tier sort is a no-op.
-//
-// WHICH OFFER. `offers[]` is a merged array and each element carries its own
-// `provider` field; a merged record can hold up to 16 offers, most of them
-// pricing the model at a DIFFERENT host. Folding all of them answers "is this
-// free anywhere", which is the wrong question. Taking offers[0] answers "is the
-// first element of an arbitrarily ordered array free", which is also the wrong
-// question and is the one the previous draft implemented. The right question is
-// "is it free on MY key", so match the offer to the provider the key belongs to.
-// Every call site has that name already: buildFrom has `cred.provider` and
-// buildProviders has `reg.provider`.
-//
-// When no offer matches, return null -- blank -- rather than falling back to
-// offer 0. A FREE badge on a model that bills the user's key is precisely the
-// lie Principle 1 exists to prevent, and it is also what sorts a mispriced entry
-// to rank 0 on the routing path in buildProviders.
-export function priceOf(entry, providerName = null) {
-  const offers = entry?.pricing?.offers;
-  if (!Array.isArray(offers)) return null;
-  const usable = (o) => {
-    const p = o?.per1MTokens;
-    return p && Number.isFinite(Number(p.input)) && Number.isFinite(Number(p.output));
-  };
-  const take = (o) => ({ in: Number(o.per1MTokens.input), out: Number(o.per1MTokens.output) });
-
-  if (providerName) {
-    const mine = offers.find((o) => o?.provider === providerName && usable(o));
-    return mine ? take(mine) : null;
-  }
-  // No provider given: only safe when there is exactly one usable offer, because
-  // then "the first" and "mine" cannot disagree.
-  const usables = offers.filter(usable);
-  return usables.length === 1 ? take(usables[0]) : null;
-}
+// `priceOf` used to be defined here. It now lives in
+// `keysync/catalog-join.mjs`, imported above and re-exported there, so that both
+// this file's call sites (`badgeOf`, `buildProviders`) and its importers read
+// exactly as before.
 
 // GUARD G1: a zero *token* price on a model whose output is not text means it is
 // billed per image/second in another unit. Blank, never "free".

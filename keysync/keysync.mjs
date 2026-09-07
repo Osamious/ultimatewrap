@@ -73,15 +73,30 @@ export function chooseKeys(filtered) {
 // ------------------------------------------------------------------ catalog
 const CATALOG_FILE = "C:\\nvm4w\\nodejs\\node_modules\\@musistudio\\claude-code-router\\dist\\models.json";
 
+// Returns the two groupings the FILE declares about itself. `byProvider` is the
+// grouping every caller already had; `byAlias` is the bundle's own `aliases[]`
+// field, which this function used to discard (report 12 §1) -- 10,184 strings
+// naming the same 4,298 models as other hosts spell them, and the single
+// largest contributor to the D3 join. The ladder's DERIVED structures (global
+// ids, tails, case-folded variants) are not built here: they are policy, and
+// they belong to `keysync/catalog-join.mjs`.
+//
+// MEASURED 2026-09-06: no alias is claimed by two entries, so a flat Map loses
+// nothing. A collision would still be first-wins, which is the same rule
+// `byProvider` push order already follows.
 export function loadCatalog() {
   const doc = readJson(CATALOG_FILE);
   const byProvider = new Map();
+  const byAlias = new Map();
   for (const m of doc.models ?? []) {
     if (!m.provider || !m.model) continue;
     if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
     byProvider.get(m.provider).push(m);
+    for (const a of m.aliases ?? []) {
+      if (typeof a === "string" && a && !byAlias.has(a)) byAlias.set(a, m);
+    }
   }
-  return { generatedAt: doc.generatedAt, byProvider };
+  return { generatedAt: doc.generatedAt, byProvider, byAlias };
 }
 
 /** free / paid / unknown — a guess is worse than no label, so default to unknown. */
