@@ -924,6 +924,123 @@ export function applyVerifiedOnly(built, verified) {
   };
 }
 
+/**
+ * The profile anchor, and WHICH RULE PRODUCED IT.
+ *
+ * EXTRACTED FOR ONE REASON: the last fallback. `?? picker[0].model` silently
+ * repoints all six CCR profile tiers on any change to picker ORDERING -- a
+ * capability signal appearing in a provider's listing is enough, and R11 added
+ * exactly that precedence. Inline in the entry block, that fallback was
+ * unobservable: nothing could assert the anchor had not moved, and a move
+ * produces no error, no log line and no failing test. It produces a working
+ * config pointed at a different model.
+ *
+ * `via` IS THE POINT, NOT `model`. Two builds can agree on the anchor id by
+ * coincidence -- the preference list resolving, and the picker head happening to
+ * be the same row -- so a test that compares only the id passes through the exact
+ * regression this function exists to catch. `via` says which of the four rules
+ * fired, and "the anchor is stable" means BOTH fields are unchanged.
+ *
+ * MEASURED 2026-09-08, pre-R11 (a68caab) vs HEAD, same vault, same catalogue,
+ * same day, `menu/denylist.mjs` and `keysync/catalog-join.mjs` byte-identical
+ * across that range so R11's change is isolated:
+ *
+ *   pre-R11   83 picker rows, routing 83,    anchor google/gemini-3.5-flash-lite
+ *   post-R11  83 picker rows, routing 1,584, anchor google/gemini-3.5-flash-lite
+ *
+ * The picker was ORDER-identical, row for row, not merely equal in count or as a
+ * set. So R11 widened routing 19x and moved the anchor not at all. Both resolve
+ * at ANCHOR_PREFERENCE[0] by exact match, four rules short of the fallback --
+ * which is why the picker head (`orcarouter/orcarouter/free`, a free-tier router
+ * row, and a poor anchor for Claude Code's real payload) never gets a vote.
+ *
+ * @param {{model: string}[]} picker
+ * @param {object}   opts
+ * @param {boolean}  opts.anthropicOn        relay live -> the constant tiers win
+ * @param {string[]} [opts.verifiedOrder]    --verified-only's fastest-first list
+ * @param {string[]} [opts.preference]       defaults to ANCHOR_PREFERENCE
+ * @param {object}   [opts.tiers]            defaults to ANTHROPIC_TIERS
+ * @returns {{model: string, via: string}} `via` is one of `anthropic-tiers`,
+ *   `preference:<entry>`, `verified`, `picker-head`
+ */
+export function resolveAnchor(picker, {
+  anthropicOn, verifiedOrder = null, preference = ANCHOR_PREFERENCE, tiers = ANTHROPIC_TIERS,
+} = {}) {
+  if (anthropicOn) return { model: tiers.model, via: "anthropic-tiers" };
+  for (const pref of preference) {
+    const hit = picker.find((r) =>
+      (pref.endsWith("/") ? r.model.startsWith(pref) : r.model === pref))?.model;
+    if (hit) return { model: hit, via: `preference:${pref}` };
+  }
+  const rowExists = (m) => picker.some((r) => r.model === m);
+  const verified = verifiedOrder?.find(rowExists);
+  if (verified) return { model: verified, via: "verified" };
+  // Unguarded on purpose: an empty picker here is already refused upstream
+  // (--verified-only exits at zero rows, validate() fails the count otherwise),
+  // and inventing a second error for it would only hide which check lapsed.
+  return { model: picker[0].model, via: "picker-head" };
+}
+
+/**
+ * What CCR would bind a BARE model name to, modelled from its own rule.
+ *
+ * `providerModelMatches` iterates raw `Providers[].models[]` behind only a
+ * provider-level enabled gate, and `resolve()` binds on exactly one match --
+ * returning undefined on more than one. So ambiguity FAILS CLOSED: a name two
+ * providers advertise routes nowhere rather than to whichever was cheapest to
+ * find. That is the property worth pinning, because it is what keeps a reseller
+ * from receiving traffic addressed to a name it merely happens to list.
+ *
+ * ENTRIES, NOT PROVIDERS, and the difference is not pedantry: one provider
+ * listing an id twice is two matches, so CCR binds nothing even though there is
+ * a single owner. Counting providers here would call that id bindable and the
+ * model would stop matching CCR.
+ *
+ * @param {object[]} providers  built `Providers[]`, each `{name, models: string[]}`
+ * @param {string} id           the bare name a client asked for
+ * @returns {{provider: string, model: string}|undefined} undefined when 0 or 2+
+ */
+export function resolveBare(providers, id) {
+  const matches = [];
+  for (const p of providers) for (const m of p.models) {
+    if (m === id) matches.push({ provider: p.name, model: m });
+  }
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * Ownership of every bare id in the built config, counted by PROVIDER.
+ *
+ * The companion to `resolveBare`, and deliberately a SEPARATE computation rather
+ * than a view over it: the census answers "how many providers claim this name",
+ * `resolveBare` answers "what would CCR do". They are asserted against each other
+ * (test/routing-split.test.mjs), so a future edit that collapses one into the
+ * other -- making the fail-closed property a tautology of its own definition --
+ * stops being able to prove anything and the paired test says so.
+ *
+ * NOT A SUBSTITUTE FOR `checkBareCollisions`. This counts every id; the guard
+ * classifies the Claude-SHAPED ones against Anthropic's published set, under
+ * two-stage exact-then-case-folded matching, and is the only thing that can go
+ * fatal. The census exists to measure the population the guard's subject sits in.
+ *
+ * @param {object[]} providers
+ * @returns {{owners: Map<string, string[]>, ambiguous: string[], soleOwned: string[]}}
+ *   `owners` values are deduplicated and sorted; `ambiguous` is 2+ providers.
+ */
+export function bareIdCensus(providers) {
+  const owners = new Map();
+  for (const p of providers) for (const m of p.models) {
+    if (!owners.has(m)) owners.set(m, new Set());
+    owners.get(m).add(p.name);
+  }
+  const flat = new Map([...owners].map(([id, set]) => [id, [...set].sort()]));
+  return {
+    owners: flat,
+    ambiguous: [...flat].filter(([, o]) => o.length > 1).map(([id]) => id).sort(),
+    soleOwned: [...flat].filter(([, o]) => o.length === 1).map(([id]) => id).sort(),
+  };
+}
+
 // ENTRY-POINT GUARD. Everything below runs the pipeline: it reads the vault,
 // writes built-rows.json, and on the dry path calls process.exit(0). Without
 // this check, `import { checkBareCollisions } from "./run.mjs"` would run all of
@@ -1321,13 +1438,12 @@ cfg.API_TIMEOUT_MS = 120000;
 
 // Anchor: prefer a model observed to handle Claude Code's real payload (system
 // prompt + tools). Small/fast models pass a bare probe but 400 on real traffic.
-const rowExists = (m) => built.picker.some((r) => r.model === m);
-const anchorModel = anthropicOn
-  ? ANTHROPIC_TIERS.model
-  : (ANCHOR_PREFERENCE.map((pref) => built.picker.find((r) =>
-      (pref.endsWith("/") ? r.model.startsWith(pref) : r.model === pref))?.model).find(Boolean)
-     ?? verifiedOrder?.find(rowExists)
-     ?? built.picker[0].model);
+const anchor = resolveAnchor(built.picker, { anthropicOn, verifiedOrder });
+const anchorModel = anchor.model;
+// Printed because `via` is the half that goes wrong silently. `picker-head` means
+// the preference list matched nothing and all six tiers are now pointed at
+// whatever sorted first -- a config that works, serves badly, and looks normal.
+console.log(`profile anchor: ${anchorModel} (via ${anchor.via})`);
 // With Claude available, keep Claude Code's normal tiering rather than pointing
 // every tier at one model.
 const tiers = anthropicOn ? ANTHROPIC_TIERS : {

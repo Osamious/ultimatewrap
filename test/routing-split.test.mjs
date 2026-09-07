@@ -20,7 +20,11 @@ import { pathToFileURL } from "node:url";
 import {
   buildProviders, validate, bucketFor, normalizeModel, outputKind, capabilityKind,
   pickerCapFrom, MAX_PICKER_MODELS_PER_PROVIDER, BUCKET_TARGETS, CTX_CAPABLE_MIN,
+  ANCHOR_PREFERENCE, ANTHROPIC_TIERS, ANTHROPIC_RELAY, ANTHROPIC_FULL,
 } from "../keysync/keysync.mjs";
+import {
+  resolveAnchor, resolveBare, bareIdCensus, checkBareCollisions,
+} from "../keysync/run.mjs";
 
 // ---------------------------------------------------------------- fixtures
 
@@ -611,4 +615,212 @@ test("a malformed or absent discovery input degrades to the pre-R11 candidate se
     const got = build(fixture({ discovery: bad })).providers.map((p) => [p.name, p.models]);
     assert.deepEqual(got, base, `discovery=${JSON.stringify(bad)} must change nothing`);
   }
+});
+
+// ---- R13: the profile anchor did not move ----------------------------------
+//
+// R11 widened `providers[].models` and left the picker capped, and its commit
+// message reports "picker stays 83". That is a COUNT, and this file's own rule is
+// that a count is satisfied by one row arriving as another leaves. R11 also
+// shipped capability precedence, which REORDERS the picker -- and the anchor's
+// last fallback is `picker[0]`, so ordering alone can repoint all six CCR profile
+// tiers with no error and no diff nearby.
+//
+//   MEASURED 2026-09-08, pre-R11 (a68caab) vs HEAD, one vault, one catalogue, one
+//   day. `menu/denylist.mjs` and `keysync/catalog-join.mjs` are byte-identical
+//   across that range (`git diff a68caab HEAD --` on both is empty), so the old
+//   builder ran against today's real inputs and R11 is the only variable:
+//
+//     pre-R11    83 picker rows, routing    83, anchor google/gemini-3.5-flash-lite
+//     post-R11   83 picker rows, routing 1,584, anchor google/gemini-3.5-flash-lite
+//
+//   The picker was ORDER-identical, row for row -- not merely equal as a set.
+//   Both anchors resolve at ANCHOR_PREFERENCE[0] by exact match. The picker head
+//   was `orcarouter/orcarouter/free` on both, so the fallback that would have made
+//   the anchor a free-tier router row never got a vote.
+//
+// That comparison is a measurement and cannot live in an assertion: it needs the
+// real `~/.llmkeys` and the hardcoded global claude-code-router bundle path
+// (report 08 F9). What IS asserted here is the property the measurement rests on
+// -- that the anchor is decided by the preference list rather than by picker
+// order -- plus the control proving the fallback is reachable at all.
+
+const pickerOf = (...models) => models.map((model) => ({ model }));
+
+test("the anchor is decided by ANCHOR_PREFERENCE, and picker ORDER cannot move it", () => {
+  // The shipped preference list, not a fixture one: the claim is about the real
+  // rule. Its first entry is an exact id, so a picker carrying it must anchor
+  // there no matter what else is present or where.
+  const head = ANCHOR_PREFERENCE[0];
+  assert.ok(!head.endsWith("/"), "this test reads ANCHOR_PREFERENCE[0] as an exact id");
+
+  const rows = ["orcarouter/orcarouter/free", head, "zzz/last"];
+  const forward = resolveAnchor(pickerOf(...rows), { anthropicOn: false });
+  assert.deepEqual(forward, { model: head, via: `preference:${head}` },
+    "the preference entry wins over the row that happens to sort first");
+
+  // THE R11-SHAPED REGRESSION, REPRODUCED: a capability signal demotes a row and
+  // the whole picker reorders. The anchor must not notice.
+  for (const order of [[...rows].reverse(), [rows[1], rows[0], rows[2]], [rows[2], rows[0], rows[1]]]) {
+    assert.deepEqual(resolveAnchor(pickerOf(...order), { anthropicOn: false }), forward,
+      `reordering the picker to ${JSON.stringify(order)} must not move the anchor`);
+  }
+});
+
+test("CONTROL: with no preference row present the anchor IS the picker head", () => {
+  // Without this the test above proves nothing -- it would pass identically if
+  // `picker-head` were unreachable dead code. It is reachable, and reaching it is
+  // the silent failure: six tiers pointed at whatever sorted first.
+  const got = resolveAnchor(pickerOf("orcarouter/orcarouter/free", "zzz/last"), { anthropicOn: false });
+  assert.deepEqual(got, { model: "orcarouter/orcarouter/free", via: "picker-head" });
+  assert.notEqual(got.model, ANCHOR_PREFERENCE[0]);
+});
+
+test("a prefix preference matches by prefix, and earlier entries still outrank it", () => {
+  // Four of the six shipped entries end in `/`. Both branches of the one
+  // conditional in the resolver need a case, or half the rule is unasserted.
+  const prefix = ANCHOR_PREFERENCE.find((p) => p.endsWith("/"));
+  assert.ok(prefix, "the prefix branch is unreachable if no shipped entry ends in `/`");
+  assert.deepEqual(resolveAnchor(pickerOf(`${prefix}some-model`), { anthropicOn: false }),
+    { model: `${prefix}some-model`, via: `preference:${prefix}` });
+  // ...and the exact entry ahead of it in the list still wins when both are present.
+  assert.deepEqual(
+    resolveAnchor(pickerOf(`${prefix}some-model`, ANCHOR_PREFERENCE[0]), { anthropicOn: false }).model,
+    ANCHOR_PREFERENCE[0], "preference order, not picker order, breaks the tie");
+});
+
+test("with the relay live the anchor is a CONSTANT, immune to the picker entirely", () => {
+  // The branch that actually ships today (`anthropicOn: true`). It reads no row,
+  // so no picker change of any kind can reach it -- which is why the measured
+  // pre/post-R11 comparison above had to be run on the relay-off branch to say
+  // anything at all.
+  const got = resolveAnchor(pickerOf("anything/at-all"), { anthropicOn: true });
+  assert.deepEqual(got, { model: ANTHROPIC_TIERS.model, via: "anthropic-tiers" });
+  assert.deepEqual(resolveAnchor([], { anthropicOn: true }), got,
+    "it does not even read picker[0], so an empty picker cannot throw on this branch");
+});
+
+test("`verifiedOrder` is consulted BELOW the preference list and only for rows that exist", () => {
+  const fast = "fast/verified-model";
+  assert.deepEqual(resolveAnchor(pickerOf(fast), { anthropicOn: false, verifiedOrder: [fast] }),
+    { model: fast, via: "verified" });
+  // A verified id whose row was pruned must not be anchored on.
+  assert.deepEqual(
+    resolveAnchor(pickerOf("other/row"), { anthropicOn: false, verifiedOrder: ["gone/row"] }),
+    { model: "other/row", via: "picker-head" });
+  // ...and it never outranks a preference hit.
+  assert.equal(
+    resolveAnchor(pickerOf(fast, ANCHOR_PREFERENCE[0]), { anthropicOn: false, verifiedOrder: [fast] }).via,
+    `preference:${ANCHOR_PREFERENCE[0]}`);
+});
+
+// ---- R13: the bare-id census, and that ambiguity FAILS CLOSED ---------------
+//
+//   MEASURED 2026-09-08 against the REAL built config, relay live, no discovery
+//   cache wired (R11 shipped without one), `--verified-only` off:
+//
+//     45 providers (44 vault + relay), 1,599 routing ENTRIES
+//     1,465 distinct bare ids
+//       1,359 sole-owned                    <- CCR binds these
+//         106 ambiguous (2+ providers)      <- CCR binds NONE of these
+//          11 Claude-shaped distinct, of which 1 is ambiguous
+//     checkBareCollisions: hijackable 0, shadowed 1, fatal false, catalogVerified true
+//       shadowed: claude-opus-4-8 <- anthropic + gorouter + tabiai
+//
+// THE CENSUS IS 106, NOT THE PLAN'S 667, AND THE DIFFERENCE IS THE DENOMINATOR.
+// `plans/model-resolver-decisions.md:544` states 667 for a ~3,784-routing-id
+// scenario. The shipped width is 1,599 entries / 1,465 distinct ids, because R11
+// wired no discovery cache -- routing is testModel u catalogue only. 667 was never
+// a measurement of what shipped, and is not restated here as one.
+//
+// The COUNT is not what these tests pin. Counts over the real vault rot on the
+// next `npm i -g` (see the note at the declaration-channel test above). The
+// PROPERTIES below hold at any width, and are asserted over the fixture.
+
+const relayWith = (...ids) => ({ ...ANTHROPIC_RELAY, models: ids });
+
+test("no Claude-shaped bare id is sole-owned by a reseller: hijackable is 0", () => {
+  // The fixture reproduces the real config's ONE Claude-shaped ambiguity exactly:
+  // tabiai and gorouter both carry `claude-opus-4-8` as their testModel, which is
+  // the shape R10 measured live. Two owners, so CCR binds nothing.
+  const providers = build(fixture()).providers;
+  const census = bareIdCensus(providers);
+  assert.deepEqual(census.owners.get("claude-opus-4-8"), ["gorouter", "tabiai"]);
+
+  // Both guard branches: `realIds: null` is the BROAD one (relay down, no cache --
+  // every RESERVED-shaped id the config advertises becomes a selector), and a
+  // populated set is the narrowed one the live catalogue produces.
+  for (const realIds of [null, new Set([...ANTHROPIC_FULL, "claude-opus-4-8"])]) {
+    const c = checkBareCollisions(providers, { realIds });
+    assert.equal(c.hijackable.length, 0,
+      `hijackable must be 0 with realIds=${realIds === null ? "null" : "populated"}`);
+    assert.equal(c.fatal, false);
+    assert.deepEqual(c.shadowed.map((s) => s.id), ["claude-opus-4-8"],
+      "the id is reported as a shared claim, which is what CCR refuses to bind");
+  }
+});
+
+test("CONTROL: strike the co-owner and the same id becomes hijackable", () => {
+  // The assertion above is a claim about ownership, not about the guard being
+  // asleep. Removing gorouter leaves tabiai as the sole owner of a Claude-shaped
+  // name -- the exploitable shape -- and the guard must go fatal on it.
+  const providers = build(fixture()).providers.filter((p) => p.name !== "gorouter");
+  const c = checkBareCollisions(providers, { realIds: null });
+  assert.deepEqual(c.hijackable.map((h) => `${h.id}<-${h.owner}`), ["claude-opus-4-8<-tabiai"]);
+  assert.equal(c.fatal, true);
+  // ...and the census agrees the ambiguity is what was protecting it.
+  assert.equal(bareIdCensus(providers).ambiguous.includes("claude-opus-4-8"), false);
+});
+
+test("EVERY ambiguous bare id resolves to nothing -- ambiguity fails closed", () => {
+  // The property that must hold at any width. `bareIdCensus` counts providers;
+  // `resolveBare` models CCR's own rule (count matching ENTRIES, bind on exactly
+  // one). They are separate computations over the same input on purpose -- if one
+  // were defined in terms of the other this assertion would be a restatement of
+  // its own definition rather than a check.
+  const providers = build(fixture()).providers;
+  const census = bareIdCensus(providers);
+  assert.ok(census.ambiguous.length > 0, "a fixture with no ambiguity proves nothing here");
+
+  for (const id of census.ambiguous) {
+    assert.equal(resolveBare(providers, id), undefined,
+      `"${id}" has ${census.owners.get(id).length} owners and must bind to nothing`);
+  }
+  // The other half, or "binds nothing" would be satisfied by binding nothing ever.
+  for (const id of census.soleOwned) {
+    const hit = resolveBare(providers, id);
+    assert.ok(hit, `"${id}" has exactly one owner and must resolve`);
+    assert.deepEqual([hit.provider], census.owners.get(id));
+  }
+  assert.equal(census.ambiguous.length + census.soleOwned.length, census.owners.size,
+    "every id is counted exactly once, so neither list can hide a row");
+});
+
+test("the relay CO-OWNING an id is what keeps it unbindable, not the guard's opinion", () => {
+  // The real config's shadowed row is `anthropic + gorouter + tabiai`. Adding the
+  // relay must not make the id bindable -- three owners is still not one.
+  const providers = [relayWith(...ANTHROPIC_FULL, "claude-opus-4-8"), ...build(fixture()).providers];
+  const census = bareIdCensus(providers);
+  assert.deepEqual(census.owners.get("claude-opus-4-8"),
+    ["anthropic", "gorouter", "tabiai"], "the real config's shadowed row, reproduced");
+  assert.equal(resolveBare(providers, "claude-opus-4-8"), undefined);
+  // The relay's OWN curated ids are sole-owned, so they DO bind -- which is the
+  // whole point of running it.
+  for (const id of ANTHROPIC_FULL) {
+    assert.deepEqual(census.owners.get(id), ["anthropic"]);
+    assert.equal(resolveBare(providers, id)?.provider, "anthropic");
+  }
+  assert.equal(checkBareCollisions(providers, { realIds: null }).hijackable.length, 0);
+});
+
+test("ENTRIES, not providers: one provider listing an id twice binds nothing", () => {
+  // The census counts providers and `resolveBare` counts entries, and this is the
+  // one input where the two must disagree. CCR's `resolve()` sees two matches and
+  // returns undefined, so a census-shaped model of binding would be wrong here.
+  const providers = [{ name: "dup", models: ["m", "m"] }, { name: "solo", models: ["n"] }];
+  assert.deepEqual(bareIdCensus(providers).owners.get("m"), ["dup"], "one OWNER");
+  assert.deepEqual(bareIdCensus(providers).soleOwned, ["m", "n"]);
+  assert.equal(resolveBare(providers, "m"), undefined, "...but two ENTRIES, so nothing binds");
+  assert.equal(resolveBare(providers, "n")?.provider, "solo");
+  assert.equal(resolveBare(providers, "absent"), undefined, "and an unadvertised name binds nothing");
 });
