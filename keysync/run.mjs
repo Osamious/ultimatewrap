@@ -56,8 +56,9 @@ const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
  * @param {boolean} [opts.allowBare=false]     --allow-bare-claude-names
  * @param {Set<string>|null} [opts.realIds=null]  ids Anthropic actually publishes
  *   (from anthropic-catalog.mjs's live /v1/models, unioned with ANTHROPIC_FULL by
- *   the caller). null means "could not be determined" and the guard falls back
- *   to the old, broader RESERVED-only match -- see the narrowing comment below.
+ *   the caller). null means "could not be determined" (relay down AND no cache)
+ *   and the guard falls back to ANTHROPIC_FULL -- see the D1 note below for why
+ *   a NETWORK failure must not widen the classification set.
  * @param {Set<string>|null} [opts.relayOwned=null]  the CURATED ids the relay
  *   vouches for. See the vouching block in the classification loop -- this is
  *   the parameter that keeps routing auto-add from disarming the guard. null
@@ -81,12 +82,14 @@ export function checkBareCollisions(providers, {
   // THE TRIM HAS A SECOND EFFECT, AND IT IS A GATING ONE. RESERVED is anchored
   // (`/^(claude|opus|...)([-._\d\/]|$)/i`), and the trim runs BEFORE it, so it
   // changes WHICH IDS ARE ADMITTED to the guard at all -- not merely how an
-  // admitted id matches. `" opus"` was invisible here and is now classified;
-  // `"claude-opus-5 "` and `"claude-opus-5"` were two distinct keys and are now
-  // one. Both are the FAITHFUL readings, since CCR compares the trimmed forms,
-  // but this is a behaviour change on the `realIds === null` branch as well as
-  // the narrowed one, and stating only the matching fidelity while leaving the
-  // gating effect unsaid is this file's named failure mode.
+  // admitted id matches. `" opus"` was invisible here and is now classified, and
+  // `"claude-opus-5 "` now folds onto the same selector as `"claude-opus-5"`
+  // (two matching ENTRIES against one selector -- see the entry-counting note at
+  // `matchingEntries`). Both are the FAITHFUL readings, since CCR compares the
+  // trimmed forms, and stating only the matching fidelity while leaving the
+  // gating effect unsaid is this file's named failure mode. The effect is
+  // uniform across both selector sources: D1 gave the fallback branch a constant
+  // set too, so there is no longer a branch on which the trim behaves differently.
   //
   // NOT LIVE, AND PERMANENTLY SO RATHER THAN PENDING. `admitId(" opus")`
   // returns null, so no such id reaches the built config.
@@ -127,6 +130,22 @@ export function checkBareCollisions(providers, {
       // /^(claude|opus|sonnet|haiku)([-\d]|$)/ -- it omitted `fable` entirely and
       // its boundary class was narrower than the denylist's, so `sonnet.1` and
       // `haiku_2` were reserved by one definition and invisible to the other.
+      //
+      // THIS TEST CAN NO LONGER REJECT ANYTHING THE SELECTOR SET ACCEPTS, AND
+      // THAT IS A DECISION RATHER THAN AN OVERSIGHT. Ownership below iterates
+      // `ANTHROPIC_ALIASES u (realIds ?? ANTHROPIC_FULL)`, so every candidate is
+      // already in the classification set; and every id in
+      // `ANTHROPIC_ALIASES u ANTHROPIC_FULL` matches RESERVED. The selector-keyed
+      // ownership made that true on the live branch; D1 extends it to the
+      // fallback branch. KEPT for two reasons: it is the one place the guard's
+      // definition of Claude-shaped is compared against the denylist's (removing
+      // it leaves `isReserved` with a single consumer and loses the comparison),
+      // and it stays a cheap pre-filter over every advertised id. The drift it
+      // still catches is an id added to ANTHROPIC_FULL that RESERVED does NOT
+      // match: this line would drop it before classification and the guard would
+      // go silent on a real id. The drift detector in denylist.test.mjs asserts
+      // the eight-id premise rather than trusting it, which is what makes a
+      // no-op safe to keep.
       if (!RESERVED.test(id)) continue;
       ids.push(id);
     }
@@ -145,16 +164,33 @@ export function checkBareCollisions(providers, {
   // is a request parameter, not a model) reads as hijackable at tabiai and
   // gorouter for a threat that cannot reach it.
   //
-  // realIds === null means "could not be determined" (relay unreachable,
-  // no cache) -- fall back to the OLD broad behaviour rather than either
-  // extreme. Silently trusting every RESERVED id when uncertain would
-  // under-flag; silently rejecting all of them would refuse the escape
-  // hatch this guard exists to preserve. RESERVED alone is the safe default
-  // when unverifiable -- though NOT bit-for-bit what shipped before this task:
-  // RESERVED now tests the TRIMMED string, so this branch admits `" opus"` and
-  // merges `"claude-opus-5 "` with `"claude-opus-5"` where it previously did
-  // neither. See the gating note at the trim. R6 replaces the SELECTOR SOURCE of
-  // this branch (with ANTHROPIC_FULL) and leaves that trim in place.
+  // realIds === null means "could not be determined": the relay was unreachable
+  // AND there was no cache. That is the one path the call site below reports as
+  // `UNAVAILABLE (relay down and no cache)`. D1: it falls back to
+  // ANTHROPIC_FULL, the static curated set, NOT to the broad set of
+  // RESERVED-shaped ids the providers happen to advertise.
+  //
+  // THE FALLBACK'S TRIGGER IS A NETWORK FAILURE, WHICH IS PRECISELY WHY IT MUST
+  // NOT WIDEN. Under the old fallback, 23 reseller inventions --
+  // `claude-opus-4-8-think`, `claude-opus-4.6`, `claude-opus-5-fast` and
+  // siblings across aihubmix, bai, veniceai, tabiai, tokenrouter, opencode --
+  // classified as hijackable and keysync exited. Nothing ever sends those bare,
+  // so all 23 were false positives, and what produced them was losing the
+  // network rather than any change in the config's actual risk. ANTHROPIC_FULL
+  // is in source and needs no network, so the uncertain path now answers with
+  // four reviewed ids instead of with every Claude-SHAPED string in the config.
+  //
+  // IT NARROWS; IT DOES NOT DISARM. The aliases are unioned in on BOTH branches,
+  // so a reseller sole-owning bare `opus` with the relay down is still FATAL,
+  // as is one sole-owning a curated id such as `claude-opus-5`. What the
+  // fallback gives up is flagging a REAL but UNCURATED Anthropic id while the
+  // network is down; with the network up, `realIds` carries exactly those.
+  //
+  // The advertised-side trim still runs before RESERVED and still decides which
+  // ids are ADMITTED (see the gating note there); what is no longer true is that
+  // the two branches differ in where their selectors come from. Both now read
+  // constants, so `" opus"` is admitted and folded onto the alias `opus` on
+  // either branch rather than only on one.
   //
   // THE ALIASES ARE EXEMPT, and leaving them out was a live hijack hole from
   // eeea057 until 2026-09-06. The premise above -- "Claude Code never emits a
@@ -186,13 +222,13 @@ export function checkBareCollisions(providers, {
   // dist/main/cli.js, `let t=e?.trim()` -- cited by minified name AND version
   // because that name is an allocation-order artifact one `npm i` can rename),
   // so this is faithful. But no PRODUCTION-SHAPED fixture can kill it: neither
-  // ANTHROPIC_ALIASES nor a `realIds` built at the call site below (live
-  // /v1/models u ANTHROPIC_FULL) can carry whitespace. A hand-built
-  // `realIds: new Set([" claude-opus-5 "])` does kill it. It guards only the
-  // case where Anthropic's own API returns a padded id.
-  const selectors = realIds !== null
-    ? new Set([...ANTHROPIC_ALIASES, ...realIds].map((s) => String(s).trim()))
-    : new Set(advertised.flatMap((a) => [...a.ids]));
+  // ANTHROPIC_ALIASES, nor ANTHROPIC_FULL, nor a `realIds` built at the call
+  // site below (live /v1/models u ANTHROPIC_FULL) can carry whitespace. A
+  // hand-built `realIds: new Set([" claude-opus-5 "])` does kill it. It guards
+  // only the case where Anthropic's own API returns a padded id.
+  const selectors = new Set(
+    [...ANTHROPIC_ALIASES, ...(realIds ?? ANTHROPIC_FULL)].map((s) => String(s).trim())
+  );
 
   // OWNERSHIP THE WAY `resolve()` COMPUTES IT: the exact match list, and the
   // case-folded list IF AND ONLY IF exact is empty. Both stages, in that order.
