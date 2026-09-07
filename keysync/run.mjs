@@ -190,12 +190,42 @@ export function checkBareCollisions(providers, {
   //
   // D1 NARROWED THIS TO ANTHROPIC_FULL AND IS REVERTED, ON MEASUREMENT. The
   // narrowing's justification was that widening on a network failure produced
-  // "23 reseller inventions, all false positives". THOSE 23 DO NOT EXIST IN THIS
-  // GUARD'S INPUT. It reads `built.providers`, and that set -- measured through
-  // `buildProviders` on the real vault -- is 83 model entries across 44
-  // providers, of which exactly 2 are RESERVED-shaped bare ids: `tabiai ->
-  // claude-opus-4-8` and `gorouter -> claude-opus-4-8`. Not 23. The 23 were
-  // counted over the full bundled catalogue, which the guard never sees.
+  // "23 reseller inventions, all false positives". THOSE 23 ARE STILL ABSENT
+  // FROM THIS GUARD'S INPUT -- but the reason this comment used to give for
+  // that is now false, and the correction matters more than the conclusion.
+  //
+  // RE-MEASURED 2026-09-07, POST-R11, through `buildProviders` on the real
+  // vault with no discovery cache. `built.providers` is 1,584 model entries
+  // across 44 providers, NOT 83: R11 uncapped `models[]`, so each provider now
+  // carries very nearly its whole bundled catalogue rather than the picker's
+  // top three. Of those 1,584, exactly 2 are RESERVED-shaped bare ids, and they
+  // are the same two as before: `tabiai -> claude-opus-4-8` and
+  // `gorouter -> claude-opus-4-8`. Still not 23, and still co-owned rather than
+  // sole-owned.
+  //
+  // SO THE OLD SENTENCE -- "the 23 were counted over the full bundled
+  // catalogue, which the guard never sees" -- IS DEAD, and must not be restored.
+  // The guard now sees close to that catalogue. What survived the widening is
+  // the measurement, not the mechanism: those 23 inventions live at catalogue
+  // providers this vault holds no key for, so widening the ROWS did not widen
+  // the bare-id set. That is a property of THESE 44 providers on THIS bundle,
+  // contingent on both, and no longer a structural guarantee about the input.
+  //
+  // THE NEXT TASK TO WIRE R10'S DISCOVERY CACHE INTO THIS PATH MUST RE-MEASURE
+  // BEFORE IT SHIPS. run.mjs passes no `discovery` argument to `buildProviders`
+  // today, so the 1,584 above is the no-discovery set and it is the only set
+  // this verdict has been checked against. Discovery only ADDS ids -- a
+  // provider's own listing of what this key can call -- and a reseller's own
+  // listing is precisely where a bare `claude-*` id appears. For scale: run the
+  // same count over the bundled catalogue's 217 providers instead of this
+  // vault's 44 and it becomes 240 bare ids / 185 sole-owned, at which point the
+  // `realIds === null` verdict flips from `fatal: false` to `fatal: true` with
+  // 33 hijackable and 25 shadowed. Whoever passes a cache here (R13/R19-adjacent
+  // work, not R11) MUST re-run `checkBareCollisions` against the widened
+  // `built.providers` and read `fatal` first. A pipeline that starts exiting 1
+  // whenever Anthropic's catalogue is unreachable is a broken pipeline, and
+  // `--allow-bare-claude-names` is not an escape hatch to discover in
+  // production.
   //
   // WHAT THE NARROWING COST, MEASURED AGAINST AN INDEPENDENT THREAT SET.
   // `ANTHROPIC_ALIASES u Anthropic's live /v1/models` is 15 ids. With the relay
@@ -217,10 +247,14 @@ export function checkBareCollisions(providers, {
   // false positives and this branch will produce them.
   //
   // THE TWO DENOMINATORS ARE WHAT DECIDE IT, and they are not the same
-  // denominator D1 used. Over the full bundled catalogue there are 23 such
-  // inventions; over `built.providers`, which is the ONLY thing this guard ever
-  // reads, there are 2 RESERVED-shaped bare ids in 83 model entries, and both
-  // are `claude-opus-4-8`. So the breadth's realised cost on shipped data is at
+  // denominator D1 used. Over the full bundled catalogue (217 providers) there
+  // are 23 such inventions; over `built.providers`, which is the ONLY thing this
+  // guard ever reads, there are 2 RESERVED-shaped bare ids in 1,584 model
+  // entries across 44 providers (re-measured post-R11; it was 2 in 83 while the
+  // picker cap still sized routing), and both are `claude-opus-4-8`. Note that
+  // the two denominators are now much closer than they were, which is why the
+  // re-measurement note above insists the next widening of this input be
+  // measured rather than assumed. So the breadth's realised cost on shipped data is at
   // most those 2 rows, on a path the operator can see and override with
   // `--allow-bare-claude-names`; the narrowing's cost is 7 of 15 published
   // Anthropic ids silently misrouting the full system prompt. Those are not
@@ -1112,6 +1146,32 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
 
 if (dry) {
   console.log("\n--dry: nothing written.");
+  // THE MEASUREMENT R13b's GATE IS ARGUED FROM, printed rather than asserted.
+  // R11 uncapped routing and left the picker capped, so `models[]` now carries
+  // ids that reach no `options[]` row -- and `options[]` is the ONLY channel
+  // that can carry `behavesAs` (see assertOptionsComplete). An undeclared id
+  // still routes; Claude Code resolves it through `lH()` to the MAXIMAL
+  // assumption set, which is exactly the priced, accepted tradeoff R11 took and
+  // Ship E/R13b owns. R11 shipped it without ever printing the number, so the
+  // decision had no denominator attached to it. It does now.
+  //
+  // THIRD-PARTY ONLY, AND THE EXCLUSION IS THE POINT. The relay's rows are
+  // V3-exempt -- Claude Code already knows those ids, so they carry no
+  // `behavesAs` by design and counting them would inflate the exposure with
+  // rows that are not exposed. Its picker rows are `[1m]`-suffixed while its
+  // routing ids are bare, so an exact-string match would have swept all of them
+  // in silently.
+  const declared = new Set(built.picker.map((r) => r.model));
+  let routable = 0, undeclared = 0;
+  for (const p of built.providers) {
+    if (p.name === ANTHROPIC_RELAY.name) continue;
+    for (const id of p.models ?? []) {
+      routable++;
+      if (!declared.has(`${p.name}/${id}`)) undeclared++;
+    }
+  }
+  console.log(`undeclared routable: ${undeclared} of ${routable} third-party routing ids ` +
+    `have no options[] row, so no behavesAs (lH() resolves them to the maximal assumption set)`);
   console.log(built.picker.slice(0, 8).map((r) => `  ${r.model}  [${r.description ?? "unlabelled"}]`).join("\n"));
   process.exit(0);
 }

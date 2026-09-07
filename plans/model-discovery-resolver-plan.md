@@ -48,7 +48,9 @@ the native menu**).
    gorouter, and it must not be opened by widening the global off-switch.
 2. **`Providers[].models` and `picker` are built from one array** (`keysync.mjs:532-619`, *(read)*),
    and **`MAX_MODELS_PER_PROVIDER` at `:553` is the sole size control on `built.picker`** — 83 rows,
-   44 providers, 18 of them exactly at the cap. Routing wants ~3,784 rows; `modelPicker.options[]` is
+   44 providers, 18 of them exactly at the cap. Routing wants ~3,784 rows *(pre-R11 estimate,
+   discovery-entitlement denominator — superseded below by R11's shipped measurement, 1,584)*;
+   `modelPicker.options[]` is
    simultaneously the rendered `/model` menu *and* the only channel that can carry `behavesAs`
    (OQ-1/OQ-2), at a measured **135 bytes per row** against a `settings.json` that is **23,242 bytes**
    and parsed at every Claude Code launch. Sizing them together is what makes D4 two steps, and
@@ -402,8 +404,13 @@ picker at 83+11 anyway, so the widening can be reviewed as a **pure routing chan
 no-op criterion on the declaration channel**. That review boundary is worth keeping.
 
 **But the sizing is not deferred to an unowned step.** Under D4 step 1 the declared set stays at 83
-while routing goes to ~3,784, so the undeclared population — every row resolving through `lH()` to
-the maximal assumption set plus an unknown-model launch warning — goes from a handful to thousands.
+while routing goes to ~3,784 *(pre-R11 estimate; R11 shipped with no discovery cache wired in, so the
+real number is `run.mjs:926`'s catalogue+testModel-only union — measured **1,584**, not 3,784. The two
+denominators differ 2.39x because 3,784 counts what the vault keys are *entitled* to list, per
+`model-resolver-decisions.md:115`, not what R11 actually built. R13/R19 wiring discovery in will move
+this number again and should re-measure rather than reuse either figure)*, so the undeclared
+population — every row resolving through `lH()` to the maximal assumption set plus an unknown-model
+launch warning — goes from a handful to thousands (**measured 1,501 today**).
 The thing that shrinks it is exactly this sizing. So it is **R13b**, the last task in Ship D, gated on
 R11's printed measurement and reviewed on its own. An unowned follow-up is how `refresh/cli.mjs` came
 not to exist, and #17 is still open because of it.
@@ -424,11 +431,16 @@ D4 step 2's bill, and it is why step 2 is not paid here.
 **And it is a pillar-2 cost, named as one rather than left as a byte count** *(#64)*.
 [[models-used-as-designed]] asks for the honest-minimal assumption where a model's capability is
 unknown; `lH()`'s maximal set is the confident-wrong direction, and after R11 it applies to **~3,784
-routing rows against 83 declarations** — roughly 3,700 rows asserting capabilities on no evidence.
+routing rows against 83 declarations** *(pre-R11 estimate — R11 shipped without discovery wired,
+measured **1,584 routing / 83 declared / 1,501 undeclared**; re-measure once R13/R19 wire discovery
+in rather than trusting either number)* — roughly 3,700 rows asserting capabilities on no evidence.
 This section books the pillar-1 benefit two paragraphs down (reach: rows that do not route at all
 today start routing) and must book this against it: **step 1 buys reach at the price of ~3,700
-maximally-assumed rows.** Both are real and the trade is still worth making — but it is a trade, and
-a reader should not have to derive the second half.
+maximally-assumed rows** *(shipped: 1,501)*. Both are real and the trade is still worth making — but it is a trade, and
+a reader should not have to derive the second half. **uwpick (Ship E) raises this exposure rather
+than bypassing it**: it emits the native `/model provider/id` command, so a user reaching a routable
+row through uwpick reaches it through the same undeclared `behavesAs` channel as any other selection,
+and widening the set uwpick can reach widens the set that resolves through `lH()`.
 
 **The mitigation is owned but not guaranteed.** R13b is the named owner of the shrink, which is
 correct process. However **R13b's acceptance criterion is a byte/parse-time budget, not a

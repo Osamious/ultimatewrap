@@ -242,6 +242,215 @@ test("UW_MAX_MODELS=x yields the default and a BOUNDED picker, never an uncapped
   assert.equal(pickerFor(build(fixture()), "wide").length, 5);
 });
 
+test("the cap parse is STRICT: a bad value that is not 3 still resolves to 3", () => {
+  // THE LIST ABOVE CANNOT FAIL AGAINST A LOOSE PARSE, which is the hole this
+  // closes. Every bad value there ("3.0", "0x3", "3e0", "-1", "0", "abc3")
+  // happens to resolve to 3 under a loose parse TOO -- `Number("3.0")` is 3, and
+  // the negatives and zero are rejected by the `n > 0` clause that survives any
+  // mutation of the regex. So the assertion "must resolve to the default" was
+  // satisfied by the mutant for the wrong reason: the bad values collided with
+  // the default.
+  //
+  // MEASURED, two mutants of `keysync.mjs`'s `/^\d+$/` survived the whole file:
+  //   `Number.isInteger(Number(s))`      accepts "5.0" -> 5
+  //   `/^[-+]?\d+(\.\d+)?$/`             accepts "5.0" -> parseInt -> 5
+  // Both are stopped here and nowhere else, because 5 !== 3 is the only way to
+  // tell a fallback apart from a successful loose parse.
+  for (const bad of ["5.0", "5e0", "0x5", "+5", "5px", "-5", "5,0"]) {
+    assert.equal(pickerCapFrom(bad), MAX_PICKER_MODELS_PER_PROVIDER,
+      `UW_MAX_MODELS=${JSON.stringify(bad)} must fall back to 3, never parse loosely to 5`);
+  }
+  // ...and the strict spelling of the same number is still honoured, so the
+  // assertions above are rejecting the SPELLING and not the value. Surrounding
+  // whitespace is part of that spelling: the regex runs on the TRIMMED string,
+  // so `" 5 "` is a valid 5 and is deliberately not in the list above.
+  assert.equal(pickerCapFrom("5"), 5);
+  assert.equal(pickerCapFrom(" 5 "), 5);
+});
+
+test("a cap too large to be an integer falls back rather than unbounding the picker", (t) => {
+  // `Number.isSafeInteger` at keysync.mjs:333. Removing it survives every other
+  // assertion in this file: `/^\d+$/` admits a 20-digit run of digits,
+  // `Number.parseInt` yields 1e20, `n > 0` is true, and `models.slice(0, 1e20)`
+  // is the whole array -- an unbounded picker, which is the exact failure
+  // `pickerCapFrom` exists to prevent, reached through the one input the regex
+  // was never going to catch.
+  const saved = process.env.UW_MAX_MODELS;
+  t.after(() => {
+    if (saved === undefined) delete process.env.UW_MAX_MODELS;
+    else process.env.UW_MAX_MODELS = saved;
+  });
+
+  const huge = "99999999999999999999";
+  assert.ok(!Number.isSafeInteger(Number.parseInt(huge, 10)),
+    "the fixture must actually exceed the safe-integer range, or this proves nothing");
+  assert.equal(pickerCapFrom(huge), MAX_PICKER_MODELS_PER_PROVIDER,
+    "an unrepresentable count is not a count");
+
+  // THE BOUND, not merely the parsed number. `wide` has 10 candidates, so a
+  // guard-free build shows all 10 and a defaulted one shows 3.
+  process.env.UW_MAX_MODELS = huge;
+  assert.equal(pickerFor(build(fixture()), "wide").length, MAX_PICKER_MODELS_PER_PROVIDER,
+    `UW_MAX_MODELS=${huge} left the picker unbounded`);
+});
+
+// ---- the capability VOCABULARY, not just its precedence --------------------
+
+test("a capability token is normalised, so case/hyphen/space variants still classify", () => {
+  // `capabilityKind`'s `.trim().toLowerCase().replace(/[\s-]+/g, "_")` was
+  // entirely unpinned: removing it survived the file, because every token the
+  // other tests pass is already lower-case and underscored. The tokens providers
+  // actually send are not.
+  //
+  // WHAT REMOVING IT COSTS, and it is a modality-guard bypass rather than a
+  // cosmetic miss. An unnormalised `"Image"` matches neither set, so
+  // `capabilityKind` answers `null` -- no signal -- and `outputKind` falls
+  // through to the bundle, which reads such a row as ordinary text. The row then
+  // sorts with the chat models and can re-enter a provider's picker top-3: a
+  // media generator advertised as a chat model, which is precisely what the
+  // precedence rule was added to stop.
+  for (const token of ["Image", "image-gen", "IMAGE GEN", " image ", "Video",
+                       "TTS", "Image-Gen", "video gen", "EMBEDDINGS"]) {
+    assert.equal(capabilityKind(token), "nontext",
+      `${JSON.stringify(token)} is a non-text claim in any casing or separator`);
+  }
+  for (const token of ["Chat", "CHAT", " completion ", "Completions", "TEXT"]) {
+    assert.equal(capabilityKind(token), "text", `${JSON.stringify(token)} is a text claim`);
+  }
+
+  // ...and it reaches `outputKind`, so the normalisation is load-bearing on the
+  // path that actually decides the row rather than only in the classifier.
+  assert.equal(outputKind({ modalities: { output: ["text"] } }, "Image"), "nontext",
+    "an unnormalised token would defer to the bundle and read as text");
+
+  // ...and through to the SELECTION SORT, which is where the bypass would be
+  // user-visible: `aa` is the shorter id and leads without a live capability.
+  const f = fixture();
+  f.chosen = [{ id: "personal.gen.free", provider: "gen" }];
+  f.vault = new Map([["gen", { protocol: "openai", baseUrl: "https://gen.invalid/v1" }]]);
+  f.catalog.byProvider = new Map([["gen", [
+    { provider: "gen", model: "aa", id: "gen/aa", modalities: { output: ["text"] } },
+    { provider: "gen", model: "bbbbbbbb", id: "gen/bbbbbbbb", modalities: { output: ["text"] } },
+  ]]]);
+  f.discovery = { gen: { outcome: "ok", models: [{ id: "aa", capabilityRaw: "Image-Gen" }] } };
+  const built = build(f);
+  assert.deepEqual(byName(built, "gen").models, ["bbbbbbbb", "aa"],
+    "a mixed-case hyphenated media claim must demote the row exactly as `image_gen` does");
+});
+
+// ---- the discovery entry SHAPE filter --------------------------------------
+
+test("malformed discovery ENTRIES are dropped before the admission gate", () => {
+  // `discoveryIndex`'s `typeof m?.id === "string" && m.id !== ""` at
+  // keysync.mjs:708. Removing it survived the file because every existing test
+  // passes malformed RECORDS (`42`, `"nope"`, `{models: "x"}`) and never a
+  // malformed ENTRY inside an otherwise-valid `models` array -- a different
+  // shape, reached through a different branch.
+  //
+  // TWO FAILURES IF IT GOES. `discovered.map((m) => m.id)` throws outright on an
+  // `undefined` entry; and the shapes that do NOT throw (a number, a bare
+  // string, `{id: ""}`) reach `admitRemoteModels` as `undefined`/`""`, which
+  // `admitId` coerces to "" and rejects -- printing
+  // `SECURITY: provider "listed" advertised N rejected model name(s)` for rows
+  // no provider ever advertised. run.mjs:754-761 records why that matters: step 4
+  // asks an operator to READ that line and stop on it, and burying it in false
+  // positives is how a security channel stops being read.
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (m) => warnings.push(String(m));
+  let built;
+  try {
+    built = build(fixture({ discovery: {
+      listed: { outcome: "ok", models: [
+        { id: "listed-ok-1" }, undefined, null, 42, "listed-raw-string",
+        { id: "" }, { notAnId: "x" }, { id: 7 }, { id: "listed-ok-2" },
+      ] },
+    } }));
+  } finally { console.warn = realWarn; }
+
+  const p = byName(built, "listed");
+  assert.deepEqual(p.models, ["listed-probe", "listed-ok-1", "listed-ok-2"],
+    "exactly the two well-formed entries join the testModel; nothing else survives");
+  assert.equal(warnings.filter((w) => /SECURITY: provider "listed"/.test(w)).length, 0,
+    "a malformed entry is not an advertised name, and must not raise a SECURITY finding");
+});
+
+// ---- provenance ORDER, pinned so R13b's decision stays deliberate ----------
+
+test("catalogue ids precede discovery-only ids, and that order decides the top-3", () => {
+  // keysync.mjs:822-835 gathers `safeEntries` and THEN discovery-only ids. The
+  // sort carries no provenance term and is stable, so for rows equal on all
+  // three terms (kind, tier, id length) insertion order is the whole of the
+  // ranking -- and the picker is a prefix, so it decides which three rows are
+  // advertised.
+  //
+  // PINNED BECAUSE IT IS A DEFERRED DECISION, NOT A SETTLED ONE. Ranking a live
+  // listing above the bundle is R13b's call, with its own evidence. Swapping the
+  // two loops today changes every tied provider's advertised top-3 and passes
+  // the rest of this file in silence; this is the assertion that stops that
+  // happening as a side effect of an unrelated refactor.
+  const f = fixture();
+  f.chosen = [{ id: "personal.ord.free", provider: "ord" }];
+  f.vault = new Map([["ord", { protocol: "openai", baseUrl: "https://ord.invalid/v1" }]]);
+  // Six ids, all length 2, all text-or-no-signal, all tier `unknown`: every
+  // sort term ties by construction, so nothing but insertion order is left.
+  f.catalog.byProvider = new Map([["ord", ["c1", "c2", "c3"].map((m) =>
+    ({ provider: "ord", model: m, id: `ord/${m}`, modalities: { output: ["text"] } }))]]);
+  f.discovery = { ord: { outcome: "ok", models: [{ id: "d1" }, { id: "d2" }, { id: "d3" }] } };
+
+  const built = build(f);
+  assert.deepEqual(byName(built, "ord").models, ["c1", "c2", "c3", "d1", "d2", "d3"],
+    "catalogue first, discovery-only after: the shipped order, deliberately unranked");
+  assert.deepEqual(pickerFor(built, "ord"), ["ord/c1", "ord/c2", "ord/c3"],
+    "swapping the two loops advertises d1/d2/d3 instead, changing the menu with no diff nearby");
+});
+
+// ---- the declaration channel, asserted as a SET ----------------------------
+
+test("widening routing leaves the {model, behavesAs} declaration channel intact", () => {
+  // R11's commit message claims the declaration channel is byte-identical --
+  // routing widened, declarations did not. That claim shipped unverified: no
+  // assertion anywhere compared the PAIRS, only counts and prefixes.
+  //
+  // A SET, NOT A COUNT. A count is satisfied by one row gaining a declaration
+  // while another loses one, which is the exact shape a `behavesAs` regression
+  // takes -- `lH()` resolves a missing or wrong declaration to the maximal
+  // assumption set, silently.
+  //
+  // OVER THE FIXTURE, NOT THE REAL VAULT, and that is deliberate. `loadVault`
+  // reads `~/.llmkeys` and `loadCatalog` reads a hardcoded absolute path into
+  // the machine's global claude-code-router install, which `npm i -g` replaces
+  // wholesale -- report 08 F9's recorded hazard, and the reason
+  // `catalog.test.mjs`'s corpus test asserts invariants and keeps its counts in
+  // a comment. Pinning the shipped rows here would make a true statement about
+  // one bundle version and then rot into a false failure on the next.
+  //
+  //   MEASURED 2026-09-07 on the real vault, `node keysync/run.mjs --dry`:
+  //   routing 83 -> 1,584 third-party entries across 44 providers while the
+  //   third-party picker stays at 83 rows (1,501 undeclared, which the dry run
+  //   now prints). With the relay: 45 providers, 94 picker rows.
+  const built = build(fixture());
+  const pairs = built.picker.map((r) => [r.model, r.behavesAs ?? null]).sort();
+
+  assert.deepEqual(pairs, [
+    ["gorouter/claude-opus-4-8", "claude-sonnet-4-5"],
+    ["listed/listed-probe", "claude-sonnet-4-5"],
+    ["tabiai/claude-opus-4-8", "claude-sonnet-4-5"],
+    ["wide/wide-m0", "claude-sonnet-4-6"],
+    ["wide/wide-m1", "claude-sonnet-4-6"],
+    ["wide/wide-probe", "claude-sonnet-4-5"],
+  ], "the declaration channel, pair for pair");
+
+  // The gap the pin is a statement ABOUT: routing carries more than twice what
+  // the picker declares, so "the declarations did not change" is a claim with
+  // content rather than a restatement of an unchanged build.
+  const routing = built.providers.reduce((n, p) => n + p.models.length, 0);
+  assert.equal(routing, 13);
+  assert.equal(built.picker.length, 6);
+  assert.ok(routing > built.picker.length,
+    "if routing did not widen, this test proves nothing about widening");
+});
+
 // ---- capability precedence -------------------------------------------------
 
 test("a discovered capability OUTRANKS the bundle's modalities.output", () => {
