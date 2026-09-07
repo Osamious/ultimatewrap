@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sanitizeDisplay, admitId, MODEL_ID_OK } from "../menu/sanitize.mjs";
+import { sanitizeDisplay, admitId } from "../menu/sanitize.mjs";
 
 test("strips CSI sequences", () => {
   assert.equal(sanitizeDisplay("a\x1b[2Jb"), "ab");
@@ -129,11 +129,6 @@ test("admitId rejects rather than sanitizes", () => {
   assert.equal(admitId(null), null);
 });
 
-test("MODEL_ID_OK is anchored at both ends", () => {
-  assert.equal(MODEL_ID_OK.source.startsWith("^"), true);
-  assert.equal(MODEL_ID_OK.source.endsWith("$"), true);
-});
-
 test("admitId accepts a scoped id whose leading @ is followed by an alphanumeric", () => {
   // Measured, not hypothetical: `@cf/openai/gpt-oss-120b` is the vault's
   // cloudflare.testModel, and the recorded health for personal.cloudflare.free
@@ -168,4 +163,203 @@ test("widening the anchor for @ refuses everything it refused before", () => {
   assert.equal(admitId("x".repeat(129)), null);      // over length
   assert.equal(admitId(""), null);
   assert.equal(admitId(null), null);
+});
+
+// ---------------------------------------------------------------------------
+// R2 / D2: admitId is a DENYLIST. One test per denied class, each carrying a
+// positive control that the class must NOT catch -- because the whole point of
+// the inversion is that the denials stay narrow.
+// ---------------------------------------------------------------------------
+
+test("D2: the real ids the allowlist refused are now admitted, unchanged", () => {
+  // Measured over the bundled catalogue this session: 16 distinct bare id
+  // strings were refused, in exactly two shapes, and neither is dangerous.
+  // 12 leading-`~` floating aliases, served by kilo and openrouter:
+  assert.equal(admitId("~anthropic/claude-opus-latest"), "~anthropic/claude-opus-latest");
+  assert.equal(admitId("~z-ai/glm-latest"), "~z-ai/glm-latest");
+  assert.equal(admitId("~deepseek/deepseek-v4-flash-latest"), "~deepseek/deepseek-v4-flash-latest");
+  // and 4 Bedrock commitment-tier ids carrying a literal `*`, which the
+  // decision's own table does not enumerate -- the allowlist was refusing more
+  // than anyone had counted, which is the argument for inverting it.
+  assert.equal(
+    admitId("bedrock/*/1-month-commitment/cohere.command-text-v14"),
+    "bedrock/*/1-month-commitment/cohere.command-text-v14");
+  // The bracketed id, from the live listing rather than the bundle.
+  assert.equal(admitId("teamorouter/kimi-k3[1M]"), "teamorouter/kimi-k3[1M]");
+});
+
+test("D2 denial: escape sequences -- control admits brackets", () => {
+  assert.equal(admitId("a\x1b[2Jb"), null);
+  assert.equal(admitId("x\x1b]52;c;aGk=\x07y"), null);
+  assert.equal(admitId("\x1b[1Aoverwrite"), null);
+  // `[` and `]` alone are not an escape and must survive the class.
+  assert.equal(admitId("kimi-k3[1M]"), "kimi-k3[1M]");
+});
+
+test("D2 denial: C0/C1 control characters -- control admits U+00FF", () => {
+  assert.equal(admitId("a\x00b"), null);
+  assert.equal(admitId("a\rb"), null);
+  assert.equal(admitId("a\nb"), null);
+  assert.equal(admitId("a\x7fb"), null);
+  assert.equal(admitId("a\x9bb"), null);
+  // U+00FF sits directly above the C1 range the class ends at, so a denial that
+  // over-reached past \x9f would catch it.
+  assert.equal(admitId("cafÿ-v1"), "cafÿ-v1");
+});
+
+test("D2 denial: every invisible in the class is refused, named one by one", () => {
+  // Reuses the same table sanitizeDisplay is checked against, so the two jobs
+  // cannot drift: a code point that stops being stripped must also stop being
+  // admitted, and vice versa.
+  for (const [cp, name] of INVISIBLE_CASES) {
+    const hex = cp.toString(16).toUpperCase().padStart(4, "0");
+    assert.equal(admitId("a" + String.fromCodePoint(cp) + "b"), null,
+      `U+${hex} ${name} was admitted as a routing selector`);
+  }
+  // The RLO specifically -- the Anthropic-lookalike primitive.
+  assert.equal(admitId("a" + String.fromCodePoint(0x202E) + "b"), null);
+});
+
+test("D2 denial: whitespace anywhere -- control admits - _ and . separators", () => {
+  // A1, and the one row whose omission would be a security regression rather
+  // than a reach cost. Space is 0x20, OUTSIDE the C0 range CTRL covers, so no
+  // other rule sees it. CCR trims a selector before matching, so `" opus"`
+  // would bind `opus` while displaying as something else.
+  assert.equal(admitId(" opus"), null);
+  assert.equal(admitId("opus "), null);
+  assert.equal(admitId("claude opus"), null);
+  assert.equal(admitId("a\tb"), null);
+  assert.equal(admitId("a b"), null);   // NO-BREAK SPACE
+  assert.equal(admitId("a　b"), null);   // IDEOGRAPHIC SPACE
+  // The separators real ids actually use are untouched.
+  assert.equal(admitId("gpt-oss-20b"), "gpt-oss-20b");
+  assert.equal(admitId("deepseek_v3"), "deepseek_v3");
+  assert.equal(admitId("deepseek-v3.2"), "deepseek-v3.2");
+});
+
+test("D2 denial: backslash -- control admits forward slashes", () => {
+  assert.equal(admitId("back\\slash"), null);
+  assert.equal(admitId("..\\..\\etc"), null);
+  assert.equal(admitId("a\\"), null);
+  // `/` is legal everywhere but the first position: this is a real two-slash id.
+  assert.equal(admitId("groq/openai/gpt-oss-20b"), "groq/openai/gpt-oss-20b");
+});
+
+test("D2 denial: traversal -- control admits a single dot", () => {
+  assert.equal(admitId("a..b"), null);
+  assert.equal(admitId("../../etc/passwd"), null);
+  assert.equal(admitId("@cf/../../etc/passwd"), null);
+  assert.equal(admitId("model.."), null);
+  // One dot is ordinary and extremely common.
+  assert.equal(admitId("deepseek-v3.2"), "deepseek-v3.2");
+  assert.equal(admitId("cohere.command-text-v14"), "cohere.command-text-v14");
+});
+
+test("D2 denial: leading separator -- control admits ~ and mid-id separators", () => {
+  // Denied so an id can never look like a flag or a switch on a command line,
+  // at a measured cost of zero real ids. This is the half of the old anchor
+  // that is CARRIED FORWARD rather than dropped.
+  assert.equal(admitId("-lead"), null);
+  assert.equal(admitId("/lead"), null);
+  assert.equal(admitId("--help"), null);
+  // A leading `~` is NOT a separator, and admitting it is the whole point.
+  assert.equal(admitId("~openai/gpt-latest"), "~openai/gpt-latest");
+  assert.equal(admitId("_lead"), "_lead");
+  assert.equal(admitId("a-b/c-d"), "a-b/c-d");
+});
+
+test("D2 denial: a leading @ that does not open a scope", () => {
+  assert.equal(admitId("@"), null);
+  assert.equal(admitId("@/foo"), null);
+  assert.equal(admitId("@-x"), null);
+  assert.equal(admitId("@."), null);
+  assert.equal(admitId("@@a"), null);
+  // Only the LEADING position is constrained -- `@` mid-id was always legal and
+  // 0 corpus ids depend on restricting it.
+  assert.equal(admitId("@cf/openai/gpt-oss-120b"), "@cf/openai/gpt-oss-120b");
+  assert.equal(admitId("model@v2"), "model@v2");
+  // The anchor itself, pinned. Dropping the `^` turns a carried-forward rule
+  // into a NEW restriction D2 never authorised: every `@` in the string would
+  // then need an alphanumeric after it, which no measurement supports and which
+  // could refuse a future real id. A trailing `@` is not dangerous, so it is
+  // admitted -- and this is the only assertion that can tell the two apart.
+  assert.equal(admitId("model@"), "model@");
+  assert.equal(admitId("a@-b"), "a@-b");
+});
+
+test("D2 denial: over 128 CODE POINTS, not code units", () => {
+  // The mutation boundary. 128 admits, 129 denies.
+  assert.equal(admitId("x".repeat(128)), "x".repeat(128));
+  assert.equal(admitId("x".repeat(129)), null);
+  // An astral character is one code point and TWO code units. A cap counting
+  // code units would refuse this at 128 code points / 256 units; the spec says
+  // code points, so it admits.
+  const astral128 = "\u{1F600}".repeat(128);
+  assert.equal(astral128.length, 256);
+  assert.equal([...astral128].length, 128);
+  assert.equal(admitId(astral128), astral128);
+  assert.equal(admitId("\u{1F600}".repeat(129)), null);
+});
+
+test("D2 denial: the empty id, and the nullish inputs that produce it", () => {
+  // A denylist admits whatever it does not name, so emptiness has to be named.
+  assert.equal(admitId(""), null);
+  assert.equal(admitId(null), null);
+  assert.equal(admitId(undefined), null);
+});
+
+test("admitId is a pure function of its argument across repeated calls", () => {
+  // ESC_SEQ, CTRL and INVISIBLE carry `g` because sanitizeDisplay replaces with
+  // them. `.test()` on a /g regex advances lastIndex, so a test-based
+  // implementation returns true then false for the SAME hostile string -- the
+  // second call admitting it. Interleave with sanitizeDisplay, which also
+  // drives those regexes, so a shared-state bug cannot hide.
+  const hostile = "a\x1b[2Jb";
+  for (let i = 0; i < 4; i++) {
+    assert.equal(admitId(hostile), null, `call ${i + 1} admitted a hostile id`);
+    sanitizeDisplay(hostile);
+    assert.equal(admitId("a" + String.fromCodePoint(0x202E) + "b"), null, `call ${i + 1}`);
+    assert.equal(admitId("a\x00b"), null, `call ${i + 1}`);
+    assert.equal(admitId("groq/openai/gpt-oss-20b"), "groq/openai/gpt-oss-20b", `call ${i + 1}`);
+  }
+});
+
+test("widening admission did not widen rendering", () => {
+  // sanitizeDisplay decides what may be PRINTED; admitId decides what may be
+  // HELD. They are different jobs, and inverting the second must not relax the
+  // first. Every newly-admitted shape renders as itself...
+  for (const id of [
+    "~anthropic/claude-opus-latest",
+    "teamorouter/kimi-k3[1M]",
+    "bedrock/*/1-month-commitment/cohere.command-text-v14",
+  ]) {
+    assert.equal(sanitizeDisplay(id, 120), id);
+  }
+  // ...and the strings admitId still refuses are still stripped on the display
+  // path, which is the path that runs whether or not admitId was consulted.
+  assert.equal(sanitizeDisplay("a\x1b[2Jb"), "ab");
+  assert.equal(sanitizeDisplay("a" + String.fromCodePoint(0x202E) + "b"), "ab");
+  assert.equal(sanitizeDisplay("a\x00b"), "ab");
+});
+
+test("no id admitId admits can carry an escape, a control, or a listed invisible", () => {
+  // The invariant that keeps the two jobs consistent, asserted as a property
+  // rather than a case list: anything that survives admission is already a
+  // fixpoint of the stripping half of sanitizeDisplay.
+  const cases = [
+    "~anthropic/claude-opus-latest", "teamorouter/kimi-k3[1M]", "@cf/openai/gpt-oss-120b",
+    "groq/openai/gpt-oss-20b", "bedrock/*/6-month-commitment/cohere.command-text-v14",
+    "a\x1b[2Jb", "a\x00b", "a" + String.fromCodePoint(0x202E) + "b", " opus", "-lead",
+    "deepseek-v3.2", "cafÿ-v1",
+  ];
+  for (const c of cases) {
+    const admitted = admitId(c);
+    if (admitted === null) continue;
+    for (const [cp, name] of INVISIBLE_CASES) {
+      assert.equal(admitted.includes(String.fromCodePoint(cp)), false,
+        `admitted ${JSON.stringify(c)} carries U+${cp.toString(16).toUpperCase()} ${name}`);
+    }
+    assert.equal(/[\x00-\x1f\x7f-\x9f]/.test(admitted), false,
+      `admitted ${JSON.stringify(c)} carries a control character`);
+  }
 });
