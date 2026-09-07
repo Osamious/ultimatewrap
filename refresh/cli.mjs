@@ -28,11 +28,10 @@ import {
 
 const VAULT = path.join(os.homedir(), ".llmkeys");
 
-const argv = process.argv.slice(2);
-const has = (f) => argv.includes(f);
-const valueOf = (f) => {
-  const i = argv.indexOf(f);
-  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+const hasFlag = (args, f) => args.includes(f);
+const valueOfFlag = (args, f) => {
+  const i = args.indexOf(f);
+  return i >= 0 && i + 1 < args.length ? args[i + 1] : null;
 };
 
 // PowerShell 5.1 writes a BOM and JSON.parse throws on a leading U+FEFF; the
@@ -116,11 +115,33 @@ export async function withKeys(ids, fn, { execFile = execFileSync } = {}) {
 
 // ------------------------------------------------------------------- the run
 
-async function main() {
-  const profiles = new Map(readJson(path.join(VAULT, "providers.json")).map((p) => [p.provider, p]));
-  const registry = readJson(path.join(VAULT, "registry.json"));
+/**
+ * Everything the run touches that is not pure computation arrives through this
+ * parameter list, and nothing else does. That is not decoration: this function
+ * is what R10 actually executes, and until it was reachable the only tested part
+ * of this file was `withKeys`. A test can now drive the whole selection, plan,
+ * fan-out and report with no vault on disk, no PowerShell child, no socket and
+ * no `process.exit` -- which is the only way to assert the ORDER of those steps,
+ * and the order is the safety property (`--out` validated before any request;
+ * nothing sent at all without `--live`).
+ *
+ * @returns {number} the exit code, so the caller decides how to exit.
+ */
+export async function main({
+  args = process.argv.slice(2),
+  vault = VAULT,
+  readJsonImpl = readJson,
+  withKeysImpl = withKeys,
+  discoverAllImpl = discoverAll,
+  writeCacheRecordImpl = writeCacheRecord,
+  resolveCacheDirImpl = resolveCacheDir,
+  log = console.log,
+  logError = console.error,
+} = {}) {
+  const profiles = new Map(readJsonImpl(path.join(vault, "providers.json")).map((p) => [p.provider, p]));
+  const registry = readJsonImpl(path.join(vault, "registry.json"));
 
-  const only = valueOf("--only");
+  const only = valueOfFlag(args, "--only");
   const wanted = only ? new Set(only.split(",").map((s) => s.trim()).filter(Boolean)) : null;
 
   let chosen = chooseCredential(eligibleCredentials(registry, profiles));
@@ -128,31 +149,31 @@ async function main() {
   chosen.sort((a, b) => a.provider.localeCompare(b.provider));
 
   if (!chosen.length) {
-    console.error("no eligible provider matched. --only takes provider names, not credential ids.");
-    process.exit(2);
+    logError("no eligible provider matched. --only takes provider names, not credential ids.");
+    return 2;
   }
 
   const targets = chosen.map((c) => ({ provider: c.provider, credentialId: c.id, profile: profiles.get(c.provider) }));
 
   // ---- the plan, printed either way, so a live run is never a surprise ------
-  console.log(`${targets.length} provider${targets.length === 1 ? "" : "s"} selected\n`);
+  log(`${targets.length} provider${targets.length === 1 ? "" : "s"} selected\n`);
   for (const t of targets) {
     const listing = listingProfileFor(t.profile);
-    if (listing === null) { console.log(`  ${t.provider.padEnd(16)} no-endpoint (listing: null)`); continue; }
+    if (listing === null) { log(`  ${t.provider.padEnd(16)} no-endpoint (listing: null)`); continue; }
     const r = resolveListingUrl(t.provider, t.profile);
     const pin = PINNED_HOSTS.has(t.provider) ? "" : "  [host not pinned]";
-    console.log(`  ${t.provider.padEnd(16)} ${r.refusal ? `REFUSED ${r.refusal}` : r.url}${pin}`);
+    log(`  ${t.provider.padEnd(16)} ${r.refusal ? `REFUSED ${r.refusal}` : r.url}${pin}`);
   }
 
-  if (!has("--live")) {
-    console.log(`\nno request was made. Re-run with --live to fan out (${targets.length} authenticated requests).`);
-    process.exit(0);
+  if (!hasFlag(args, "--live")) {
+    log(`\nno request was made. Re-run with --live to fan out (${targets.length} authenticated requests).`);
+    return 0;
   }
 
   // Validated BEFORE a single request is spent: this path reaches an icacls DACL
   // rewrite, and finding out it was `.` after 44 authenticated calls is the
   // wrong order to discover it in.
-  const outDir = resolveCacheDir(valueOf("--out"));
+  const outDir = resolveCacheDirImpl(valueOfFlag(args, "--out"));
 
   // A partial or failed run RETAINS its cache, and each record is written THE
   // MOMENT ITS PROVIDER RESOLVES rather than after the fan-out. Writing at the
@@ -160,47 +181,50 @@ async function main() {
   // completed record and forced a re-authorized re-run of all 44 calls.
   const writeFailure = new Map();          // provider -> message, or null on success
   const onResult = (r) => {
-    try { writeCacheRecord(r, { dir: outDir }); writeFailure.set(r.provider, null); }
+    try { writeCacheRecordImpl(r, { dir: outDir }); writeFailure.set(r.provider, null); }
     catch (e) { writeFailure.set(r.provider, String(e.message).slice(0, 120)); }
   };
 
-  const results = await withKeys(targets.map((t) => t.credentialId), (keyOf) =>
-    discoverAll(targets.map((t) => ({ ...t, key: keyOf(t.credentialId) })), { onResult }));
+  const results = await withKeysImpl(targets.map((t) => t.credentialId), (keyOf) =>
+    discoverAllImpl(targets.map((t) => ({ ...t, key: keyOf(t.credentialId) })), { onResult }));
 
   results.sort((a, b) => a.provider.localeCompare(b.provider));
 
   // ---- the report: providers by name, never a key, never a response body ----
-  console.log("");
+  log("");
   for (const r of results) {
     const tail =
-      r.outcome === "ok" ? `${r.models.length} kept of ${r.count} listed${r.rejected ? `, ${r.rejected} refused` : ""}` :
-      r.outcome === "unsupported-shape" ? `top-level keys: ${r.keys.join(", ") || "(none)"}` :
-      r.outcome === "error" ? `${r.status || ""} ${r.reason ?? ""}`.trim() :
-      r.outcome === "auth" ? String(r.status) : "";
-    console.log(`  ${r.outcome.padEnd(18)} ${r.provider.padEnd(16)} ${tail}`);
+      r.outcome === "ok"
+        ? `${r.models.length} kept of ${r.count} listed` +
+          `${r.rejected ? `, ${r.rejected} refused` : ""}${r.truncated ? `, ${r.truncated} past the cap` : ""}`
+        : r.outcome === "unsupported-shape" ? `shape seen: ${r.keys.join(", ") || "(none)"}` :
+          r.outcome === "error" ? `${r.status || ""} ${r.reason ?? ""}`.trim() :
+          r.outcome === "auth" ? String(r.status) : "";
+    log(`  ${r.outcome.padEnd(18)} ${r.provider.padEnd(16)} ${tail}`);
   }
 
   for (const [provider, failure] of writeFailure) {
-    if (failure) console.error(`  cache write failed for ${provider}: ${failure}`);
+    if (failure) logError(`  cache write failed for ${provider}: ${failure}`);
   }
   const written = [...writeFailure.values()].filter((v) => v === null).length;
 
   const cov = coverageOf(results);
   const pct = cov.eligible ? Math.round((cov.ok / cov.eligible) * 1000) / 10 : 0;
-  console.log(`\ncoverage ${cov.ok} of ${cov.eligible} eligible (${pct}%), ${cov.total} attempted, ${written} of ${results.length} records cached`);
-  console.log(Object.entries(cov.by).map(([k, v]) => `${k} ${v}`).join("  "));
+  log(`\ncoverage ${cov.ok} of ${cov.eligible} eligible (${pct}%), ${cov.total} attempted, ${written} of ${results.length} records cached`);
+  log(Object.entries(cov.by).map(([k, v]) => `${k} ${v}`).join("  "));
 
   const shapes = cov.by["unsupported-shape"] ?? 0;
   if (shapes) {
-    console.log(`\n${shapes} of ${results.length} providers returned a shape this parser does not read.`);
-    console.log("Re-run ONLY those providers after adding an envelope candidate; the other records stand.");
+    log(`\n${shapes} of ${results.length} providers returned a shape this parser does not read.`);
+    log("Re-run ONLY those providers after adding an envelope candidate; the other records stand.");
   }
+  return written === results.length ? 0 : 1;
 }
 
-// Run only when invoked as the entry point, so the two functions above are
-// reachable from a test without the vault read and the fan-out running on
-// import. Compared by resolved path rather than `import.meta.main`, which only
-// exists from Node 24 and would silently make this file a no-op below it.
+// Run only when invoked as the entry point, so the functions above are reachable
+// from a test without the vault read and the fan-out running on import. Compared
+// by resolved path rather than `import.meta.main`, which only exists from Node 24
+// and would silently make this file a no-op below it.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await main();
+  process.exit(await main());
 }

@@ -301,13 +301,37 @@ export function scrubProxyEnv(env = process.env) {
 export const PROXY_ENV_AT_LOAD = Object.freeze(
   PROXY_ENV.filter((n) => n in process.env || n.toLowerCase() in process.env));
 
+/**
+ * The runtime flags this process was started with. `NODE_OPTIONS` is only ONE of
+ * the two routes to a preload, and the environment snapshot above does not cover
+ * the other: `node --require ./patch.cjs cli.mjs` runs the preload BEFORE this
+ * module is parsed, so `FETCH_AT_LOAD` below captures the already-patched
+ * function and then compares it with itself. Measured: with `--require` on argv
+ * the refusal was null, the fetch was patched, and the fan-out proceeded.
+ *
+ * No stricter identity check can close that -- once the patch precedes load
+ * there is no pristine reference left to compare against, and Node's `fetch` is
+ * ordinary JavaScript rather than `[native code]`. So the flags themselves are
+ * the signal, and the refusal is on ANY of them rather than on an enumerated
+ * few: `--require`, `--import` and `--experimental-loader` are the three that
+ * load code today, and a denylist of three is defeated by the fourth.
+ *
+ * DELIBERATELY OVER-REFUSING, and stated as such: `node --max-old-space-size=4096
+ * refresh/cli.mjs --live` is refused too, though it is harmless. A live run is 44
+ * authenticated requests that need explicit authorization anyway, so the cost of
+ * the false refusal is re-running one command without a flag, and the cost of
+ * the false admission is 44 credentials through somebody else's transport.
+ */
+export const EXEC_ARGV_AT_LOAD = Object.freeze([...process.execArgv]);
+
 const FETCH_AT_LOAD = globalThis.fetch;
 
 // Node's own `fetch` is a named function declaration. The ordinary interception
 // -- an arrow function or an anonymous wrapper assigned over the global -- does
 // not match. STATED LIMIT, not overclaimed: a wrapper that reproduces the name
-// and parameter list defeats this check, and the environment snapshot above is
-// what actually covers the mechanism CCR uses. Neither is a proof of identity.
+// and parameter list defeats this check, and it can only ever see a replacement
+// made AFTER this module loaded. The two snapshots above are what cover a
+// replacement made before it. None of the three is a proof of identity.
 const NATIVE_FETCH_SHAPE = /^(?:async\s+)?function fetch\s*\(/;
 
 /**
@@ -318,10 +342,19 @@ const NATIVE_FETCH_SHAPE = /^(?:async\s+)?function fetch\s*\(/;
  *
  * @returns {string|null} the refusal, or null when the fan-out may proceed.
  */
-export function proxyRefusal({ atLoad = PROXY_ENV_AT_LOAD, fetchNow = globalThis.fetch } = {}) {
+export function proxyRefusal({
+  atLoad = PROXY_ENV_AT_LOAD,
+  execArgv = EXEC_ARGV_AT_LOAD,
+  fetchNow = globalThis.fetch,
+} = {}) {
   if (atLoad.length) {
     return `refusing to fan out: ${atLoad.join(", ")} was set when this process started, ` +
            "and an interception installed that way cannot be undone from here";
+  }
+  if (execArgv.length) {
+    return `refusing to fan out: this process was started with ${execArgv.length} runtime ` +
+           "flag(s), and a preload among them would already have replaced the transport " +
+           "before this module was parsed";
   }
   if (fetchNow !== FETCH_AT_LOAD) {
     return "refusing to fan out: globalThis.fetch was replaced after this module loaded";
@@ -456,8 +489,23 @@ export function projectModel(entry, listing = LISTING_DEFAULTS) {
 
 // -------------------------------------------------------------- the outcomes
 
-/** Top-level keys, display-sanitised and bounded. Never the values. */
+/**
+ * Top-level keys, display-sanitised and bounded. Never the values.
+ *
+ * A BARE TOP-LEVEL ARRAY is called out rather than enumerated. `Object.keys` on
+ * one yields `["0","1","2"...]`, which is not merely useless but actively
+ * misleading: it invites the next reader to add an envelope candidate named `0`,
+ * when the body has no envelope at all and what it needs is a root-array branch.
+ * The whole stated point of recording these keys is that the next `envelope`
+ * candidate should be data rather than a guess, and indices are neither.
+ *
+ * The descriptor is entirely ours -- a fixed string and a number -- so nothing
+ * provider-controlled rides in on it.
+ */
 function observedKeys(json) {
+  if (Array.isArray(json)) {
+    return [`(bare top-level array of ${json.length}; needs a root-array branch, not an envelope name)`];
+  }
   return Object.keys(json).slice(0, 20).map((k) => sanitizeDisplay(k, 40));
 }
 
@@ -514,6 +562,20 @@ const TIMEOUT_MS = 45_000;
 export const MAX_BODY_BYTES = 8 << 20;
 
 /**
+ * The cap on entries PROJECTED out of one listing, and the byte ceiling above is
+ * not a substitute for it. Measured: a 6.38 MB body of `{"id":"mN"}` -- well
+ * under 8 MB -- yielded `ok` with 400,000 models and a 45.7 MB record, which
+ * `lastGood` then carried into every subsequent failure and re-serialised on
+ * each write. A short entry is cheap in the body and expensive in the record.
+ *
+ * 5,000 is roughly a tenfold headroom over the largest real listing in the set.
+ * Entries past it are DROPPED, never summarised: `count` still carries the raw
+ * entry count, so the record keeps its true denominator, and `truncated` names
+ * how many were dropped rather than leaving the gap to be inferred.
+ */
+export const MAX_ENTRIES = 5_000;
+
+/**
  * `responded` is a first-class field and not an inference from the outcome enum.
  * Without it `auth`, `empty`, `unsupported-shape` and an all-refused `ok` differ
  * only by a string, and every one of them is a host that ANSWERED -- so a
@@ -521,7 +583,7 @@ export const MAX_BODY_BYTES = 8 << 20;
  * alive. It is false only where nothing was sent or nothing came back.
  */
 const blank = (provider, at) =>
-  ({ provider, at, responded: false, models: [], count: 0, rejected: 0 });
+  ({ provider, at, responded: false, models: [], count: 0, rejected: 0, truncated: 0 });
 
 /**
  * @returns {Promise<string|null>} the body, or null when it exceeded `max`.
@@ -561,6 +623,7 @@ export async function discoverProvider(target, opts = {}) {
     fetchImpl = globalThis.fetch,
     timeoutMs = TIMEOUT_MS,
     maxBodyBytes = MAX_BODY_BYTES,
+    maxEntries = MAX_ENTRIES,
     now = () => new Date().toISOString(),
   } = opts;
   const { provider, profile = {}, key } = target;
@@ -620,8 +683,12 @@ export async function discoverProvider(target, opts = {}) {
   if (c.outcome === "ok") {
     const models = [];
     let rejected = 0;
-    for (const e of c.entries) {
-      const m = projectModel(e, listing);
+    // Bounded at the ENTRY, not at the byte, because a 6 MB body of very short
+    // entries is what produced a 45 MB record. Everything past the cap is
+    // counted and dropped; nothing past it is parsed.
+    const seen = Math.min(c.entries.length, maxEntries);
+    for (let i = 0; i < seen; i += 1) {
+      const m = projectModel(c.entries[i], listing);
       if (m) models.push(m); else rejected += 1;
     }
     // `count` is the RAW entry count, so `ok{n}` stays the design's number and
@@ -629,7 +696,10 @@ export async function discoverProvider(target, opts = {}) {
     // id is refused is `ok{42}` with zero models and 42 rejections -- which is
     // our finding to act on, and is not the same event as a provider that
     // genuinely serves nothing.
-    return { ...base, outcome: "ok", envelopeKey: c.envelopeKey, count: c.entries.length, rejected, models };
+    return {
+      ...base, outcome: "ok", envelopeKey: c.envelopeKey, count: c.entries.length,
+      rejected, truncated: c.entries.length - seen, models,
+    };
   }
   if (c.outcome === "empty") return { ...base, outcome: "empty", envelopeKey: c.envelopeKey };
   if (c.outcome === "unsupported-shape") return { ...base, outcome: "unsupported-shape", keys: c.keys };
@@ -646,18 +716,31 @@ export async function discoverProvider(target, opts = {}) {
  * all 44 -- an auth failure is account state to surface, not a reason to stop
  * reaching everybody else.
  *
- * LATENT TODAY, and the threshold stated correctly rather than by a factor of
- * three: `refresh/cli.mjs` emits one target per provider, so the budget bites
- * only when one provider carries MORE THAN `authBudget` (3) targets. The vault's
- * densest provider carries 2 (groq and deepseek, of 46 eligible credentials
- * across the 44 probed providers), so it stays latent.
+ * WHAT THE BUDGET PROMISES, stated in terms that are achievable under
+ * concurrency rather than in terms that read well: STOP DISPATCHING once
+ * `authBudget` consecutive auth failures have been OBSERVED for a provider. Up
+ * to `concurrency` further requests may already be in flight when the third
+ * observation lands, so the number actually sent is bounded by
+ * `authBudget - 1 + concurrency`, not by `authBudget`.
  *
- * It was previously unreachable below SEVEN targets for one provider, not four,
- * because every worker read `spent` in the same synchronous window before any
- * await resolved -- so the budget could not bite until there were more targets
- * than workers. The reservation below is the fix, and the control is kept rather
- * than deleted for being currently latent: a stated safety property removed
- * because nothing exercises it today is how safety properties rot.
+ * The stronger promise -- never send a fourth -- would need the counter checked
+ * and claimed atomically across the await, and an earlier attempt at exactly
+ * that is why this comment is explicit. Reserving the slot before the await made
+ * the counter measure REQUESTS IN FLIGHT rather than auth failures: with six
+ * workers and six targets, three all-200 responses produced three spurious
+ * auth-budget refusals, because the fourth worker read the three reservations
+ * and refused without ever issuing a request. Counting only what came back is
+ * the correction.
+ *
+ * The increment reads the counter FRESH at write time rather than adding to the
+ * `spent` captured before the await, which is a lost update: two concurrent auth
+ * failures both captured 0 and both wrote 1.
+ *
+ * LATENT TODAY: `refresh/cli.mjs` emits one target per provider, and the vault's
+ * densest provider carries 2 (groq and deepseek, of 46 eligible credentials
+ * across the 44 probed providers). The control is kept rather than deleted for
+ * being latent -- a stated safety property removed because nothing exercises it
+ * today is how safety properties rot.
  */
 export async function discoverAll(targets, opts = {}) {
   const {
@@ -699,13 +782,11 @@ export async function discoverAll(targets, opts = {}) {
         });
         continue;
       }
-      // RESERVE before the await, pessimistically. Every worker otherwise reads
-      // the same `spent` in one synchronous window and none of them sees another
-      // worker's increment, which is what made the budget unreachable.
-      consecutiveAuth.set(t.provider, spent + 1);
       const r = await discoverProvider(t, opts);
-      // Released on any non-auth outcome: the counter is CONSECUTIVE failures.
-      if (r.outcome !== "auth") consecutiveAuth.set(t.provider, 0);
+      // Read fresh, not `spent + 1`: `spent` was captured before the await, and
+      // adding to it loses a concurrent worker's increment.
+      consecutiveAuth.set(t.provider,
+        r.outcome === "auth" ? (consecutiveAuth.get(t.provider) ?? 0) + 1 : 0);
       record(r);
     }
   };
@@ -747,8 +828,19 @@ export function cacheFileFor(provider, dir) {
   return path.join(dir, `${h.slice(0, 32)}.json`);
 }
 
+/**
+ * BOTH system tools below are invoked by ABSOLUTE PATH, never by bare name.
+ * `PATH` on a developer machine is not a trusted lookup: measured on this host,
+ * a bare `whoami` resolves to Git's POSIX build ahead of the Windows one, which
+ * rejects `/user` and throws. `icacls` resolves correctly here only by PATH
+ * order, which is the same accident pointing the other way -- and it is the
+ * command that decides whether a plaintext credential inventory is readable.
+ */
+const SYSTEM32 = path.join(process.env.SystemRoot || "C:\\Windows", "System32");
+
 const icacls = (args) =>
-  execFileSync("icacls", args, { encoding: "utf8", timeout: 30_000, windowsHide: true });
+  execFileSync(path.join(SYSTEM32, "icacls.exe"), args,
+               { encoding: "utf8", timeout: 30_000, windowsHide: true });
 
 /**
  * Parse the principals out of an `icacls` listing. Pure, so the owner-only
@@ -781,12 +873,16 @@ export function aclPrincipals(output, filePath = "") {
  */
 const SID_FORM = /^S-1-(?:\d+-)+\d+$/i;
 
-let cachedSid;
-function currentUserSid() {
-  if (cachedSid !== undefined) return cachedSid;
+let cachedSid = "";
+export function currentUserSid({ execFile = execFileSync } = {}) {
+  // Only a SUCCESSFUL lookup is cached. Caching the empty answer turned one
+  // transient failure -- a busy host, a `PATH` that resolved the wrong binary --
+  // into an unresolvable SID for the rest of the process, and from there into
+  // every subsequent cache write failing its own verification.
+  if (cachedSid) return cachedSid;
   try {
-    const out = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"],
-                             { encoding: "utf8", timeout: 30_000, windowsHide: true });
+    const out = execFile(path.join(SYSTEM32, "whoami.exe"), ["/user", "/fo", "csv", "/nh"],
+                         { encoding: "utf8", timeout: 30_000, windowsHide: true });
     cachedSid = out.match(/S-1-(?:\d+-)+\d+/)?.[0] ?? "";
   } catch { cachedSid = ""; }              // unknown SID matches nothing: still closed
   return cachedSid;
@@ -847,6 +943,12 @@ export function resolveCacheDir(given, opts = {}) {
   if (!fsImpl.statSync(dir).isDirectory()) {
     throw new Error(`refusing to use ${dir} as a cache directory: it is not a directory`);
   }
+  // An EMPTY pre-existing directory is accepted DELIBERATELY, and this comment
+  // is the record of that choice rather than an oversight. `mkdir out && --out
+  // out` is the ordinary way anyone reaches this flag, and the blast radius of
+  // relocking an empty directory is that directory alone -- there is nothing
+  // inside it whose permissions could change. It is the non-empty case that
+  // carries somebody else's files, and that is the one refused below.
   const foreign = fsImpl.readdirSync(dir).filter((n) => !RECORD_NAME.test(n));
   if (foreign.length) {
     throw new Error(
@@ -877,11 +979,68 @@ function priorRecord(file, user, acl) {
  * The carried models are already-projected records, so this discloses nothing
  * the file did not already hold.
  */
-function lastGoodOf(record, prior) {
+export const LAST_GOOD_KEYS = Object.freeze(["at", "count", "models"]);
+
+/**
+ * The SIZE bound on a carried listing, and it is a separate control from the
+ * key allowlist rather than a consequence of it: an allowlist pins field NAMES,
+ * and a 45.7 MB `lastGood` satisfies one perfectly. Only a byte budget bounds a
+ * byte problem.
+ *
+ * 256 KB. `lastGood` is a convenience -- "here is what this provider last
+ * served" -- rather than the record's primary content, and it is re-serialised
+ * on EVERY consecutive failure, so its worst case wants to stay small next to
+ * the record carrying it. A few hundred projected models run to roughly 50 KB,
+ * so this is about a fivefold headroom over any real listing.
+ */
+export const LAST_GOOD_MAX_BYTES = 256 << 10;
+
+/**
+ * REBUILT FIELD BY FIELD, never spread. The prior record is a file on disk, and
+ * a file on disk is not this process's own output: returning `prior.lastGood`
+ * as-is would let whatever is in that file define the shape of what this
+ * function writes back, which is how the persisted-field allowlist stops being
+ * a bound on what reaches the cache. Exactly the three keys above, always.
+ *
+ * TWO BOUNDS, and they bind on different things rather than duplicating each
+ * other. `maxEntries` bounds the WORK -- no more than that many entries are ever
+ * projected, whatever a hand-edited prior file claims to hold. `maxBytes` bounds
+ * the RESULT, and at the shipped values it is the one that usually bites first,
+ * because a projected model does not fit in the 52 bytes that 5,000 of them
+ * would need to stay under 256 KB. Both are kept: dropping the entry cap makes a
+ * 400,000-entry prior file cost 400,000 projections to produce a 256 KB answer.
+ *
+ * `count` stays the prior listing's own raw total, so the carried record keeps
+ * its true denominator; `models.length` may legitimately be smaller than it.
+ */
+export function lastGoodOf(record, prior, opts = {}) {
+  const { maxEntries = MAX_ENTRIES, maxBytes = LAST_GOOD_MAX_BYTES } = opts;
   if (record.outcome === "ok") return undefined;      // today's listing IS the good one
   if (!prior) return undefined;
-  if (prior.outcome === "ok") return { at: prior.at, count: prior.count, models: prior.models };
-  return prior.lastGood;                              // carry an older one forward
+  const source = prior.outcome === "ok" ? prior : prior.lastGood;
+  if (!source || typeof source !== "object") return undefined;
+
+  const models = [];
+  // The budget bounds `JSON.stringify(models)` -- the enclosing brackets and the
+  // separator between elements included. Counting only the elements undercounts
+  // by one byte per model, which at 2,500 models is 2.5 KB of overshoot: small
+  // as a fraction, and still a budget that does not hold at its stated number.
+  let bytes = 2;
+  for (const m of (Array.isArray(source.models) ? source.models : []).slice(0, maxEntries)) {
+    // Re-projected, not copied: the prior file's per-model fields are no more
+    // trustworthy than its top-level ones.
+    const projected = projectModel(m);
+    if (!projected) continue;
+    const next = bytes + Buffer.byteLength(JSON.stringify(projected), "utf8") + (models.length ? 1 : 0);
+    if (next > maxBytes) break;            // checked BEFORE the push, not after
+    bytes = next;
+    models.push(projected);
+  }
+  return {
+    at: typeof source.at === "string" ? sanitizeDisplay(source.at, 40) : null,
+    count: Number.isInteger(source.count) && source.count >= 0 ? source.count : 0,
+    models,
+  };
 }
 
 /**

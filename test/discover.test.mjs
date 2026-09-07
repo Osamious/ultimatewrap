@@ -16,11 +16,12 @@ import {
   aclPrincipals, cacheFileFor, classifyOutcome, coverageOf, discoverAll,
   discoverProvider, headersFor, isOwnerOnly, listingProfileFor, projectModel,
   proxyRefusal, readCacheRecord, resolveCacheDir, resolveListingUrl,
-  scrubProxyEnv, writeCacheRecord,
+  scrubProxyEnv, writeCacheRecord, EXEC_ARGV_AT_LOAD, PROXY_ENV_AT_LOAD,
+  MAX_ENTRIES, LAST_GOOD_KEYS, LAST_GOOD_MAX_BYTES, lastGoodOf, currentUserSid,
 } from "../refresh/discover.mjs";
 // cli.mjs runs its fan-out only when it is the process entry point, so importing
 // it here reads no vault and issues no request.
-import { withKeys } from "../refresh/cli.mjs";
+import { main, withKeys } from "../refresh/cli.mjs";
 
 const SCRATCH = path.join(process.env.HOME ?? process.env.USERPROFILE,
                           ".uw", "harness", "scratch", "discovery");
@@ -130,6 +131,27 @@ test("`empty` and `unsupported-shape` never share a bucket", async () => {
   assert.equal(b.outcome, "unsupported-shape");
   assert.equal(a.keys, undefined, "an empty listing has no shape complaint to record");
   assert.ok(Array.isArray(b.keys), "an unsupported shape must carry what it saw");
+});
+
+test("a bare top-level array names what it needs, not its own indices", async () => {
+  // `Object.keys` on an array yields ["0","1","2"...], which is not merely
+  // useless but actively misleading: it invites the next reader to add an
+  // envelope candidate named `0`. The whole stated point of recording these keys
+  // is that the next candidate is data rather than a guess, and indices are
+  // neither. This is the diagnostic a reader acts on.
+  const r = await run(PROF, one(200, [{ id: "m1" }, { id: "m2" }, { id: "m3" }]));
+  assert.equal(r.outcome, "unsupported-shape");
+  assert.equal(r.keys.length, 1, "one descriptor, not one entry per index");
+  assert.match(r.keys[0], /bare top-level array of 3/);
+  assert.match(r.keys[0], /root-array branch/);
+  assert.equal(r.keys.some((k) => /^\d+$/.test(k)), false, "no index leaked into the diagnostic");
+  // An empty array is still a shape this parser does not read, and says so.
+  const empty = await run(PROF, one(200, []));
+  assert.equal(empty.outcome, "unsupported-shape");
+  assert.match(empty.keys[0], /array of 0/);
+  // The descriptor is entirely ours: no provider-controlled text rides in.
+  const hostile = await run(PROF, one(200, [{ id: "[2J" }]));
+  assert.equal(hostile.keys.join("").includes(""), false);
 });
 
 test("`listing: null` is `no-endpoint` and opens no socket", async () => {
@@ -303,12 +325,40 @@ test("a proxy variable present at load REFUSES the fan-out rather than being del
   // globalThis.fetch -- demonstrated end to end, the variable was deleted and the
   // next request still came back from the preload. The property that is worth
   // asserting is PROTECTION, and deletion is structurally blind to it.
-  assert.equal(proxyRefusal({ atLoad: [] }), null, "a clean load permits the fan-out");
+  assert.equal(proxyRefusal({ atLoad: [], execArgv: [] }), null, "a clean load permits the fan-out");
   for (const n of PROXY_ENV) {
-    const refusal = proxyRefusal({ atLoad: [n] });
+    const refusal = proxyRefusal({ atLoad: [n], execArgv: [] });
     assert.match(refusal, /refusing to fan out/);
     assert.ok(refusal.includes(n), `the refusal must name ${n}`);
   }
+});
+
+test("a runtime flag on the command line refuses the fan-out, as NODE_OPTIONS does", async () => {
+  // NODE_OPTIONS is only ONE of the two routes to a preload, and the environment
+  // snapshot does not cover the other. `node --require ./patch.cjs cli.mjs` runs
+  // the preload BEFORE this module is parsed, so FETCH_AT_LOAD captures the
+  // already-patched function and then compares it with itself: measured, the
+  // refusal was null, the fetch was patched, and the fan-out proceeded.
+  for (const flag of ["--require", "--import", "--experimental-loader", "--max-old-space-size=4096"]) {
+    const refusal = proxyRefusal({ atLoad: [], execArgv: [flag] });
+    assert.match(refusal, /refusing to fan out/, `${flag} must refuse`);
+    assert.match(refusal, /runtime/);
+  }
+  // The over-refusal is deliberate and is asserted as such: enumerating the
+  // three flags that load code today is a denylist the fourth one defeats.
+  assert.notEqual(proxyRefusal({ atLoad: [], execArgv: ["--max-old-space-size=4096"] }), null);
+  // The environment snapshot is checked FIRST, so its message is the one a user
+  // acting on it sees when both are true.
+  assert.match(proxyRefusal({ atLoad: ["NODE_OPTIONS"], execArgv: ["--require"] }), /NODE_OPTIONS/);
+});
+
+test("the real process snapshots are frozen arrays, not a live view", () => {
+  // Both must be captured at load: by the time discoverAll runs, whatever they
+  // set up is in place and the variables themselves may already have been
+  // scrubbed -- by this module's own scrubProxyEnv, among others.
+  assert.ok(Object.isFrozen(PROXY_ENV_AT_LOAD));
+  assert.ok(Object.isFrozen(EXEC_ARGV_AT_LOAD));
+  assert.ok(Array.isArray(EXEC_ARGV_AT_LOAD));
 });
 
 test("a patched globalThis.fetch refuses the fan-out and issues no request", async () => {
@@ -325,10 +375,17 @@ test("a patched globalThis.fetch refuses the fan-out and issues no request", asy
       () => discoverAll([{ provider: "groq", profile: PROF, key: "K" }], { scrub: false }),
       /refusing to fan out/);
     assert.deepEqual(calls, [], "0 requests of 1: the credential never left this process");
+
+    // The branch in isolation. The other two snapshots are neutralised here
+    // deliberately: `node --test` populates execArgv with its own defaulted
+    // flags, so without pinning them this assertion would pass on the wrong
+    // reason and say nothing about the replaced fetch at all.
+    assert.match(proxyRefusal({ atLoad: [], execArgv: [] }), /globalThis\.fetch was replaced/);
   } finally {
     globalThis.fetch = original;
   }
-  assert.equal(proxyRefusal(), null, "and the guard passes again once the patch is gone");
+  assert.equal(proxyRefusal({ atLoad: [], execArgv: [] }), null,
+    "and the guard passes again once the patch is gone");
 });
 
 test("scrubProxyEnv names every variable it removed, in either case", () => {
@@ -393,21 +450,69 @@ test("the auth failure budget is per provider and never global", async () => {
     "the second provider was still reached, 1 request of 1");
 });
 
-test("the auth budget bites at four targets even when every worker starts together", async () => {
-  // The budget was unreachable below SEVEN targets for one provider, not four:
-  // at the default concurrency all six workers shifted a target and read `spent`
-  // in the same synchronous window, before any await resolved, so none of them
-  // saw another's increment. Concurrency 1 hid it completely, which is why every
-  // budget fixture above passes either way. This one runs at the real default.
-  const seen = [];
-  const fetchImpl = async (url) => { seen.push(url); return { status: 401, text: async () => "" }; };
-  const targets = Array.from({ length: 6 }, () =>
-    ({ provider: "dead", profile: { baseUrl: "https://dead.test/v1" }, key: "K" }));
-  const results = await discoverAll(targets, { fetchImpl, scrub: false });
+test("the budget counts auth failures, never requests in flight", async () => {
+  // The counter must not be a semaphore. Reserving a slot before the await made
+  // it exactly that: with six workers and six all-200 targets, three workers
+  // reserved, the fourth read the three reservations and refused WITHOUT EVER
+  // ISSUING A REQUEST -- three spurious auth-budget refusals on a provider that
+  // answered every time. Ten 500s behaved identically. A healthy fan-out must
+  // refuse nothing, whatever the concurrency.
+  for (const status of [200, 500, 404]) {
+    const seen = [];
+    const fetchImpl = async (url) => {
+      seen.push(url);
+      return { status, text: async () => JSON.stringify({ data: [] }) };
+    };
+    const targets = Array.from({ length: 12 }, () =>
+      ({ provider: "healthy", profile: { baseUrl: "https://healthy.test/v1" }, key: "K" }));
+    const results = await discoverAll(targets, { fetchImpl, scrub: false });
+    assert.equal(seen.length, 12, `12 requests of 12 were issued at status ${status}`);
+    assert.equal(results.filter((r) => r.reason === REASONS.AUTH_BUDGET).length, 0,
+      `status ${status} produced a spurious auth-budget refusal`);
+  }
+});
 
-  assert.equal(seen.length, 3, "3 requests of 6 were spent before the budget stopped the rest");
-  assert.equal(results.filter((r) => r.outcome === "auth").length, 3);
-  assert.equal(results.filter((r) => r.reason === REASONS.AUTH_BUDGET).length, 3);
+test("dispatch stops once three consecutive auth failures have been OBSERVED", async () => {
+  // The achievable promise, stated as the code now implements it: stop
+  // DISPATCHING at three observations. Up to `concurrency` requests may already
+  // be in flight when the third lands, so the number sent is bounded by
+  // `authBudget - 1 + concurrency`, not by `authBudget`.
+  const sentAt = (concurrency, targetCount) => {
+    const seen = [];
+    const fetchImpl = async (url) => { seen.push(url); return { status: 401, text: async () => "" }; };
+    const targets = Array.from({ length: targetCount }, () =>
+      ({ provider: "dead", profile: { baseUrl: "https://dead.test/v1" }, key: "K" }));
+    return discoverAll(targets, { fetchImpl, scrub: false, concurrency })
+      .then((results) => ({ seen, results }));
+  };
+
+  // Serial: exactly the budget, and every one of them a real request.
+  const serial = await sentAt(1, 20);
+  assert.equal(serial.seen.length, 3, "3 requests of 20 at concurrency 1");
+  assert.equal(serial.results.filter((r) => r.outcome === "auth").length, 3);
+  assert.equal(serial.results.filter((r) => r.reason === REASONS.AUTH_BUDGET).length, 17);
+
+  // Concurrent: still bounded, and still stops well short of the 20 targets.
+  const parallel = await sentAt(6, 20);
+  assert.ok(parallel.seen.length >= 3, `${parallel.seen.length} sent, at least the budget`);
+  assert.ok(parallel.seen.length <= 3 - 1 + 6,
+    `${parallel.seen.length} sent, over the authBudget - 1 + concurrency bound of 8`);
+  assert.ok(parallel.results.some((r) => r.reason === REASONS.AUTH_BUDGET),
+    "the budget stopped the remainder rather than letting all 20 through");
+  assert.equal(parallel.results.length, 20, "and every target still produced a record");
+});
+
+test("concurrency 0 still resolves every target rather than silently returning none", async () => {
+  // `Math.max(1, concurrency)` is the only thing between a caller's 0 and a
+  // fan-out with no workers, which returns an empty array and no error at all --
+  // a run that reports zero providers attempted and looks like a clean result.
+  const fetchImpl = async () => ({ status: 200, text: async () => JSON.stringify({ data: [] }) });
+  const targets = Array.from({ length: 4 }, (_, i) =>
+    ({ provider: `p${i}`, profile: { baseUrl: `https://p${i}.test/v1` }, key: "K" }));
+  for (const concurrency of [0, -1]) {
+    const results = await discoverAll(targets, { fetchImpl, scrub: false, concurrency });
+    assert.equal(results.length, 4, `concurrency ${concurrency} resolved 4 targets of 4`);
+  }
 });
 
 test("a non-auth outcome resets that provider's consecutive counter", async () => {
@@ -583,6 +688,73 @@ test("a hostile model id is refused rather than sanitised", () => {
   assert.equal(projectModel({ id: "@cf/openai/gpt-oss-120b" }).id, "@cf/openai/gpt-oss-120b");
 });
 
+test("a listing is bounded by ENTRY COUNT, not only by byte ceiling", async () => {
+  // Measured: a 6.38 MB body of `{"id":"mN"}` -- well under the 8 MB ceiling --
+  // yielded ok with 400,000 models and a 45.7 MB record, which lastGood then
+  // carried into every later failure and re-serialised on each write. A short
+  // entry is cheap in the body and expensive in the record.
+  const entries = Array.from({ length: 500 }, (_, i) => ({ id: `m${i}` }));
+  const r = await run(PROF, one(200, { data: entries }), { maxEntries: 100 });
+  assert.equal(r.outcome, "ok");
+  assert.equal(r.count, 500, "count keeps the RAW entry count, so the denominator stays true");
+  assert.equal(r.models.length, 100, "100 kept of 500");
+  assert.equal(r.truncated, 400, "and the 400 dropped are named rather than left to be inferred");
+  assert.equal(r.rejected, 0, "dropped past the cap is not the same event as an id refused");
+  assert.deepEqual(r.models.at(-1).id, "m99", "the cap takes a prefix, not a sample");
+
+  // Under the cap, nothing is truncated and the field is still present.
+  const small = await run(PROF, one(200, { data: entries.slice(0, 3) }), { maxEntries: 100 });
+  assert.equal(small.truncated, 0);
+  assert.equal(small.models.length, 3);
+
+  // The real default is a ceiling no legitimate listing approaches.
+  assert.ok(MAX_ENTRIES >= 5000, `${MAX_ENTRIES} must clear the largest real listing`);
+  const real = await run(PROF, one(200, { data: entries }));
+  assert.equal(real.truncated, 0, "500 entries is an ordinary listing, not a truncation");
+});
+
+test("`rejected` and `truncated` are 0 on every non-ok record, never absent", async () => {
+  // Both are persisted on every outcome and both were asserted only inside the
+  // `ok` branch. A record carrying `rejected: undefined` reads as "unknown" to a
+  // consumer that has been told the field is always present -- the same failure
+  // as the four projected model fields, which is why those are always present.
+  const cases = [
+    [one(200, { data: [] }), "empty"],
+    [one(200, { foo: 1 }), "unsupported-shape"],
+    [one(401, null, { throwOnRead: true }), "auth"],
+    [one(500, null, { throwOnRead: true }), "error"],
+  ];
+  for (const [f, outcome] of cases) {
+    const r = await run(PROF, f);
+    assert.equal(r.outcome, outcome);
+    assert.equal(r.rejected, 0, `${outcome} must state 0 refused, not omit the field`);
+    assert.equal(r.truncated, 0, `${outcome} must state 0 truncated, not omit the field`);
+    assert.equal(r.count, 0);
+  }
+  // And on the paths that never reached a host at all.
+  for (const r of [await run({ ...PROF, listing: null }, never),
+                   await run({ ...PROF, baseUrl: "http://api.groq.com/v1" }, never)]) {
+    assert.equal(r.rejected, 0);
+    assert.equal(r.truncated, 0);
+  }
+});
+
+test("a status that arrives as a string is still classified, not silently reclassified", async () => {
+  // `Number(res.status)` is the only thing standing between `"401"` and the
+  // generic error branch: `"401" === 401` is false, so a stringly-typed status
+  // from any non-conforming Response shim turns an expired key into an
+  // indistinguishable upstream failure, and R11 prunes the provider.
+  const asString = await run(PROF, stubFetch(() => ({ status: "401", throwOnRead: true })));
+  assert.equal(asString.outcome, "auth", "a string 401 is still auth");
+  assert.equal(asString.status, 401);
+  assert.equal(typeof asString.status, "number", "the persisted status is always a number");
+
+  const okString = await run(PROF, stubFetch(() => ({ status: "200", body: { data: [{ id: "m1" }] } })));
+  assert.equal(okString.outcome, "ok");
+  assert.equal(okString.status, 200);
+  assert.equal(typeof okString.status, "number");
+});
+
 test("a refused id is counted, not folded into the total silently", async () => {
   const r = await run(PROF, one(200, { data: [{ id: "good" }, { id: "b\u001b[2Jd" }, { id: "also-good" }] }));
   assert.equal(r.outcome, "ok");
@@ -629,9 +801,103 @@ test("the body of a non-2xx is never read, so provider error text cannot enter t
 test("a record holds only the outcome enum, a status, a fixed reason and projected models", async () => {
   const r = await run(PROF, one(200, { data: [{ id: "m1", owned_by: "org-secret" }] }));
   const allowed = new Set(["provider", "at", "outcome", "status", "envelopeKey", "count",
-                           "rejected", "models", "keys", "reason", "hostPinned", "responded"]);
+                           "rejected", "truncated", "models", "keys", "reason", "hostPinned",
+                           "responded", "lastGood"]);
   for (const k of Object.keys(r)) assert.ok(allowed.has(k), `unexpected persisted field: ${k}`);
   assert.equal(JSON.stringify(r).includes("org-secret"), false);
+
+  // AND ON DISK. This control guards the cache's disclosure surface, and until
+  // now it ran on discoverProvider's return value only -- one function short of
+  // the file, with writeCacheRecord merging `lastGood` in afterwards. The bytes
+  // that actually land are what the allowlist has to bound.
+  const dir = path.join(SCRATCH, "persisted-shape");
+  fs.rmSync(dir, { recursive: true, force: true });
+  const acl = { run: (args) => (args.length > 1 ? "" : `${args[0]} HOST\\osami:(F)\r\n`) };
+  const opts = { dir, user: "osami", acl };
+  writeCacheRecord(await run(PROF, one(200, { data: [{ id: "m1", owned_by: "org-secret" }] })), opts);
+  writeCacheRecord(await run(PROF, one(403, null, { throwOnRead: true })), opts);
+
+  const onDisk = JSON.parse(fs.readFileSync(cacheFileFor("groq", dir), "utf8"));
+  for (const k of Object.keys(onDisk)) assert.ok(allowed.has(k), `unexpected field ON DISK: ${k}`);
+  assert.deepEqual(Object.keys(onDisk.lastGood), [...LAST_GOOD_KEYS]);
+  const modelKeys = new Set(["id", "capabilityRaw", "contextLength", "modalityHints"]);
+  for (const m of onDisk.lastGood.models) {
+    for (const k of Object.keys(m)) assert.ok(modelKeys.has(k), `unexpected model field ON DISK: ${k}`);
+  }
+  assert.equal(fs.readFileSync(cacheFileFor("groq", dir), "utf8").includes("org-secret"), false);
+});
+
+test("a carried listing is bounded in BYTES, which no key allowlist can do", () => {
+  // The allowlist above pins field NAMES, and a 45.7 MB `lastGood` satisfies it
+  // perfectly -- so the size bound is a separate control and needs its own
+  // assertion. Measured before it existed: a 6.38 MB body under the byte ceiling
+  // produced a 45.7 MB record, which `lastGood` then carried into every later
+  // failure and re-serialised on each write.
+  const huge = Array.from({ length: 20_000 }, (_, i) => ({
+    id: `provider/family/model-variant-${i}`, capabilityRaw: "chat",
+    contextLength: 131072, modalityHints: ["image", "text"],
+  }));
+  const prior = { provider: "groq", at: "day-1", outcome: "ok", status: 200, count: 20_000, models: huge };
+  const today = { provider: "groq", at: "day-2", outcome: "auth", status: 403, models: [] };
+
+  // The byte budget binds at the shipped values: a projected model does not fit
+  // in the 52 bytes that 5,000 of them would need to stay under 256 KB.
+  const real = lastGoodOf(today, prior);
+  assert.ok(real.models.length > 0, "the bound must carry something, not everything or nothing");
+  assert.ok(real.models.length < 20_000, "20,000 models were carried through unbounded");
+  assert.ok(Buffer.byteLength(JSON.stringify(real.models), "utf8") <= LAST_GOOD_MAX_BYTES,
+    `carried ${Buffer.byteLength(JSON.stringify(real.models), "utf8")} bytes over a ${LAST_GOOD_MAX_BYTES} budget`);
+  assert.equal(real.count, 20_000, "the prior listing's true denominator survives the truncation");
+
+  // The two bounds bind on different things, so each is asserted where it bites.
+  // Entry cap, with a byte budget too large to be the constraint:
+  const byEntries = lastGoodOf(today, prior, { maxEntries: 7, maxBytes: 1 << 30 });
+  assert.equal(byEntries.models.length, 7);
+  // Byte budget, with an entry cap too large to be the constraint:
+  const byBytes = lastGoodOf(today, prior, { maxEntries: 20_000, maxBytes: 400 });
+  assert.ok(byBytes.models.length >= 1 && byBytes.models.length <= 4,
+    `${byBytes.models.length} models in a 400-byte budget`);
+  assert.ok(Buffer.byteLength(JSON.stringify(byBytes.models), "utf8") <= 400 + 200,
+    "the budget is checked before the model is kept, not after the whole array is built");
+
+  // And end to end, through the file that actually lands on disk.
+  const dir = path.join(SCRATCH, "lastgood-bytes");
+  fs.rmSync(dir, { recursive: true, force: true });
+  const acl = { run: (args) => (args.length > 1 ? "" : `${args[0]} HOST\\osami:(F)\r\n`) };
+  const opts = { dir, user: "osami", acl };
+  writeCacheRecord(prior, opts);
+  writeCacheRecord(today, opts);
+  const file = cacheFileFor("groq", dir);
+  assert.ok(fs.statSync(file).size < 4 << 20, `the record on disk is ${fs.statSync(file).size} bytes`);
+  assert.equal(readCacheRecord("groq", opts).lastGood.models.length, real.models.length);
+});
+
+test("a planted prior record cannot widen the shape of what gets written back", () => {
+  // `lastGood` is built field by field for this reason: a prior record is a file
+  // on disk, and spreading it would let whatever is in that file decide what
+  // this code persists -- which is the allowlist above ceasing to be a bound.
+  const dir = path.join(SCRATCH, "shape-widening");
+  fs.rmSync(dir, { recursive: true, force: true });
+  const acl = { run: (args) => (args.length > 1 ? "" : `${args[0]} HOST\\osami:(F)\r\n`) };
+  const opts = { dir, user: "osami", acl };
+
+  writeCacheRecord({
+    provider: "groq", at: "day-1", outcome: "ok", status: 200, count: 1,
+    models: [{ id: "m1", owned_by: "org-4f2a", credits_remaining: 4.21 }],
+    smuggled: "should never survive", lastGood: { injected: true },
+  }, opts);
+  writeCacheRecord({ provider: "groq", at: "day-2", outcome: "auth", status: 403, models: [] }, opts);
+
+  const after = readCacheRecord("groq", opts);
+  assert.deepEqual(Object.keys(after.lastGood), [...LAST_GOOD_KEYS]);
+  assert.equal(JSON.stringify(after.lastGood).includes("smuggled"), false);
+  assert.equal(JSON.stringify(after.lastGood).includes("injected"), false);
+  // The models carried forward are re-projected, so the prior file's extra
+  // per-model fields do not ride along either.
+  assert.deepEqual(Object.keys(after.lastGood.models[0]).sort(),
+                   ["capabilityRaw", "contextLength", "id", "modalityHints"]);
+  assert.equal(JSON.stringify(after.lastGood).includes("org-4f2a"), false);
+  assert.equal(JSON.stringify(after.lastGood).includes("4.21"), false);
 });
 
 test("observed keys on an unsupported shape are bounded and display-sanitised", async () => {
@@ -793,6 +1059,25 @@ test("the owner appearing FIRST among several principals is still not owner-only
   assert.equal(isOwnerOnly("Successfully processed 1 files", "osami", "C:\\tmp\\x.json"), false);
 });
 
+test("the SID lookup uses an absolute path, and a failed lookup is not cached", () => {
+  // The three assertions below are ORDERED on purpose and share the module's
+  // cache, so they live in one test rather than three.
+  const boom = () => { throw new Error("PATH resolved the wrong binary"); };
+  assert.equal(currentUserSid({ execFile: boom }), "", "a failed lookup must fail closed");
+
+  // The real lookup, AFTER that failure. Caching the empty answer -- which
+  // `!== undefined` did -- would return "" here for the life of the process, and
+  // every later cache write would then fail its own verification: no leak, but
+  // zero records after 44 spent authenticated requests. The absolute path is the
+  // other half: measured on this host, a bare `whoami` resolves to Git's POSIX
+  // build ahead of System32, which rejects `/user` and throws.
+  const sid = currentUserSid();
+  assert.match(sid, /^S-1-(?:\d+-)+\d+$/, "the absolute System32 lookup yielded no SID");
+
+  // A SUCCESSFUL lookup is cached, so the throwing stub is never consulted.
+  assert.equal(currentUserSid({ execFile: boom }), sid);
+});
+
 test("a principal icacls renders as a bare SID is matched by SID, not by name", () => {
   // icacls prints an unresolvable principal as a bare SID -- an account whose
   // reverse lookup is unavailable, or a machine off its domain. `.split("\\")`
@@ -870,6 +1155,42 @@ test("an icacls failure AFTER the rename removes the record instead of leaving i
     "a record whose DACL could not be verified is removed, not kept");
 });
 
+test("a prior record that is NOT owner-only is never carried into lastGood", () => {
+  // The security case for that gate, which deleting it survives every other
+  // fixture: a file this user does not exclusively own is a file somebody else
+  // could have written, and carrying its contents forward re-publishes them
+  // under our own owner-only DACL. The post-write verification cannot catch it,
+  // because by then the planted content IS our record.
+  const dir = path.join(SCRATCH, "acl-planted");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(cacheFileFor("groq", dir), JSON.stringify({
+    provider: "groq", at: "planted", outcome: "ok", status: 200, count: 1,
+    models: [{ id: "planted-by-a-third-party", capabilityRaw: null, contextLength: null, modalityHints: [] }],
+  }));
+
+  let jsonListings = 0;
+  const acl = {
+    run: (args) => {
+      if (args.length > 1) return "";
+      if (!args[0].endsWith(".json")) return `${args[0]} HOST\\osami:(F)\r\n`;
+      jsonListings += 1;
+      // The FIRST listing of the record path is the planted file, which grants a
+      // third party. Every later one is the record we just wrote ourselves.
+      return jsonListings === 1
+        ? `${args[0]} HOST\\osami:(F)\r\n${args[0]} DESKTOP-1\\somebodyelse:(F)\r\n`
+        : `${args[0]} HOST\\osami:(F)\r\n`;
+    },
+  };
+  const opts = { dir, user: "osami", acl };
+  writeCacheRecord({ provider: "groq", at: "today", outcome: "auth", status: 403, models: [] }, opts);
+
+  const after = readCacheRecord("groq", opts);
+  assert.equal(after.lastGood, undefined, "a record we could not attribute was carried forward");
+  assert.equal(JSON.stringify(after).includes("planted-by-a-third-party"), false);
+  assert.equal(after.outcome, "auth");
+});
+
 test("a failed listing does not destroy the last good one", () => {
   // One 403 renamed over a cached 120-model listing and it was gone. The new
   // record still states today's truth; the last listing that worked rides
@@ -889,10 +1210,18 @@ test("a failed listing does not destroy the last good one", () => {
   assert.deepEqual(after.models, [], "and it does not pretend today's listing succeeded");
   assert.equal(after.lastGood.at, "day-1");
   assert.deepEqual(after.lastGood.models.map((m) => m.id), ["m1", "m2"]);
+  // Exactly three keys, always. `lastGood` is rebuilt field by field rather than
+  // spread from the prior file, so a hand-edited or planted record on disk
+  // cannot define the shape of what this code writes back.
+  assert.deepEqual(Object.keys(after.lastGood), [...LAST_GOOD_KEYS]);
 
-  // Carried forward across a second consecutive failure, not lost on the way.
+  // Carried forward across a second consecutive failure, not lost on the way,
+  // and still exactly three keys after the carry rather than only on the first.
   writeCacheRecord({ provider: "groq", at: "day-3", outcome: "error", status: 500, models: [] }, opts);
-  assert.equal(readCacheRecord("groq", opts).lastGood.at, "day-1");
+  const carried = readCacheRecord("groq", opts);
+  assert.equal(carried.lastGood.at, "day-1");
+  assert.deepEqual(Object.keys(carried.lastGood), [...LAST_GOOD_KEYS]);
+  assert.deepEqual(carried.lastGood.models.map((m) => m.id), ["m1", "m2"]);
 
   // A fresh success replaces it: the record IS the good listing again.
   writeCacheRecord({ provider: "groq", at: "day-4", outcome: "ok", status: 200, count: 1,
@@ -910,7 +1239,12 @@ test("the real icacls path leaves an owner-only record on disk", () => {
   const user = os.userInfo().username;
   const file = writeCacheRecord({ provider: "groq", outcome: "empty", status: 200, models: [] },
                                 { dir, user });
-  const listed = execFileSync("icacls", [file], { encoding: "utf8", windowsHide: true });
+  // Absolute, for the same reason discover.mjs is: PATH is not a trusted lookup
+  // on a developer machine, and a shadowed `icacls` would make this test assert
+  // whatever the shadowing binary happened to print.
+  const listed = execFileSync(
+    path.join(process.env.SystemRoot || "C:\\Windows", "System32", "icacls.exe"),
+    [file], { encoding: "utf8", windowsHide: true });
   assert.equal(isOwnerOnly(listed, user, file), true, listed);
   assert.equal(readCacheRecord("groq", { dir, user }).outcome, "empty");
 });
@@ -1008,16 +1342,31 @@ test("`responded` separates a host that answered from one that never did", async
 // ============================================================== the body cap
 
 test("a declared content-length over the ceiling costs zero bytes read", async () => {
-  const f = stubFetch(() => ({
+  // Declared at exactly `maxBodyBytes + 1`, not at some comfortable multiple: a
+  // 64 MB fixture against an 8 MB ceiling passes just as well with the
+  // comparison loosened to `> maxBodyBytes * 2`, which is not the bound anyone
+  // wrote down. One byte over is the only fixture that pins the boundary.
+  const ceiling = 4096;
+  const at = (declared) => stubFetch(() => ({
     status: 200,
-    headers: { get: (h) => (h === "content-length" ? String(64 << 20) : null) },
+    headers: { get: (h) => (h === "content-length" ? String(declared) : null) },
     throwOnRead: true,             // the stub throws if the body is read at all
   }));
-  const r = await run(PROF, f);
-  assert.equal(r.outcome, "error");
-  assert.equal(r.reason, REASONS.OVERSIZE);
-  assert.equal(r.responded, true, "the host answered; its answer was too large");
-  assert.equal(r.status, 200);
+
+  const over = await run(PROF, at(ceiling + 1), { maxBodyBytes: ceiling });
+  assert.equal(over.outcome, "error");
+  assert.equal(over.reason, REASONS.OVERSIZE);
+  assert.equal(over.responded, true, "the host answered; its answer was too large");
+  assert.equal(over.status, 200);
+
+  // And exactly at the ceiling is admitted, so the bound is `>` and not `>=`.
+  const exact = stubFetch(() => ({
+    status: 200,
+    headers: { get: () => String(ceiling) },
+    body: JSON.stringify({ data: [{ id: "m1" }] }),
+  }));
+  const ok = await run(PROF, exact, { maxBodyBytes: ceiling });
+  assert.equal(ok.outcome, "ok", "a body declaring exactly the ceiling is read, not refused");
 });
 
 test("a body that lies about its length is stopped mid-stream", async () => {
@@ -1042,6 +1391,32 @@ test("a body that lies about its length is stopped mid-stream", async () => {
   // characters is 1,200 bytes, and a code-unit count would have admitted it.
   const astral = await run(PROF, one(200, "\u{1F600}".repeat(300)), { maxBodyBytes: 1000 });
   assert.equal(astral.reason, REASONS.OVERSIZE);
+});
+
+test("a streamed body is decoded as UTF-8, which is the only branch a live run uses", async () => {
+  // A real Response always carries a body stream, so `res.text()` is the branch
+  // NO live request ever takes -- and every non-ASCII fixture in this file went
+  // through it. Decoding the streamed path as latin1 leaves all of them green
+  // while mangling every id a provider actually returns.
+  const payload = JSON.stringify({
+    data: [
+      { id: "qwen/qwen2.5-72b", capability: "chat" },
+      { id: "mistral/ministral-8b-café" },
+      { id: "中文/model-éè" },
+    ],
+  });
+  // Split mid-codepoint so a chunk boundary cannot be reassembled by luck: the
+  // concat has to happen in bytes before the decode, not per chunk.
+  const bytes = Buffer.from(payload, "utf8");
+  const cut = bytes.indexOf(Buffer.from("café", "utf8")) + 4;
+  const { stream } = streamOf([bytes.subarray(0, cut), bytes.subarray(cut)]);
+
+  const r = await run(PROF, stubFetch(() => ({ status: 200, stream })));
+  assert.equal(r.outcome, "ok");
+  assert.deepEqual(r.models.map((m) => m.id),
+                   ["qwen/qwen2.5-72b", "mistral/ministral-8b-café", "中文/model-éè"]);
+  assert.equal(r.models[0].capabilityRaw, "chat");
+  assert.equal(r.rejected, 0, "a mangled decode refuses ids and would show up here");
 });
 
 test("a body under the ceiling still parses, and one hostile body costs one provider", async () => {
@@ -1127,7 +1502,10 @@ test("--out refuses any directory this tool did not write", () => {
 
   const file = path.join(base, "a-file");
   fs.writeFileSync(file, "x");
-  assert.throws(() => resolveCacheDir(file), /not a directory/);
+  // Matched on OUR refusal, not on "not a directory": Node's own readdirSync
+  // raises `ENOTDIR: not a directory, scandir '...'`, so the loose regex passed
+  // with the guard deleted and asserted nothing about this code at all.
+  assert.throws(() => resolveCacheDir(file), /refusing to use .* as a cache directory/);
 });
 
 test("an absent --out falls back to the cache root rather than to the working directory", () => {
@@ -1185,10 +1563,143 @@ test("a failed vault read never carries the child's stdout into the thrown error
 test("a successful vault read hands keys to the callback and drops them after", async () => {
   const SENTINEL = "sk-fake-sentinel-never-a-real-key-0001";
   let seen;
-  const out = await withKeys(["cred-1"], async (keyOf) => { seen = keyOf("cred-1"); return "done"; },
-                             { execFile: () => `{"cred-1":"${SENTINEL}"}\n` });
+  let escaped;                             // the accessor, captured past its scope
+  const out = await withKeys(
+    ["cred-1", "cred-2"],
+    async (keyOf) => { seen = keyOf("cred-1"); escaped = keyOf; return "done"; },
+    { execFile: () => `{"cred-1":"${SENTINEL}","cred-2":"${SENTINEL}2"}\n` });
   assert.equal(out, "done");
   assert.equal(seen, SENTINEL, "the callback is the only place a key value is reachable");
+
+  // The `finally` is the whole reason the accessor is scoped: without it, the
+  // closure keeps the map alive and every key stays readable for as long as
+  // anything holds a reference -- through the report, the cache writes and the
+  // rest of the process. Deleting it leaves every other assertion here green.
+  assert.equal(escaped("cred-1"), undefined, "a key was still reachable after the callback returned");
+  assert.equal(escaped("cred-2"), undefined);
+
+  // Dropped even when the callback throws, which is the path a failed fan-out
+  // takes and the one where keys linger longest if the teardown is conditional.
+  let afterThrow;
+  await assert.rejects(() => withKeys(["cred-1"], async (keyOf) => {
+    afterThrow = keyOf;
+    throw new Error("the fan-out failed");
+  }, { execFile: () => `{"cred-1":"${SENTINEL}"}` }), /the fan-out failed/);
+  assert.equal(afterThrow("cred-1"), undefined);
+});
+
+test("main plans without sending, and validates --out before spending a request", async () => {
+  // main() is what R10 runs, and it was the untested part of this file. The
+  // ORDER is the safety property: nothing is sent without --live, and --out is
+  // resolved before the fan-out rather than after 44 authenticated calls.
+  const vaultFiles = {
+    "providers.json": [
+      { provider: "groq", baseUrl: "https://api.groq.com/openai/v1", protocol: "openai" },
+      { provider: "deepseek", baseUrl: "https://api.deepseek.com/v1", protocol: "openai" },
+      { provider: "skipme", baseUrl: "https://skip.test/v1", protocol: "generic" },
+    ],
+    "registry.json": [
+      { id: "c-groq", provider: "groq", tier: "free" },
+      { id: "c-deep", provider: "deepseek", tier: "free" },
+      { id: "c-skip", provider: "skipme", tier: "free" },
+      { id: "c-mgmt", provider: "groq", tier: "management" },
+      { id: "c-sv", provider: "groq", tier: "free", bucket: "sportsvector-1" },
+    ],
+  };
+  const readJsonImpl = (f) => vaultFiles[path.basename(f)];
+  const out = [];
+  const errs = [];
+  const base = { readJsonImpl, log: (s) => out.push(String(s)), logError: (s) => errs.push(String(s)) };
+
+  // --- dry: the plan prints, and nothing else is even constructed ------------
+  const boom = () => { throw new Error("a dry run must not reach this"); };
+  const dry = await main({
+    ...base, args: [],
+    withKeysImpl: boom, discoverAllImpl: boom, writeCacheRecordImpl: boom, resolveCacheDirImpl: boom,
+  });
+  assert.equal(dry, 0);
+  const dryText = out.join("\n");
+  assert.match(dryText, /2 providers selected/, "the generic-protocol provider is excluded");
+  assert.match(dryText, /groq\s+https:\/\/api\.groq\.com\/openai\/v1\/models/);
+  assert.match(dryText, /no request was made/);
+  assert.equal(dryText.includes("skipme"), false);
+
+  // --- --only filters, and an --only that matches nothing exits 2 ------------
+  out.length = 0;
+  await main({ ...base, args: ["--only", "groq"], withKeysImpl: boom, discoverAllImpl: boom });
+  assert.match(out.join("\n"), /1 provider selected/);
+  out.length = 0;
+  const none = await main({ ...base, args: ["--only", "c-groq"], withKeysImpl: boom });
+  assert.equal(none, 2, "--only takes provider names, not credential ids");
+  assert.match(errs.join("\n"), /no eligible provider matched/);
+
+  // --- live: --out is resolved BEFORE any key is read or request issued ------
+  out.length = 0;
+  const order = [];
+  await assert.rejects(() => main({
+    ...base, args: ["--live", "--out", "whatever"],
+    resolveCacheDirImpl: () => { order.push("out"); throw new Error("refusing to rewrite the permissions"); },
+    withKeysImpl: () => { order.push("keys"); throw new Error("the vault was read anyway"); },
+    discoverAllImpl: boom,
+  }), /refusing to rewrite the permissions/);
+  assert.deepEqual(order, ["out"], "the vault was read before --out was validated");
+});
+
+test("main writes each record as it resolves and reports without a key or a body", async () => {
+  const SENTINEL = "sk-fake-sentinel-never-a-real-key-0002";
+  const vaultFiles = {
+    "providers.json": [
+      { provider: "groq", baseUrl: "https://api.groq.com/openai/v1", protocol: "openai" },
+      { provider: "deepseek", baseUrl: "https://api.deepseek.com/v1", protocol: "openai" },
+    ],
+    "registry.json": [
+      { id: "c-groq", provider: "groq", tier: "free" },
+      { id: "c-deep", provider: "deepseek", tier: "free" },
+    ],
+  };
+  const out = [];
+  const errs = [];
+  const written = [];
+
+  // A stub fan-out that answers one provider and fails the other, so both the
+  // success and the failure lines are exercised in one run.
+  const discoverAllImpl = async (targets, opts) => {
+    const results = targets.map((t) => (t.provider === "groq"
+      ? { provider: "groq", at: "t", responded: true, outcome: "ok", status: 200,
+          envelopeKey: "data", count: 9, rejected: 1, truncated: 6, models: [{ id: "m1" }, { id: "m2" }] }
+      : { provider: "deepseek", at: "t", responded: true, outcome: "error", status: 429,
+          count: 0, rejected: 0, truncated: 0, models: [], reason: REASONS.RATE_LIMIT }));
+    // The key reaches the fan-out and nothing further.
+    assert.equal(targets.every((t) => t.key === SENTINEL), true);
+    for (const r of results) opts.onResult(r);
+    return results;
+  };
+
+  const code = await main({
+    args: ["--live"],
+    readJsonImpl: (f) => vaultFiles[path.basename(f)],
+    withKeysImpl: (ids, fn) => fn(() => SENTINEL),
+    discoverAllImpl,
+    resolveCacheDirImpl: () => path.join(SCRATCH, "main-out"),
+    writeCacheRecordImpl: (r) => {
+      written.push(r.provider);
+      if (r.provider === "deepseek") throw new Error("icacls exited 1");
+    },
+    log: (s) => out.push(String(s)),
+    logError: (s) => errs.push(String(s)),
+  });
+
+  assert.deepEqual(written.sort(), ["deepseek", "groq"], "each record was handed to the writer");
+  const text = out.join("\n");
+  // Every count in the line carries its denominator, and the entries dropped at
+  // the cap are reported separately from the ids that were refused: they are two
+  // different findings and folding them would hide both.
+  assert.match(text, /ok\s+groq\s+2 kept of 9 listed, 1 refused, 6 past the cap/);
+  assert.match(text, /error\s+deepseek\s+429 rate-limited/);
+  assert.match(text, /coverage 1 of 2 eligible \(50%\), 2 attempted, 1 of 2 records cached/);
+  assert.match(errs.join("\n"), /cache write failed for deepseek: icacls exited 1/);
+  assert.equal(code, 1, "a run that could not cache every record does not exit 0");
+  assert.equal(`${text}\n${errs.join("\n")}`.includes(SENTINEL), false, "a key reached the report");
 });
 
 test("coverage carries its denominator and excludes no-endpoint", () => {
