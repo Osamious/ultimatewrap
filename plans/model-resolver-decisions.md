@@ -19,7 +19,7 @@ numbers since re-measured. They are recorded here only so a planner recognises a
 
 | superseded | actual *(measured)* | why it moved |
 |---|---|---|
-| "641 of 3,752 live rows join (17%)" | **3,046 of 3,784 (80%)** | the 17% used bare-tail matching only, and ignored the bundle's own `aliases[]` field (10,184 entries) and vendor-qualified tails |
+| "641 of 3,752 live rows join (17%)" | **3,046 of 3,784 (80%)** — **unguarded; the guarded rate is 65.0%** *(revision 10, §1 amendment 1)* | the 17% used bare-tail matching only, and ignored the bundle's own `aliases[]` field (10,184 entries) and vendor-qualified tails. The 80% remains the honest correction of the 17%, but it is a **provider-free** figure and must never be cited as an acceptance threshold for a §4.3-compliant join |
 | "~0 capable / 3,720 weak" | ~80% classified, ~20% weak | that was the live-only scenario, which D3 rejects |
 | "the other 23 providers hold one model each" | **22 providers, 1,374 live models, 77% join** | the "one row" described UW's current *output* under bundle-only discovery, not those providers' inventory. `nousresearch` alone lists 390 |
 | "1,281 phantoms" | ~738 unjoined of 3,784; phantom count is a separate quantity not re-measured | different denominators; the phantom set is bundle-rows-absent-from-live, measured per provider in the discovery pass |
@@ -34,7 +34,9 @@ Sources: CCR bundled `dist/models.json` (`schemaVersion: 2`, `generatedAt: 2026-
 aliases**) and `~/.maestro/model_cache.json` (live authenticated listings on the same 44 vault keys).
 No network call, no key read, in-process only.
 
-**Join ladder, over 2,136 distinct live id strings** *(measured)*:
+**Join ladder, over 2,136 distinct live id strings** *(measured)*. **The ladder below was measured by
+a provider-free matcher and does not describe a §4.3-compliant join** — amendment 1 below, revision
+10. The figures are kept as history and are labelled rather than deleted:
 
 | strategy | +hits | cumulative |
 |---|--:|--:|
@@ -42,13 +44,59 @@ No network call, no key read, in-process only.
 | normalisation (`models/`, `:free`/`:batch`, `.`→`-`) | 51 | 45% |
 | case-insensitive | 38 | 47% |
 | **vendor-qualified tail match** | 376 | 65% |
-| + `accounts/…/models/`, leading `~`, `[…]` suffix | | **70.9%** |
-| residual | 622 | 29.1% |
+| + `accounts/…/models/`, leading `~`, `[…]` suffix | **≤14** | **≤65.3%** *(corrected — amendment 2)* |
+| residual | **~742** | **~34.7%** *(corrected — amendment 2)* |
 
-**Per (provider, model) pair, 42 provider roots** *(measured)*: **3,784 live pairs, 3,046 join (80%)**.
+**Per (provider, model) pair, 42 provider roots** *(measured)*: **3,784 live pairs, 3,046 join (80%)
+— unguarded.** Re-measured to the row 2026-09-06 on the same denominator *(revision 10)*: **3,037 /
+3,784 = 80.3% loose, with no guard**, which reproduces the locked 3,046 (80%); and **2,460 / 3,784 =
+65.0% guarded, per §4.3**. The 80% figure is the ceiling of a matcher this design does not ship.
+**65.0% is the rate a §4.3-compliant join achieves**, and it is the figure R5's observable now states.
 Bundle-covered providers 82%; providers with zero bundle coverage 77%. Coverage is near-uniform
 once the join uses `aliases[]` and vendor-qualified tails — the bundle's *provider* coverage
 barely matters.
+
+**Amendment 1, 2026-09-07 — this section's ladder and R5's observable were not simultaneously
+satisfiable, and the cause is here, not in the implementation** *(revision 10)*.
+
+R5 shipped (`77c9cc6`) and its primary observable — *"≥75% of the 3,784 live (provider, model) pairs
+join"* — **failed**. Re-measurement found no defect in the join. It found a contradiction between two
+locked statements:
+
+- the rung table above **reproduces exactly** — 42.8 / 45.2 / 47.0 / 64.6 against its own 43 / 45 /
+  47 / 65 — **only** with a **provider-free matcher**: one with no provider in hand, which therefore
+  **cannot obey §4.3's same-provider guard**;
+- §4.3 is a **decision** and requires that guard.
+
+§1 is an observation of a prototype; §4.3 is a decision. They describe incompatible things, and no
+implementation can satisfy both. The rung table is therefore labelled, not repaired: it records what a
+provider-free matcher reaches, and **that is not this design's matcher**.
+
+**The guard stays. This is the user's decision, recorded as such** *(2026-09-07)*. The 577-pair gap
+between 3,037 and 2,460 closes at **Ship C, with first-party listing data** — R8 already keeps
+`contextLength` and `capabilityRaw` per model from each provider's own authenticated listing — **not
+with a cross-provider guess**.
+
+A uniqueness-gated rung was measured and **rejected**: **76.8%** of the refused pairs (447 of 577)
+have a bare id that is unique catalogue-wide, so a uniqueness gate would recover them — but **168 of
+458 multi-provider ids (37%) disagree on `ctx`**, so a row recovered that way inherits one arbitrary
+vendor's number. `inkling` carries six values from **65,536 to 1,048,576**; `mimo-v2.5-pro` four
+across **24 providers**. Recovering a row by attaching a wrong context window is a confident-wrong
+under [[models-used-as-designed]], and the honest miss is preferred. **Do not re-litigate the guard on
+reach grounds** — the reach is recovered at Ship C from the provider's own data.
+
+**Amendment 2, 2026-09-07 — the ladder's last rung is arithmetically impossible** *(revision 10)*.
+
+**What the table used to say:** the `accounts/…/models/` + leading `~` + `[…]` rung carried the
+cumulative from **65% to 70.9%**, i.e. **+5.9pp ≈ 126 ids**, with a **residual of 622 (29.1%)**.
+
+The live corpus cannot supply 126 ids for that rung. It holds **13** leading-`~` ids, **1** bracketed
+id (`kimi-k3[1M]`), and **0** `accounts/…/models/` ids — **14 total, a ceiling of 0.66pp** *(measured)*.
+The 13 is the same count §2.5 of the plan and D2's table below already carry, so this is the same
+corpus, not a different one. The corrected rung is therefore **≤14 hits, cumulative ≤65.3%**, and the
+residual moves with it to **~742 (~34.7%)** — arithmetic from the corrected ceiling, not an
+independent re-measurement. The prose below reading *"~622 unclassifiable ids"* inherits the same
+error and should be read as **~742**.
 
 **The residual is not a normalisation defect.** All string rules combined contribute ~89 hits (4%).
 What remains is two populations no rule can reach:
@@ -322,6 +370,19 @@ Bare names never join cross-provider. `auto`, `hy3`, `inkling`, `mistral` carry 
 and stay `null`. This is the measured false positive that loose matching produced in the bucketing
 work — `orcarouter/auto` matched `morph/auto`. Prefix present → join; absent → unknown.
 
+**Confirmed by the user 2026-09-07, after the guard's cost was measured** *(revision 10)*. The guard
+costs **577 (provider, model) pairs**: a §4.3-compliant join reaches **2,460 / 3,784 = 65.0%** where a
+provider-free matcher reaches **3,037 / 3,784 = 80.3%**. The user's decision is that **the guard
+stays**, and the reasoning is recorded in full at §1 amendment 1: the gap closes at **Ship C with
+first-party listing data**, and the uniqueness-gated rung that would have recovered 76.8% of the
+refused pairs was rejected because **37% of multi-provider ids disagree on `ctx`** — `inkling` carries
+six values from 65,536 to 1,048,576 — so a recovered row inherits one arbitrary vendor's window.
+
+**This section is the decision; §1's ladder is not.** §1's rung table was measured by a provider-free
+matcher and cannot obey this guard; where the two conflict, this section governs. That is the
+contradiction §1 amendment 1 resolves, and it is why R5's shipped observable failed on a correct
+implementation.
+
 ### 4.4 The bundle is enrichment, never a dependency
 
 Provenance makes the dependency explicit so a later swap — models.dev direct, or authenticated
@@ -343,6 +404,15 @@ assertion (`picker ⊆ models`), which widening *relaxes*. Independently shippab
 
 This is the B2 fix: ~1,501 rows currently resolve to `undefined` and fall through CCR policy 7 to
 `anthropic/claude-opus-5`, which is the silent substitution in #47/#48.
+
+***Correction, 2026-09-07 — the second clause is falsified and is withdrawn; step 1 itself is
+untouched*** *(revision 10, #74, OQ-6)*. R1 ran. The layer that substitutes in #47 is **Claude Code's
+`env.ANTHROPIC_MODEL` taking precedence over `settings.model`**, resolved client-side before the
+request is sent; CCR rewrote nothing on any of the 25 measured rows. **Step 1's widening is unchanged
+and still right** — it is justified on reach ([[route-max-working-models]]): ~1,501 rows do not route
+today and will. What is withdrawn is the claim that step 1 *fixes #47/#48*. It cannot: the override
+fires regardless of whether the selected model is recognized. See `plans/open-questions.md` OQ-6 and
+the plan's §1.2 / §1.6 corrections.
 
 **Amendment, 2026-09-06 — the candidate set is a union, not the discovered set. The widening is
 unchanged; only its floor is.** *(#58)*
@@ -634,8 +704,19 @@ provider-supplied deprecation field as a later enhancement.
 4. **`--verified-only` under never-prune** (#6) — it becomes a labeller and its name becomes wrong.
 5. **Provenance persistence and badging** — snapshot schema and badge vocabulary are unspecified,
    and the badge column is already fully spent on `FREE`/`FREE?`/`PLAN`/`PAID`/blank.
-6. **Which layer substitutes the model in #47** — not yet traced. Everything about honouring a
-   user's selection depends on it.
+6. **Which layer substitutes the model in #47** — ~~not yet traced~~ **TRACED 2026-09-07; this item
+   is answered** *(revision 10, #74, OQ-6)*. It is **Claude Code's `env.ANTHROPIC_MODEL` winning over
+   `settings.model`**, applied client-side before the request leaves Claude Code — **not** CCR's
+   `Router.builtInRules["claude-code"]`, which §1.2 and §1.6 of the plan had ruled in. Measured
+   read-only against the live gateway: 23 in-profile rows whose distinct `requestedModel` set is
+   exactly `{anthropic/claude-opus-5, anthropic/claude-sonnet-5}` while `settings.model` was
+   `anthropic/claude-haiku-4-5-20251001`, which appears in **zero** rows; `x-ccr-routed-model` equals
+   `requestedModel` on all 25. **The conditional is falsified too**: the documented behaviour
+   substitutes only *"when the client has not selected a recognized model"*, and
+   `claude-haiku-4-5-20251001` **is** recognized and routable — it is in the gateway's own
+   allowed-models list — and was overridden anyway. The override is **unconditional**.
+   Full record: `plans/open-questions.md` OQ-6. **Not fixed in this branch** — R1 was read-only, and
+   the remedy is a two-fields-of-`settings.json` problem, not a resolver one.
 7. **`autoFetchModels: false` is not enforced** (#44). It is the enforcement point for the whole
    remote-id gate and going wide raises the cost of a silent flip.
 

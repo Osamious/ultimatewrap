@@ -127,9 +127,14 @@ routing, and no `ANCHOR_PREFERENCE` change motivated by subagent behaviour.
 
 - **The boundary that matters, because issue #47's *title* records the misdiagnosis the user
   corrected** — "Subagent requests ignore the selected model". The user's correction was verbatim:
-  *"it wasn't CC subagents but the agent itself."* #47's in-scope half is **main-agent** substitution
-  — an unresolvable selection falling through CCR policy 7 to `anthropic/claude-opus-5` — and that is
-  exactly what D4 step 1 fixes. An executor opening #47 must read past the title.
+  *"it wasn't CC subagents but the agent itself."* #47's in-scope half is **main-agent** substitution.
+  An executor opening #47 must read past the title.
+  **Corrected 2026-09-07** *(revision 10, #74, OQ-6)*: this bullet used to continue *"— an
+  unresolvable selection falling through CCR policy 7 to `anthropic/claude-opus-5` — and that is
+  exactly what D4 step 1 fixes."* **Both halves are withdrawn.** R1 measured the layer as **Claude
+  Code's `env.ANTHROPIC_MODEL` winning over `settings.model`**, client-side and **unconditional**, so
+  D4 step 1 does not fix #47. The scope boundary this bullet draws is unaffected — main-agent is in,
+  subagent is out — and **#47 is not closed by anything in this branch**. See §1.2, §1.6.
 - **Near the line, and in scope:** R13's anchor assertion. It exists because `anchorModel`'s
   `built.picker[0].model` fallback silently repoints the six profile tiers when picker ordering
   changes under the widening. That is main-agent config integrity caused by this branch's own change.
@@ -407,18 +412,49 @@ this at its own site, including that no successor task in this plan closes it.
 Two things make step 1 a clear improvement anyway:
 
 - Those rows do not route at all today. Degraded-but-working beats not-working under Principle 1.
-- The status quo for them is worse than "undeclared": ~1,501 rows resolve to `undefined` and fall
-  through CCR policy 7 to `anthropic/claude-opus-5` — the **silent substitution** in #47/#48. A loud,
-  declared-maximal route replaces a silent wrong-model answer.
+- The status quo for them is worse than "undeclared": ~1,501 rows resolve to `undefined` and do not
+  route. A loud, declared-maximal route replaces a selection that goes nowhere. *(This bullet
+  previously ended *"…fall through CCR policy 7 to `anthropic/claude-opus-5` — the **silent
+  substitution** in #47/#48."* That attribution is withdrawn — see the correction below. The
+  resolution failure is real and measured; naming it as #47's mechanism was not.)*
 
-**This is now corroborated in the vendor's own words**, not inferred from behaviour. CCR's routing
-documentation describes the built-in Claude Code route as detecting requests from Claude Code and
-routing **main** requests to the Claude Code Agent Config model *"when the client has not selected a
-recognized model."* That is policy 7 stated by its author, and the operative phrase is **recognized**:
-the ~1,501 unresolvable rows are the documented *cause* of the substitution, not a symptom of it. It
-also fixes the direction of the remedy — widening the recognized set is the fix, so D4 step 1 is not
-a workaround for #47 but its root-cause repair. (Confirmed alongside: v3.0.22 is current, and the v1
-router fields are gone from both docs and source. Nothing in this plan references them.)
+**Correction, 2026-09-07 — R1 ran and falsified this paragraph. The substituting layer is not CCR's,
+and the conditional this paragraph rests on does not hold** *(revision 10, #74, OQ-6)*.
+
+**What this paragraph used to say.** *"This is now corroborated in the vendor's own words, not
+inferred from behaviour. CCR's routing documentation describes the built-in Claude Code route as
+detecting requests from Claude Code and routing **main** requests to the Claude Code Agent Config
+model 'when the client has not selected a recognized model.' That is policy 7 stated by its author,
+and the operative phrase is **recognized**: the ~1,501 unresolvable rows are the documented cause of
+the substitution, not a symptom of it. It also fixes the direction of the remedy — widening the
+recognized set is the fix, so D4 step 1 is not a workaround for #47 but its root-cause repair."*
+
+**The layer is wrong.** It is **Claude Code's `env.ANTHROPIC_MODEL` taking precedence over
+`settings.model`** — #47's open-question-1 **candidate 1**, which this section and §1.6 ruled **out**
+in favour of CCR's `Router.builtInRules["claude-code"]`. Measured read-only against the live gateway:
+**23 in-profile rows**, distinct `requestedModel` set exactly
+`{anthropic/claude-opus-5, anthropic/claude-sonnet-5}`, with `settings.model` pinned to
+`anthropic/claude-haiku-4-5-20251001` throughout and that id appearing in **zero** rows. The pin never
+reaches CCR, so CCR cannot be the layer that replaced it. `x-ccr-routed-model` equals `requestedModel`
+on **all 25** rows — **CCR rewrote nothing**. The substitution is resolved client-side, before the
+request leaves Claude Code.
+
+**The conditional is falsified too, and this is the load-bearing half.** The documented behaviour
+substitutes *"when the client has not selected a **recognized** model."*
+`claude-haiku-4-5-20251001` **is** recognized and routable — it is in the gateway's own allowed-models
+list, which the gateway enumerates in its own 400 body — and it was **overridden anyway**. The
+override is **unconditional**.
+
+**Therefore D4 step 1 / R11 is not #47's root-cause repair, and that justification is withdrawn.** It
+cannot be: **widening the *recognized* set cannot stop an override that fires regardless of
+recognition.** R11 remains fully justified — on **reach**, [[route-max-working-models]], pillar 1:
+~1,501 rows that do not route today will route. Only its #47/#48 justification goes. The remedy for
+#47 is a disagreement between two fields of `settings.json` that keysync itself writes, and it is
+**out of scope for this branch** (R1 is read-only; nothing here fixes it).
+
+Full record: `plans/open-questions.md` **OQ-6**, committed at `77fd735`; issue **#74**. *(Still true
+from the withdrawn paragraph, and retained: v3.0.22 is current, and the v1 router fields are gone from
+both docs and source. Nothing in this plan references them.)*
 
 **The reframing that should govern step 2 when it is scoped:** `modelPicker.options[]` is not "the
 menu", it is **the declaration registry**. Its size should be set by the `settings.json` parse budget
@@ -526,15 +562,43 @@ check or a reader. The new fields take `?? null` at the serialization site.
 
 ### 1.6 Item 6 — which layer substitutes the model in #47
 
-**Largely settled by the vendor documentation cited in §1.2; what remains is confirmation, not
-discovery.** #47's open question 1 offered two candidates — Claude Code's `ANTHROPIC_MODEL`
-precedence over `settings.model`, or CCR's `Router.builtInRules["claude-code"]`. The routing
-documentation names the second: the built-in Claude Code route sends **main** requests to the Agent
-Config model when the client has not selected a *recognized* model. `Router.fallback` is `mode:
-"off"`, so it was never that.
+**SETTLED BY MEASUREMENT, AND NOT AS THIS SECTION PREDICTED** *(revision 10, #74, OQ-6)*. R1 ran. It
+was written as a confirmation of a documented mechanism and it **falsified** that mechanism instead —
+which is what its own instruction to *"say so rather than fitting it"* asked for.
 
-R1 therefore shrinks to **one live confirmation**, because documentation is not a measurement and
-this is the fact pre-mortem scenario 3 rests on. It can run immediately; nothing blocks it.
+**The answer: Claude Code's `env.ANTHROPIC_MODEL` takes precedence over `settings.model`.** That is
+#47's open-question-1 **candidate 1** — the one this section ruled out. The substitution happens
+client-side, before the request is put on the wire. **CCR is not the substituting layer**:
+`x-ccr-routed-model` equals `requestedModel` on **all 25** measured rows, `x-ccr-route-reason` is only
+ever `default` or `custom-router`, and the pinned `anthropic/claude-haiku-4-5-20251001` appears in
+**zero** of the 23 in-profile rows. It never reached CCR at all.
+
+**And the conditional does not hold.** The documented behaviour substitutes *"when the client has not
+selected a **recognized** model"*. The pinned haiku id **is** recognized and routable — it is in the
+gateway's own allowed-models list — and was overridden regardless. **The override is unconditional**,
+so no widening of the recognized set can suppress it. This is why §1.2's *"root-cause repair"* claim
+for D4 step 1 / R11 is withdrawn there.
+
+**What this section used to say, and why it was wrong.** *"Largely settled by the vendor documentation
+cited in §1.2; what remains is confirmation, not discovery. #47's open question 1 offered two
+candidates — Claude Code's `ANTHROPIC_MODEL` precedence over `settings.model`, or CCR's
+`Router.builtInRules["claude-code"]`. The routing documentation names the second: the built-in Claude
+Code route sends **main** requests to the Agent Config model when the client has not selected a
+recognized model. `Router.fallback` is `mode: "off"`, so it was never that. R1 therefore shrinks to
+one live confirmation, because documentation is not a measurement and this is the fact pre-mortem
+scenario 3 rests on."*
+
+It read the vendor's documentation as naming the layer, and then treated the reading as settled enough
+that R1 became a formality. Two errors compound there: the documentation described a route that never
+fires for this traffic, and the section's own caveat — *"documentation is not a measurement"* — was
+stated and then not acted on. The `Router.fallback` observation stands and is retained; it simply
+excluded a third candidate rather than confirming the second.
+
+**Consequence, and the scope line.** The divergence is between two fields of `settings.json` that
+**keysync itself writes** — `model` (the pin uwpick writes) and `env.ANTHROPIC_MODEL` (the anchor
+keysync writes) — and it is resolved before any request is made. **Nothing in this branch fixes it**:
+R1 is read-only and confirmation-only, and a remedy aimed at `Router.builtInRules["claude-code"]`
+would miss entirely. Full record: `plans/open-questions.md` **OQ-6** (`77fd735`); issue **#74**.
 
 **Two of #47's three open questions are out of scope and R1 must not chase them:**
 
@@ -1253,6 +1317,16 @@ against.
 **WRITES:** `plans/open-questions.md` (append one OQ entry).
 **Parallel-safe with:** every other task in Ship A.
 
+> **DONE — ran 2026-09-06, committed `77fd735` as OQ-6. The prediction below did not hold, and the
+> task's own escape clause is what fired** *(revision 10, #74)*. The substituting layer is **Claude
+> Code's `env.ANTHROPIC_MODEL` taking precedence over `settings.model`**, not CCR's built-in Claude
+> Code route; and the documented conditional — substitute *"when the client has not selected a
+> **recognized** model"* — is **falsified**, because the pinned `anthropic/claude-haiku-4-5-20251001`
+> is recognized and routable and was overridden anyway. `x-ccr-routed-model` equals `requestedModel`
+> on all 25 rows: **CCR rewrote nothing**. §1.2 and §1.6 are corrected; §1.2's *"root-cause repair"*
+> claim for D4 step 1 / R11 and §8.2's *"#48 is materially reduced by R11"* are **withdrawn**. Read
+> the body below as the method that was used, not as a live prediction.
+
 **Confirmation, not discovery** — §1.2 records CCR's own routing documentation naming the built-in
 Claude Code route as the substituting layer for **main** requests when the client has not selected a
 *recognized* model. Documentation is not a measurement, and pre-mortem scenario 3 rests on this, so
@@ -1513,9 +1587,38 @@ part of the function, not of its caller:** an id with no vendor prefix never joi
 Greedier normalisation (date-suffix stripping, `-instruct` stripping) is out of scope and rejected.
 
 **Verify:** a one-off script joining `~/.maestro/model_cache.json` against the bundle **as a
-measurement fixture only — never as a runtime source**. Expected observable: ≥75% of the 3,784 live
-(provider, model) pairs join (locked figure 80%), and `orcarouter/auto` does **not** join
-`morph/auto`. Then `node --test "test/catalog-join.test.mjs"`.
+measurement fixture only — never as a runtime source**. Expected observable: **65.0% of the 3,784
+distinct live (provider, model) pairs, across 42 provider roots, join under the §4.3 same-provider
+guard — 2,460 pairs**; and `orcarouter/auto` does **not** join `morph/auto`. Then
+`node --test "test/catalog-join.test.mjs"`.
+
+**What that observable measures, stated because the previous one did not** *(revision 10)*. It is the
+**guarded** rate: the join with §4.3's same-provider guard applied, on the denominator of **3,784**
+distinct (root, id) pairs. It is **not** the loose rate. The two are 577 pairs apart and both are
+real:
+
+| matcher | pairs | rate |
+|---|--:|--:|
+| **guarded, per D3 §4.3 — what this task ships** | **2,460 / 3,784** | **65.0%** |
+| loose, no guard — reproduces the locked "3,046 (80%)" | 3,037 / 3,784 | 80.3% |
+
+**What this observable used to say, and why it could not pass** *(revision 10)*. It read *"≥75% of
+the 3,784 live (provider, model) pairs join (locked figure 80%)"*. **R5 shipped at `77c9cc6` and this
+observable failed.** The cause was **not** the implementation: a §4.3-compliant join cannot reach 75%,
+because the 80% locked figure was produced by a **provider-free** matcher — one with no provider in
+hand, which by construction cannot obey the same-provider guard. Decisions §1's rung table reproduces
+exactly (42.8 / 45.2 / 47.0 / 64.6 against its own 43 / 45 / 47 / 65) **only** under that
+provider-free matcher. So the threshold was measuring one thing and the task shipping another.
+**Decisions §1 is amended to label its ladder; §4.3 governs; and the threshold here moves to the
+measured guarded rate.** Nothing about R5's code is implicated, and this observable is not a
+loosening — it is the correct denominator's correct number.
+
+**The guard stays — the user's decision, recorded at decisions §4.3 and §1 amendment 1** *(2026-09-07)*.
+The 577-pair gap is real reach and is **not** paid for with a cross-provider guess: it closes at
+**Ship C, from first-party listing data**. The uniqueness-gated rung that would have recovered 447 of
+the 577 (76.8%) was measured and rejected — **168 of 458 multi-provider ids (37%) disagree on `ctx`**,
+so a recovered row inherits one arbitrary vendor's context window. Do not re-open this on reach
+grounds.
 
 ---
 
@@ -1524,6 +1627,28 @@ measurement fixture only — never as a runtime source**. Expected observable: �
 **WRITES:** `keysync/catalog-join.mjs` (one added export; `priceOf` itself unchanged),
 `menu/catalog.mjs` (`badgeOf` only), `test/catalog-join.test.mjs`, `test/catalog.test.mjs`.
 **Serial after:** R5. **Serial before:** R3, R14.
+
+> **SHIPPED — `e3667be`.** *(Revision 10: the record below is what happened, not what was predicted.
+> The design body that follows is retained as the reasoning that produced it.)*
+>
+> - **`hasPricedOffer` lives beside `priceOf` in `keysync/catalog-join.mjs`** and is **shared by both
+>   callers**, as designed — one owner of the #55 rule rather than two implementations of it.
+> - **It reads the whole offers array, and that stayed load-bearing in the shipped form:** on the sole
+>   survivor the **matched** offer *is* the `0/0`. A predicate trusting the matched offer would have
+>   blanked the one row that must keep its badge.
+> - **The predicate's asymmetry is now stated where it ships:** `true` is **proof of pricing**;
+>   **`false` is evidence of absence and not proof of it.** The named exception is a **genuinely free
+>   routing mode** — a provider offering its `auto` mode at no charge — which is real and is
+>   **deferred to #75**, folded into R14 above. Until then a free mode reads as price-absent, which is
+>   the honest-minimal direction rather than a confident-wrong one.
+> - **The corpus assertion shipped bundle-independent, not as an absolute count.** Pinning literal
+>   totals would make the suite fail on the next CCR bundle rather than on a regression — report 08
+>   F9's hazard, applied to a test.
+> - **The fixture gained `acme-free-1`, the mistral shape**, because `test/fixtures/catalog.json`
+>   **could not previously express a genuinely-free row** at all. Without it the discriminator is
+>   untestable and the whole zero-price branch is satisfiable by returning `""` unconditionally.
+> - **Measured effect: `FREE?` 124 → 1 across 1,588 rows**, sole survivor
+>   `mistral/labs-devstral-small-2512`.
 
 **Why a sibling task and not a fold, in one sentence each.** Folding into **R3** is the tempting fit
 because R3 owns the #55 rule — but R3's WRITES is `keysync/keysync.mjs`, its observable is a
@@ -1623,6 +1748,11 @@ the genuine free tier along with the lie:
   individually, so the diff is provably one branch wide;
 - a corpus assertion over the snapshot join: **`FREE?` falls from 124 to 1**, and **`PAID` (535),
   `PLAN` (4) and the total row count (1,588) are unchanged** — the blanks absorb exactly the 123.
+  ***As shipped this assertion is bundle-independent*** *(revision 10)*: it asserts the **relation** —
+  every surviving `FREE?` has a non-zero offer somewhere in its array, and `PAID`/`PLAN`/total are
+  unmoved — rather than the literal 124/1/535/4/1,588. Those numbers stay here as the **measurement
+  that motivated the change**; a test pinning them fails on the next CCR bundle instead of on a
+  regression, which is report 08 F9's hazard applied to the suite.
 
 **Mutation check** *(§6.4)*: **deleting the `hasPricedOffer` line must fail the first corpus
 assertion and the `openai/omni-moderation-latest` fixture, and nothing else.** Inverting it (badging
@@ -1735,6 +1865,21 @@ state that explicitly rather than pretending a behavioural test exists for dead 
 ---
 
 ### Ship C — security review + live-run authorization
+
+**This is where the join gap closes, and it closes with first-party data** *(revision 10)*. R5's
+guarded join reaches **2,460 of 3,784 pairs (65.0%)**; the **577 pairs** it refuses are refused by
+D3 §4.3's same-provider guard, which the user confirmed stays (decisions §4.3, §1 amendment 1). Those
+pairs are not recovered by loosening the matcher — they are recovered **here**, because R8's KEEP list
+already persists **`contextLength`** and **`capabilityRaw`** per model **from each provider's own
+authenticated listing**. A bare id served by 24 providers needs no cross-provider guess once each
+provider states its own window.
+
+Recorded so nobody re-litigates the guard later on reach grounds: the alternative — a
+uniqueness-gated rung recovering 447 of the 577 (76.8%) — was measured and **rejected**, because
+**168 of 458 multi-provider ids (37%) disagree on `ctx`** (`inkling`: six values, 65,536 to
+1,048,576; `mimo-v2.5-pro`: four across 24 providers). Loosening buys reach by attaching an arbitrary
+vendor's number to a row; Ship C buys the same reach with the provider's own. **The reach is deferred
+to this ship, not surrendered.**
 
 ---
 
@@ -1956,6 +2101,29 @@ half read from R10's cache, **uncapped**; `picker` keeps a cap
 under a **distinct renamed constant** `MAX_PICKER_MODELS_PER_PROVIDER`, **value 3, unchanged**, and
 ranked by the **two terms that actually exist** — R3's `outputKind` guard, then the R3-repaired
 free-first term, then id length. **No `localeCompare`** (A4, §1.2).
+
+#### R11 is not #47's root-cause repair. Its justification is reach, and only reach (#74, OQ-6)
+
+*(revision 10.)* **What the plan used to claim on this task's behalf**, at §1.2: *"widening the
+recognized set is the fix, so D4 step 1 is not a workaround for #47 but its root-cause repair."*
+
+R1 has run and falsified it. The substituting layer is **Claude Code's `env.ANTHROPIC_MODEL` taking
+precedence over `settings.model`**, applied client-side before the request reaches CCR — not CCR's
+`Router.builtInRules["claude-code"]`. **And the conditional is falsified, not merely the layer**: the
+documented route substitutes only *"when the client has not selected a **recognized** model"*, yet the
+pinned `anthropic/claude-haiku-4-5-20251001` **is** recognized and routable and was overridden anyway.
+**An override that fires regardless of recognition cannot be stopped by widening the recognized set.**
+R11 therefore could not be #47's root-cause repair under any implementation.
+
+**This changes nothing about whether R11 ships.** It is justified on **reach** —
+[[route-max-working-models]], pillar 1: ~1,501 rows resolve to `undefined` and do not route today, and
+after R11 they route. That was always the pillar-1 case for step 1 and it is untouched. What is
+withdrawn is the **#47/#48 justification** and the "root-cause repair" framing.
+
+**Two things an executor must not do with this.** Do not treat #47 as closed by R11 — it is not, and
+nothing in this branch fixes it. Do not widen R11's scope toward the real cause: the fix is a
+disagreement between two `settings.json` fields keysync writes, out of scope here. Record: OQ-6
+(`77fd735`), issue #74.
 
 #### The candidate set is a union, and "the full discovered set" would have pruned live providers (#58)
 
@@ -2342,6 +2510,57 @@ probe result and has no producer wired in this branch (§2.3).
 of the listing, and every catalogue-only row is still kept; only the label on those rows moves one
 rung. Nothing about the union changes.
 
+#### #75 addition: routing modes and non-LLM services are not models, and this task must stop rendering them as models
+
+*(Revision 10. Folded here because R14 owns the `capability` → `outputKind` precedence, which is the
+same decision surface.)*
+
+**The finding.** The catalogue carries rows that are not models, and every consumer treats them as
+models:
+
+- **`auto` exists under 8 providers with a 62× context spread** — `morph` at **32,000**, `kilo` at
+  **2,000,000**. That spread is not a disagreement about one model. Each row describes **that
+  provider's own pool**, so `ctx` is a property of a routing policy, not of anything that answers.
+- **`search` appears under 16 providers with `ctx: null`** — DuckDuckGo, Firecrawl, Exa. Those are
+  **services**, not chat models.
+- **Four reach the live picker today:** `openrouter/auto`, `kilo/auto` (both `ctx: 2,000,000`),
+  `orcarouter/auto`, `openrouter/router`.
+
+**What this task must do.** Classify such a row as a **mode**, alongside the `outputKind` decision it
+already makes:
+
+- **Do not present pool properties as model facts.** `ctx` and capability **must not render as model
+  values** on a mode row. A 2,000,000 window that describes a router's reach is a confident-wrong
+  about whatever eventually answers, which is exactly what [[models-used-as-designed]] forbids where a
+  value is not knowable.
+- **A mode must never feed `bucketFor`.** Its `ctx` is not the answering model's window, so the
+  context proxy branch (D3 §4.2, the `>= CTX_CAPABLE_MIN` promotion) would promote a row on a number
+  that belongs to a pool. `kilo/auto` at 2,000,000 would classify **capable** on no evidence about
+  any model.
+- **Price stays visible when it is real.** Providers often offer their auto mode **free**, and
+  `morph/auto` at **0.85 / 1.55** shows it can also be paid. Price is a fact about the mode itself —
+  it is what the user is actually billed — so it renders. This is the one property that does not
+  belong to the pool.
+- **Rows stay selectable. Never prune.** [[responding-provider-never-pruned]]. `auto` is a legitimate
+  thing to select; the defect is describing it wrongly, not offering it.
+
+**No hand-maintained name list.** A literal `["auto", "search", "router", …]` is exactly the label
+that goes stale the first time a provider invents a name, and the standing rule forbids a label that
+cannot be kept fresh ([[uwpick-shows-latest-functional-state]]). Classify from **signals**:
+
+| signal | availability |
+|---|---|
+| `ctx: null` alongside a text output declaration | today, from the bundle |
+| a **modality union across a pool** — an entry declaring more output modalities than any single model serves | today, from the bundle |
+| the **provider's own `capability` field** | once discovery lands; R8 keeps it as `capabilityRaw`, and this task already consumes `capability` for `outputKind` |
+
+The third is the durable one and arrives on the same input this task already reads, which is why the
+classification belongs here rather than in a later render task.
+
+**Scope fence.** This changes **how a mode row is described**, never **whether it exists**, and it
+touches no `BUCKET_TARGETS` value, no `ALLOWED_BEHAVES_AS` entry and not `CTX_CAPABLE_MIN` (§0.1) —
+it keeps mode rows **out of** the classifier rather than reclassifying anything.
+
 **Verify:** `node --test "test/catalog.test.mjs"`. Expected observables:
 - a model present **only** in `discovery` becomes a row, with `provenance: "listing-verified"`;
 - a model present only in the bundle becomes a row with `provenance: "catalogue-only"`;
@@ -2361,6 +2580,21 @@ rung. Nothing about the union changes.
 - **an id refused by `admitRemoteModels` appears in the row's `refused[]` with its reason, and does
   not appear in `models[]`** — the two lists are complementary, which is the property that makes the
   count in §2.5(a) meaningful.
+
+**#75 observables** *(revision 10)*:
+
+- a `ctx: null` row declaring text output (the `search` shape, 16 providers) classifies as a **mode**,
+  and its `ctx` and capability cells render as **not-a-model-value**, not as `?` and not as a number;
+- `kilo/auto` (`ctx: 2,000,000`) and `morph/auto` (`ctx: 32,000`) both classify as modes **from
+  signals, not from the string `auto`** — assert with a fixture whose id is *not* a known mode name,
+  so a hand-maintained list cannot satisfy this;
+- **a mode row never reaches `bucketFor`** — assert directly, because the 2,000,000 value would
+  otherwise promote it to the capable target through the D3 §4.2 proxy branch;
+- **`morph/auto` keeps a visible price of 0.85 / 1.55**, and a free auto mode keeps its free badge —
+  the discriminator that fails if price is suppressed along with the pool properties;
+- **all four live picker rows survive**: `openrouter/auto`, `kilo/auto`, `orcarouter/auto`,
+  `openrouter/router` are present and selectable after the change. **Mutation check:** a
+  classification that prunes a mode row must fail this assertion.
 
 ---
 
@@ -2711,6 +2945,31 @@ observable rather than assumed. R6's D1 narrowing and R13's census bound the bar
 Claude-shaped `hijackable` must stay 0 and every ambiguous bare id must fail closed. R1 traces the
 substitution layer so "which model answered" is answerable at all before anything goes live.
 
+**Correction, 2026-09-07 — R1 has run, and this scenario was aimed at the wrong layer** *(revision 10,
+#74, OQ-6)*. **What this scenario used to rest on:** that the substituting layer is CCR's built-in
+Claude Code route, so that widening the recognized set both causes and cures the repointing risk, and
+that R1 would confirm it. **It is not CCR's layer.** The substitution is **Claude Code's
+`env.ANTHROPIC_MODEL` taking precedence over `settings.model`**, resolved client-side; on all 25
+measured rows `x-ccr-routed-model` equals `requestedModel` and CCR rewrote nothing. Three consequences
+for this scenario, and the scenario **survives** all three:
+
+- **Mechanism (b) is unchanged and remains the real risk.** Bare-id binding at width is a CCR
+  `resolve()` stage-B4 property and has nothing to do with the substituting layer. R6 and R13 still
+  bound it, and `hijackable` must still stay 0.
+- **Mechanism (a) is unchanged.** `anchorModel`'s `built.picker[0].model` fallback is UW's own code
+  (`run.mjs:891`); R13's byte-identical anchor assertion is untouched. It is also now **more**
+  load-bearing, not less: the anchor keysync writes **is** `env.ANTHROPIC_MODEL`, which is the field
+  measured to win over the user's pin. A silent anchor repoint therefore silently repoints the
+  *effective* model for every main-agent request.
+- **The compounding clause is corrected.** This scenario said the widening's risk *"compounds with
+  #47's existing silent substitution."* It still compounds — but with an **unconditional client-side
+  override**, not with a CCR route that widening could switch off. A remedy aimed at
+  `Router.builtInRules["claude-code"]` would miss entirely, and none is proposed here.
+
+**R1's role is discharged, with a different finding than predicted.** Its "which model answered"
+method still works and is still what the detection check below uses; see OQ-6 (`77fd735`) for the
+measured record.
+
 **Detection.** The `--target live` apply is a **gated manual step requiring the user's explicit
 authorization** — it writes the real `~/.claude/settings.json` and restarts the CCR gateway.
 `built-rows.json` is written *before* any pruning, so a row lost to a transient failure is re-probed
@@ -2957,9 +3216,17 @@ genuinely out of scope, and saying *where* is the point.
 
 Two effects worth recording, because a reader tracking issues should not have to derive them:
 
-- **#48 is materially reduced by R11, as a side effect.** ~1,501 rows currently resolve to `undefined`
-  and fall through to a silent substitution; widening routing removes most of those dead selections.
-  #48's remaining half — the picker not *saying* anything at selection time — is untouched.
+- ~~**#48 is materially reduced by R11, as a side effect.**~~ **WITHDRAWN 2026-09-07** *(revision 10,
+  #74, OQ-6)*. **What this bullet used to say:** *"#48 is materially reduced by R11, as a side effect.
+  ~1,501 rows currently resolve to `undefined` and fall through to a silent substitution; widening
+  routing removes most of those dead selections. #48's remaining half — the picker not saying anything
+  at selection time — is untouched."* It falls with §1.2's root-cause claim, on which it depended. R1
+  measured the substituting layer as **Claude Code's `env.ANTHROPIC_MODEL` winning over
+  `settings.model`**, client-side, **unconditionally** — the pinned
+  `anthropic/claude-haiku-4-5-20251001` is recognized and routable and was overridden regardless. So
+  widening the routable set does not reduce the substitution at all, and R11 has **no measured effect
+  on #48**. What remains true and is retained: ~1,501 rows resolve to `undefined` today and will route
+  after R11. That is **reach**, booked under pillar 1 — not an #48 reduction.
 - **#3's 95%-dimmed ratio inverts.** `routable: false` today covers ~1,501 of 1,588 rows; after R11
   most become routable, so the dim stops being the page and starts being exceptional again. **That
   changes what the picker looks like more than any render task in Ship E**, and it happens in Ship D
