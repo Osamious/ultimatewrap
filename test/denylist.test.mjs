@@ -795,28 +795,67 @@ test("B1/L16: two providers SHARING a name are two matches, not one owner", () =
   assert.deepEqual(r.shadowed[0].owners, ["tabiai"]);
 });
 
-test("B1: the relay strip removes EVERY relay entry, not one per name", () => {
-  // COVERAGE FOR THE OTHER HALF OF ENTRY-COUNTING. `effective` is
-  // `owners.filter(o => o !== relay)`, which drops all matching elements. A
-  // strip that removed only the FIRST relay entry would leave a stale
-  // ["anthropic", "tokenrouter"] here -- length 2 -- and silently downgrade a
-  // real sole claim to a safe-looking ambiguity. That is an UNDER-report, the
-  // one direction this guard must never fail in, so it gets a fixture rather
-  // than an annotation: unlike the selector-side trim, this mutant is killable.
+test("B1: the relay's TWO entries for one selector are two matches, counted then deduplicated", () => {
+  // ITS SUBJECT WAS REMOVED BY A2, AND ITS OLD EXPECTATION WAS AN OVER-REPORT.
+  // This asserted `fatal: true` under the title "the relay strip removes EVERY
+  // relay entry, not one per name", guarding `effective = owners.filter(o => o
+  // !== relay)` against a strip that dropped only the first relay entry. There is
+  // no strip: A2 computes the verdict from the unstripped `owners`, so the
+  // mechanism this named no longer exists and the mutant it was built to kill has
+  // no line to be applied to.
   //
-  // The relay lists the id TWICE (routing auto-add can only add it once, but
-  // ownership must not depend on that) and does not vouch for it, so the strip
-  // fires on two entries.
+  // THE OLD VERDICT WAS WRONG, NOT MERELY OBSOLETE, AND THAT IS WHY THIS IS NOT A
+  // LOST PROTECTION. Stripping both relay entries left `["tokenrouter"]` and
+  // claimed a bind CCR would never make: `providerModelMatches` finds THREE
+  // matching entries here, `resolve()` sees `s.length > 1` and returns undefined,
+  // so nothing is routed anywhere. `shadowed` is the faithful verdict. Under #9
+  // the old FATAL was not a free over-caution either -- every false FATAL pushes
+  // the operator toward `--allow-bare-claude-names`, which disarms the guard for
+  // every id in the run.
+  //
+  // WHAT IS STILL LIVE, AND WHY THE FIXTURE IS KEPT RATHER THAN DELETED. A relay
+  // holding TWO matching entries for ONE selector is a shape no other test in this
+  // file produces, and entry counting is entirely alive. Routing auto-add can only
+  // add the id once, but ownership must not depend on that.
   const liveId = "claude-opus-4-1-20250805";   // in PROD_REAL_IDS, not curated
   const r = checkBareCollisions(
     [P("anthropic", liveId, liveId), P("tokenrouter", liveId)],
     { realIds: PROD_REAL_IDS, relayOwned: new Set(ANTHROPIC_FULL) });
-  assert.equal(r.fatal, true,
-    "both relay entries strip, leaving tokenrouter as the sole unvouched owner");
-  assert.deepEqual(r.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
-    [{ id: liveId, owner: "tokenrouter" }]);
-  assert.equal(r.hijackable[0].relayRoutes, true,
-    "the relay does route it -- that is why stripping, not absence, is what empties it");
+  assert.equal(r.fatal, false,
+    "three matching entries: resolve() returns undefined, so there is no bind to report");
+  assert.deepEqual(r.hijackable, []);
+  assert.deepEqual(r.shadowed.map((s) => s.id), [liveId]);
+  // THE COUNT AND THE RENDER, IN ONE ASSERTION. Three entries decided the verdict;
+  // two NAMES are shown, because the operator has two providers to look at, not
+  // three. Both halves of R0's work are pinned here -- ownership counts entries,
+  // deduplication happens only at render.
+  assert.deepEqual(r.shadowed[0].owners, ["anthropic", "tokenrouter"]);
+  assert.equal(r.shadowed[0].relayRoutes, true);
+  assert.equal(r.shadowed[0].vouched, false,
+    "the relay routes it and does not curate it, which the message must say");
+
+  // THE DISCRIMINATING CASE, and the reason the pair above is not enough: with
+  // tokenrouter removed the relay's two entries stand alone. Entry counting sees
+  // 2 and reports a shadowed finding whose owner list renders as ONE name. A
+  // name-keyed accumulator would see a single owner, that owner IS the relay, and
+  // the id would fall through both branches to no finding at all. This is the
+  // assertion a name-collapsing mutation cannot survive, and it is the relay-side
+  // half of entry counting that the deleted strip assertion used to cover.
+  const relayOnly = checkBareCollisions([P("anthropic", liveId, liveId)],
+    { realIds: PROD_REAL_IDS, relayOwned: new Set(ANTHROPIC_FULL) });
+  assert.equal(relayOnly.fatal, false);
+  assert.deepEqual(relayOnly.shadowed.map((s) => s.id), [liveId],
+    "two entries from one provider are still an ambiguity, even when that provider is us");
+  assert.deepEqual(relayOnly.shadowed[0].owners, ["anthropic"],
+    "counted as two, named once");
+
+  // ...and the control that proves the finding above came from the SECOND entry
+  // rather than from the relay's mere presence: one entry is one match, the sole
+  // owner is the relay, and there is nobody to be hijacked by.
+  const relayOnce = checkBareCollisions([P("anthropic", liveId)],
+    { realIds: PROD_REAL_IDS, relayOwned: new Set(ANTHROPIC_FULL) });
+  assert.deepEqual(relayOnce.shadowed, []);
+  assert.deepEqual(relayOnce.hijackable, []);
 });
 
 test("B1 control: entry-counting must not disarm the sole-owner FATAL", () => {
@@ -846,19 +885,34 @@ test("B1 control: entry-counting must not disarm the sole-owner FATAL", () => {
 
 const CURATED = new Set(ANTHROPIC_FULL);
 
-test("a reseller sole-claiming a live-but-UNCURATED id is still FATAL", () => {
-  // THE LOAD-BEARING TEST FOR THE REGRESSION. The relay is present in
-  // Providers[].models for this id -- exactly what routing auto-add produces --
-  // and that must NOT be what makes tabiai's sole claim acceptable. Delete the
-  // relayOwned check and this is the test that fails.
+test("R7 observable (b): a reseller co-claiming an UNCURATED id the relay routes is REPORTED, not fatal", () => {
+  // INVERTED BY A2 (plan §1.1, §6.0 row 5). This asserted `fatal: true` under the
+  // title "a reseller sole-claiming a live-but-UNCURATED id is still FATAL", and
+  // its stated rationale -- "the relay is present in Providers[].models for this
+  // id, and that must NOT be what makes tabiai's sole claim acceptable" --
+  // REVERSES. tabiai's claim is not sole: `providerModelMatches` finds the relay's
+  // entry AND tabiai's, `resolve()` sees `s.length > 1` and returns undefined, so
+  // CCR binds NOTHING and there is no hijack to report. The old verdict was a
+  // false positive on the one row where CCR already refuses to route.
+  //
+  // WHAT REPLACES THE PROTECTION IS THE MESSAGE, and that is what this now pins.
+  // The distinction the stripping used to enforce by classifying is still
+  // computed and now RENDERED: this ambiguity came from our own auto-add, not
+  // from a human review, and the operator is told so.
   const r = checkBareCollisions([
     { name: "anthropic", models: ["claude-opus-5", "claude-opus-4-8"] },   // auto-added
     P("tabiai", "claude-opus-4-8", "reseller-chat-1"),
   ], { realIds: new Set(["claude-opus-5", "claude-opus-4-8"]), relayOwned: CURATED });
-  assert.equal(r.fatal, true,
-    "our own config auto-adding an unreviewed id must never launder a reseller's sole claim");
-  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-4-8"]);
-  assert.equal(r.hijackable[0].owner, "tabiai", "the reseller is named, not the relay");
+  assert.equal(r.fatal, false,
+    "two matching entries, so resolve() returns undefined -- a clean failure, not a misroute");
+  assert.deepEqual(r.hijackable, [], "the sole-owner branch requires the relay to be ABSENT");
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["claude-opus-4-8"]);
+  assert.deepEqual(r.shadowed[0].owners, ["anthropic", "tabiai"],
+    "and the relay is named as the co-owner it really is");
+  assert.equal(r.shadowed[0].relayRoutes, true);
+  assert.equal(r.shadowed[0].vouched, false);
+  assert.match(r.message, /claude-opus-4-8 \(anthropic, tabiai; the relay routes this id but does not curate it\)/,
+    "H5: the note moved to the branch that can carry it, and it renders here");
 });
 
 test("a CURATED id co-owned by the relay stays a safe ambiguity, exactly as before", () => {
@@ -875,14 +929,20 @@ test("a CURATED id co-owned by the relay stays a safe ambiguity, exactly as befo
     "and the reported owner list stays truthful, relay included");
 });
 
-test("an uncurated id the relay ALONE serves is not a finding", () => {
-  // Stripping the relay must not manufacture findings either. Nobody else
-  // claims this id, so there is no one to be hijacked by.
+test("R7 observable (d): an uncurated id the relay ALONE serves is not a finding", () => {
+  // ASSERTIONS UNCHANGED, RATIONALE CORRECTED BY A2. This read "stripping the
+  // relay must not manufacture findings either", and there is no stripping any
+  // more, so that sentence described a mechanism the code no longer has. The
+  // verdict is identical and arrives by a different route: `owners` is length 1
+  // and its one member IS the relay, so it fails `owners[0] !== relay` and falls
+  // through the `> 1` branch too. Nobody else claims the id, so there is no one
+  // to be hijacked by -- which was always the real reason.
   const r = checkBareCollisions([{ name: "anthropic", models: ["claude-opus-4-8"] }],
     { realIds: new Set(["claude-opus-4-8"]), relayOwned: CURATED });
   assert.equal(r.fatal, false);
   assert.deepEqual(r.hijackable, []);
   assert.deepEqual(r.shadowed, []);
+  assert.equal(r.message, "no bare Claude-shaped collisions");
 });
 
 test("an uncurated id claimed by TWO resellers is shadowed, not fatal", () => {
@@ -897,14 +957,21 @@ test("an uncurated id claimed by TWO resellers is shadowed, not fatal", () => {
   assert.deepEqual(r.shadowed[0].owners, ["anthropic", "gorouter", "tabiai"]);
 });
 
-test("END TO END: the sets the pipeline derives really do keep the FATAL path armed", () => {
-  // MUTATION-FOUND GAP. The guard tests above pass `relayOwned: CURATED` by
-  // hand, and the derivation tests assert set shapes -- so a mutation at the
-  // ROOT CAUSE (`relayOwned: new Set(routingIds)`, which is literally what
-  // shipped) was caught only by an abstract invariant, never by anything showing
-  // the security consequence. Nothing exercised the WIRING, which is precisely
-  // where the regression lived. This test builds the sets the way run.mjs does
-  // and feeds them straight into the guard.
+test("END TO END: the sets the pipeline derives report an auto-add ambiguity, and still arm FATAL when the relay is absent", () => {
+  // INVERTED BY A2 (plan §1.1, §6.0 row 7). This is the most dangerous edit in
+  // the plan and the plan says so: this test was written specifically to catch
+  // the regression 3fa8025 fixed -- the regression A2 deliberately reverses --
+  // and its own comment read "Nothing exercised the WIRING, which is precisely
+  // where the regression lived." So the DERIVATION and the CONSTRUCTION are kept
+  // exactly as they were and only the verdict moves, and a relay-ABSENT fatal
+  // case is added below so the wired path still has a case that goes fatal.
+  // Flipping the boolean without that addition would leave the wiring untested,
+  // which is the failure this test exists to prevent.
+  //
+  // MUTATION-FOUND GAP, still the reason it is built this way. The guard tests
+  // above pass `relayOwned: CURATED` by hand and the derivation tests assert set
+  // shapes, so a mutation at the ROOT CAUSE (`relayOwned: new Set(routingIds)`,
+  // which is literally what shipped) was caught only by an abstract invariant.
   const live = new Set([...ANTHROPIC_FULL, "claude-opus-4-8"]);
   const { routingIds, relayOwned } = deriveAnthropicSets(live, ANTHROPIC_FULL);
   // The relay's Providers[] entry, exactly as the pipeline unshifts it.
@@ -914,9 +981,27 @@ test("END TO END: the sets the pipeline derives really do keep the FATAL path ar
   ];
   const realIds = new Set([...live, ...ANTHROPIC_RELAY.models]);
   const r = checkBareCollisions(providers, { realIds, relayOwned, relayRouting: routingIds });
-  assert.equal(r.fatal, true,
-    "auto-add put claude-opus-4-8 in the relay's models[]; that must not disarm the guard");
-  assert.deepEqual(r.hijackable.map((h) => h.id), ["claude-opus-4-8"]);
+  assert.equal(r.fatal, false,
+    "auto-add made the relay a co-owner, so resolve() finds two entries and binds nothing");
+  assert.deepEqual(r.hijackable, []);
+  assert.deepEqual(r.shadowed.map((s) => s.id), ["claude-opus-4-8"]);
+  assert.deepEqual(r.shadowed[0].owners, ["anthropic", "tabiai"],
+    "the relay is NAMED as co-owner, which is what makes the non-fatal verdict readable");
+  assert.match(r.message, /the relay routes this id but does not curate it/,
+    "and the auto-add origin of the ambiguity is still reported, per A2's reporting half");
+
+  // R7 OBSERVABLE (c) -- THE REPLACEMENT FATAL, BUILT THROUGH THE SAME WIRING.
+  // The relay is DOWN or --no-anthropic, so the pipeline never unshifts its
+  // entry: `owners = {tabiai}`, which IS resolve()'s bind condition. This is the
+  // genuine report-08-F1 hijack and it must stay fatal under A2. Without this
+  // case the end-to-end path would have no fatal left at all.
+  const relayDown = checkBareCollisions([P("tabiai", "claude-opus-4-8", "reseller-chat-1")],
+    { realIds, relayOwned, relayRouting: routingIds });
+  assert.equal(relayDown.fatal, true,
+    "one matching entry and it is not ours -- resolve() binds tabiai");
+  assert.deepEqual(relayDown.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+    [{ id: "claude-opus-4-8", owner: "tabiai" }]);
+
   // ...while a curated id in the same config is still the safe ambiguity.
   const curatedToo = checkBareCollisions([
     { name: "anthropic", models: [...routingIds] },
@@ -924,6 +1009,8 @@ test("END TO END: the sets the pipeline derives really do keep the FATAL path ar
   ], { realIds, relayOwned, relayRouting: routingIds });
   assert.equal(curatedToo.fatal, false);
   assert.deepEqual(curatedToo.shadowed.map((s) => s.id), ["claude-opus-5"]);
+  assert.doesNotMatch(curatedToo.message, /does not curate it/,
+    "a REVIEWED co-ownership must not be reported as an unreviewed one");
 });
 
 test("omitting relayOwned keeps the pre-auto-add behaviour intact", () => {
@@ -936,21 +1023,34 @@ test("omitting relayOwned keeps the pre-auto-add behaviour intact", () => {
   assert.equal(r.fatal, false, "with no vouching distinction the relay shields everything");
 });
 
-test("the remedy for an uncurated hijack is review, not an unachievable restart", () => {
-  // "Start the relay" is false advice here -- the relay is already running and
-  // already routes the id; starting it again changes nothing. The honest remedy
-  // is to review the id into ANTHROPIC_FULL, or take the opt-out.
+test("an uncurated id the relay already routes is REPORTED as such, and needs no remedy at all", () => {
+  // INVERTED BY A2 (plan §1.1a, §6.0 row 6): "becomes a reporting test or goes".
+  // It asserted `fatal: true` plus a remedy reading "the relay already routes
+  // these ids but they are not in the reviewed set (ANTHROPIC_FULL); review and
+  // add them". That remedy branch is DELETED, and its deletion is what this test
+  // now documents: the branch was gated on `h.relayRoutes`, and a hijackable
+  // finding requires the relay to be absent from `owners`, so the two conditions
+  // are contradictory and the branch could never be entered once `fatal` reads
+  // the unstripped set. There is no remedy to print because there is nothing to
+  // remedy -- CCR binds nothing on two matching entries.
+  //
+  // WHAT SURVIVES IS THE HONEST HALF. The old assertion `doesNotMatch(/start the
+  // Anthropic relay/)` is kept and still means what it meant: the relay is
+  // already running and already routes the id, so telling the operator to start
+  // it is advice that changes nothing.
   const r = checkBareCollisions([
     { name: "anthropic", models: ["claude-opus-4-8"] },
     P("tabiai", "claude-opus-4-8"),
   ], { realIds: new Set(["claude-opus-4-8"]), relayOwned: CURATED,
        relayRouting: new Set([...ANTHROPIC_FULL, "claude-opus-4-8"]) });
-  assert.equal(r.fatal, true);
+  assert.equal(r.fatal, false);
   assert.doesNotMatch(r.message, /start the Anthropic relay/);
-  assert.match(r.message, /ANTHROPIC_FULL/, "it must name where the review lands");
-  assert.match(r.message, /--allow-bare-claude-names/);
+  assert.doesNotMatch(r.message, /review and add/,
+    "the deleted branch's wording must not survive anywhere else in the message");
+  assert.doesNotMatch(r.message, /--allow-bare-claude-names/,
+    "an escape hatch is offered only where something is actually being blocked");
   assert.match(r.message, /routes this id but does not curate it/,
-    "and the finding line must say why the relay's ownership did not count");
+    "and the note still says why the relay's ownership is not a human review");
 });
 
 test("the remedy consults the EFFECTIVE routing set, not the static constant", () => {
@@ -965,6 +1065,72 @@ test("the remedy consults the EFFECTIVE routing set, not the static constant", (
   });
   assert.equal(r.fatal, true);
   assert.match(r.message, /start the Anthropic relay/);
+});
+
+test("R7 observable (a): a reseller sole-owning bare `opus` is FATAL, production-shaped", () => {
+  // THE REAL report-08-F1 SHAPE, AND IT IS UNCHANGED BY A2 -- `owners` and
+  // `owners \ {relay}` are the same list when the relay is not an owner, so the
+  // one row A2 moves is not this one. Constructed the way run.mjs:762,771-772
+  // does (#22): `realIds` = live u ANTHROPIC_RELAY.models, `relayOwned` and
+  // `relayRouting` from deriveAnthropicSets. A test that defaulted any of the
+  // three would exercise a path production never uses.
+  const { routingIds, relayOwned } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
+  const realIds = new Set([...LIVE, ...ANTHROPIC_RELAY.models]);
+  const r = checkBareCollisions([P("tabiai", "opus", "reseller-chat-1")],
+    { realIds, relayOwned, relayRouting: routingIds });
+  assert.equal(r.fatal, true, "one entry, not ours: resolve() binds it");
+  assert.deepEqual(r.hijackable.map((h) => ({ id: h.id, owner: h.owner })),
+    [{ id: "opus", owner: "tabiai" }]);
+  assert.deepEqual(r.shadowed, []);
+  assert.match(r.message, /--allow-bare-claude-names/);
+});
+
+test("R7/H5 COVERAGE: no reachable config produces a hijackable finding the relay routes", () => {
+  // A COVERAGE ASSERTION, NOT A BEHAVIOURAL ONE, AND THE DIFFERENCE IS STATED
+  // RATHER THAN PAPERED OVER. A2 deleted `routedNotVouched` and its remedy branch
+  // because both were gated on `h.relayRoutes`, which the hijackable branch makes
+  // structurally false. Re-introducing that branch would leave it UNREACHABLE, so
+  // no behavioural test can fail on it -- there is no input that enters it. What
+  // is falsifiable is the premise the deletion rests on, and that is what this
+  // exhausts: over every owner multiset drawable from {relay, tabiai, gorouter}
+  // up to size 3, on both the vouched and unvouched branch, no hijackable finding
+  // ever carries `relayRoutes: true`. If that ever becomes possible, the deleted
+  // branch was load-bearing and this test is the one that says so.
+  const NAMES = ["anthropic", "tabiai", "gorouter"];
+  const ID = "claude-opus-4-8";                       // real, live, not curated
+  const realIds = new Set([...ANTHROPIC_FULL, ID]);
+  let sawHijackable = 0, sawShadowedRelay = 0, cases = 0;
+  const multisets = [];
+  for (const a of NAMES) {
+    multisets.push([a]);
+    for (const b of NAMES) {
+      multisets.push([a, b]);
+      for (const c of NAMES) multisets.push([a, b, c]);
+    }
+  }
+  for (const owners of multisets) {
+    for (const relayOwned of [CURATED, new Set([...ANTHROPIC_FULL, ID])]) {
+      // One provider entry per owner slot -- entry-counting means duplicate names
+      // are two matches, which is exactly the shape that must not slip through.
+      const r = checkBareCollisions(owners.map((n) => P(n, ID)), { realIds, relayOwned });
+      cases++;
+      for (const h of r.hijackable) {
+        sawHijackable++;
+        assert.equal(h.relayRoutes, false,
+          `hijackable ${h.id} claimed the relay routes it, owners=[${owners}] -- the ` +
+          `deleted routedNotVouched branch would have been reachable after all`);
+        assert.doesNotMatch(r.message, /routes this id but does not curate it/);
+      }
+      for (const s of r.shadowed) if (s.relayRoutes && !s.vouched) sawShadowedRelay++;
+    }
+  }
+  // The exhaustion must have actually exercised both branches, or it proves
+  // nothing: an empty domain trivially satisfies a universal claim.
+  assert.equal(cases, 78, "39 owner multisets x 2 vouching states");
+  assert.ok(sawHijackable > 0, `${sawHijackable} hijackable findings were examined`);
+  assert.ok(sawShadowedRelay > 0,
+    `${sawShadowedRelay} shadowed findings DID carry the relay-routes-unvouched note, ` +
+    `so the note is reachable on the branch it moved to`);
 });
 
 test("an empty realIds set narrows everything away, rather than matching everything", () => {
@@ -1181,12 +1347,27 @@ test("routing auto-adds every live id, unioned with the curated set", () => {
   for (const id of ANTHROPIC_FULL) assert.equal(partial.routingIds.has(id), true);
 });
 
-test("relayOwned NEVER grows with live data -- the invariant the guard rests on", () => {
-  // THE REGRESSION TEST FOR THE REGRESSION'S CAUSE. `routingIds` and the guard's
-  // `realIds` both reduce to `live u curated`; if the VOUCHED set were computed
-  // the same way, the relay would own every id the guard considers and its FATAL
-  // path could never fire. relayOwned must stay curated-only, and must therefore
+test("relayOwned NEVER grows with live data -- the invariant the guard's REPORTING rests on", () => {
+  // RATIONALE-ONLY CORRECTION UNDER A2 (plan §1.1a, §6.0's trailing paragraph).
+  // Every assertion below is unchanged and still holds; what was false was the
+  // reason given for them. This read: "if the VOUCHED set were computed the same
+  // way, the relay would own every id the guard considers and its FATAL path
+  // could never fire." Under A2 the guard classifies from the unstripped
+  // `owners`, so the FATAL path is reachable by construction and no value of
+  // relayOwned can close it.
+  //
+  // WHAT REUNIFICATION WOULD ACTUALLY COST, WHICH IS WHY THE RULE STAYS.
+  // `vouched()` would become universally true, and the two things vouching still
+  // decides would both fail silently: the shadowed finding would stop saying "the
+  // relay routes this id but does not curate it", so an ambiguity our own
+  // auto-add manufactured would read identically to one a human reviewed; and
+  // `relayHelps` would start offering "start the Anthropic relay" for ids the
+  // relay merely routes -- the unachievable-remedy class claude-opus-4-8 taught
+  // this file not to print. relayOwned must stay curated-only, and must therefore
   // be a strict subset whenever live data adds anything.
+  //
+  // `routingIds` and the guard's `realIds` both reduce to `live u curated`, which
+  // is why computing the vouched set the same way is the tempting edit.
   const { routingIds, relayOwned, relayAliases } = deriveAnthropicSets(LIVE, ANTHROPIC_FULL);
 
   // Asserted as the INVARIANT, not as a literal set. The literal was

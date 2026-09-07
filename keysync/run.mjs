@@ -264,57 +264,85 @@ export function checkBareCollisions(providers, {
     byBare.set(sel, exact.length ? exact : matchingEntries((id) => id.toLowerCase() === folded));
   }
 
-  // VOUCHING vs MERELY ROUTING. This distinction is the whole of the fix for a
-  // HIGH regression this guard shipped with, and it is worth stating plainly
-  // because the bug was invisible in the diff of this function -- which did not
-  // change at all.
+  // VOUCHING vs MERELY ROUTING -- A REPORTING DISTINCTION, NOT A CLASSIFYING ONE.
+  // A2 (plan §1.1) moved the verdict off the stripped list and onto `owners`.
+  // What vouching still decides is the WORDING: whether the relay's co-ownership
+  // is something a human reviewed, or something routing auto-add produced on its
+  // own. It no longer decides who is hijackable.
   //
-  // Routing auto-add (a live /v1/models id joins Providers[].models on its own)
-  // meant the relay came to own every id `realIds` even considers, since both
-  // reduce to `liveCatalog.ids u ANTHROPIC_FULL`. The test below is
-  // `effective.length === 1 && effective[0] !== relay` -- on the STRIPPED list,
-  // not on `owners`, which stays unstripped precisely so the message can render
-  // the true co-owners -- so with the relay owning everything the FATAL path
-  // became STRUCTURALLY UNREACHABLE. Measured against
-  // live data: `claude-opus-4-8` is served by the relay and also listed by
-  // tabiai and gorouter, and it went from FATAL to a silent informational note.
+  // WHY THE STRIPPING LEFT THE VERDICT. It classified from `owners` minus the
+  // relay wherever the id was unvouched, so `{relay, tabiai}` read as a sole
+  // claim by tabiai and went FATAL. But `providerModelMatches` counts BOTH
+  // entries, `resolve()` sees `s.length > 1` and returns undefined -- it binds
+  // NOTHING, so there is no hijack to report. Every fatal the stripping added on
+  // that row was a false positive, and it could never remove a true one: where
+  // `|owners| === 1` and the relay is not among them, stripping removes nothing
+  // and the id stays hijackable. So the unstripped set is exactly CCR's bind
+  // condition -- under the two-stage, trimmed, ENTRY-counting ownership above,
+  // and ONLY under it. Name-keyed or single-stage ownership breaks the identity,
+  // which is what #53 and B1 were.
   //
-  // So the relay's ownership counts as SAFETY only where a human curated the id.
-  // Everywhere else the relay is stripped from the owner set before classifying:
-  // our own config auto-adding a name must never be what makes a reseller's
-  // sole claim on it look acceptable. Stripping cannot manufacture a finding
-  // either -- if the relay was the ONLY claimant, nothing remains to protect
-  // against and the id is simply dropped.
+  // WHAT THIS GIVES UP, STATED RATHER THAN IMPLIED. The HIGH regression
+  // `relayOwned` was added to fix -- routing auto-add making the relay a co-owner
+  // of every id, so `owners.size === 1 && !owners.has(relay)` could never be true
+  // -- is no longer prevented by stripping it back out. It does not need to be:
+  // the row auto-add silenced is a row CCR refuses to route. What replaces the
+  // stripping is the MESSAGE -- an unvouched co-ownership is named as such on the
+  // `shadowed` finding below instead of being classified into a fatal. The
+  // per-id escape hatch went with it; only the global --allow-bare-claude-names
+  // remains, and that is acceptable precisely because what fires is now CCR's own
+  // bind condition rather than a proxy for it.
+  //
+  // THE FIDELITY HAS A DEPENDENCY, and it is not decorative: it holds only while
+  // nothing but keysync mutates `Providers[].models`. `autoFetchModels: true`
+  // would let CCR discover models past `admitRemoteModels` and invisibly to this
+  // guard, so validate()'s V9 rule is load-bearing under A2 (#44).
   const vouched = (id) => relayOwned === null || relayOwned.has(id);
   const hijackable = [], shadowed = [];
   for (const [id, owners] of byBare) {
     const relayRoutes = owners.includes(relay);
-    const effective = vouched(id) ? owners : owners.filter((o) => o !== relay);
-    // NOTHING TO PROTECT AGAINST. Two ways to land here, and under #53's
-    // selector-keyed ownership the first is now THE COMMON CASE rather than a
-    // redundant one: every selector in the classification set that no enabled
-    // provider advertises -- most of `ANTHROPIC_ALIASES u realIds` in a typical
-    // config -- reaches this line with no matching entries. (The second way is
-    // the original one: the relay was the sole owner and stripping emptied the
-    // list.) The two branches below still both fail on length 0, so this
-    // `continue` remains behaviourally redundant against them AS THEY ARE
-    // WRITTEN; what is no longer true is the old comment's implication that
-    // reaching it is rare. Kept because it states the rule, and because an edit
-    // that turns the pair below into an if/else chain would otherwise silently
-    // start classifying an empty owner list.
-    if (effective.length === 0) continue;
-    if (effective.length === 1 && effective[0] !== relay) {
-      hijackable.push({ id, owner: effective[0], relayRoutes });
-    } else if (effective.length > 1) {
-      // The TRUE owner list is reported, relay included. Classification must not
-      // count the relay here, but a message that hides a real co-owner would be
-      // describing a config the operator does not have.
+    // NOTHING TO PROTECT AGAINST. Under #53's selector-keyed ownership this is
+    // THE COMMON CASE rather than a redundant one: every selector in the
+    // classification set that no enabled provider advertises -- most of
+    // `ANTHROPIC_ALIASES u realIds` in a typical config -- reaches this line with
+    // no matching entries. The second way in is GONE: it used to be "the relay
+    // was the sole owner and stripping emptied the list", and with no stripping
+    // that row now falls through both branches below instead (length 1, and the
+    // one owner IS the relay). The pair still both fail on length 0, so this
+    // `continue` stays behaviourally redundant AS THEY ARE WRITTEN; it is kept
+    // because it states the rule, and because an edit that turns the pair into an
+    // if/else chain would otherwise silently start classifying an empty list.
+    if (owners.length === 0) continue;
+    if (owners.length === 1 && owners[0] !== relay) {
+      // `relayRoutes` IS PROVABLY FALSE ON THIS BRANCH. Reaching it requires the
+      // relay to be absent from `owners`, and that absence is the whole of
+      // `relayRoutes`. The field is kept -- rather than written as a literal
+      // `false` -- so `relayHelps` below reads a computed fact, and it is passed
+      // through because a caller printing per-finding provenance (§6.6) should
+      // read the same fact the guard read.
+      //
+      // THIS IS WHY THE ROUTES-BUT-DOES-NOT-CURATE NOTE MOVED. Under the stripped
+      // verdict a hijackable finding could carry the relay as a co-owner, so the
+      // note rendered here; under A2 that shape is `shadowed`, and this branch can
+      // never carry it. `denylist.test.mjs` pins the emptiness with a COVERAGE
+      // assertion over the reachable owner domain, not a behavioural one -- a
+      // branch that cannot be entered cannot be observed failing.
+      hijackable.push({ id, owner: owners[0], relayRoutes });
+    } else if (owners.length > 1) {
+      // The TRUE owner list is reported, relay included -- a message that hid a
+      // real co-owner would describe a config the operator does not have.
       //
       // DEDUPLICATED ONLY HERE, at render. Ownership above counts entries, so a
       // single provider advertising `Opus` and `OPUS` arrives as two entries and
       // must be reported once -- the operator has one provider to look at, not
       // two. The COUNT is what decided the verdict; the NAMES are what is shown.
-      shadowed.push({ id, owners: [...new Set(owners)].sort() });
+      //
+      // BOTH FACTS ARE CARRIED, NOT THEIR CONJUNCTION: whether the relay routes
+      // the id, and whether it curates it. They answer different operator
+      // questions, and §6.6 requires both per finding.
+      shadowed.push({
+        id, owners: [...new Set(owners)].sort(), relayRoutes, vouched: vouched(id),
+      });
     }
   }
   hijackable.sort((a, b) => a.id.localeCompare(b.id));
@@ -343,25 +371,32 @@ export function checkBareCollisions(providers, {
     // changes nothing -- the precise class of unachievable remedy the
     // claude-opus-4-8 case already taught us not to print.
     const relayHelps = hijackable.filter((h) => !h.relayRoutes && wouldServe.has(h.id) && vouched(h.id));
-    const routedNotVouched = hijackable.filter((h) => h.relayRoutes && !vouched(h.id));
+    // A2 DELETED THE THIRD BRANCH. It read `routedNotVouched = hijackable.filter(
+    // (h) => h.relayRoutes && !vouched(h.id))` and printed "the relay already
+    // routes these ids but they are not in the reviewed set". Its guard required
+    // `h.relayRoutes`, which the hijackable branch above makes structurally
+    // false, so the filter is always empty and the branch is unreachable. It is
+    // DELETED rather than left: dead code that looks like a control reads as one,
+    // and the next reader would have to re-derive its emptiness to find out
+    // otherwise. Re-introducing it would not fail a behavioural test -- nothing
+    // can reach it -- so the coverage assertion in denylist.test.mjs is what
+    // stands in for one.
     const remedy = relayHelps.length === hijackable.length
       ? `start the Anthropic relay so it co-owns these ids and they become ambiguous, or `
       : relayHelps.length
         ? `start the Anthropic relay, which co-owns ${relayHelps.map((h) => h.id).join(", ")} ` +
           `but not the rest, and/or `
-        : routedNotVouched.length === hijackable.length
-          ? `the relay already routes ${routedNotVouched.length === 1 ? "this id" : "these ids"} but ` +
-            `${routedNotVouched.length === 1 ? "it is" : "they are"} not in the reviewed set ` +
-            `(ANTHROPIC_FULL), so that ownership is not treated as vouching for ` +
-            `${routedNotVouched.length === 1 ? "it" : "them"}; review and add ` +
-            `${routedNotVouched.map((h) => h.id).join(", ")} to ANTHROPIC_FULL in keysync.mjs, or `
-          : `the relay does not serve ${hijackable.length === 1 ? "this id" : "these ids"}, ` +
-            `so co-ownership cannot resolve ${hijackable.length === 1 ? "it" : "them"}; `;
+        : `the relay does not serve ${hijackable.length === 1 ? "this id" : "these ids"}, ` +
+          `so co-ownership cannot resolve ${hijackable.length === 1 ? "it" : "them"}; `;
     message =
       `SECURITY: ${hijackable.length} bare Claude-shaped model id(s) have a single ` +
       `owner this config does not vouch for:\n` +
-      hijackable.map((h) => `  ${h.id}  <-  sole owner: ${h.owner}` +
-        (h.relayRoutes ? `  (the relay routes this id but does not curate it)` : "")).join("\n") +
+      // NO PER-FINDING RELAY SUFFIX HERE. It used to read `(the relay routes this
+      // id but does not curate it)`; a sole owner that is not the relay means the
+      // relay does not route the id at all, so the suffix could only ever render
+      // as the empty string. It now renders on the `shadowed` branch below, which
+      // is the branch that CAN carry a relay co-owner.
+      hijackable.map((h) => `  ${h.id}  <-  sole owner: ${h.owner}`).join("\n") +
       `\nCCR's resolve() binds Claude Code's built-in rows to a uniquely-owned bare ` +
       `id, so the full system prompt, tool definitions and file contents would go ` +
       `to that host.\n` +
@@ -373,14 +408,32 @@ export function checkBareCollisions(providers, {
       // listing `Opus` and `OPUS` lands here with one name in the list, and
       // "more than one owner" in front of one name is the confident-wrong
       // message this file has a standing rule against.
+      //
+      // THE ROUTES-BUT-DOES-NOT-CURATE NOTE LIVES HERE NOW (A2/H5). It is the
+      // one place the relay can be a co-owner, so it is the one place the
+      // distinction is true. BOTH conjuncts are required: the relay being an
+      // owner is "routes", and only the absence of vouching makes it "does not
+      // curate" -- printing it on a curated co-ownership would tell the operator
+      // a reviewed id was unreviewed. It is what remains of the protection the
+      // stripping used to provide: this ambiguity is one our own auto-add
+      // produced, not one a human signed off.
       `note: bare Claude-shaped id(s) with more than one match -- ` +
-      `${shadowed.map((s) => `${s.id} (${s.owners.join(", ")})`).join("; ")}. ` +
+      `${shadowed.map((s) => `${s.id} (${s.owners.join(", ")}` +
+        (s.relayRoutes && !s.vouched
+          ? `; the relay routes this id but does not curate it`
+          : "") + `)`).join("; ")}. ` +
       `resolve() returns undefined on an ambiguous match, so this is a clean ` +
       `failure, not a misroute.`;
   } else {
     message = "no bare Claude-shaped collisions";
   }
 
+  // `fatal` IS COMPUTED FROM THE UNSTRIPPED OWNER SET (A2). The expression here
+  // did not change; what changed is that `hijackable` above is now derived from
+  // `owners` rather than from `owners` minus the relay. Stated at the return
+  // because this is the line a reader checks when asking what makes keysync exit,
+  // and the answer -- "exactly when CCR's resolve() would bind a bare Claude
+  // selector to a single non-relay host" -- is decided fifty lines up.
   return { hijackable, shadowed, fatal: hijackable.length > 0 && !allowBare, message };
 }
 
@@ -507,15 +560,36 @@ export function assertRelayNameUnclaimed(providers, relayName = ANTHROPIC_RELAY.
 }
 
 /**
- * The one invariant that keeps `checkBareCollisions`' FATAL path reachable.
+ * The one invariant that keeps `checkBareCollisions`' REPORTING honest.
  *
- * `relayOwned` is what the relay's ownership VOUCHES for and `routingIds` is
- * what it merely ROUTES. Auto-add grows routing with every live id; nothing may
- * ever grow the vouched set. If the two are reunified, every id the guard
- * considers becomes vouched, `effective` keeps the relay in every owner set, and
- * the sole-owner branch that reports a hijack can no longer be entered. That is
- * not a hypothetical -- it is the HIGH regression this branch shipped and fixed,
- * and it was invisible in the diff of the guard itself, which did not change.
+ * CORRECTED UNDER A2 (plan §1.1a). This opened "the one invariant that keeps
+ * `checkBareCollisions`' FATAL path reachable", and that is now FALSE. The guard
+ * classifies from the unstripped `owners`, so the sole-owner branch is reachable
+ * BY CONSTRUCTION -- it is CCR's own bind condition, and no value of `relayOwned`
+ * can close it. Leaving the old sentence would have handed the next reader a
+ * confident, wrong account of what this invariant protects, which is the failure
+ * mode `menu/catalog.mjs:112-122` carries a standing rule against.
+ *
+ * WHAT IT PROTECTS INSTEAD, AND IT IS STILL WORTH ASSERTING. `relayOwned` is what
+ * the relay's ownership VOUCHES for and `routingIds` is what it merely ROUTES.
+ * Auto-add grows routing with every live id; nothing may ever grow the vouched
+ * set. If the two are reunified, `vouched()` becomes universally true and the
+ * guard loses the two things vouching still decides: the `shadowed` finding stops
+ * saying "the relay routes this id but does not curate it" -- so an ambiguity our
+ * own auto-add manufactured becomes indistinguishable from one a human reviewed
+ * -- and `relayHelps` starts offering "start the Anthropic relay" for ids the
+ * relay merely routes, which is the unachievable-remedy class the
+ * `claude-opus-4-8` case taught this file not to print.
+ *
+ * THE ERROR MESSAGE BELOW STILL SAYS "FATAL sole-owner path", AND IS LEFT ALONE
+ * DELIBERATELY. It is asserted verbatim by the reunification test, and R7's
+ * mandate is that this function's assertions are unchanged; correcting the string
+ * would invert an assertion outside R7's enumerated three. Recorded as a
+ * follow-up rather than silently repaired.
+ *
+ * That reunification is not a hypothetical -- it is the HIGH regression this
+ * branch shipped and fixed, and it was invisible in the diff of the guard itself,
+ * which did not change.
  *
  * THE OLD SHAPE OF THIS CHECK COULD NOT FIRE ON THE FAILURE IT NAMED. It was
  * `relayOwned.size > routingIds.size`, and reunification makes the two sets
