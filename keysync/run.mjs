@@ -988,11 +988,14 @@ if (has("--verified-only")) {
   // Says what was pruned AND what was not. The old line reported a surviving
   // provider count, which read as verification while the flag was truncating
   // routing behind it.
-  console.log(`--verified-only: ${built.picker.length} of ${builtAll.picker.length} picker rows ` +
-    `survive; routing untouched (${built.providers.length} providers)`);
-  // Routing can no longer reach zero from this flag, but the picker can, and a
-  // zero-row picker passes validation and then crashes when anchoring the
-  // profile. The count check below cannot catch it: it counts providers.
+  console.log(`--verified-only: ${built.picker.length} of ${builtAll.picker.length} pre-relay picker ` +
+    `rows survive; routing untouched (${built.providers.length} providers, pre-relay)`);
+  // Routing can no longer reach zero from this flag, but the picker can. With
+  // the relay on, a zero-row picker still leaves ANTHROPIC_TIERS.model as the
+  // anchor and would not crash -- but shipping zero third-party rows on an
+  // explicit verification flag is a silent no-op worth refusing outright
+  // regardless of anchor safety. The count check below cannot catch it: it
+  // counts providers.
   if (!built.picker.length) {
     console.error("--verified-only pruned every row — nothing to apply. Re-run verify-cli.mjs.");
     process.exit(2);
