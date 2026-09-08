@@ -52,7 +52,7 @@
 // sanitise every id and to show the answering hostname on every row -- not a
 // reason to refuse the models they sell.
 
-import { admitId, sanitizeDisplay } from "./sanitize.mjs";
+import { admitId, classifyRefusal, sanitizeDisplay } from "./sanitize.mjs";
 
 // Anchored. The trailing group means "opus" and "opus-4-8" match while
 // "opusculum" and "hakuna" do not -- the boundary must be a separator, a digit,
@@ -106,6 +106,20 @@ export const UW_ALIAS = /^uw\//i;
 // resolver both read it, which is why it is exported.
 export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.test(String(id ?? ""));
 
+// THE ONLY CONSTRUCTOR OF A REJECTION, so the sanitised form is the only form
+// that exists past this point (#52). There is deliberately no second field
+// holding the raw string "for debugging": that is not a smaller version of the
+// egress, it IS the egress, relocated.
+//
+// `Math.max(0, ...)` is not defensive padding. NFC can LENGTHEN a string in the
+// composition-exclusion cases (U+0958 and its family decompose to two code
+// points and do not recompose), so the delta is genuinely signed, and a negative
+// "removed" count in a security list would read as nonsense.
+const refusal = (raw, reason) => {
+  const id = sanitizeDisplay(raw);
+  return { id, reason, removed: Math.max(0, [...String(raw ?? "")].length - [...id].length) };
+};
+
 /**
  * @param {string}   providerName
  * @param {string[]} ids
@@ -122,8 +136,23 @@ export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.te
  *                  rejections across all 4,298 bundled ids today, so this is
  *                  latent -- but it goes live with Task B6, where discovery
  *                  returns raw provider strings instead of a curated bundle.
- * @returns {{kept: string[], rejected: string[]}} `rejected` holds the
- *                  DISPLAY-SAFE form of each refused name, never the raw one.
+ * @returns {{kept: string[], rejected: {id: string, reason: string, removed: number}[]}}
+ *                  `rejected` holds the DISPLAY-SAFE form of each refused name,
+ *                  never the raw one, plus the reason code (#51) and `removed`,
+ *                  the number of code points the raw string had that the display
+ *                  form does not. `removed` counts stripping, NFC composition and
+ *                  the 80-code-point cap together -- all three are ways what was
+ *                  advertised differs from what is shown, which is the one thing
+ *                  a reader of the withheld list needs told.
+ *
+ * THE BOUNDARY OF THIS GUARANTEE, stated because the claim is what makes it
+ * dangerous (#24). One safe representation means this path cannot acquire a new
+ * hole when someone adds the next consumer -- and that is true of THIS path
+ * only. `keysync/anthropic-catalog.mjs` feeds relay ids into `deriveAnthropicSets`
+ * -> `Providers[].models` without calling `admitId` or `admitRemoteModels` at
+ * all. That is #24, it is not covered here, and the risk this note exists to
+ * defuse is that a completeness framing makes the second path harder to notice
+ * afterwards than it is today.
  */
 export function admitRemoteModels(providerName, ids, { trusted = "anthropic", warn = true } = {}) {
   const kept = [], rejected = [];
@@ -149,22 +178,27 @@ export function admitRemoteModels(providerName, ids, { trusted = "anthropic", wa
     // OSC 52 -- a clipboard write. A provider listing could put content into
     // the operator's clipboard THROUGH the warning that refused it.
     //
-    // Both branches sanitise, so the invariant is a property of the array
-    // rather than of the caller's discipline. `sanitizeDisplay`'s 80-code-point
-    // cap is accepted here: a rejected name is by definition not a routing
-    // selector, so its exact length is not load-bearing, and an unbounded
-    // provider string in a security line is itself a way to flood a terminal.
-    if (!id) { rejected.push(sanitizeDisplay(raw)); continue; }
+    // Both branches go through `refusal`, so the invariant is a property of the
+    // array rather than of the caller's discipline. `sanitizeDisplay`'s
+    // 80-code-point cap is accepted here: a rejected name is by definition not a
+    // routing selector, so its exact length is not load-bearing, and an
+    // unbounded provider string in a security line is itself a way to flood a
+    // terminal. What the cap costs is now stated rather than swallowed -- it is
+    // part of `removed`.
+    if (!id) { rejected.push(refusal(raw, classifyRefusal(raw))); continue; }
     // RULE 2. This line was `if (!exempt && isReserved(id))`. `isReserved` is
     // still exported and still true for Claude names -- it is now consumed by
     // the collision guard, which can see the ownership this loop cannot. Do not
     // reinstate it here: doing so drops every model tabiai and gorouter sell.
-    if (!exempt && UW_ALIAS.test(id)) { rejected.push(sanitizeDisplay(id)); continue; }
+    // `uw-namespace` is the one reason `classifyRefusal` cannot produce: this id
+    // PASSED `admitId`, and whether it is refused depends on `providerName`,
+    // which sanitize.mjs never sees. Named here, at the branch that owns it.
+    if (!exempt && UW_ALIAS.test(id)) { rejected.push(refusal(id, "uw-namespace")); continue; }
     kept.push(id);
   }
   if (warn && rejected.length) {
     console.warn(`SECURITY: provider "${providerName}" advertised ${rejected.length} ` +
-      `rejected model name(s): ${rejected.slice(0, 10).join(", ")}`);
+      `rejected model name(s): ${rejected.slice(0, 10).map((r) => r.id).join(", ")}`);
   }
   return { kept, rejected };
 }

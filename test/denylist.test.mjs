@@ -85,7 +85,66 @@ test("admitRemoteModels still admits the relay's own names", () => {
 test("admitRemoteModels still rejects the uw/ namespace from a non-relay provider", () => {
   const r = admitRemoteModels("tokenrouter", ["qwen3-max", "uw/fast", "uw/slot-1"]);
   assert.deepEqual(r.kept, ["qwen3-max"]);
-  assert.deepEqual(r.rejected, ["uw/fast", "uw/slot-1"]);
+  // `uw-namespace` is the one reason `classifyRefusal` cannot produce: these ids
+  // PASS `admitId`, and whether they are refused depends on the provider, which
+  // sanitize.mjs never sees. `removed` is 0 because nothing was stripped -- the
+  // name is reported in full, which is what makes the warning actionable.
+  assert.deepEqual(r.rejected, [
+    { id: "uw/fast",   reason: "uw-namespace", removed: 0 },
+    { id: "uw/slot-1", reason: "uw-namespace", removed: 0 },
+  ]);
+});
+
+test("the relay itself is exempt: uw/ from `anthropic` is no refusal at all", () => {
+  // The other half of the same rule, and it must be "no entry", not "an entry
+  // with a benign reason" -- the withheld count in the picker is derived from
+  // `rejected.length`, so an exempt id appearing there at all would report our
+  // own relay as withholding models from us.
+  const r = admitRemoteModels("anthropic", ["uw/fast", "uw/slot-1", "claude-opus-5"]);
+  assert.deepEqual(r.rejected, []);
+  assert.deepEqual(r.kept, ["uw/fast", "uw/slot-1", "claude-opus-5"]);
+});
+
+test("every admitId rule reaches `rejected` under its own reason code", () => {
+  // One fixture per code, asserting the CODE rather than the refusal. The pair
+  // (id, reason) is what the withheld overlay renders, so a collapsed pair of
+  // codes shows a user the wrong explanation for a missing model -- which is
+  // worse than #51's silence, because it is silence that looks like an answer.
+  //
+  // `uw-namespace` is included here and nowhere in sanitize.test.mjs, because
+  // this is the only layer that can produce it.
+  const cases = [
+    ["bad\x1b[2J",   "escape-sequence"],
+    ["bell\x07",     "control-char"],
+    ["a\u202Eb",    "invisible"],
+    ["a b",          "whitespace"],
+    ["a..b",         "traversal"],
+    ["-lead",        "leading-separator"],
+    ["@/f",          "bad-scope"],
+    ["x".repeat(129), "too-long"],
+    ["uw/fast",      "uw-namespace"],
+  ];
+  const r = admitRemoteModels("acme", cases.map(([id]) => id), { warn: false });
+  assert.deepEqual(r.kept, [], "every fixture must actually be refused, or this proves nothing");
+  assert.deepEqual(r.rejected.map((x) => x.reason), cases.map(([, code]) => code));
+});
+
+test("a rejection carries exactly {id, reason, removed} and no fourth field", () => {
+  // THE #52 MUTATION GUARD. Reintroducing the raw string under any name -- `raw`,
+  // `original`, `advertised` -- moves the egress rather than removing it, and the
+  // stderr observable alone would not catch it, because the warn line reads `.id`.
+  // So the shape itself is asserted, and then every string anywhere in the object
+  // is scanned, which catches a raw field whatever it is called.
+  const r = admitRemoteModels("acme", ["evil\x1b[2J", "\u202Eexe.gnp"], { warn: false });
+  for (const entry of r.rejected) {
+    assert.deepEqual(Object.keys(entry).sort(), ["id", "reason", "removed"],
+      `a rejection grew a field: ${JSON.stringify(entry)}`);
+    for (const v of Object.values(entry)) {
+      if (typeof v !== "string") continue;
+      assert.equal(TERMINAL_HOSTILE.test(v), false,
+        `a rejection holds a terminal-hostile code point: ${JSON.stringify(entry)}`);
+    }
+  }
 });
 
 // isReserved is unchanged and still exported: it is now a SHAPE predicate that
@@ -147,7 +206,7 @@ test("#52: a refused id reaches neither `rejected` nor the SECURITY line raw", (
 
   assert.deepEqual(r.kept, [], "every fixture must actually be refused, or this proves nothing");
   assert.equal(r.rejected.length, hostile.length);
-  for (const id of r.rejected) {
+  for (const { id } of r.rejected) {
     assert.equal(TERMINAL_HOSTILE.test(id), false,
       `rejected[] holds a terminal-hostile code point: ${JSON.stringify(id)}`);
   }
@@ -156,7 +215,8 @@ test("#52: a refused id reaches neither `rejected` nor the SECURITY line raw", (
   // denies all three -- so sanitising there is structural rather than
   // load-bearing, and this asserts the name survives intact rather than that
   // anything was stripped from it.
-  assert.ok(r.rejected.includes("uw/fast"), "the UW_ALIAS branch still reports its id in full");
+  assert.ok(r.rejected.some((x) => x.id === "uw/fast" && x.removed === 0),
+    "the UW_ALIAS branch still reports its id in full");
 
   assert.equal(warnings.length, 1, "one SECURITY line for the batch");
   assert.equal(TERMINAL_HOSTILE.test(warnings[0]), false,
@@ -164,6 +224,62 @@ test("#52: a refused id reaches neither `rejected` nor the SECURITY line raw", (
   assert.equal(warnings[0].includes("\x1b"), false, "no ESC");
   assert.equal(warnings[0].includes("\x07"), false, "no BEL");
   assert.match(warnings[0], /SECURITY: provider "tabiai" advertised 7 rejected model name/);
+});
+
+test("#52 closing observable: the two attack fixtures, asserted on the RETURNED value", () => {
+  // Asserted on what `admitRemoteModels` RETURNS, not on what this test then
+  // does with it. That is the difference between "the one consumer under test is
+  // safe" and "every future consumer is", and #52 is a finding about a consumer
+  // nobody had written yet -- the warn line was the first, not the last.
+  const ESC_ID = "evil\x1b[2J";                 // CSI erase-display
+  const RLO_ID = "‮exe.gnp";               // renders as a different name entirely
+  const r = admitRemoteModels("tabiai", [ESC_ID, RLO_ID], { warn: false });
+
+  assert.deepEqual(r.kept, []);
+  assert.equal(r.rejected.length, 2);
+
+  const [esc, rlo] = r.rejected;
+  assert.equal(esc.id.includes("\x1b"), false, "the ESC survived into `rejected`");
+  assert.equal(esc.reason, "escape-sequence");
+  assert.ok(esc.removed > 0, `nothing was reported stripped from ${JSON.stringify(ESC_ID)}`);
+
+  assert.equal(rlo.id.includes("‮"), false, "U+202E survived into `rejected`");
+  assert.equal(rlo.reason, "invisible");
+  assert.ok(rlo.removed > 0, `nothing was reported stripped from ${JSON.stringify(RLO_ID)}`);
+
+  // `removed` is a count of code points, and it must be the real one -- a
+  // hardcoded 1 would satisfy `> 0` while telling a reader nothing.
+  assert.equal(esc.removed, [...ESC_ID].length - [...esc.id].length);
+  assert.equal(rlo.removed, 1, "exactly the one RLO was removed");
+});
+
+test("#52: real stderr from a warn:true call carries no ESC and no U+202E", () => {
+  // The observable that fails on `main`, asserted against ACTUAL PROCESS STDERR
+  // rather than a `console.warn` override. The override above proves the string
+  // handed to console.warn is clean; only this proves the bytes that reach the
+  // terminal are, which is what #52 is about. A child process is the only way to
+  // read them.
+  const src = `
+    import { admitRemoteModels } from ${JSON.stringify(pathToFileURL(
+      path.join(HERE, "..", "menu", "denylist.mjs")).href)};
+    admitRemoteModels("tabiai", [
+      "evil\\u001b[2J\\u001b]52;c;aGk=\\u0007",
+      "\\u202Eexe.gnp",
+      "bell\\u0007",
+      "uw/fast",
+    ], { warn: true });
+  `;
+  const out = spawnSync(process.execPath, ["--input-type=module"],
+    { input: src, encoding: "utf8" });
+
+  assert.equal(out.status, 0, `child failed: ${out.stderr}`);
+  assert.match(out.stderr, /SECURITY: provider "tabiai" advertised 4 rejected model name/,
+    "the warning must actually have been emitted, or this asserts nothing");
+  assert.equal(out.stderr.includes("\x1b"), false, "an ESC reached the terminal");
+  assert.equal(out.stderr.includes("\x07"), false, "a BEL reached the terminal");
+  assert.equal(out.stderr.includes("‮"), false, "U+202E reached the terminal");
+  assert.equal(TERMINAL_HOSTILE.test(out.stderr.replace(/\r?\n/g, "")), false,
+    `stderr carries a terminal-hostile code point: ${JSON.stringify(out.stderr)}`);
 });
 
 test("a provider with no testModel produces no SECURITY warning", () => {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sanitizeDisplay, admitId } from "../menu/sanitize.mjs";
+import { sanitizeDisplay, admitId, classifyRefusal } from "../menu/sanitize.mjs";
 
 test("strips CSI sequences", () => {
   assert.equal(sanitizeDisplay("a\x1b[2Jb"), "ab");
@@ -362,4 +362,121 @@ test("no id admitId admits can carry an escape, a control, or a listed invisible
     assert.equal(/[\x00-\x1f\x7f-\x9f]/.test(admitted), false,
       `admitted ${JSON.stringify(c)} carries a control character`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// classifyRefusal (#51): the discriminator admitId never had.
+// ---------------------------------------------------------------------------
+
+// One fixture per reason code, and each one is chosen to trip EXACTLY its own
+// rule -- no fixture here satisfies two rows of the table. That is what gives
+// this list its mutation property: collapse any two codes into one and exactly
+// that pair's cases fail, because no third case was covering for them.
+//
+// The `code` is asserted, never merely "it was refused". A test that only
+// checked for refusal would pass against `admitId` alone and prove nothing this
+// task added.
+const REFUSAL_CASES = [
+  ["empty",             "",                       "the empty string"],
+  ["escape-sequence",   "bad\x1b[2J",             "CSI erase-display"],
+  ["escape-sequence",   "x\x1b]52;c;aGk=\x07y",   "OSC 52 clipboard write"],
+  ["control-char",      "a\x07b",                 "BEL, with no ESC anywhere"],
+  ["control-char",      "a\x00b",                 "NUL"],
+  ["control-char",      "a\x7fb",                 "DEL"],
+  ["control-char",      "a\x9bb",                 "C1"],
+  ["control-char",      "a\tb",                   "tab is 0x09, INSIDE CTRL -- not whitespace"],
+  ["invisible",         "a\u202Eb",               "U+202E RLO -- neither C0 nor C1"],
+  ["invisible",         "a\u200Bb",               "U+200B zero-width space"],
+  ["whitespace",        "a b",                    "0x20, which is outside CTRL"],
+  ["whitespace",        " opus",                  "the #53/A1 shape"],
+  ["whitespace",        "opus ",                  "trailing, which CCR would trim away"],
+  ["backslash",         "a\\b",                   "must never reach a filesystem path"],
+  ["traversal",         "a..b",                   "traversal, and no backslash in it"],
+  ["traversal",         "..",                     "bare traversal"],
+  ["leading-separator", "-x",                     "reads as a flag on a command line"],
+  ["leading-separator", "/x",                     "reads as a path"],
+  ["bad-scope",         "@",                      "a bare scope sigil"],
+  ["bad-scope",         "@/f",                    "a separator hiding behind a scope"],
+  ["bad-scope",         "@-x",                    "a flag hiding behind a scope"],
+  ["bad-scope",         "@.",                     "a dot hiding behind a scope"],
+  ["too-long",          "x".repeat(129),          "129 code points, one past the bound"],
+  ["too-long",          "\u{1F600}".repeat(129),  "129 astral code points -- 258 UTF-16 units"],
+];
+
+test("classifyRefusal names a distinct reason for every rule admitId enforces", () => {
+  for (const [code, id, why] of REFUSAL_CASES) {
+    assert.equal(classifyRefusal(id), code,
+      `${JSON.stringify(id)} (${why}) should classify as ${code}`);
+  }
+});
+
+test("classifyRefusal covers every code the table can produce, with no dead row", () => {
+  // Guards the other direction from the case list above: a row nothing reaches
+  // is a reason the withheld overlay can never display, and a row two fixtures
+  // reach for different rules is a code that has quietly merged.
+  const seen = new Set(REFUSAL_CASES.map(([code]) => code));
+  assert.deepEqual([...seen].sort(), [
+    "backslash", "bad-scope", "control-char", "empty", "escape-sequence",
+    "invisible", "leading-separator", "too-long", "traversal", "whitespace",
+  ], "a code was added or removed without a fixture proving it reachable");
+});
+
+test("an admitted id yields null -- the absence of a reason IS admission", () => {
+  for (const id of [
+    "claude-opus-5", "qwen3-max", "groq/openai/gpt-oss-20b", "@cf/openai/gpt-oss-120b",
+    "~anthropic/claude-opus-latest", "teamorouter/kimi-k3[1M]",
+    "bedrock/*/1-month-commitment/cohere.command-text-v14",
+    "uw/fast",                       // admitId ADMITS this; the uw rule is denylist.mjs's
+    "x".repeat(128),                 // exactly at the bound
+    "\u{1F600}".repeat(128),         // 128 astral code points: at the bound, not past it
+  ]) {
+    assert.equal(classifyRefusal(id), null, `${JSON.stringify(id)} is admitted`);
+  }
+});
+
+test("escape-sequence outranks control-char, so the classes stay distinguishable", () => {
+  // Every ESC_SEQ alternative begins with \x1b, which is 0x1B and therefore also
+  // inside CTRL -- so an escape-carrying id satisfies both rows and only the
+  // ORDER of the table decides which is reported. This is the assertion that
+  // makes the ESC_SEQ row killable: delete it and these classify as
+  // `control-char`, which nothing else in the suite would notice.
+  assert.equal(classifyRefusal("bad\x1b[2J"), "escape-sequence");
+  assert.equal(classifyRefusal("\x1b]0;title\x1b\\"), "escape-sequence");
+  // ...and a control character with no ESC still reports as itself.
+  assert.equal(classifyRefusal("bell\x07"), "control-char");
+});
+
+test("classifyRefusal is null exactly when admitId admits, over every shape here", () => {
+  // THE INVARIANT THAT KEEPS THE TWO FROM DRIFTING, asserted as a property.
+  // `admitId` is now defined in terms of this classifier, so the two cannot
+  // disagree by construction -- and this is what would catch a future edit that
+  // reintroduces a second, parallel ladder.
+  const corpus = [
+    ...REFUSAL_CASES.map(([, id]) => id),
+    "claude-opus-5", "qwen3-max", "opus", "uw/fast", "@cf/openai/gpt-oss-120b",
+    "groq/openai/gpt-oss-20b", "~z-ai/glm-latest", "deepseek-v3.2",
+    "x".repeat(128), "\u{1F600}".repeat(128), undefined, null, 42,
+  ];
+  for (const c of corpus) {
+    assert.equal(classifyRefusal(c) === null, admitId(c) !== null,
+      `classifyRefusal and admitId disagree about ${JSON.stringify(c)}`);
+  }
+});
+
+test("classifyRefusal is a pure function of its argument, called twice", () => {
+  // Same hazard `carries` was written for: ESC_SEQ, CTRL and INVISIBLE carry `g`,
+  // and a `.test()` on a /g regex advances lastIndex. Calling the classifier
+  // twice on one hostile string must return the same code both times.
+  const hostile = "evil\x1b[2J";
+  assert.equal(classifyRefusal(hostile), "escape-sequence");
+  assert.equal(classifyRefusal(hostile), "escape-sequence");
+  const inv = "a\u202Eb";
+  assert.equal(classifyRefusal(inv), "invisible");
+  assert.equal(classifyRefusal(inv), "invisible");
+});
+
+test("nullish and non-string inputs classify as empty, not as a crash", () => {
+  // `admitId(undefined)` is a real call site: keysync passes an absent testModel.
+  for (const v of [undefined, null, ""]) assert.equal(classifyRefusal(v), "empty");
+  assert.equal(classifyRefusal(42), null, "a stringified number is an ordinary id");
 });

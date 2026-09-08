@@ -151,22 +151,65 @@ const carries = (re, s) => s.search(re) !== -1;
 // module, and D2 scopes this task to reusing the existing regexes rather than
 // redefining them.
 //
-// The ESC_SEQ line below cannot be the SOLE cause of a rejection: every
+// The ESC_SEQ rule below cannot be the SOLE cause of a rejection: every
 // alternative of that pattern begins with \x1b, which is 0x1B and therefore
-// inside `CTRL`. It is kept because it names the class distinctly, which is
-// what lets the refusal reasons (#51) tell an escape sequence from a stray
-// control character. No test can kill it while the verdict stays boolean.
+// inside `CTRL`. It is kept because it names the class distinctly, which is what
+// lets the refusal reasons (#51) tell an escape sequence from a stray control
+// character -- and now that the verdict carries a code rather than a boolean,
+// that distinction is finally testable: delete the ESC_SEQ row and an id
+// carrying `\x1b[2J` classifies as `control-char`, which a test can see.
+//
+// THE RULES LIVE IN ONE ORDERED TABLE because `admitId` and `classifyRefusal`
+// must never disagree about which ids are refused. Two parallel ladders is
+// exactly how a "why" drifts from a "whether" -- the same argument denylist.mjs
+// makes for having one `RESERVED` rather than two. Order IS precedence: an id
+// carrying both an escape sequence and a bare control character is reported as
+// `escape-sequence`, because that row comes first.
+//
+// #86 is a KNOWN, DEFERRED GAP in this table, not an omission: U+061C, U+2060,
+// U+00AD and the U+E0000 TAG block are invisible, are admitted here, and survive
+// `sanitizeDisplay`. Widening `INVISIBLE` changes what the renderer strips and
+// has a blast radius into style.mjs's width invariants, so it is its own lane.
+const REFUSAL_RULES = [
+  ["empty",             (s) => s === ""],
+  ["escape-sequence",   (s) => carries(ESC_SEQ, s)],
+  ["control-char",      (s) => carries(CTRL, s)],      // C0 incl. CR/LF/NUL, DEL, C1
+  ["invisible",         (s) => carries(INVISIBLE, s)], // zero-width, bidi, U+202E RLO
+  ["whitespace",        (s) => WHITESPACE.test(s)],
+  ["backslash",         (s) => s.includes("\\")],      // must never reach a filesystem path
+  ["traversal",         (s) => s.includes("..")],
+  ["leading-separator", (s) => LEADING_SEP.test(s)],
+  ["bad-scope",         (s) => BAD_SCOPE.test(s)],
+  ["too-long",          (s) => [...s].length > MAX_CODE_POINTS],
+];
+
+/**
+ * Why an id was refused (#51), where `admitId` could only ever say "no".
+ *
+ * `null` means ADMITTED -- the return is a reason, so the absence of a reason is
+ * the absence of a refusal, and `classifyRefusal(x) === null` iff
+ * `admitId(x) !== null` by construction rather than by two lists agreeing.
+ *
+ * §2.5 enumerates seven of these plus `uw-namespace`. Three more are named here
+ * because `admitId` enforces them and a classifier that returned `null` for an
+ * id it refuses would be lying: `empty`, `whitespace`, `bad-scope`.
+ * `uw-namespace` is NOT here -- it is not an `admitId` rule, it is denylist.mjs's
+ * own branch over an id this function admits, and it is assigned there.
+ *
+ * This classifies; it does not decide. What gets refused is unchanged (#86).
+ *
+ * @param {string} id
+ * @returns {string|null} a reason code, or `null` for an admitted id.
+ */
+export function classifyRefusal(id) {
+  const s = String(id ?? "");
+  for (const [code, hits] of REFUSAL_RULES) if (hits(s)) return code;
+  return null;
+}
+
+// UNCHANGED CONTRACT (`string | null`), and unchanged rules -- the ladder that
+// used to be inline is the table above, read in the same order.
 export function admitId(id) {
   const s = String(id ?? "");
-  if (s === "") return null;
-  if (carries(ESC_SEQ, s)) return null;      // terminal escapes
-  if (carries(CTRL, s)) return null;         // C0 incl. CR/LF/NUL, DEL, C1
-  if (carries(INVISIBLE, s)) return null;    // zero-width, bidi, U+202E RLO
-  if (WHITESPACE.test(s)) return null;
-  if (s.includes("\\")) return null;         // must never reach a filesystem path
-  if (s.includes("..")) return null;         // traversal
-  if (LEADING_SEP.test(s)) return null;
-  if (BAD_SCOPE.test(s)) return null;
-  if ([...s].length > MAX_CODE_POINTS) return null;
-  return s;
+  return classifyRefusal(s) === null ? s : null;
 }
