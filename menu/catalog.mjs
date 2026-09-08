@@ -594,6 +594,13 @@ export function buildFrom({ chosen, providers, catalog, relay,
     // be shown.
     for (const e of listed) {
       const canon = canonicalOf.get(e.id);
+      // NOTED, NOT FIXED (F12, low): a hostile raw id whose canonical already
+      // has a row is dropped here silently -- no row, no `refused[]` entry.
+      // Safe (it never reaches a display or a selector, and `seen` never
+      // learns of it, so complementarity is untouched), but it is a disclosure
+      // asymmetry against the cross-provider case just below, which DOES land
+      // in `refused[]` with its reason. Left as a known, accepted gap rather
+      // than a silent one.
       if (added.has(canon)) continue;
       const kept = admit([e.id]);
       if (!kept.has(e.id)) continue;

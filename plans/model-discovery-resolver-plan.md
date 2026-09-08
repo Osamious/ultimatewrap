@@ -3338,6 +3338,13 @@ template exists at `test/snapshot.test.mjs:171` and `:186`.
 **WRITES:** `menu/style.mjs`, `menu/uwpick.mjs`, `test/style.test.mjs`, `test/menu-layout.test.mjs`,
 `test/uwpick.test.mjs`.
 
+**Inherited from R14 (its #75 addition, §3226-3227), named so this task's own Verify list doesn't
+silently drop it: a mode row's `ctx`/capability cells currently render `null` (safe — keeps the row
+selectable, matches every existing consumer's `number|null` reading), not the plan's stated
+not-a-model-value cell text. R14's own row shape and the `mode` field it always carries are what this
+task renders from; picking the actual cell text for a mode is this task's job, not something R14
+already discharged.**
+
 *(Revision 11: **§2.6's consumer half is proposed as a separate task serial after this one**, on the
 same two source files. It is not folded in here — it renders a keysync **run** record, not catalogue
 data, and it reverses the decision recorded above `framesFor` in `menu/uwpick.mjs` that the picker reads no keysync state
