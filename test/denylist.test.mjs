@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { isReserved, admitRemoteModels, RESERVED } from "../menu/denylist.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
 import { buildProviders, validate, ANTHROPIC_RELAY, ANTHROPIC_FULL,
@@ -232,7 +233,7 @@ test("#52 closing observable: the two attack fixtures, asserted on the RETURNED 
   // safe" and "every future consumer is", and #52 is a finding about a consumer
   // nobody had written yet -- the warn line was the first, not the last.
   const ESC_ID = "evil\x1b[2J";                 // CSI erase-display
-  const RLO_ID = "‮exe.gnp";               // renders as a different name entirely
+  const RLO_ID = "\u202Eexe.gnp";               // renders as a different name entirely
   const r = admitRemoteModels("tabiai", [ESC_ID, RLO_ID], { warn: false });
 
   assert.deepEqual(r.kept, []);
@@ -243,7 +244,7 @@ test("#52 closing observable: the two attack fixtures, asserted on the RETURNED 
   assert.equal(esc.reason, "escape-sequence");
   assert.ok(esc.removed > 0, `nothing was reported stripped from ${JSON.stringify(ESC_ID)}`);
 
-  assert.equal(rlo.id.includes("‮"), false, "U+202E survived into `rejected`");
+  assert.equal(rlo.id.includes("\u202E"), false, "U+202E survived into `rejected`");
   assert.equal(rlo.reason, "invisible");
   assert.ok(rlo.removed > 0, `nothing was reported stripped from ${JSON.stringify(RLO_ID)}`);
 
@@ -260,8 +261,8 @@ test("#52: real stderr from a warn:true call carries no ESC and no U+202E", () =
   // terminal are, which is what #52 is about. A child process is the only way to
   // read them.
   const src = `
-    import { admitRemoteModels } from ${JSON.stringify(pathToFileURL(
-      path.join(HERE, "..", "menu", "denylist.mjs")).href)};
+    import { admitRemoteModels } from ${JSON.stringify(
+      new URL("../menu/denylist.mjs", import.meta.url).href)};
     admitRemoteModels("tabiai", [
       "evil\\u001b[2J\\u001b]52;c;aGk=\\u0007",
       "\\u202Eexe.gnp",
@@ -277,7 +278,7 @@ test("#52: real stderr from a warn:true call carries no ESC and no U+202E", () =
     "the warning must actually have been emitted, or this asserts nothing");
   assert.equal(out.stderr.includes("\x1b"), false, "an ESC reached the terminal");
   assert.equal(out.stderr.includes("\x07"), false, "a BEL reached the terminal");
-  assert.equal(out.stderr.includes("‮"), false, "U+202E reached the terminal");
+  assert.equal(out.stderr.includes("\u202E"), false, "U+202E reached the terminal");
   assert.equal(TERMINAL_HOSTILE.test(out.stderr.replace(/\r?\n/g, "")), false,
     `stderr carries a terminal-hostile code point: ${JSON.stringify(out.stderr)}`);
 });
