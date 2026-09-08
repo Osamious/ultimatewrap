@@ -1646,8 +1646,13 @@ if (target === "isolated") {
       headers: { "Content-Type": "application/json", "x-ccr-web-auth": token },
       body: JSON.stringify({ method, args: a }),
       // A wedged CCR would otherwise hang this fetch forever while the exclusive
-      // lock is held, after which every future run refuses to start.
-      signal: AbortSignal.timeout(30000)
+      // lock is held, after which every future run refuses to start. WAS 30000:
+      // measured 2026-09-08, saveConfig on the post-R13b-reopen uncapped picker
+      // (5,037 rows, ~1.07 MB) took 69.3s real -- the picker-uncap decision grew
+      // this payload ~54x (94 -> 5,037 rows) and nobody re-measured this specific
+      // server-side RPC against the new size. 120000 gives ~1.7x headroom over the
+      // measured cost, not a guess; a wedged gateway still aborts, just later.
+      signal: AbortSignal.timeout(120000)
     });
     const j = await res.json();
     if (!j.ok) throw new Error(`${method} failed: ${String(j.error?.message).slice(0, 300)}`);
