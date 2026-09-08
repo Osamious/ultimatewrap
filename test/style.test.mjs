@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { detectCaps, motionEnabled, glyphsFor, painter, badgeColour, proportionBar,
-         healthDot, highlight, frame, confirmLine, sleepSync,
+         healthDot, provenanceDot, padId, countCell, highlight, frame, confirmLine, sleepSync,
          slideFrames, flashFrames, revealFrames, FRAME_W, W } from "../menu/style.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
@@ -154,11 +154,13 @@ test("level 0 renders the exact provider row, columns included", () => {
 });
 
 test("level 1 renders the exact model row, columns included", () => {
+  // R16: the provenance gutter (blank -- this fixture's model carries no
+  // `provenance`) adds two columns before the id, and `W.id` moved 34 -> 37.
   const lines = frame(V1, META, { caps: PLAIN });
   const row = lines.find((l) => l.includes("gemini-3.5-flash-lite"));
   assert.equal(row,
-    "|> gemini-3.5-flash-lite" + " ".repeat(17) + "1M" + " ".repeat(4) + "0.00" +
-    " ".repeat(3) + "0.00" + "  " + "FREE" + "  " + "TVR" + " ".repeat(8) + "|");
+    "|>   gemini-3.5-flash-lite" + " ".repeat(20) + "1M" + " ".repeat(4) + "0.00" +
+    " ".repeat(3) + "0.00" + "  " + "FREE" + "  " + "TVR" + " ".repeat(3) + "|");
 });
 
 test("every column begins where the W constants say it begins", () => {
@@ -181,7 +183,9 @@ test("every column begins where the W constants say it begins", () => {
 
   const l1 = frame(V1, META, { caps: PLAIN }).find((l) => l.includes("gemini-3.5-flash-lite"));
   const h1 = frame(V1, META, { caps: PLAIN }).find((l) => l.includes("model "));
-  const badgeCol = 1 + 2 + W.id + W.ctx + 1 + W.price * 2 + 2;
+  // R16: `1 + 2` (frame char + mark/space) is followed by the provenance
+  // gutter (`W.prov` glyph + 1 space) before the id cell.
+  const badgeCol = 1 + 2 + (W.prov + 1) + W.id + W.ctx + 1 + W.price * 2 + 2;
   assert.equal(strip(l1).indexOf("FREE"), badgeCol, "badge column");
   assert.equal(strip(l1).indexOf("TVR"), badgeCol + W.badge, "caps column");
   assert.equal(strip(h1).indexOf("badge"), badgeCol);
@@ -212,7 +216,9 @@ test("a coloured badge occupies exactly W.badge visible columns", () => {
     .find((l) => strip(l).includes("gemini-3.5-flash-lite"));
   assert.match(row, /\x1b\[3[0-9]m *FREE|\x1b\[3[0-9]mFREE/, "the badge must still be coloured");
   const s = strip(row);
-  const badgeCol = 1 + 2 + W.id + W.ctx + 1 + W.price * 2 + 2;
+  // R16: `1 + 2` (frame char + mark/space) is followed by the provenance
+  // gutter (`W.prov` glyph + 1 space) before the id cell.
+  const badgeCol = 1 + 2 + (W.prov + 1) + W.id + W.ctx + 1 + W.price * 2 + 2;
   assert.equal(s.slice(badgeCol, badgeCol + W.badge), "FREE  ");
   assert.equal(s.indexOf("TVR"), badgeCol + W.badge);
 });
@@ -232,7 +238,9 @@ test("the capability cell has three glyphs, not two, and still occupies W.caps",
   const cell = (caps) => {
     const v = { ...V1, filter: "", cursor: 9, items: [mk(caps)] };
     const line = frame(v, META, { caps: PLAIN }).find((l) => l.includes(" m "));
-    const badgeCol = 1 + 2 + W.id + W.ctx + 1 + W.price * 2 + 2;
+    // R16: `1 + 2` (frame char + mark/space) is followed by the provenance
+  // gutter (`W.prov` glyph + 1 space) before the id cell.
+  const badgeCol = 1 + 2 + (W.prov + 1) + W.id + W.ctx + 1 + W.price * 2 + 2;
     return strip(line).slice(badgeCol + W.badge, badgeCol + W.badge + W.caps);
   };
   assert.equal(cell({ tools: true, vision: true, reason: true }), "TVR");
@@ -454,7 +462,8 @@ test("the context column never overflows, so the unit is never the thing clipped
   // value here was at most five wide and right-aligned, so `.trim()` hid it --
   // until a six-column value filled the cell and read as `ochat`. A test whose
   // whole subject is a cell being clipped was itself clipping the cell.
-  const ctxCol = 1 + 2 + W.id;
+  // R16: `+ (W.prov + 1)` for the provenance gutter inserted before the id.
+  const ctxCol = 1 + 2 + (W.prov + 1) + W.id;
   const cell = (ctx, extra) => {
     V.items = [mk(ctx, extra)];
     return strip(frame(V, META, { caps: PLAIN })[4]).slice(ctxCol, ctxCol + W.ctx).trim();
@@ -518,4 +527,374 @@ test("a non-chat row is dimmed whole, and a chat row beside it is not", () => {
   // ...and the reason is still readable off the row.
   assert.match(strip(lines.find((l) => strip(l).includes(" pic "))), /nochat/);
   assert.match(strip(lines.find((l) => strip(l).includes(" unroutable "))), /8k/);
+});
+
+// --- R16: provenance gutter, id elision, count cell, WITHHELD LIST ---------
+
+test("the provenance dot renders five distinct states, glyph carries the state not only colour", () => {
+  const g = glyphsFor(VT), p = painter(VT);
+  const gA = glyphsFor(PLAIN), pA = painter(PLAIN);
+  const rungs = ["call-verified", "config-asserted", "listing-verified", "catalogue-only", null];
+
+  const glyphs = rungs.map((r) => strip(provenanceDot(r, g, p)));
+  assert.equal(new Set(glyphs).size, rungs.length,
+    `${glyphs.join(",")} must be five distinct glyphs`);
+  for (const one of glyphs) assert.equal([...one].length, 1, "one column each");
+
+  // The no-colour path (caps.colours === 0, every ASCII terminal): the glyph
+  // alone must still carry all five states, with zero SGR codes.
+  const glyphsA = rungs.map((r) => provenanceDot(r, gA, pA));
+  assert.equal(new Set(glyphsA).size, rungs.length);
+  assert.equal(glyphsA.join("").includes("\x1b"), false);
+
+  // call-verified is unfed on this branch (§2.3) -- nothing produces it today.
+  // This is the only check on the top of the ladder; deleting it because "no
+  // row can reach it" would remove the sole guard against it silently breaking.
+  assert.equal(strip(provenanceDot("call-verified", g, p)), "◆");
+  assert.equal(provenanceDot("call-verified", gA, pA), "#");
+
+  // The relay row (catalog.mjs's CONFIG_ASSERTED) must render its OWN glyph --
+  // not blank, and not call-verified's diamond, even though both are green.
+  assert.equal(strip(provenanceDot("config-asserted", g, p)), "◈");
+  assert.notEqual(strip(provenanceDot("config-asserted", g, p)),
+                   strip(provenanceDot("call-verified", g, p)));
+  assert.match(provenanceDot("config-asserted", g, p), /\x1b\[36m/, "config-asserted is cyan");
+
+  // null / unknown renders ONE blank column, not a fifth glyph competing with
+  // the other four for meaning -- the header's `discovered` stamp is where
+  // that disclosure lives instead (Q1.3's pattern, restated for this field).
+  assert.equal(provenanceDot(null, g, p), " ");
+  assert.equal(provenanceDot(undefined, g, p), " ");
+});
+
+test("null provenance renders a blank row gutter, and the header discloses discovery separately", () => {
+  const mk = (provenance) => ({ kind: "model", target: "p/m",
+    model: { id: "m", ctx: 8192, pin: 0, pout: 0, badge: "",
+             tools: null, vision: null, reason: null, routable: null, provenance } });
+  const V = { level: 1, scope: "tree", filter: "", legend: false, cursor: 9, top: 0,
+              empty: false, more: 0, provider: { keyId: "p", provider: "p", models: [1] },
+              items: [mk(undefined)] };
+  const row = strip(frame(V, META, { caps: PLAIN }).find((l) => l.includes(" m ")));
+  // Absolute column: frame char (1) + mark-and-space (2) puts the gutter at 3.
+  assert.equal(row[3], " ", "unknown provenance leaves the gutter blank, not a glyph");
+
+  const relay = strip(frame({ ...V, items: [mk("config-asserted")] }, META,
+    { caps: PLAIN }).find((l) => l.includes(" m ")));
+  assert.equal(relay[3], "=", "config-asserted renders its own glyph, not blank");
+
+  // The row staying blank is a different claim from "nobody has ever looked" --
+  // the header's own stamp is the disclosure for the LATTER. On the MODEL
+  // level header (beside `N of M`), not level 0's -- the plan is explicit that
+  // level 0 is unchanged, already carrying four segments at 78 columns.
+  const noStamp = strip(frame(V, { ...META, discoveredAsOf: null }, { caps: PLAIN })[1]);
+  assert.match(noStamp, /discovered -/, "absent discovery data renders a dash, not silence");
+  const stamped = strip(frame(V,
+    { ...META, discoveredAsOf: "2026-09-07T13:37:38.115Z" }, { caps: PLAIN })[1]);
+  assert.match(stamped, /discovered 09-07 13:37/);
+  // Level 0 stays exactly as before this task: no discoveredStamp appended.
+  const level0 = strip(frame(V0,
+    { ...META, discoveredAsOf: "2026-09-07T13:37:38.115Z" }, { caps: PLAIN })[1]);
+  assert.doesNotMatch(level0, /discovered/, "level 0's header is unchanged by this task");
+
+  // Flat scope is a MODEL-level view too -- its rows run `provenanceDot`
+  // exactly like level 1's, so the same disclosure applies. Missing this
+  // left flat scope rendering blank gutters with nothing on screen saying
+  // why -- the one branch that shows the thing being disclosed and skips
+  // the stamp that discloses it.
+  const flatV = { ...V1, scope: "flat",
+    items: [{ kind: "model", target: "google/gemini-3.5-flash-lite", model: ROWS[0].models[0] }] };
+  const flatHeader = strip(frame(flatV,
+    { ...META, discoveredAsOf: "2026-09-07T13:37:38.115Z" }, { caps: PLAIN })[1]);
+  assert.match(flatHeader, /discovered 09-07 13:37/, "flat scope must disclose discovery too");
+});
+
+test("the discovered stamp survives at real production scale, unclipped, once routability is also populated", () => {
+  // MEASURED regression: appending discoveredStamp to level 0's `right`
+  // pushed `left + gap + right` past INNER=75 the moment `routableAsOf` was
+  // ALSO populated -- true in every real session once the refresher has run
+  // once, not a rare edge case. `bar()`'s clip then ate the new stamp first,
+  // rendering the bare word `discovered` or a mangled date. Fixed by moving
+  // the stamp to the model-level header instead (the plan's own placement),
+  // where it has 75 - ~49 = 26 spare columns rather than none.
+  const bigMeta = { providers: 13, models: 1588,
+    routableAsOf: "2026-09-07T13:37:38.115Z", discoveredAsOf: "2026-09-07T13:37:38.115Z" };
+  const V = { level: 1, scope: "tree", filter: "", legend: false, cursor: 0, top: 0,
+              empty: false, more: 0,
+              provider: { keyId: "p", provider: "p", models: new Array(1588).fill(1) },
+              items: [] };
+  const row = strip(frame(V, bigMeta, { caps: PLAIN })[1]);
+  assert.equal([...row].length, FRAME_W);
+  assert.match(row, /discovered 09-07 13:37/,
+    "the full stamp, unclipped, at real production provider/model counts");
+});
+
+test("padId elides the MIDDLE, so ids sharing a long prefix keep their distinguishing suffix", () => {
+  // MEASURED against the real 4,732-model catalogue (see style.mjs's own
+  // comment on padId): right-truncating at the old W.id collided 33 rows into
+  // 16 groups, and even at the new width, 21 into 10. This is the synthetic,
+  // permanent version of that measurement -- two ids differing only after the
+  // width where right-truncation would have cut them.
+  const g = glyphsFor(PLAIN), p = painter(PLAIN);
+  const a = "provider-shared-prefix-AAAA-2024-01-15";
+  const b = "provider-shared-prefix-AAAA-2024-06-30";
+  const n = 20;
+  assert.equal(a.slice(0, n), b.slice(0, n),
+    "sanity: the two ids share exactly this much of a common prefix");
+
+  const outA = padId(a, n, "", g, p), outB = padId(b, n, "", g, p);
+  assert.equal([...outA].length, n);
+  assert.equal([...outB].length, n);
+  assert.notEqual(outA, outB, "the differing suffix must survive elision");
+});
+
+test("a filter match inside the elided middle still shows, on the marker itself (#49)", () => {
+  // The previous draft ran `highlight` against the already-truncated text, so a
+  // match living in the dropped tail vanished with no visible trace -- the row
+  // still passed the filter (pick-state.mjs matches the FULL id) but nothing on
+  // screen explained why it was there. When the match falls entirely inside the
+  // elided middle, the marker renders a DISTINCT GLYPH, not merely a colour.
+  const id = "provider-shared-prefix-AAAA-HIDDEN-2024-01-15-suffix";
+  const n = 20;
+
+  const g = glyphsFor(VT), p = painter(VT);
+  const out = padId(id, n, "HIDDEN", g, p);
+  assert.equal([...strip(out)].length, n);
+  assert.equal(strip(out).includes("HIDDEN"), false,
+    "the match's own text is in the elided middle, not on screen");
+  assert.equal(strip(out).includes("‡"), true, "the marker itself carries the distinct glyph");
+  assert.match(out, /\x1b\[1m‡\x1b\[0m/, "the glyph is also bolded, as an enhancement");
+
+  // The no-colour path (every ASCII terminal, `caps.colours === 0`): `p.bold`
+  // is a no-op there, so if the state lived in colour alone this would render
+  // an ordinary `-`, indistinguishable from an unfiltered row. The glyph
+  // alone must still carry it.
+  const gA = glyphsFor(PLAIN), pA = painter(PLAIN);
+  const outA = padId(id, n, "HIDDEN", gA, pA);
+  assert.equal(outA.includes("\x1b"), false);
+  assert.equal(outA.includes("!"), true, "ASCII's distinct middle-match glyph, no colour needed");
+  const outAUnmatched = padId(id, n, "", gA, pA);
+  assert.notEqual(outA, outAUnmatched, "a matched middle must render differently from an unmatched one");
+});
+
+test("padId highlights a match that survives in the head or tail, same as any other cell", () => {
+  const g = glyphsFor(VT), p = painter(VT);
+  const short = "gemini-3.5-flash-lite";
+  const out = padId(short, 37, "flash", g, p);
+  assert.match(strip(out), /gemini-3\.5-flash-lite/);
+  assert.match(out, /\x1b\[1mflash\x1b\[0m/);
+});
+
+test("padId never signals a middle match for a query that matches nothing (N5)", () => {
+  // The containment check (`hasMatch`) guards the whole decision now. Without
+  // it, `!inHead && !inTail` is true for ANY query absent from the id, not
+  // just one hiding in the elided middle -- a positive "it's in the middle"
+  // claim for a string that is not in the id anywhere. Unreachable from
+  // `frame()` today (rows are pre-filtered on this same string at both level
+  // 1 and flat), but `padId` is exported and this is hygiene on the function
+  // itself, not a fixture-only concern.
+  const g = glyphsFor(VT), p = painter(VT);
+  const id = "provider-shared-prefix-AAAA-HIDDEN-2024-01-15-suffix";
+  const out = padId(id, 20, "ZZNOMATCH", g, p);
+  assert.equal(out.includes("\x1b"), false, "no query match means no highlight and no bold marker");
+  assert.equal(strip(out).includes("‡"), false, "and no distinct match glyph either");
+});
+
+test("a match straddling the head/middle or middle/tail boundary still bolds the marker (#49 regression)", () => {
+  // The first fix computed inHead/inTail from where the match STARTS and ENDS
+  // in the full string. A match that starts in the head but runs into the
+  // elided middle set inHead = true (no bold), while `highlight(head, ...)` --
+  // which looks for the query as a whole SUBSTRING of head -- found nothing
+  // there: the marker stayed plain AND the highlight vanished, leaving the row
+  // blind. Checking CONTAINMENT in head/tail, the same test `highlight` itself
+  // makes, is what closes both straddling directions.
+  const g = glyphsFor(VT), p = painter(VT);
+  const id = "provider-shared-prefixAAAA-HIDDEN-2024-01-15-suffix";
+  const n = 20;
+  for (const q of ["der-shared", "01-15-suf"]) {
+    const out = padId(id, n, q, g, p);
+    const s = strip(out);
+    assert.equal([...s].length, n);
+    assert.equal(s.toLowerCase().includes(q.toLowerCase()), false,
+      `"${q}" straddles a boundary and must not appear whole on screen`);
+    assert.equal(s.includes("‡"), true,
+      `"${q}" straddles a boundary, so the marker must show the distinct match glyph`);
+  }
+});
+
+test("the count cell is bare with nothing withheld, paired when something is, and never a plausible-wrong truncation", () => {
+  // #51 (§2.5(a)), revision 11. A provider withholding nothing renders the bare
+  // count -- never `343/0` -- because the count itself is never suppressed.
+  assert.equal(countCell(343, 0), "343");
+  assert.equal(countCell(343, undefined), "343");
+  assert.equal(countCell(343, 5), "343/5");
+  assert.equal(countCell(120, 30, 7), "120/30", "a pair that fits exactly stays exact");
+
+  // `sanitizeDisplay("1501/1501", 7)` would return "1501/15" -- a PLAUSIBLE
+  // WRONG PAIR, worse than truncation because nothing about it looks wrong.
+  // A single decimal of abbreviation is not always enough to reach 7 columns
+  // either: `1.5k/1.5k` is nine. Dropping the decimal only on that second
+  // attempt reaches `2k/2k` without losing precision on the common case.
+  assert.equal(countCell(1501, 1501, 7), "2k/2k",
+    "a pair too wide even at one decimal steps down to integer-k");
+  assert.notEqual(countCell(1501, 1501, 7), "1501/15", "never the truncated lie");
+
+  // Six-digit-plus counts on both sides abbreviate to something still too
+  // wide at any k-precision (MEASURED max real count today: 434, one
+  // provider) -- CORRECT must beat TRUNCATED even past `width` here: the
+  // function returns the honest exact pair rather than cut digits.
+  assert.equal(countCell(100000, 100000, 7), "100000/100000",
+    "unabbreviatable-to-width overflows honestly rather than truncating to a lie");
+});
+
+test("the count cell's honest overflow survives all the way to the rendered row, not just the function's return", () => {
+  // The plan's own words: this must be asserted on the RENDERED STRING, not
+  // width alone (plans/model-discovery-resolver-plan.md:3419-3422) -- a
+  // function-level assertion alone would have passed while `rpad` truncated
+  // the very overflow this cell exists to render honestly.
+  const wide = { ...ROWS[0], refused: new Array(1501).fill({ id: "x" }),
+                 models: new Array(1501).fill(ROWS[0].models[0]) };
+  const V = { ...V0, items: [{ kind: "provider", row: wide }] };
+  const row = strip(frame(V, META, { caps: PLAIN }).find((l) => l.includes(wide.keyId)));
+  assert.match(row, /2k\/2k/, "the abbreviated pair must reach the actual rendered row");
+  assert.doesNotMatch(row, /1501\/15\D/, "never the width-truncated plausible-wrong pair");
+});
+
+test("the WITHHELD LIST row appears only for a provider that actually withholds something", () => {
+  // #51 (§2.5(b)), render-only in this task: the row becoming a cursor-reachable
+  // item is R18's own WRITES (menu/pick-state.mjs), explicitly not this one's.
+  const withRefusals = { ...ROWS[0], refused: [{ id: "x", reason: "no-price" }] };
+  const V = { ...V1, provider: withRefusals };
+  const lines = frame(V, META, { caps: PLAIN }).map(strip);
+  assert.ok(lines.some((l) => l.includes("WITHHELD LIST (1)")),
+    "a provider with a refused entry must show the row, with the right count");
+
+  const noRefusals = { ...ROWS[0], refused: [] };
+  const clean = frame({ ...V1, provider: noRefusals }, META, { caps: PLAIN }).map(strip);
+  assert.ok(clean.every((l) => !l.includes("WITHHELD")),
+    "a provider withholding nothing must not show the row");
+
+  // Flat scope has no single provider in view, so the row cannot apply there
+  // regardless of what any one provider withholds.
+  const flatV = { ...V, scope: "flat" };
+  const flatLines = frame(flatV, META, { caps: PLAIN }).map(strip);
+  assert.ok(flatLines.every((l) => !l.includes("WITHHELD")));
+});
+
+test("the WITHHELD LIST row never grows the frame past what pick-state.mjs sized the viewport for", () => {
+  // HIGH 5: `pick-state.mjs`'s `rowsAvail` never budgeted for this row (that
+  // constant lives in the file R16 may not touch). Left unaccounted, a
+  // provider that both withholds AND already fills the viewport (`v.more >
+  // 0`, so the window is already scrolled) renders one line taller than the
+  // terminal -- `uwpick.mjs`'s `draw()` writes HOME plus lines with no full
+  // clear, so an over-tall frame SCROLLS by one line per redraw rather than
+  // clipping cleanly. The mitigation trades one item row for the WITHHELD
+  // row ONLY when `v.more` is already > 0 -- the "N more" footer was already
+  // going to render, so bumping its count costs no new line. (Trimming when
+  // `v.more === 0` would instead MANUFACTURE a "1 more" line where none
+  // existed, which a separate case below guards against.) It must also never
+  // do so by hiding the cursor's own row.
+  const mkModels = (n) => Array.from({ length: n },
+    (_, i) => ({ id: `m${i}`, ctx: 8192, pin: 0, pout: 0, badge: "", routable: null }));
+  const provider = { keyId: "p", provider: "p", models: mkModels(5) };
+  const mkItems = (models) => models.map((m) => ({ kind: "model", target: `p/${m.id}`, model: m }));
+
+  const baseline = (cursor) => frame({ level: 1, scope: "tree", filter: "", legend: false,
+    cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [] },
+    items: mkItems(provider.models) }, META, { caps: PLAIN }).length;
+
+  const withheld = (cursor) => frame({ level: 1, scope: "tree", filter: "", legend: false,
+    cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
+    items: mkItems(provider.models) }, META, { caps: PLAIN }).length;
+
+  // Cursor at front (0), middle (2), and back (4) of the 5-item window --
+  // the three positions the mitigation's front/back choice has to cover.
+  for (const cursor of [0, 2, 4]) {
+    assert.equal(withheld(cursor), baseline(cursor),
+      `cursor at ${cursor}: adding a WITHHELD LIST row must not grow the frame once already scrolled`);
+  }
+
+  // And the cursor's own row must still be marked selected in every case --
+  // the property the front/back choice exists to preserve.
+  for (const cursor of [0, 2, 4]) {
+    const lines = frame({ level: 1, scope: "tree", filter: "", legend: false,
+      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
+      items: mkItems(provider.models) }, META, { caps: VT }).map(strip);
+    const marked = lines.filter((l) => l.includes("▶"));
+    assert.equal(marked.length, 1, `cursor ${cursor}: exactly one row must carry the marker`);
+  }
+
+  // N2 (found on re-review): the visible SET of rendered rows must stay
+  // stable as the cursor moves within the window, not just individually
+  // correct at each position -- the earlier draft dropped the FRONT by
+  // default and only special-cased the cursor sitting at the front, so
+  // leaving row 0 for row 1 repainted the entire list one line over (and
+  // back again on the way up) for no reason tied to what should be visible.
+  // Anchoring on the BACK by default confines that discontinuity to the
+  // window's one true edge (the cursor reaching the LAST visible row),
+  // where a shift is already the natural behaviour a window is about to
+  // need anyway.
+  const idsAt = (cursor) => {
+    const lines = frame({ level: 1, scope: "tree", filter: "", legend: false,
+      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
+      items: mkItems(provider.models) }, META, { caps: PLAIN }).map(strip);
+    return lines.filter((l) => /\bm\d\b/.test(l)).map((l) => l.match(/\bm\d\b/)[0]);
+  };
+  assert.deepEqual(idsAt(0), idsAt(1), "moving off the very first row must not reshuffle the window");
+  assert.deepEqual(idsAt(1), idsAt(2), "the window is stable through the middle of its range");
+  assert.deepEqual(idsAt(2), idsAt(3), "still stable one short of the true edge");
+  assert.notDeepEqual(idsAt(3), idsAt(4),
+    "the one legitimate shift happens only at the window's actual last row (4)");
+
+  // N3 (found on re-review): `pick-state.mjs:327` defines `more` strictly as
+  // items BELOW the window. When the trim drops the FRONT (cursor at the
+  // back edge), the hidden item is ABOVE -- folding it into `more` anyway
+  // would count it in the wrong population
+  // ([[counts-carry-their-denominator]]). At cursor 4 (the back edge, drops
+  // the front) the footer must show the SAME count as the undisturbed
+  // baseline; only at a front-drop position does it grow by one.
+  const moreCountAt = (cursor) => {
+    const lines = frame({ level: 1, scope: "tree", filter: "", legend: false,
+      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
+      items: mkItems(provider.models) }, META, { caps: PLAIN }).map(strip);
+    const moreLine = lines.find((l) => l.includes("more"));
+    return Number(moreLine.match(/(\d+) more/)[1]);
+  };
+  assert.equal(moreCountAt(4), 3,
+    "cursor at the back edge drops the FRONT (an above-item) -- `more` (below-only) must not grow");
+  assert.equal(moreCountAt(2), 4,
+    "cursor in the middle drops the BACK (a genuine below-item) -- `more` grows by exactly one");
+
+  // N4 (found on re-review): the header's own `N of M` count must describe
+  // what actually renders, not the untrimmed `v.items.length` -- it is the
+  // one line on the frame whose entire job is saying how much of the list is
+  // on screen.
+  const headerCountAt = (cursor) => {
+    const header = strip(frame({ level: 1, scope: "tree", filter: "", legend: false,
+      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
+      items: mkItems(provider.models) }, META, { caps: PLAIN })[1]);
+    return Number(header.match(/(\d+) of/)[1]);
+  };
+  for (const cursor of [0, 2, 4]) {
+    assert.equal(headerCountAt(cursor), 4,
+      `cursor ${cursor}: the header must count the trimmed, actually-rendered 4 rows, not the original 5`);
+  }
+});
+
+test("the WITHHELD LIST row does not manufacture a new \"more\" line when the item list already fits", () => {
+  // The other half of HIGH 5's fix: when `v.more === 0` the item list already
+  // fits inside `rowsAvail` with room to spare (or exactly none -- see the
+  // deferred residual noted in style.mjs), so trimming an item here would
+  // trade a line that was never in danger for a "1 more" footer that would
+  // not otherwise exist -- a strictly worse outcome. The row still shows,
+  // and every original item still renders.
+  const models = [{ id: "a", ctx: 8192, pin: 0, pout: 0, badge: "", routable: null },
+                   { id: "b", ctx: 8192, pin: 0, pout: 0, badge: "", routable: null }];
+  const provider = { keyId: "p", provider: "p", models, refused: [{ id: "x" }] };
+  const items = models.map((m) => ({ kind: "model", target: `p/${m.id}`, model: m }));
+  const lines = frame({ level: 1, scope: "tree", filter: "", legend: false, cursor: 0, top: 0,
+    empty: false, more: 0, provider, items }, META, { caps: PLAIN }).map(strip);
+  assert.ok(lines.some((l) => l.includes("WITHHELD LIST (1)")));
+  assert.ok(lines.some((l) => l.includes(" a ")), "no item is sacrificed when there is no scroll pressure");
+  assert.ok(lines.some((l) => l.includes(" b ")));
+  assert.ok(lines.every((l) => !l.includes("more")), "no manufactured \"more\" line");
 });

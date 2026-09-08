@@ -36,7 +36,7 @@ const INNER = FRAME_W - 3;
 // That gutter is why the label gets the full 8 rather than W.health - 2: the
 // longest label, "needs $", is 7 characters and was being clipped to "needs ".
 export const W = { keyId: 30, count: 7, bar: 6, free: 12, health: 8,
-                   id: 34, ctx: 6, price: 7, badge: 6, caps: 3 };
+                   id: 37, ctx: 6, price: 7, badge: 6, caps: 3, prov: 1 };
 
 const ESC = "\x1b";
 const SAB = new Int32Array(new SharedArrayBuffer(4));
@@ -67,12 +67,28 @@ const UNI = {
   marker: "▶", fav: "★", recent: "↺",
   dotOk: "●", dotWarn: "◐", dotBad: "✖", dotStale: "○",
   on: "▰", off: "▱", check: "✔", arrow: "→", sep: "▸", caret: "▏", ell: "…", dash: "—",
+  // The provenance ladder's five rungs, one glyph each, ordered exactly as
+  // PROVENANCE_RUNGS (snapshot.mjs) names them: call-verified, config-asserted,
+  // listing-verified, catalogue-only, null (blank). Each is exactly one column
+  // in both sets -- `healthDot`'s own established constraint, restated here
+  // because a five-way glyph set is exactly where a repeat of ITS bug (two
+  // states sharing one glyph under `caps.colours === 0`) would hide.
+  provCV: "◆", provCA: "◈", provLV: "◇", provCO: "·",
+  // `padId`'s middle-match marker, distinct from the plain elision dash. The
+  // first draft carried this state in colour alone (`p.bold(g.dash)`), which
+  // renders as a bare `—` -- indistinguishable from an unfiltered row -- the
+  // moment `caps.colours === 0` (every ASCII terminal, `painter` returning
+  // identity). Same doctrine as `healthDot`/`provenanceDot`: the glyph
+  // carries the state, colour is the enhancement.
+  dashMatch: "‡",
   frame: { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" },
 };
 const ASCII = {
   marker: ">", fav: "*", recent: "~",
   dotOk: "*", dotWarn: "$", dotBad: "x", dotStale: "o",
   on: "#", off: ".", check: "OK", arrow: "->", sep: ">", caret: "_", ell: "...", dash: "-",
+  provCV: "#", provCA: "=", provLV: "+", provCO: ".",
+  dashMatch: "!",
   frame: { tl: "+", tr: "+", bl: "+", br: "+", h: "-", v: "|" },
 };
 export function glyphsFor(caps) { return caps.unicode ? UNI : ASCII; }
@@ -122,6 +138,23 @@ export function healthDot(health, g, p) {
   return p.dim(g.dotStale);
 }
 
+// The provenance ladder's own dot, same doctrine as `healthDot`: the glyph
+// carries the state, colour is the enhancement. `call-verified` renders here
+// even though nothing in this branch produces it (§2.3) -- the rung is
+// defined and unfed, and the glyph test is what keeps it correct for the day
+// it is wired; dropping the branch because "no row can reach it" would delete
+// the only check on the top of the ladder. `null` -- unknown, nobody looked --
+// renders a single blank column, not one of the four glyphs: the disclosure
+// this needs is the header's `discovered` stamp (Q1.3's pattern, restated for
+// this field), not a fifth mark competing with the other four for meaning.
+export function provenanceDot(provenance, g, p) {
+  if (provenance === "call-verified") return p.grn(g.provCV);
+  if (provenance === "config-asserted") return p.cya(g.provCA);
+  if (provenance === "listing-verified") return p.grn(g.provLV);
+  if (provenance === "catalogue-only") return p.dim(g.provCO);
+  return " ";
+}
+
 export function highlight(text, query, p) {
   const q = String(query ?? "");
   if (!q) return text;
@@ -152,6 +185,77 @@ const vis  = (s) => [...strip(String(s ?? ""))].length;
 const fill = (n) => " ".repeat(Math.max(0, n));
 const pad  = (s, n) => { const t = sanitizeDisplay(String(s ?? ""), n); return t + fill(n - vis(t)); };
 const rpad = (s, n) => { const t = sanitizeDisplay(String(s ?? ""), n); return fill(n - vis(t)) + t; };
+
+// PAD, never truncate. `rpad` caps its content to `n` via `sanitizeDisplay`,
+// which is right for text but wrong for `countCell`: that function already
+// chooses between an exact pair and an honest abbreviation, and the one
+// value it can still return wider than `width` is deliberately the exact,
+// correct pair (see its own comment) rather than a truncated lie. Running
+// THAT through `rpad` would silently cut it right back to the lie it was
+// built to avoid. A result already <= n pads as normal; one that overflows
+// passes through untouched, so any resulting frame overflow is `bar()`'s own
+// visible, already-tested row clip -- never a specific wrong digit.
+const rpadCount = (s, n) => (vis(s) <= n ? rpad(s, n) : String(s));
+
+// MIDDLE elision, not `pad`'s right-truncation, for the one cell whose whole
+// job is telling two rows apart. Right-truncation collides whenever two ids
+// share a long common prefix -- MEASURED against the real 4,732-model
+// catalogue, grouped per provider: right-truncating at the old W.id (34)
+// collides 33 rows into 16 groups; at the new W.id (37) alone, still 21 into
+// 10. Middle elision at 37 collides ZERO -- the distinguishing suffix (a
+// date, a version, a size) that right-truncation always drops is usually
+// exactly what a shared prefix hides.
+//
+// THE MARKER IS ONE CODE POINT IN BOTH GLYPH SETS (`g.dash`: "—" / "-"),
+// not `g.ell` ("…" is one code point in UNI but ASCII's "..." is three) --
+// using `g.ell` here would silently eat two extra columns from the tail in
+// the ASCII path only, an invariant break that only one glyph set's tests
+// would catch.
+//
+// HIGHLIGHT-AFTER-ELISION (#49). The previous draft (implicit in `pad` +
+// `highlight`) ran the filter match against the ALREADY-TRUNCATED text, so a
+// match living in the dropped tail simply vanished with no visible trace --
+// the row still passed the filter (pick-state.mjs matches against the FULL
+// id, never the rendered cell) but nothing on screen explained why it was
+// there. This runs `highlight` against the head and tail SEPARATELY, against
+// their own real substrings, and -- when the match falls entirely inside the
+// ELIDED middle -- bolds the marker itself, so a filtered row is never blind:
+// every row that matched shows SOMETHING highlighted.
+export function padId(id, n, query, g, p) {
+  const clean = sanitizeDisplay(String(id ?? ""), 10_000);
+  const cps = [...clean];
+  if (cps.length <= n) return highlight(clean, query, p) + fill(n - cps.length);
+
+  const keep = n - 1; // one column reserved for the marker
+  const headLen = Math.ceil(keep / 2), tailLen = keep - headLen;
+  const head = cps.slice(0, headLen).join("");
+  const tail = cps.slice(cps.length - tailLen).join("");
+
+  // Containment, not index arithmetic. The previous form derived inHead/inTail
+  // from where the match STARTS and ENDS in the full string, so a match that
+  // starts in the head but runs into the elided middle set inHead = true (no
+  // bold) while `highlight(head, ...)` -- which looks for the query as a whole
+  // SUBSTRING of head -- finds nothing there. Both straddling directions hit
+  // this: the marker stayed plain and the highlight vanished, leaving a
+  // filtered row with no visible match indication at all. Checking containment
+  // the same way `highlight` does (a substring search on head/tail themselves)
+  // keeps the two in agreement by construction.
+  const q = String(query ?? "");
+  // The query must actually be IN the id somewhere before "it must be hiding
+  // in the middle" is a claim this can make. Without this, a query absent
+  // from the id entirely (unreachable from `frame()` today -- rows are
+  // pre-filtered on this same string -- but this function is exported and
+  // called directly by tests and, eventually, other callers) falls through
+  // to "not in head, not in tail" and signals a match that does not exist.
+  const hasMatch = q !== "" && clean.toLowerCase().includes(q.toLowerCase());
+  const inHead = hasMatch && head.toLowerCase().includes(q.toLowerCase());
+  const inTail = hasMatch && tail.toLowerCase().includes(q.toLowerCase());
+  // A distinct GLYPH (`dashMatch`), not a bolded ordinary dash: `p.bold` is a
+  // no-op under `caps.colours === 0`, which would leave the marker a plain
+  // `—` -- blind again, for the whole no-colour population.
+  const marker = hasMatch && !inHead && !inTail ? p.bold(g.dashMatch) : g.dash;
+  return highlight(head, query, p) + marker + highlight(tail, query, p);
+}
 // Context window, formatted to FIT ITS COLUMN. The previous form was
 //   c >= 1e6 ? `${c / 1e6}M` : `${Math.round(c / 1000)}k`
 // which emits the raw quotient: 1048576 becomes "1.048576M", nine characters in a
@@ -177,6 +281,42 @@ const ctxS = (c) => {
 };
 const money = (v) => (v == null ? "" : Number(v).toFixed(2));
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+// #51 (§2.5(a)), revision 11: the model-count cell carries BOTH numbers
+// instead of a new column. A provider withholding nothing renders the BARE
+// count -- never `343/0` -- because the count itself is never suppressed,
+// only the second half; one that withholds renders both with the separator.
+//
+// NEVER BLINDLY TRUNCATED. `sanitizeDisplay("1501/1501", 7)` returns
+// `"1501/15"` -- a PLAUSIBLE WRONG PAIR, not a visibly clipped one, which is
+// worse than truncation because nothing about it looks wrong. If the exact
+// pair does not fit, fall back to a k-abbreviated pair before ever reaching
+// for a raw truncation; MEASURED against the real vault (max 434 models on
+// one provider) this branch is not live today, but the cell must still
+// answer honestly if routing ever grows past it.
+// Two abbreviation precisions, tried in order, because one is not always
+// enough to reach `width`: at 1501/1501, `1.5k/1.5k` is STILL nine columns,
+// wider than the exact pair it was meant to shrink. Dropping the decimal only
+// when the first attempt does not fit reaches `2k/2k` (five columns) without
+// giving up a digit of precision for the common, already-narrow case.
+const abbrevCount1 = (n) => (n < 1000 ? String(n) : `${trimZeros((n / 1000).toFixed(1))}k`);
+const abbrevCount0 = (n) => (n < 1000 ? String(n) : `${Math.round(n / 1000)}k`);
+export function countCell(total, refused, width = W.count) {
+  if (!refused) return String(total);
+  const exact = `${total}/${refused}`;
+  if (exact.length <= width) return exact;
+  const abbrev1 = `${abbrevCount1(total)}/${abbrevCount1(refused)}`;
+  if (abbrev1.length <= width) return abbrev1;
+  const abbrev0 = `${abbrevCount0(total)}/${abbrevCount0(refused)}`;
+  if (abbrev0.length <= width) return abbrev0;
+  // Neither abbreviation reaches `width` (six-digit-plus counts on both
+  // sides -- unreached today, MEASURED max 434 on one real provider). CORRECT
+  // beats TRUNCATED even over width: `rpad` must not silently cut this to a
+  // plausible wrong pair, so the caller passes it through uncapped and any
+  // resulting overflow is the frame's own visible, already-tested row clip,
+  // not a lie inside the cell.
+  return exact;
+}
 
 // Pad OR TRUNCATE to the frame's inner width using the VISIBLE length, so a
 // coloured cell does not shorten its row. This is the one place colour and layout
@@ -262,6 +402,53 @@ export function frame(v, meta, { caps }) {
       : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
   L.push(title(g, p, crumb));
 
+  // THIS ROW COSTS A LINE `pick-state.mjs`'s `rowsAvail` never budgeted for
+  // (that constant lives in the file R16 may not touch -- R18's). Left
+  // unaccounted, a provider that both withholds AND already fills the
+  // viewport renders one line taller than the terminal; `uwpick.mjs`'s
+  // `draw()` writes HOME + lines with no full clear, so an over-tall frame
+  // SCROLLS the terminal by one line per redraw instead of clipping cleanly --
+  // creeping, duplicated chrome, not a static row. Reserving one item slot
+  // here (dropping whichever end of `v.items` the cursor is NOT on, so the
+  // marked row is never the one hidden) keeps the total line count exactly
+  // what `pick-state.mjs` already sized the viewport for. This is a
+  // mitigation done from this task's own side of the boundary, not the fix --
+  // the fix is `rowsAvail` accounting for this row, and that belongs to R18
+  // (see the plan addendum forwarding it there).
+  //
+  // Computed here, ahead of `right` below, so the header's own `N of M`
+  // count can report what this loop actually renders (N4) rather than the
+  // untrimmed `v.items.length`.
+  const withheldCount = v.provider?.refused?.length ?? 0;
+  const showWithheld = !flat && v.level === 1 && withheldCount > 0;
+  let renderItems = v.items, renderTop = v.top, renderMore = v.more;
+  if (showWithheld && v.more > 0 && renderItems.length >= 2) {
+    // Default to dropping the BACK (anchor -- `top` unchanged), and only drop
+    // the FRONT when the cursor sits on the very last visible row. The
+    // opposite ordering (default drop-front, special-case cursor-at-front)
+    // moved the discontinuity to the SECOND keypress -- leaving row 0 for row
+    // 1 repainted the whole list one line over, and back again on the way up,
+    // for every position in between where nothing about the window's content
+    // needed to change. Anchoring on the back means the visible set is STABLE
+    // across the whole window except at its one true edge, where a shift is
+    // already the natural behaviour a window is about to need anyway.
+    const atBack = renderTop + renderItems.length - 1 === v.cursor;
+    if (atBack) {
+      // The hidden item is now ABOVE the window. `pick-state.mjs`'s `more`
+      // (`pick-state.mjs:327`) is defined strictly as items BELOW the
+      // window -- `all.length - (top + shown.length)` -- so folding an
+      // above-item into it would mislabel it as one of the below ones, the
+      // exact class of defect [[counts-carry-their-denominator]] exists to
+      // catch. Only when the trim drops the BACK does the hidden item
+      // actually join the below population `renderMore` counts.
+      renderItems = renderItems.slice(1);
+      renderTop = renderTop + 1;
+    } else {
+      renderItems = renderItems.slice(0, -1);
+      renderMore += 1;
+    }
+  }
+
   // Q1.3: the routability stamp is printed, not implied. An undimmed row means
   // either "routable" or "nobody checked", and those are different claims; the
   // stamp is what lets the user tell which one they are looking at. `—` means the
@@ -269,11 +456,36 @@ export function frame(v, meta, { caps }) {
   const routableStamp = meta.routableAsOf
     ? `routable ${String(meta.routableAsOf).slice(5, 16).replace("T", " ")}`
     : `routable ${g.dash}`;
+  // Same pattern as `routableStamp`, restated for a second field the renderer
+  // reads and, until this task, nobody wrote (R15/B3-OQ-4's exact failure
+  // shape, one field over): `null` provenance renders blank at the row level,
+  // and this stamp is what discloses THAT rather than leaving a silent dash
+  // indistinguishable from "every row happens to be catalogue-only".
+  //
+  // ON THE MODEL-LEVEL HEADER, beside `N of M` -- NOT level 0's. The plan is
+  // explicit that level 0 is unchanged: it already carries four segments at
+  // 78 columns, and `routableStamp` alone already uses most of the spare
+  // width there. MEASURED: appending `discoveredStamp` to level 0's `right`
+  // instead produced a header that clips the stamp to a bare word or a
+  // mangled date the moment `routableAsOf` is populated (i.e. always, once
+  // the refresher has run once) -- the exact silent-disclosure failure this
+  // stamp exists to prevent, one level up.
+  const discoveredStamp = meta.discoveredAsOf
+    ? `discovered ${String(meta.discoveredAsOf).slice(5, 16).replace("T", " ")}`
+    : `discovered ${g.dash}`;
+  // Flat is a MODEL-level view too -- its rows run `provenanceDot` exactly
+  // like level 1's, so the same disclosure applies: blank must be disclosed,
+  // not implied (§2.3). Missing this left flat scope showing blank gutters
+  // with nothing on screen saying why, in the one branch that renders the
+  // thing being disclosed and skips the stamp that discloses it.
   const right = flat
-    ? `${v.items.length + v.more} of ${meta.models} models`
+    ? `${v.items.length + v.more} of ${meta.models} models ${g.sep} ${discoveredStamp}`
     : v.level === 0
       ? `${meta.providers} providers ${g.sep} ${meta.models} models ${g.sep} ${routableStamp}`
-      : `${v.items.length} of ${v.provider.models.length}`;
+      // `renderItems.length`, not `v.items.length` (N4): the trim above can
+      // render one fewer row than `v.items` carries, and this count's whole
+      // job is saying how much of the list is on screen.
+      : `${renderItems.length} of ${v.provider.models.length} ${g.sep} ${discoveredStamp}`;
   const left = `  filter: ${sanitizeDisplay(v.filter, 40)}${p.inv(g.caret)}`;
   const gap = Math.max(1, INNER - vis(left) - vis(right));
   L.push(bar(g, left + " ".repeat(gap) + p.dim(right)));
@@ -294,10 +506,15 @@ export function frame(v, meta, { caps }) {
   // 3-wide T/V/R cell. Both are now derived from the same W constants as the row,
   // and the derived-offset test below asserts they agree rather than trusting it.
   // The two-space gap before "health" is the dot gutter (see W).
+  // The provenance gutter is a two-column blank in the header, matching the
+  // health dot's own gutter convention (see W): the glyph needs no text
+  // label of its own, since "distinct glyph per state" is the whole
+  // observable, and a label would compete with the `discovered` stamp
+  // already carrying that disclosure at the header line above.
   L.push(bar(g, p.dim(!flat && v.level === 0
     ? "  " + pad("key id", W.keyId) + rpad("models", W.count) + "   " +
       pad("free", W.bar + W.free) + "  " + pad("health", W.health)
-    : "  " + pad(flat ? "provider/model" : "model", W.id) + rpad("ctx", W.ctx) + " " +
+    : "  " + "  " + pad(flat ? "provider/model" : "model", W.id) + rpad("ctx", W.ctx) + " " +
       rpad("$in", W.price) + rpad("$out", W.price) + "  " +
       pad("badge", W.badge) + pad("TVR", W.caps))));
 
@@ -315,8 +532,26 @@ export function frame(v, meta, { caps }) {
                   `"${sanitizeDisplay(v.filter, 20)}"`));
   }
 
-  v.items.forEach((it, i) => {
-    const selected = v.top + i === v.cursor;
+  // #51 (§2.5(b)): the visible entry point. RENDER ONLY -- this task's WRITES
+  // are `style.mjs`/`uwpick.mjs`; the row becoming an actual cursor-reachable
+  // item (a `kind: "withheld-list"` member of `v.items`, opening the ctrl+r
+  // overlay on enter) is `menu/pick-state.mjs`'s job, explicitly R18's WRITES
+  // and explicitly not this task's (see the plan's own boundary note above
+  // this function). Suppressed entirely when the provider withholds nothing,
+  // matching ctrl+r's own "no-op when the count is zero" rule so an overlay
+  // that cannot open and a row that opens it never disagree. Wording is
+  // WITHHELD, never BLOCKED (§2.5(c)): the population is dominated by
+  // withheld-with-a-reason rows, not hostile ids.
+  //
+  // `showWithheld`/`renderItems`/`renderTop`/`renderMore` are computed above,
+  // before `right`, so the header's own `N of M` count (N4) can report what
+  // this loop actually renders rather than the untrimmed `v.items.length`.
+  if (showWithheld) {
+    L.push(bar(g, p.dim(`  ${g.arrow} WITHHELD LIST (${withheldCount})`)));
+  }
+
+  renderItems.forEach((it, i) => {
+    const selected = renderTop + i === v.cursor;
     const mark = selected ? g.marker : " ";
     let body;
     if (it.kind === "provider") {
@@ -325,7 +560,10 @@ export function frame(v, meta, { caps }) {
       const freeTxt = r.free == null ? g.dash
         : r.planCount ? `${r.free} +${r.planCount} plan` : String(r.free);
       body = `${mark} ` + highlight(pad(r.keyId, W.keyId), v.filter, p) +
-             rpad(total, W.count) + "   " +
+             // #51 (§2.5(a)): bare count when nothing is withheld, `#/#`
+             // when something is -- never a new column, the same W.count
+             // cell renamed to a wider role (revision 11).
+             rpadCount(countCell(total, r.refused?.length ?? 0), W.count) + "   " +
              proportionBar(r.free, total, g) + " " + pad(freeTxt, W.free - 1) +
              healthDot(r.health, g, p) + " " + pad(r.health, W.health);
     } else if (it.kind === "pinned") {
@@ -370,7 +608,12 @@ export function frame(v, meta, { caps }) {
       // so the cell says the consequence it can prove instead of the cause it
       // cannot. Recorded rather than quietly narrowed.
       const ctxCell = m.outputKind === "nontext" ? "nochat" : ctxS(m.ctx);
-      body = `${mark} ` + highlight(pad(flat ? it.target : m.id, W.id), v.filter, p) +
+      // The provenance gutter, same 2-column convention as health's dot: one
+      // glyph, one space, no text label. `m.provenance` arrives straight off
+      // the snapshot row (schema 3, R15) -- `null` for a synthetic/unknown
+      // row (relay is `config-asserted`, never null; see catalog.mjs).
+      body = `${mark} ` + provenanceDot(m.provenance, g, p) + " " +
+             padId(flat ? it.target : m.id, W.id, v.filter, g, p) +
              rpad(ctxCell, W.ctx) + " " +
              rpad(money(m.pin), W.price) + rpad(money(m.pout), W.price) + "  " +
              badgeOut +
@@ -401,7 +644,7 @@ export function frame(v, meta, { caps }) {
     L.push(bar(g, selected ? p.inv(strip(body)) : body));
   });
 
-  if (v.more > 0) L.push(bar(g, p.dim(`  ${g.ell} ${v.more} more`)));
+  if (renderMore > 0) L.push(bar(g, p.dim(`  ${g.ell} ${renderMore} more`)));
   const atProviders = !flat && v.level === 0;
   L.push(footer(g, p, caps.unicode ? (atProviders ? HELP0 : HELP1)
                                    : (atProviders ? HELP0_A : HELP1_A)));

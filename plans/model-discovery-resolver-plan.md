@@ -3438,6 +3438,35 @@ Extra observables *(revision 11)*:
 `test/style.test.mjs`, `test/uwpick.test.mjs`.
 **Serial after:** R16 (same `style.mjs` and `uwpick.mjs`).
 
+**Inherited from R16, found in its own review: the static `WITHHELD LIST` row costs a line
+`pick-state.mjs`'s `rowsAvail` (`:123`) never budgeted for.** R16 may not touch that file, so the row
+was pushed straight into `frame()`'s output with no matching change to the viewport's row count. A
+provider that both withholds AND already fills the viewport (`v.more > 0`) renders one line taller
+than the terminal; `uwpick.mjs`'s `draw()` writes `HOME` plus lines with no full clear, so an over-tall
+frame **scrolls the terminal by one line per redraw** rather than clipping cleanly — creeping,
+duplicated chrome, not a static row. MEASURED: `termRows=30, items=24, more=6` → 31 rendered lines,
+one over. R16 shipped a mitigation from its own side of the boundary (trims one item from the render,
+choosing whichever end of the window the cursor is *not* on so the marked row is never hidden, and
+only when `v.more` was already `> 0` so no line is manufactured where none existed) — but that is
+scaffolding around the gap, not the fix. **This task already turns the row into a real, selectable
+`v.items` member** (revision 11, below), which resolves the gap as a natural side effect: once the row
+is one of the items `rowsAvail` sizes for, it needs no separate accounting. Confirm this actually
+lands — i.e. that `rowsAvail`'s row count includes the WITHHELD LIST row once it is a real item — and
+that R16's interim item-trim in `style.mjs` is removed once this task's own accounting supersedes it,
+rather than the two stacking.
+
+**Also inherited from R16's review: `test/uwpick.test.mjs`'s Constraint 25 line-count budget (currently
+960) will move again.** This task adds a reducer field, a `ctrl+r` binding, and a modal overlay across
+`style.mjs` and `pick-state.mjs` — real code, not comment bloat, so the same "either cut, or change the
+number deliberately" choice R16 already made will recur, and R16's own bump landed at 959 of 960 with
+nothing of this task's yet added. Three consecutive reactive bumps (R15, R16, and now this one) is a
+constraint that moves whenever it binds, which is not the same as one that measures anything. This task
+should either **set the budget once with this task's actual cost already known** (measure the real
+addition, then pick a number with headroom, not the next-smallest value that passes), or **convert the
+line count to a reported-not-gated tripwire** and let the real thing it stands in for — the 300 ms
+first-frame wall-clock budget, MEASURED at 25.6 ms against the full 4,732-model production snapshot,
+~12x headroom — be the assertion that actually gates. Either is fine; a fourth reactive bump is not.
+
 **What the reducer ends up owning — stated explicitly, because decisions doc §9.1 depends on it:**
 
 - **one nullable field**, `state.refusals`: `null` when closed, otherwise

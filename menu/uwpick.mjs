@@ -54,6 +54,13 @@ export function firstFrame({ snap, recents, favourites, caps, termRows }) {
     // picker asks nobody anything; it prints the stamp so the user can see how
     // old the dim state is rather than assuming it is live.
     routableAsOf: snap.routableAsOf ?? null,
+    // R15/R16: same reasoning, same failure shape (B3/OQ-4) this file's own
+    // comment already names for `routableAsOf` -- a field the renderer reads
+    // and nobody writes renders a permanent, indistinguishable-from-broken
+    // dash. `meta` is a fixed literal built here, not derived from `snap`
+    // downstream, so adding the field to the snapshot (R15) without adding it
+    // HERE would have shipped a header reading `undefined` on every row.
+    discoveredAsOf: snap.discoveredAsOf ?? null,
   };
   return { state, meta, text: screen(view(state), meta, { caps }) };
 }

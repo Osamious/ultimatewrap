@@ -233,8 +233,13 @@ test("the picker's runtime path stays inside its line budget", () => {
     return [f, n];
   });
   const total = counts.reduce((a, [, n]) => a + n, 0);
-  assert.ok(total <= 900,
-    `picker runtime path is ${total} lines against a 900 budget:\n` +
+  // R16 (provenance gutter, padId elision, countCell, discoveredStamp,
+  // WITHHELD LIST render) added real lines, not comment bloat: 900 -> 960.
+  // Measured against the thing this proxy bounds -- a real firstFrame() call
+  // against the full production snapshot (4,732 models) -- cost 25.6ms,
+  // ~12x headroom under the 300ms budget, so 960 stays a conservative proxy.
+  assert.ok(total <= 960,
+    `picker runtime path is ${total} lines against a 960 budget:\n` +
     counts.map(([f, n]) => `  ${String(n).padStart(4)}  ${f}`).join("\n") +
     `\nThe 300 ms first-frame budget is what this bounds. Either cut, or change the ` +
     `number deliberately and say why.`);
