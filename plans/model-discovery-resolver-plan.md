@@ -3345,6 +3345,14 @@ not-a-model-value cell text. R14's own row shape and the `mode` field it always 
 task renders from; picking the actual cell text for a mode is this task's job, not something R14
 already discharged.**
 
+**Inherited from R15, found in its own review: `modality` (the new snapshot field this task's `ctx`
+cell is meant to consume, per D2-A's original intent) carries the listing's raw capability FLAG
+(`tool_calling`, `chat`, `base`, `web_search`, ...), not a modality name. Measured on the real vault:
+115 `tool_calling`, 115 `text`, 46 `base`, 38 `chat`, 7 `reasoning`, 6 `video`, 3 `image`, 2
+`web_search` — a naive render would name `tool_calling` as a modality on 161 real rows. This task
+must map the raw flag through something capability-shaped (e.g. `keysync.mjs`'s own
+`capabilityKind`-style classification) before using it as cell text, not render `m.modality` verbatim.**
+
 *(Revision 11: **§2.6's consumer half is proposed as a separate task serial after this one**, on the
 same two source files. It is not folded in here — it renders a keysync **run** record, not catalogue
 data, and it reverses the decision recorded above `framesFor` in `menu/uwpick.mjs` that the picker reads no keysync state
