@@ -425,7 +425,7 @@ test("the legend lists every key, including the ones with no visible affordance"
   // the one that searches.
   const lines = frame({ ...V0, legend: true }, META, { caps: PLAIN }).map(strip).join("\n");
   for (const k of ["up / down", "type to filter", "backspace", "enter", "tab",
-                   "ctrl+f", "esc", "ctrl+c", "?"]) {
+                   "ctrl+f", "ctrl+r", "esc", "ctrl+c", "?"]) {
     assert.ok(lines.includes(k), `legend does not mention ${k}`);
   }
   assert.match(lines, /wraps/, "the legend must say the cursor wraps");
@@ -759,142 +759,155 @@ test("the count cell's honest overflow survives all the way to the rendered row,
   assert.doesNotMatch(row, /1501\/15\D/, "never the width-truncated plausible-wrong pair");
 });
 
-test("the WITHHELD LIST row appears only for a provider that actually withholds something", () => {
-  // #51 (§2.5(b)), render-only in this task: the row becoming a cursor-reachable
-  // item is R18's own WRITES (menu/pick-state.mjs), explicitly not this one's.
-  const withRefusals = { ...ROWS[0], refused: [{ id: "x", reason: "no-price" }] };
-  const V = { ...V1, provider: withRefusals };
+test("style.mjs renders a real WITHHELD LIST v.items member, with no knowledge of provider.refused", () => {
+  // R18: the row is now a genuine, cursor-reachable `v.items` member that
+  // `pick-state.mjs` places and sizes `rowsAvail` for like any other row --
+  // R16's item-trim mitigation (needed only while this row was a static
+  // addition OUTSIDE `v.items`) is retired along with it. `frame()` no
+  // longer reads `v.provider.refused` at all; it renders whatever `v.items`
+  // hands it. Whether the row appears, and where, is `pick-state.mjs`'s
+  // decision now -- covered in `test/pick-state.test.mjs`, not here.
+  const V = { ...V1, items: [{ kind: "withheld-list", count: 3 }, ...V1.items] };
   const lines = frame(V, META, { caps: PLAIN }).map(strip);
-  assert.ok(lines.some((l) => l.includes("WITHHELD LIST (1)")),
-    "a provider with a refused entry must show the row, with the right count");
+  assert.ok(lines.some((l) => l.includes("WITHHELD LIST (3)")),
+    "a withheld-list item in v.items must render with its own count");
 
-  const noRefusals = { ...ROWS[0], refused: [] };
-  const clean = frame({ ...V1, provider: noRefusals }, META, { caps: PLAIN }).map(strip);
-  assert.ok(clean.every((l) => !l.includes("WITHHELD")),
-    "a provider withholding nothing must not show the row");
+  // Selectable and markable like any other row -- the cursor can land on it.
+  const selected = frame({ ...V, cursor: 0 }, META, { caps: VT })
+    .map(strip).find((l) => l.includes("WITHHELD LIST"));
+  assert.match(selected, /▶/, "the cursor must be able to mark this row");
 
-  // Flat scope has no single provider in view, so the row cannot apply there
-  // regardless of what any one provider withholds.
-  const flatV = { ...V, scope: "flat" };
-  const flatLines = frame(flatV, META, { caps: PLAIN }).map(strip);
-  assert.ok(flatLines.every((l) => !l.includes("WITHHELD")));
+  // Dimmed, matching the file's existing WITHHELD wording and dim styling.
+  const row = frame({ ...V, cursor: 9 }, META, { caps: VT }).find((l) => l.includes("WITHHELD LIST"));
+  assert.match(row, /\x1b\[2m/, "the row is dimmed like the rest of this file's informational rows");
 });
 
-test("the WITHHELD LIST row never grows the frame past what pick-state.mjs sized the viewport for", () => {
-  // HIGH 5: `pick-state.mjs`'s `rowsAvail` never budgeted for this row (that
-  // constant lives in the file R16 may not touch). Left unaccounted, a
-  // provider that both withholds AND already fills the viewport (`v.more >
-  // 0`, so the window is already scrolled) renders one line taller than the
-  // terminal -- `uwpick.mjs`'s `draw()` writes HOME plus lines with no full
-  // clear, so an over-tall frame SCROLLS by one line per redraw rather than
-  // clipping cleanly. The mitigation trades one item row for the WITHHELD
-  // row ONLY when `v.more` is already > 0 -- the "N more" footer was already
-  // going to render, so bumping its count costs no new line. (Trimming when
-  // `v.more === 0` would instead MANUFACTURE a "1 more" line where none
-  // existed, which a separate case below guards against.) It must also never
-  // do so by hiding the cursor's own row.
-  const mkModels = (n) => Array.from({ length: n },
-    (_, i) => ({ id: `m${i}`, ctx: 8192, pin: 0, pout: 0, badge: "", routable: null }));
-  const provider = { keyId: "p", provider: "p", models: mkModels(5) };
-  const mkItems = (models) => models.map((m) => ({ kind: "model", target: `p/${m.id}`, model: m }));
+// --- R18: the refusal drill-in overlay --------------------------------------
 
-  const baseline = (cursor) => frame({ level: 1, scope: "tree", filter: "", legend: false,
-    cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [] },
-    items: mkItems(provider.models) }, META, { caps: PLAIN }).length;
+const V_REFUSALS = { level: 1, scope: "tree", filter: "", legend: false, cursor: 0, top: 0,
+  empty: false, provider: ROWS[0], more: 0, items: [],
+  refusals: { provider: "personal.acme.free", top: 0,
+    items: [{ id: "bad-model", reason: "cap-exceeded", removed: 0 }], total: 1 } };
 
-  const withheld = (cursor) => frame({ level: 1, scope: "tree", filter: "", legend: false,
-    cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
-    items: mkItems(provider.models) }, META, { caps: PLAIN }).length;
+test("the overlay is a full-screen modal, an early return like the legend, wording WITHHELD not BLOCKED", () => {
+  const lines = frame(V_REFUSALS, META, { caps: PLAIN }).map(strip);
+  assert.match(lines[0], /WITHHELD/);
+  assert.doesNotMatch(lines.join("\n"), /BLOCKED/i, "§2.5(c): the wording is WITHHELD, never BLOCKED");
+  assert.match(lines.join("\n"), /bad-model/);
+  assert.match(lines.join("\n"), /cap-exceeded/);
+});
 
-  // Cursor at front (0), middle (2), and back (4) of the 5-item window --
-  // the three positions the mitigation's front/back choice has to cover.
-  for (const cursor of [0, 2, 4]) {
-    assert.equal(withheld(cursor), baseline(cursor),
-      `cursor at ${cursor}: adding a WITHHELD LIST row must not grow the frame once already scrolled`);
-  }
-
-  // And the cursor's own row must still be marked selected in every case --
-  // the property the front/back choice exists to preserve.
-  for (const cursor of [0, 2, 4]) {
-    const lines = frame({ level: 1, scope: "tree", filter: "", legend: false,
-      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
-      items: mkItems(provider.models) }, META, { caps: VT }).map(strip);
-    const marked = lines.filter((l) => l.includes("▶"));
-    assert.equal(marked.length, 1, `cursor ${cursor}: exactly one row must carry the marker`);
-  }
-
-  // N2 (found on re-review): the visible SET of rendered rows must stay
-  // stable as the cursor moves within the window, not just individually
-  // correct at each position -- the earlier draft dropped the FRONT by
-  // default and only special-cased the cursor sitting at the front, so
-  // leaving row 0 for row 1 repainted the entire list one line over (and
-  // back again on the way up) for no reason tied to what should be visible.
-  // Anchoring on the BACK by default confines that discontinuity to the
-  // window's one true edge (the cursor reaching the LAST visible row),
-  // where a shift is already the natural behaviour a window is about to
-  // need anyway.
-  const idsAt = (cursor) => {
-    const lines = frame({ level: 1, scope: "tree", filter: "", legend: false,
-      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
-      items: mkItems(provider.models) }, META, { caps: PLAIN }).map(strip);
-    return lines.filter((l) => /\bm\d\b/.test(l)).map((l) => l.match(/\bm\d\b/)[0]);
-  };
-  assert.deepEqual(idsAt(0), idsAt(1), "moving off the very first row must not reshuffle the window");
-  assert.deepEqual(idsAt(1), idsAt(2), "the window is stable through the middle of its range");
-  assert.deepEqual(idsAt(2), idsAt(3), "still stable one short of the true edge");
-  assert.notDeepEqual(idsAt(3), idsAt(4),
-    "the one legitimate shift happens only at the window's actual last row (4)");
-
-  // N3 (found on re-review): `pick-state.mjs:327` defines `more` strictly as
-  // items BELOW the window. When the trim drops the FRONT (cursor at the
-  // back edge), the hidden item is ABOVE -- folding it into `more` anyway
-  // would count it in the wrong population
-  // ([[counts-carry-their-denominator]]). At cursor 4 (the back edge, drops
-  // the front) the footer must show the SAME count as the undisturbed
-  // baseline; only at a front-drop position does it grow by one.
-  const moreCountAt = (cursor) => {
-    const lines = frame({ level: 1, scope: "tree", filter: "", legend: false,
-      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
-      items: mkItems(provider.models) }, META, { caps: PLAIN }).map(strip);
-    const moreLine = lines.find((l) => l.includes("more"));
-    return Number(moreLine.match(/(\d+) more/)[1]);
-  };
-  assert.equal(moreCountAt(4), 3,
-    "cursor at the back edge drops the FRONT (an above-item) -- `more` (below-only) must not grow");
-  assert.equal(moreCountAt(2), 4,
-    "cursor in the middle drops the BACK (a genuine below-item) -- `more` grows by exactly one");
-
-  // N4 (found on re-review): the header's own `N of M` count must describe
-  // what actually renders, not the untrimmed `v.items.length` -- it is the
-  // one line on the frame whose entire job is saying how much of the list is
-  // on screen.
-  const headerCountAt = (cursor) => {
-    const header = strip(frame({ level: 1, scope: "tree", filter: "", legend: false,
-      cursor, top: 0, empty: false, more: 3, provider: { ...provider, refused: [{ id: "x" }] },
-      items: mkItems(provider.models) }, META, { caps: PLAIN })[1]);
-    return Number(header.match(/(\d+) of/)[1]);
-  };
-  for (const cursor of [0, 2, 4]) {
-    assert.equal(headerCountAt(cursor), 4,
-      `cursor ${cursor}: the header must count the trimmed, actually-rendered 4 rows, not the original 5`);
+test("every overlay line measures exactly FRAME_W, including at the 128-code-point id limit", () => {
+  const longId = "x".repeat(128);
+  const V = { ...V_REFUSALS,
+    refusals: { ...V_REFUSALS.refusals,
+      items: [{ id: longId, reason: "too-long", removed: 5 }], total: 1 } };
+  for (const caps of [VT, PLAIN]) {
+    for (const l of frame(V, META, { caps })) {
+      assert.equal([...strip(l)].length, FRAME_W, `caps ${caps.colours}: ${strip(l)}`);
+    }
   }
 });
 
-test("the WITHHELD LIST row does not manufacture a new \"more\" line when the item list already fits", () => {
-  // The other half of HIGH 5's fix: when `v.more === 0` the item list already
-  // fits inside `rowsAvail` with room to spare (or exactly none -- see the
-  // deferred residual noted in style.mjs), so trimming an item here would
-  // trade a line that was never in danger for a "1 more" footer that would
-  // not otherwise exist -- a strictly worse outcome. The row still shows,
-  // and every original item still renders.
-  const models = [{ id: "a", ctx: 8192, pin: 0, pout: 0, badge: "", routable: null },
-                   { id: "b", ctx: 8192, pin: 0, pout: 0, badge: "", routable: null }];
-  const provider = { keyId: "p", provider: "p", models, refused: [{ id: "x" }] };
-  const items = models.map((m) => ({ kind: "model", target: `p/${m.id}`, model: m }));
-  const lines = frame({ level: 1, scope: "tree", filter: "", legend: false, cursor: 0, top: 0,
-    empty: false, more: 0, provider, items }, META, { caps: PLAIN }).map(strip);
-  assert.ok(lines.some((l) => l.includes("WITHHELD LIST (1)")));
-  assert.ok(lines.some((l) => l.includes(" a ")), "no item is sacrificed when there is no scroll pressure");
-  assert.ok(lines.some((l) => l.includes(" b ")));
-  assert.ok(lines.every((l) => !l.includes("more")), "no manufactured \"more\" line");
+test("the load-bearing security test: a hostile id and a bidi override render with no escape sequence and no override reaching the frame", () => {
+  // Mirrors the existing "escape sequences in a model id cannot reach the
+  // frame" test -- this is the one place in the product where a hostile
+  // string is DELIBERATELY displayed. Asserted against the RENDERED STRING,
+  // not against the sanitiser, and defence in depth over what
+  // `denylist.mjs`'s `refusal()` already did upstream (§2.5): if this pass is
+  // ever the ONLY thing standing between a hostile id and the terminal, R17
+  // has regressed and #52 is open again.
+  const V = { ...V_REFUSALS,
+    refusals: { ...V_REFUSALS.refusals,
+      items: [
+        { id: "\x1b[2Jclear-screen", reason: "escape-sequence", removed: 6 },
+        { id: "evil\u202Ereversed", reason: "invisible", removed: 1 },
+      ], total: 2 } };
+  const out = frame(V, META, { caps: VT }).join("\n");
+  assert.equal(out.includes("\x1b[2J"), false, "the escape sequence itself must never reach the frame");
+  assert.equal(out.includes("\u202E"), false, "the bidi override must never reach the frame");
+  assert.match(strip(out), /clear-screen/, "the harmless remainder of the id still renders");
+  assert.match(strip(out), /evilreversed/);
+});
+
+test("the overlay's header names the withheld total and the visible page, and the column header names its three fields", () => {
+  const many = { ...V_REFUSALS.refusals,
+    items: Array.from({ length: 5 }, (_, i) => ({ id: `r${i}`, reason: "cap-exceeded", removed: 0 })),
+    top: 5, total: 30 };
+  const lines = frame({ ...V_REFUSALS, refusals: many }, META, { caps: PLAIN }).map(strip);
+  assert.match(lines[1], /30 withheld/);
+  assert.match(lines[1], /6-10 of 30/, "1-based, current page, against the real total");
+  assert.match(lines.join("\n"), /\bid\b/);
+  assert.match(lines.join("\n"), /reason/);
+  assert.match(lines.join("\n"), /removed/);
+});
+
+test("the overlay's footer says how to close it, distinctly from the tree/flat footers", () => {
+  const lines = frame(V_REFUSALS, META, { caps: PLAIN }).map(strip);
+  assert.match(lines.at(-1), /scroll/);
+  assert.match(lines.at(-1), /close/);
+});
+
+test("an empty refused page (all withheld already shown) renders no rows and no crash", () => {
+  const V = { ...V_REFUSALS, refusals: { ...V_REFUSALS.refusals, items: [], total: 0 } };
+  const lines = frame(V, META, { caps: PLAIN });
+  assert.ok(lines.length > 0);
+  for (const l of lines) assert.equal([...strip(l)].length, FRAME_W);
+});
+
+// --- R18: #60, the capped-recents disclosure --------------------------------
+
+test("a hidden-recents count renders \"... N more recents\" right after the pinned block, and is silent at zero", () => {
+  const withPins = { ...V0,
+    items: [{ kind: "pinned", target: "google/gemini-3.5-flash-lite", mark: "~" }, ...V0.items],
+    recentsHidden: 4 };
+  const lines = frame(withPins, META, { caps: PLAIN }).map(strip);
+  const pinnedIdx = lines.findIndex((l) => l.includes("gemini-3.5-flash-lite"));
+  assert.match(lines[pinnedIdx + 1], /4 more recents/,
+    "the disclosure must sit immediately after the pinned block");
+
+  const zero = frame({ ...withPins, recentsHidden: 0 }, META, { caps: PLAIN }).map(strip);
+  assert.ok(zero.every((l) => !l.includes("more recents")), "must not read \"0 more recents\"");
+
+  // Absent entirely without any pinned rows to disclose, even if the count
+  // were somehow nonzero -- there is no pinned block to sit "immediately
+  // after".
+  const noPins = frame({ ...V0, recentsHidden: 4 }, META, { caps: PLAIN }).map(strip);
+  assert.ok(noPins.every((l) => !l.includes("more recents")));
+
+  // Not level 0, not this disclosure: flat and level 1 never show it.
+  const flatV = { ...withPins, scope: "flat",
+    items: [{ kind: "model", target: "google/gemini-3.5-flash-lite", model: ROWS[0].models[0] }] };
+  assert.ok(frame(flatV, META, { caps: PLAIN }).map(strip).every((l) => !l.includes("more recents")));
+});
+
+test("the recents disclosure is suppressed while a filter is active (M4)", () => {
+  // `recentsHidden` is computed ONCE in `initState`, over the UNFILTERED
+  // recents list -- it does not shrink as `v.filter` narrows `v.items`.
+  // Rendering it under an active filter would claim "N more recents" exist
+  // below when the true count matching THIS filter could be anywhere from 0
+  // to N -- an unfiltered number attached to a filtered view, the exact
+  // failure shape [[counts-carry-their-denominator]] exists to catch. Hidden
+  // under a filter is fine (same rule as the WITHHELD LIST row, §2.5(b)); a
+  // wrong claim is not.
+  const withPins = { ...V0, filter: "flash",
+    items: [{ kind: "pinned", target: "google/gemini-3.5-flash-lite", mark: "~" }, ...V0.items],
+    recentsHidden: 4 };
+  const lines = frame(withPins, META, { caps: PLAIN }).map(strip);
+  assert.ok(lines.every((l) => !l.includes("more recents")),
+    "the disclosure must not render while v.filter is non-empty");
+
+  // And it returns the instant the filter clears.
+  const cleared = frame({ ...withPins, filter: "" }, META, { caps: PLAIN }).map(strip);
+  assert.ok(cleared.some((l) => l.includes("4 more recents")));
+});
+
+test("the recents disclosure is distinct wording from the bottom overflow line, so the two truncations are never confused", () => {
+  const V = { ...V0,
+    items: [{ kind: "pinned", target: "google/gemini-3.5-flash-lite", mark: "~" }, ...V0.items],
+    recentsHidden: 2, more: 7 };
+  const lines = frame(V, META, { caps: PLAIN }).map(strip);
+  assert.ok(lines.some((l) => l.includes("2 more recents")));
+  assert.ok(lines.some((l) => l.includes("7 more") && !l.includes("7 more recents")),
+    "the bottom overflow line must read plain \"more\", never \"more recents\"");
 });

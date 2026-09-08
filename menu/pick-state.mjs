@@ -93,26 +93,47 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30 }
   // nscale/flux.1-schnell has it in recents, and enter on that pin still switched.
   //
   // This is a hide, under a principle that says show and never hide, so: the row
-  // itself still renders in the tree, dimmed, with its modality. What is dropped
-  // is a DUPLICATE SHORTCUT to a row that is already visible and already refuses.
-  // A pin whose only possible action is refusal is not information, it is a dead
-  // control -- and the filter two lines below already establishes exactly this
-  // rule for a pin naming a model the catalogue dropped.
+  // itself still renders in the tree, dimmed. What is dropped is a DUPLICATE
+  // SHORTCUT to a row that is already visible and already refuses. A pin whose
+  // only possible action is refusal is not information, it is a dead control --
+  // and the filter two lines below already establishes exactly this rule for a
+  // pin naming a model the catalogue dropped.
   for (const r of rows) for (const m of r.models) {
     if (isSelectable({ kind: "model", model: m })) known.add(asTarget(r.provider, m.id));
   }
+  // Display cap, distinct from `MAX_RECENTS` (`state.mjs`, storage cap = 10).
+  // MEASURED live: 10 stored recents, 0 favourites, 9 rendering after the
+  // `known` filter above, and `rowsAvail` = 24 on a 30-row terminal -- the
+  // pinned block was consuming 37% of the pane. At 5 it consumes 21%. Now
+  // strictly the smaller of the two, so it is the only bound that ever limits
+  // what renders; `MAX_RECENTS` can be read at `state.mjs` without implying it
+  // is also the display count.
+  const MAX_RECENTS_SHOWN = 5;
   // Favourites first, then recents, both filtered to targets that still exist.
   // A pinned row naming a model the catalogue dropped would be a dead selection.
+  // Capped AFTER the favourite exclusion, not before -- a recent that is also a
+  // favourite must not consume one of the five slots while rendering zero rows
+  // under its own mark.
+  const knownRecents = recents.filter((t) => known.has(t) && !favourites.includes(t));
+  const shownRecents = knownRecents.slice(0, MAX_RECENTS_SHOWN);
   const pinned = [
     ...favourites.filter((t) => known.has(t)).map((target) => ({ kind: "pinned", target, mark: "*" })),
-    ...recents.filter((t) => known.has(t) && !favourites.includes(t))
-              .map((target) => ({ kind: "pinned", target, mark: "~" })),
+    ...shownRecents.map((target) => ({ kind: "pinned", target, mark: "~" })),
   ];
   return {
     rows, pinned,
+    // #60: the cap is a hiding action and must disclose itself, the same
+    // principle §2.5 already applies to a withheld model -- storage
+    // (`recordRecent`, newest-first) still holds every entry this drops, so
+    // `recentsHidden` is what lets style.mjs render "... N more" rather than
+    // silently rendering fewer rows than the user remembers saving.
+    recentsHidden: knownRecents.length - shownRecents.length,
     level: 0, scope: "tree", legend: false,
     q: ["", "", ""], cur: [0, 0, 0], top: [0, 0, 0],
     provider: null, termRows,
+    // #51 (§2.5(b)/(c)), R18: null when closed, otherwise
+    // `{ provider: <keyId>, top: <scroll offset> }` for the drill-in overlay.
+    refusals: null,
   };
 }
 
@@ -120,7 +141,33 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30 }
 // restores the filters the user had typed there.
 const slot = (s) => (s.scope === "flat" ? 2 : s.level);
 
-const rowsAvail = (s) => Math.max(3, (s.termRows || 30) - 6);
+// R18's worst case, not the tree view's own 5: level 0's fixed chrome (title,
+// meta bar, blank, column header, footer = 5) can carry TWO conditional
+// lines at once -- the pre-existing bottom overflow ("... N more") and the
+// new #60 recents-disclosure ("... N more recents") -- and the refusals
+// overlay's own chrome (title, meta bar, blank, column header, blank, "any
+// key closes", footer) is 7 fixed lines on its own. Both are shared against
+// this ONE budget (the overlay's paging in `view()` and its arrow-scroll
+// clamp below reuse it rather than inventing a second constant), so it must
+// reserve for the more demanding of the two. MEASURED: at the old `- 6`,
+// a provider that both fills the viewport AND withholds something rendered
+// one line taller than the terminal (R16's forwarded bug); separately, the
+// live vault's own default state (10 stored recents, 0 favourites) overflows
+// level 0's first frame by exactly one line, on every launch. `- 7` costs one
+// spare, harmless row in the common case (neither conditional line present,
+// or the overlay's page short of a full screen) and is exact at both worst
+// cases.
+//
+// The `Math.max(3, ...)` FLOOR is a separate, pre-existing tradeoff, restated
+// here rather than left implicit now that the divisor changed: below a
+// termRows of 10, this guarantees at least 3 visible rows -- never a
+// zero-row pane -- at the cost of the overlay's 7-line chrome (7 + 3 = 10)
+// exceeding an extremely small terminal. This is not new to this change: the
+// original `- 6` already overflowed the tree/flat chrome (6 + 3 = 9) below a
+// termRows of 9. Usable-with-a-floor beats correctly-sized-and-empty; a
+// terminal shorter than 10 rows is far outside this product's stated target
+// and is accepted, disclosed tradeoff rather than a silently broken one.
+const rowsAvail = (s) => Math.max(3, (s.termRows || 30) - 7);
 
 function flatItems(s) {
   const out = [];
@@ -139,10 +186,21 @@ function items(s) {
   if (s.scope === "flat") return flatItems(s).filter((i) => has(i.target));
 
   if (s.level === 1) {
-    return s.provider.models
+    const modelItems = s.provider.models
       .filter((m) => has(m.id))
       .map((m) => ({ kind: "model", model: m, row: s.provider,
                      target: asTarget(s.provider.provider, m.id) }));
+    // #51 (§2.5(b), revision 11): a second door onto the ctrl+r overlay, placed
+    // FIRST so it sits above every model row. It is not a model row -- it has
+    // no id to match against a query -- so it never enters the filter's match
+    // set: present only while nothing is filtering (hiding it while a query
+    // narrows the models below is fine; a query MATCHING it as though it were
+    // a model id would be the defect §2.5(b) names).
+    const withheldCount = s.provider.refused?.length ?? 0;
+    if (!needle && withheldCount > 0) {
+      return [{ kind: "withheld-list", count: withheldCount }, ...modelItems];
+    }
+    return modelItems;
   }
 
   // Level 0. The filter matches member model ids too, so typing "opus" finds the
@@ -222,7 +280,21 @@ export function tokenize(chunk) {
 
 export function reduce(state, ev) {
   if (ev && typeof ev === "object" && Number.isFinite(ev.resize)) {
-    return { ...NONE, state: clamp({ ...state, termRows: ev.resize }) };
+    let next = clamp({ ...state, termRows: ev.resize });
+    // `clamp()` only re-derives the main list's `top`. Left alone, a resize
+    // while the overlay is open (L1) can leave `refusals.top` scrolled past
+    // the new, smaller max -- the page then starts mid-list with room to
+    // show everything, and the very next single-row scroll press jumps `top`
+    // back to a sane value in one keystroke, which reads as the overlay
+    // teleporting rather than resizing.
+    if (next.refusals) {
+      const providerRow = next.rows.find((r) => r.keyId === next.refusals.provider);
+      const total = providerRow?.refused?.length ?? 0;
+      const maxTop = Math.max(0, total - rowsAvail(next));
+      const top = Math.max(0, Math.min(next.refusals.top, maxTop));
+      next = { ...next, refusals: { ...next.refusals, top } };
+    }
+    return { ...NONE, state: next };
   }
   const key = String(ev ?? "");
   const c0 = key.charCodeAt(0);
@@ -232,6 +304,37 @@ export function reduce(state, ev) {
 
   if (c0 === 3) return { ...NONE, state, exit: { target: null } };               // ctrl+c
 
+  // REFUSALS OVERLAY -- the pinned dispatch position (H1/L14): after the ctrl+c
+  // check, before both the legend branch and the esc ladder. Placed after
+  // legend, `?` would stack a second modal; placed after the esc ladder, esc
+  // would fall through and clear the filter instead of closing this one.
+  // What is reused from legend is the POSITION in the dispatch chain, not the
+  // grammar: legend swallows every key including arrows in one branch; this is
+  // a two-branch rule -- arrows scroll, everything else closes -- because a
+  // modal with scrollable content establishes no precedent for eating the keys
+  // that would scroll it.
+  if (state.refusals) {
+    // Any CSI sequence is arrow-SHAPED input, not a "close" instruction.
+    // Left/Right/Home/End/PgUp/PgDn are silent no-ops everywhere else in this
+    // picker -- the ordinary arrow handler below matches the same CSI prefix
+    // and only acts on an `A`/`B` final, leaving every other final to fall
+    // through to an unchanged `clamp()`. Closing the overlay on one of those
+    // by accident would make it the one place that convention breaks (L2).
+    if (key.length >= 3 && c0 === 27 && key[1] === "[") {
+      if (key[2] === "A" || key[2] === "B") {
+        const providerRow = state.rows.find((r) => r.keyId === state.refusals.provider);
+        const total = providerRow?.refused?.length ?? 0;
+        const avail = rowsAvail(state);
+        const top = key[2] === "A"
+          ? Math.max(0, state.refusals.top - 1)
+          : Math.min(Math.max(0, total - avail), state.refusals.top + 1);
+        return { ...NONE, state: { ...state, refusals: { ...state.refusals, top } } };
+      }
+      return { ...NONE, state };                        // other CSI finals: no-op, stays open
+    }
+    return { ...NONE, state: { ...state, refusals: null } };
+  }
+
   // The legend is modal and swallows exactly one key, including enter and esc.
   // Swallowing is the point: a user who opens it to find out what esc does should
   // not have esc quit the picker on the way out.
@@ -240,6 +343,22 @@ export function reduce(state, ev) {
 
   if (key === "\t") {                                                          // scope toggle
     return { ...NONE, state: clamp({ ...state, scope: state.scope === "flat" ? "tree" : "flat" }) };
+  }
+
+  if (c0 === 18 && state.scope !== "flat") {                                 // ctrl+r
+    // Reachable from BOTH levels (H3): at level 0 for the FOCUSED provider
+    // under the cursor, and at level 1 for the provider being viewed
+    // (`state.provider` -- already in hand, set on descent). A user who
+    // notices models missing is looking at that provider's own model list,
+    // not the provider index, so restricting this to level 0 would answer
+    // the wrong half of the question. No-op wherever the refused count is
+    // zero (including a pinned/recent row at level 0, which carries no
+    // provider), so an empty overlay can never open.
+    const providerRow = state.level === 0
+      ? (focused?.kind === "provider" ? focused.row : null)
+      : state.provider;
+    if (!providerRow || (providerRow.refused?.length ?? 0) === 0) return { ...NONE, state };
+    return { ...NONE, state: { ...state, refusals: { provider: providerRow.keyId, top: 0 } } };
   }
 
   if (c0 === 6 && focused?.kind === "model") {                                // ctrl+f
@@ -288,6 +407,12 @@ export function reduce(state, ev) {
 
   if (c0 === 13 || c0 === 10) {                                                // enter
     if (!focused) return { ...NONE, state };
+    // Revision 11: the WITHHELD LIST row is a second DOOR onto the same
+    // overlay ctrl+r opens, not a second mechanism -- it sets the identical
+    // `state.refusals` shape for the provider already being viewed.
+    if (focused.kind === "withheld-list") {
+      return { ...NONE, state: { ...state, refusals: { provider: state.provider.keyId, top: 0 } } };
+    }
     if (focused.kind === "provider") {
       const q = [...state.q], cur = [...state.cur], top = [...state.top];
       q[1] = ""; cur[1] = 0; top[1] = 0;
@@ -320,10 +445,26 @@ export function view(state) {
   const all = items(state);
   const avail = rowsAvail(state);
   const shown = all.slice(state.top[i], state.top[i] + avail);
+  // The one projection this task adds, beside `legend`: `refusals` resolved
+  // from the reducer's minimal `{provider, top}` into what style.mjs actually
+  // renders -- the page of `refused[]` entries the current scroll offset
+  // names, and the total the same paging arithmetic (`rowsAvail`) uses for
+  // the arrow-scroll clamp above, so the two can never disagree about how
+  // many rows a page holds.
+  let refusals = null;
+  if (state.refusals) {
+    const providerRow = state.rows.find((r) => r.keyId === state.refusals.provider);
+    const list = providerRow?.refused ?? [];
+    const top = state.refusals.top;
+    refusals = { provider: state.refusals.provider, top,
+                 items: list.slice(top, top + avail), total: list.length };
+  }
   return {
     level: state.level, scope: state.scope, filter: state.q[i], legend: state.legend,
     items: shown, cursor: state.cur[i], top: state.top[i],
     empty: all.length === 0, provider: state.provider,
     more: Math.max(0, all.length - (state.top[i] + shown.length)),
+    recentsHidden: state.recentsHidden ?? 0,
+    refusals,
   };
 }

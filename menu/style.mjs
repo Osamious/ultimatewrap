@@ -379,6 +379,7 @@ const LEGEND = [
   "enter          open a provider, or select a model",
   "tab            toggle flat provider/model search",
   "ctrl+f         add or remove a favourite",
+  "ctrl+r         show withheld models for this provider",
   "esc            clear the filter, then go back, then quit",
   "ctrl+c         quit without changing the chat input",
   "?              this legend",
@@ -395,59 +396,74 @@ export function frame(v, meta, { caps }) {
   // counted providers. view() has always passed scope; frame() simply never read
   // it.
   const flat = v.scope === "flat";
+
+  // #51 (§2.5(b)/(c)), R18: the refusal drill-in, an early return exactly like
+  // `v.legend` below -- a full modal, not a variant of the tree/flat chrome.
+  // Wording is WITHHELD, never BLOCKED (§2.5(c)): the population is dominated
+  // by withheld-with-a-reason rows, not hostile ids. `id` and `reason` are
+  // ALREADY sanitised once, at the only constructor of a rejection
+  // (`denylist.mjs`'s `refusal()`) -- `pad()` runs `sanitizeDisplay` again
+  // here as DEFENCE IN DEPTH, not as the guarantee: the snapshot this data
+  // arrives on is a file on disk something else could edit, and a renderer
+  // must be safe against any input regardless of provenance. If this pass is
+  // ever the ONLY thing standing between a hostile id and the terminal, R17
+  // has regressed and #52 is open again.
+  if (v.refusals) {
+    L.push(title(g, p, `UW ${g.sep} ${sanitizeDisplay(v.refusals.provider, 30)} ${g.sep} WITHHELD`));
+    const shown = v.refusals.items.length;
+    const from = shown ? v.refusals.top + 1 : 0;
+    const to = v.refusals.top + shown;
+    const left = `  ${v.refusals.total} withheld`;
+    const right = `${from}-${to} of ${v.refusals.total}`;
+    const gap = Math.max(1, INNER - vis(left) - vis(right));
+    L.push(bar(g, left + " ".repeat(gap) + p.dim(right)));
+    L.push(bar(g, ""));
+    L.push(bar(g, p.dim("  " + pad("id", W.id) + "  " + pad("reason", 24) + rpad("removed", 7))));
+    // MIDDLE elision (`padId`, R16) for the ID column only, not `pad`'s
+    // right-truncation: MEASURED against the real snapshot, 117 of 4,732
+    // model ids exceed 37 code points (max 52), and this overlay's whole job
+    // is naming WHICH ids were withheld -- right-truncating two long ids
+    // sharing a prefix (a common shape:
+    // `accounts/fireworks/models/llama-v3p1-...`) renders them as one
+    // indistinguishable string, on the one screen this is supposed to be
+    // legible on. No filter applies here (the overlay is not searchable), so
+    // the query is always empty and `padId` degrades to plain elision with
+    // no highlight -- exactly what a non-searchable column needs.
+    //
+    // `reason` stays on plain `pad`, deliberately not `padId`. The reason
+    // vocabulary is CLOSED (`sanitize.mjs`'s `REFUSAL_RULES`, 11 codes, plus
+    // `uw-namespace`) and its longest member is 17 code points against this
+    // 24-wide cell -- it never elides today, so `padId` here would be inert.
+    // It is also the wrong SHAPE if a longer free-form reason ever arrives:
+    // ids are SUFFIX-distinctive (a shared prefix hides a distinguishing
+    // date, version or size at the end, which `padId` exists to preserve),
+    // while these classifier labels are PREFIX-distinctive
+    // (`leading-separator` vs `leading-something-else`) -- middle elision
+    // would hide the very part that tells two reasons apart.
+    for (const entry of v.refusals.items) {
+      const id = padId(String(entry?.id ?? ""), W.id, "", g, p);
+      const reason = pad(String(entry?.reason ?? ""), 24);
+      const removed = rpad(String(entry?.removed ?? 0), 7);
+      L.push(bar(g, "  " + id + "  " + reason + removed));
+    }
+    L.push(bar(g, ""));
+    L.push(bar(g, p.dim("  any key closes")));
+    L.push(footer(g, p, caps.unicode ? "[↑↓] scroll  [any key] close" : "[up/dn] scroll  [any key] close"));
+    return L;
+  }
+
+  // `flat` is a THIRD chrome, not a variant of level 0 -- see the comment
+  // above. Computed AFTER the overlay's own early return (L5): the overlay
+  // builds its own title from `v.refusals.provider` directly and never reads
+  // `crumb`, so evaluating `v.provider.keyId` here unconditionally derefs a
+  // field that can be null at level 0 the moment the overlay ever opens
+  // there too (today it does, via ctrl+r) for a value nothing uses.
   const crumb = flat
     ? "UW " + g.sep + " all models"
     : v.level === 0
       ? "UW " + g.sep + " providers"
       : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
   L.push(title(g, p, crumb));
-
-  // THIS ROW COSTS A LINE `pick-state.mjs`'s `rowsAvail` never budgeted for
-  // (that constant lives in the file R16 may not touch -- R18's). Left
-  // unaccounted, a provider that both withholds AND already fills the
-  // viewport renders one line taller than the terminal; `uwpick.mjs`'s
-  // `draw()` writes HOME + lines with no full clear, so an over-tall frame
-  // SCROLLS the terminal by one line per redraw instead of clipping cleanly --
-  // creeping, duplicated chrome, not a static row. Reserving one item slot
-  // here (dropping whichever end of `v.items` the cursor is NOT on, so the
-  // marked row is never the one hidden) keeps the total line count exactly
-  // what `pick-state.mjs` already sized the viewport for. This is a
-  // mitigation done from this task's own side of the boundary, not the fix --
-  // the fix is `rowsAvail` accounting for this row, and that belongs to R18
-  // (see the plan addendum forwarding it there).
-  //
-  // Computed here, ahead of `right` below, so the header's own `N of M`
-  // count can report what this loop actually renders (N4) rather than the
-  // untrimmed `v.items.length`.
-  const withheldCount = v.provider?.refused?.length ?? 0;
-  const showWithheld = !flat && v.level === 1 && withheldCount > 0;
-  let renderItems = v.items, renderTop = v.top, renderMore = v.more;
-  if (showWithheld && v.more > 0 && renderItems.length >= 2) {
-    // Default to dropping the BACK (anchor -- `top` unchanged), and only drop
-    // the FRONT when the cursor sits on the very last visible row. The
-    // opposite ordering (default drop-front, special-case cursor-at-front)
-    // moved the discontinuity to the SECOND keypress -- leaving row 0 for row
-    // 1 repainted the whole list one line over, and back again on the way up,
-    // for every position in between where nothing about the window's content
-    // needed to change. Anchoring on the back means the visible set is STABLE
-    // across the whole window except at its one true edge, where a shift is
-    // already the natural behaviour a window is about to need anyway.
-    const atBack = renderTop + renderItems.length - 1 === v.cursor;
-    if (atBack) {
-      // The hidden item is now ABOVE the window. `pick-state.mjs`'s `more`
-      // (`pick-state.mjs:327`) is defined strictly as items BELOW the
-      // window -- `all.length - (top + shown.length)` -- so folding an
-      // above-item into it would mislabel it as one of the below ones, the
-      // exact class of defect [[counts-carry-their-denominator]] exists to
-      // catch. Only when the trim drops the BACK does the hidden item
-      // actually join the below population `renderMore` counts.
-      renderItems = renderItems.slice(1);
-      renderTop = renderTop + 1;
-    } else {
-      renderItems = renderItems.slice(0, -1);
-      renderMore += 1;
-    }
-  }
 
   // Q1.3: the routability stamp is printed, not implied. An undimmed row means
   // either "routable" or "nobody checked", and those are different claims; the
@@ -482,16 +498,29 @@ export function frame(v, meta, { caps }) {
     ? `${v.items.length + v.more} of ${meta.models} models ${g.sep} ${discoveredStamp}`
     : v.level === 0
       ? `${meta.providers} providers ${g.sep} ${meta.models} models ${g.sep} ${routableStamp}`
-      // `renderItems.length`, not `v.items.length` (N4): the trim above can
-      // render one fewer row than `v.items` carries, and this count's whole
-      // job is saying how much of the list is on screen.
-      : `${renderItems.length} of ${v.provider.models.length} ${g.sep} ${discoveredStamp}`;
+      // Counts MODEL rows only, not the WITHHELD LIST door that can sit at
+      // `v.items[0]` -- that row is not a model, and folding it into "N of M"
+      // would count it against a population (`v.provider.models.length`) it
+      // is not a member of (the exact miscount class
+      // [[counts-carry-their-denominator]] exists to catch).
+      : `${v.items.filter((it) => it.kind === "model").length} of ${v.provider.models.length} ` +
+        `${g.sep} ${discoveredStamp}`;
   const left = `  filter: ${sanitizeDisplay(v.filter, 40)}${p.inv(g.caret)}`;
   const gap = Math.max(1, INNER - vis(left) - vis(right));
   L.push(bar(g, left + " ".repeat(gap) + p.dim(right)));
   L.push(bar(g, ""));
 
   if (v.legend) {
+    // The one chrome in this function that never consults `rowsAvail` or
+    // `termRows` -- it is a fixed-size block (currently `LEGEND.length + 4` =
+    // 16 lines: title, meta bar, blank, `LEGEND`, blank, "any key returns",
+    // footer), so it overflows a terminal shorter than that. Pre-existing in
+    // shape and DISCLOSED rather than silently accepted: adding the `ctrl+r`
+    // entry (R18) moved the threshold from 15 to 16, the same
+    // usable-with-a-floor tradeoff `rowsAvail`'s own `Math.max(3, ...)`
+    // floor makes elsewhere in this file, not a new defect. Paginating the
+    // legend, or giving it its own budget, is future work -- not required
+    // for a screen whose entire content is a fixed, short reference list.
     for (const line of LEGEND) L.push(bar(g, "  " + line));
     L.push(bar(g, ""));
     L.push(bar(g, p.dim("  any key returns")));
@@ -532,29 +561,46 @@ export function frame(v, meta, { caps }) {
                   `"${sanitizeDisplay(v.filter, 20)}"`));
   }
 
-  // #51 (§2.5(b)): the visible entry point. RENDER ONLY -- this task's WRITES
-  // are `style.mjs`/`uwpick.mjs`; the row becoming an actual cursor-reachable
-  // item (a `kind: "withheld-list"` member of `v.items`, opening the ctrl+r
-  // overlay on enter) is `menu/pick-state.mjs`'s job, explicitly R18's WRITES
-  // and explicitly not this task's (see the plan's own boundary note above
-  // this function). Suppressed entirely when the provider withholds nothing,
-  // matching ctrl+r's own "no-op when the count is zero" rule so an overlay
-  // that cannot open and a row that opens it never disagree. Wording is
-  // WITHHELD, never BLOCKED (§2.5(c)): the population is dominated by
-  // withheld-with-a-reason rows, not hostile ids.
-  //
-  // `showWithheld`/`renderItems`/`renderTop`/`renderMore` are computed above,
-  // before `right`, so the header's own `N of M` count (N4) can report what
-  // this loop actually renders rather than the untrimmed `v.items.length`.
-  if (showWithheld) {
-    L.push(bar(g, p.dim(`  ${g.arrow} WITHHELD LIST (${withheldCount})`)));
-  }
+  // #60: the display cap on pinned recents (`pick-state.mjs`'s
+  // `MAX_RECENTS_SHOWN`) is a hiding action and must disclose itself, the same
+  // way a withheld model does. Reuses the picker's existing "... N more"
+  // affordance (the plan's own suggestion) rather than a new one, worded
+  // distinctly from the bottom overflow line below so two differently-caused
+  // truncations are never visually the same sentence. Pinned rows are always
+  // a CONTIGUOUS PREFIX of `v.items` (`pick-state.mjs`'s `[...pins, ...provs]`),
+  // so the boundary is just "the index where they end" -- computed once
+  // rather than re-scanned per row.
+  const pinnedCount = v.items.filter((it) => it.kind === "pinned").length;
+  let recentsDisclosed = false;
+  const maybeDiscloseRecents = () => {
+    // `recentsHidden` (`pick-state.mjs`) is computed ONCE in `initState`, over
+    // the unfiltered recents list -- it does not shrink when a query narrows
+    // `v.items`. Rendering it under an active filter claims "N more recents"
+    // exist below when the true count of recents matching THIS filter could
+    // be anything from 0 to N: a stale, unfiltered number attached to a
+    // filtered view is exactly [[counts-carry-their-denominator]]'s failure
+    // shape. Suppressed while filtering, the same as the WITHHELD LIST row's
+    // own rule (§2.5(b)) -- hidden under a filter is fine, a wrong claim is not.
+    if (recentsDisclosed || flat || v.level !== 0 || v.filter || pinnedCount === 0 || !v.recentsHidden) return;
+    recentsDisclosed = true;
+    L.push(bar(g, p.dim(`  ${g.ell} ${v.recentsHidden} more recents`)));
+  };
 
-  renderItems.forEach((it, i) => {
-    const selected = renderTop + i === v.cursor;
+  v.items.forEach((it, i) => {
+    if (i === pinnedCount) maybeDiscloseRecents();
+    const selected = v.top + i === v.cursor;
     const mark = selected ? g.marker : " ";
     let body;
-    if (it.kind === "provider") {
+    if (it.kind === "withheld-list") {
+      // #51 (§2.5(b), revision 11): a real, cursor-reachable v.items member
+      // now -- `pick-state.mjs` places it first and sizes `rowsAvail` for it
+      // like any other row, so it needs no separate line-budget accounting
+      // (R16's own item-trim mitigation, needed only because this row was
+      // then a static addition outside `v.items`, is retired along with it).
+      // Wording is WITHHELD, never BLOCKED (§2.5(c)): the population is
+      // dominated by withheld-with-a-reason rows, not hostile ids.
+      body = `${mark} ` + p.dim(`${g.arrow} WITHHELD LIST (${it.count})`);
+    } else if (it.kind === "provider") {
       const r = it.row;
       const total = r.models.length;
       const freeTxt = r.free == null ? g.dash
@@ -643,8 +689,9 @@ export function frame(v, meta, { caps }) {
     }
     L.push(bar(g, selected ? p.inv(strip(body)) : body));
   });
+  maybeDiscloseRecents();               // all-pinned, no-providers edge: the loop above never hit i === pinnedCount
 
-  if (renderMore > 0) L.push(bar(g, p.dim(`  ${g.ell} ${renderMore} more`)));
+  if (v.more > 0) L.push(bar(g, p.dim(`  ${g.ell} ${v.more} more`)));
   const atProviders = !flat && v.level === 0;
   L.push(footer(g, p, caps.unicode ? (atProviders ? HELP0 : HELP1)
                                    : (atProviders ? HELP0_A : HELP1_A)));
