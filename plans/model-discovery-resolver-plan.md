@@ -187,6 +187,8 @@ CCR 3.0.22's `resolve()`. **Revision 2 quoted only the first three lines and dre
 claim from them. There is a fifth stage, and omitting it hid a live hole** (C3, now #53):
 
 ```js
+// FRAGMENT: excerpt from resolve()'s body for discussion — the surrounding
+// method signature and braces are omitted, so this does not parse standalone.
 let s = this.providerModelMatches(n, !1);
 if (s.length === 1) return gb(s[0].provider, s[0].model, n);
 if (s.length > 1) return;                    // undefined — nothing binds
@@ -1699,7 +1701,7 @@ seven that tested leading-separator rejection keep passing unchanged.
 
 **Verify:** `node --test "test/sanitize.test.mjs"`. Expected observables, asserted individually:
 `~anthropic/claude-opus-latest` and `teamorouter/kimi-k3[1M]` are returned unchanged; each of
-`"a\x1b[2Jb"`, `"a\\b"`, `"a..b"`, `"a‮b"`, `"a\x00b"`, `"-lead"`, `"/lead"`, `"@-x"`, and a
+`"a\x1b[2Jb"`, `"a\\b"`, `"a..b"`, `"a\u202Eb"`, `"a\x00b"`, `"-lead"`, `"/lead"`, `"@-x"`, and a
 129-code-point id returns `null`. Plus a one-off count over the live listing corpus showing the
 previously-rejected real ids now admit. **The criterion counts distinct id strings: 14.** *(Unit named
 — D. The decisions doc states both: **14 distinct ids**, **40 distinct (provider, id) pairs**, because
@@ -2044,6 +2046,7 @@ rather than implementing #55 twice — the same discipline §2.5 applies to the 
 the same rule R5 itself states about helpers two lanes need:
 
 ```js
+// FRAGMENT: a signature-only illustration, not a pasteable implementation.
 // keysync/catalog-join.mjs, beside priceOf
 export function hasPricedOffer(entry)   // true iff some usable offer is non-zero
 ```
@@ -2582,6 +2585,9 @@ from R10's cache, **uncapped**."* Fed literally into `buildProviders`, that is n
 `keysync/keysync.mjs:558-564`)*:
 
 ```js
+// FRAGMENT: excerpt quoted out of its enclosing for-loop — the `continue`
+// below has no surrounding iteration statement here, so this does not parse
+// standalone.
 if (!models.length) {
   notes.push(`${reg.provider}: no testModel and no catalog entry — skipped`);
   continue;                       // <- precedes the out.push below

@@ -928,7 +928,7 @@ export function normalizeModel(id, entry, providerName = null, capability = null
  * retired. Routing on it would advertise ids nothing has confirmed this run; the
  * `testModel` half of the union is what keeps such a provider present.
  */
-function discoveryIndex(discovery) {
+export function discoveryIndex(discovery) {
   const out = new Map();
   if (!discovery) return out;
   const pairs = discovery instanceof Map
