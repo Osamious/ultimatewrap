@@ -2861,6 +2861,78 @@ A per-candidate table is a measurement; a self-satisfying equality is not.)*
 The bare-ambiguity surface is a property of the built config, and this is the last task in Ship D that
 alters it.
 
+> **REOPENED 2026-09-08, at the user's direction, after #91.** The 2x-parse-time rule above was
+> growth discipline, not a measured stall threshold — the task's own report said so at the time
+> ("absolute parse cost is sub-millisecond at every candidate"). Three-way binary-level research
+> (direct reads of the installed Claude Code CLI, `keysync/keysync.mjs`, and CCR's source) then
+> established two facts that change the calculus entirely:
+>
+> 1. **Claude Code enforces no size limit on `modelPicker.options[]`** — the array is iterated with no
+>    slice, no length check (`Ato`, the options builder). The only enforced ceiling is 10 VISIBLE rows
+>    in the picker viewport with 1-row scroll, **and search/filter is confirmed dead code** — present
+>    as unreachable strings (`"Search models"`, `"Type to filter"`) behind `canEnter:!1`. That ceiling
+>    is already blown past at cap=10's 391 total rows; raising the per-provider cap makes native
+>    browsing no worse than it already was, because uwpick — not the native `/model` menu — is the
+>    real interface.
+> 2. **No alternate declaration channel exists.** `availableModels` (allowlist only, no capability
+>    field), `modelOverrides` (structurally capped at a few dozen entries by its own key-uniqueness —
+>    one provider id per KNOWN Anthropic model, cannot fan many third-party ids onto a shared profile
+>    the way `behavesAs` rows do), `ANTHROPIC_CUSTOM_MODEL_OPTION` (one entry, hard limit), and CCR's
+>    own config (protocol detection only, no capability surface back to the client) were each checked
+>    against source and ruled out. `options[]` is the only channel, confirmed three independent ways.
+>
+> **Decision: drop the per-provider cap entirely. Keep full rows (`model`, `label`, `description`,
+> `behavesAs`) — reversed from an earlier minimal-shape (`model`+`behavesAs` only) choice.**
+>
+> **Measured against the real vault before this change was written, not assumed:**
+>
+> | | today (cap 10) | uncapped, minimal rows | uncapped, full rows |
+> |---|---|---|---|
+> | picker rows | 391 | 5,026 | 5,026 |
+> | `settings.json` bytes | 17,608 | 30,360 (1.72×) | 57,415 (3.26×) |
+> | parse time | — | 0.1064 ms | 0.1708 ms |
+>
+> **Both shapes are sub-millisecond and both are negligible in absolute size.** The minimal-shape
+> byte saving (157.3 → 74.9 B/row) was chosen first, on the byte metric alone, without checking
+> whether that metric still needed optimizing once "no hard limit exists" was established. It didn't:
+> 57 KB / 0.17ms costs nothing real, so there was no threshold the minimal shape was actually rescuing
+> anything from.
+>
+> **What minimal shape would have cost, for no corresponding gain:** `run.mjs:1494` sets `description`
+> to the answering hostname — a vault-nickname disambiguator for when one provider has multiple
+> keys/endpoints mapped to visually identical model ids. Auto-filled text (`"Custom model (id)"`)
+> cannot carry that. `label` similarly currently carries a formatted `"${provider} > ${model}"` string
+> the auto-fill can't reproduce. Neither loss buys anything once the byte/parse cost it would have
+> saved was never load-bearing. Full rows keep both. uwpick's own display is unaffected either way —
+> it reads neither field, sourced from a separate pipeline (`menu/catalog.mjs`) — so this choice is
+> scoped entirely to Claude Code's native `/model` command.
+>
+> **This effectively re-merges routing and picker in OUTPUT SIZE, even though the code path stays
+> distinct.** R11 decoupled them specifically so the picker could stay small while routing grew
+> unbounded. Uncapping the picker means it now tracks routing 1:1 in practice (minus staleness
+> filtering, which still applies independently to each). State this plainly rather than let it pass
+> as a quiet architectural collapse — the two remain separate constants and separate slice points in
+> code, for whenever a real reason to diverge them returns.
+>
+> **WRITES for the reopened work:** `keysync/keysync.mjs`, `keysync/run.mjs`,
+> `test/routing-split.test.mjs`, `test/infertier.test.mjs`, `test/denylist.test.mjs`.
+>
+> **Re-run all four re-checks from the original task** (V7/V8 `assertOptionsComplete`, relay-first
+> `orderNativePickerOptions`, `anchorModel` stability via `resolveAnchor`, `reconcileUserModelPin`
+> monotonicity) — uncapping the picker is a far larger composition change than 3→10 was, and is far
+> more likely to actually move the anchor than R13b's own change did. **Do not special-case the anchor
+> to avoid the assertion firing** — if it moves, find out why before accepting it.
+>
+> **Re-run R13's census** per the note above — `providers[].models` (routing) is unaffected by a
+> picker-only change, but confirm this by measurement rather than by assumption, exactly as R13b's own
+> executor did the first time.
+>
+> **Watch for hardcoded fixtures.** R13b's own cap change (3→10) already forced five hardcoded
+> top-3-window assertions in `test/infertier.test.mjs` to be rewritten as `.slice(0,3)` comparisons.
+> An uncapped change is a much larger jump and will likely surface more of the same class — any test
+> asserting a specific picker row count, or asserting `label`/`description` are present on a row,
+> needs re-examination under the minimal shape.
+
 ---
 
 ### Ship E — uwpick (D7), including refusal disclosure (#51)

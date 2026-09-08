@@ -182,19 +182,37 @@ test("MUTATION: reverting the candidate set to discovery-only DELETES tabiai and
 
 // ---- observable 2: the gap --------------------------------------------------
 
-test("routing carries every candidate; the picker carries a bounded prefix", () => {
+test("routing carries every candidate, and by default so does the picker", () => {
+  // THE GAP THIS TEST WAS WRITTEN TO PIN IS NOW ZERO, DELIBERATELY (R13b
+  // reopened, #91). It asserted `picker === MAX_PICKER_MODELS_PER_PROVIDER` and
+  // `routing > picker * 3` -- both true only while a FINITE cap bound the
+  // picker, and both encode the cap's value as if it were the invariant. The
+  // durable invariant underneath was never the gap's size: it was that routing
+  // carries every candidate and the picker is a PREFIX of it, which is what
+  // keeps the two from disagreeing about a provider's best rows.
+  //
+  // The gap's size was a cost, not a property -- every row outside the picker
+  // lost its `behavesAs` declaration, because `options[]` is the only channel
+  // that can carry one. Uncapped, that cost is zero, and the assertion that
+  // matters flips from "the picker is much smaller" to "nothing routes
+  // undeclared". Test 5 below still proves a finite cap BINDS when one is set.
   const built = build(fixture());
   const wide = byName(built, "wide");
 
-  // A GAP, not a number. `wide` has one testModel plus forty catalogue entries.
   assert.equal(wide.models.length, 41, "testModel + 40 catalogue entries, uncapped");
-  assert.equal(pickerFor(built, "wide").length, MAX_PICKER_MODELS_PER_PROVIDER);
-  assert.ok(wide.models.length > pickerFor(built, "wide").length * 3,
-    "routing must be much larger than the picker once the two are decoupled");
+  assert.equal(pickerFor(built, "wide").length, 41,
+    "the default cap is unbounded, so every routing id gets a picker row");
+  // `pickerFor` yields namespaced `provider/id`; `models` are bare ids.
+  assert.deepEqual(pickerFor(built, "wide").map((m) => m.slice("wide/".length)), wide.models,
+    "still a PREFIX of models -- at the default the prefix is the whole list");
 
-  const routingTotal = built.providers.reduce((n, p) => n + p.models.length, 0);
-  assert.ok(routingTotal > built.picker.length,
-    `routing (${routingTotal}) must exceed picker rows (${built.picker.length})`);
+  // ZERO UNDECLARED, over every provider and not just `wide`. This is #91's
+  // subject stated as an assertion: an id in `models[]` with no `options[]` row
+  // resolves through `lH()` to the maximal assumption set.
+  const declared = new Set(built.picker.map((r) => r.model));
+  const undeclared = built.providers.flatMap((p) =>
+    p.models.filter((id) => !declared.has(`${p.name}/${id}`)).map((id) => `${p.name}/${id}`));
+  assert.deepEqual(undeclared, [], "every routable id must carry a declaration");
 });
 
 test("the picker is a PREFIX of models, which is what keeps the two agreeing", () => {
@@ -225,7 +243,7 @@ test("validate() passes on the widened build, subset rule untouched", () => {
 
 // ---- the cap parse: the NaN bug, which the rename alone does not fix --------
 
-test("UW_MAX_MODELS=x yields the default and a BOUNDED picker, never an uncapped one", (t) => {
+test("UW_MAX_MODELS=x yields the default, and a real value still BINDS", (t) => {
   // THE REGRESSION THIS EXISTS FOR. The old form was
   // `Number(process.env.UW_MAX_MODELS ?? 3)` compared with
   // `models.length >= MAX_MODELS_PER_PROVIDER`. `Number("x")` is `NaN` and every
@@ -233,6 +251,17 @@ test("UW_MAX_MODELS=x yields the default and a BOUNDED picker, never an uncapped
   // -- it removed the cap. Renaming the constant and keeping the coercion
   // reproduces that exactly, passes every other assertion in this file, and
   // silently uncaps the menu.
+  //
+  // WHICH DIRECTION STILL DISCRIMINATES NOW THAT THE DEFAULT IS UNBOUNDED
+  // (R13b reopened). "A typo silently uncaps the picker" was the failure, and
+  // uncapped is where the default now sits -- so on the default path the bug and
+  // the correct behaviour produce the same picker, and the old assertion
+  // (`picker.length === MAX_PICKER_MODELS_PER_PROVIDER`) could no longer tell
+  // them apart. The direction that survives is the OPERATOR's: a typo must not
+  // be read as some other finite cap. So a bad value must leave the picker at
+  // FULL length (41), and every loose parse of these values yields something
+  // shorter -- `"3.0"` -> 3, `"0"` -> 0, `"-1"` -> 40 -- so the check still has
+  // teeth. Paired with the real value below, both edges of the parse are pinned.
   const saved = process.env.UW_MAX_MODELS;
   t.after(() => {
     if (saved === undefined) delete process.env.UW_MAX_MODELS;
@@ -243,15 +272,14 @@ test("UW_MAX_MODELS=x yields the default and a BOUNDED picker, never an uncapped
     process.env.UW_MAX_MODELS = bad;
     assert.equal(pickerCapFrom(process.env.UW_MAX_MODELS), MAX_PICKER_MODELS_PER_PROVIDER,
       `UW_MAX_MODELS=${JSON.stringify(bad)} must resolve to the default`);
-    // ...and the BOUND, not merely the parsed number. `wide` has 10 candidates,
-    // so an uncapped picker shows 10 rows for it and a defaulted one shows 3.
     const built = build(fixture());
-    assert.equal(pickerFor(built, "wide").length, MAX_PICKER_MODELS_PER_PROVIDER,
-      `UW_MAX_MODELS=${JSON.stringify(bad)} left the picker unbounded`);
+    assert.equal(pickerFor(built, "wide").length, 41,
+      `UW_MAX_MODELS=${JSON.stringify(bad)} was parsed as a cap instead of falling back`);
   }
 
-  // A real value still works, or the fallback would be indistinguishable from
-  // ignoring the variable.
+  // A real value still BINDS, or the fallback would be indistinguishable from
+  // ignoring the variable -- and with an unbounded default that is now the only
+  // assertion in this file proving the cap mechanism is still wired at all.
   process.env.UW_MAX_MODELS = "5";
   assert.equal(pickerFor(build(fixture()), "wide").length, 5);
 });
@@ -282,30 +310,31 @@ test("the cap parse is STRICT: a bad value that is not 3 still resolves to 3", (
   assert.equal(pickerCapFrom(" 5 "), 5);
 });
 
-test("a cap too large to be an integer falls back rather than unbounding the picker", (t) => {
-  // `Number.isSafeInteger` at keysync.mjs:333. Removing it survives every other
-  // assertion in this file: `/^\d+$/` admits a 20-digit run of digits,
-  // `Number.parseInt` yields 1e20, `n > 0` is true, and `models.slice(0, 1e20)`
-  // is the whole array -- an unbounded picker, which is the exact failure
-  // `pickerCapFrom` exists to prevent, reached through the one input the regex
-  // was never going to catch.
-  const saved = process.env.UW_MAX_MODELS;
-  t.after(() => {
-    if (saved === undefined) delete process.env.UW_MAX_MODELS;
-    else process.env.UW_MAX_MODELS = saved;
-  });
-
+test("a cap too large to be an integer is not a count, and falls back", () => {
+  // `Number.isSafeInteger` in `pickerCapFrom`. `/^\d+$/` admits a 20-digit run
+  // of digits, `Number.parseInt` yields 1e20, and `n > 0` is true, so without
+  // the guard the parse returns 1e20 and `models.slice(0, 1e20)` is the whole
+  // array -- an unbounded picker, reached through the one input the regex was
+  // never going to catch.
+  //
+  // THE BOUND HALF OF THIS TEST WAS DELETED, NOT WEAKENED, AND THE GUARD IS NOW
+  // NEARLY UNOBSERVABLE (R13b reopened). It used to assert the resulting picker
+  // length as well, which was the assertion that made the guard load-bearing.
+  // With an unbounded default, `slice(0, 1e20)` and `slice(0, Infinity)` are the
+  // SAME array: the guard's only failure mode was unbounding, and unbounding is
+  // now the default. So no build-level observation can distinguish a guarded
+  // parse from an unguarded one, and an assertion pretending otherwise would
+  // pass for the wrong reason -- exactly the fault the sibling STRICT test above
+  // was written to close. What remains provable is the return value, which still
+  // pins the contract for an operator who sets a finite cap. Stated here so a
+  // later reader does not mistake this test's survival for the guard still
+  // carrying weight; the constant's comment says the same thing from the other
+  // side.
   const huge = "99999999999999999999";
   assert.ok(!Number.isSafeInteger(Number.parseInt(huge, 10)),
     "the fixture must actually exceed the safe-integer range, or this proves nothing");
   assert.equal(pickerCapFrom(huge), MAX_PICKER_MODELS_PER_PROVIDER,
     "an unrepresentable count is not a count");
-
-  // THE BOUND, not merely the parsed number. `wide` has 10 candidates, so a
-  // guard-free build shows all 10 and a defaulted one shows 3.
-  process.env.UW_MAX_MODELS = huge;
-  assert.equal(pickerFor(build(fixture()), "wide").length, MAX_PICKER_MODELS_PER_PROVIDER,
-    `UW_MAX_MODELS=${huge} left the picker unbounded`);
 });
 
 // ---- the capability VOCABULARY, not just its precedence --------------------
@@ -470,6 +499,10 @@ test("widening routing leaves the {model, behavesAs} declaration channel intact"
   //   and it still holds: what changed the declarations here is the cap, not the
   //   union. On the real vault the third-party picker goes 83 -> 189 rows
   //   (94 -> 200 with the relay) and undeclared falls 1,501 -> 1,395 of 1,584.
+  //   R13b REOPENED, 2026-09-08 (#91): the cap is gone, so the picker declares
+  //   every routing id and this pin grew to the full 44. Same reading as before
+  //   -- the cap moved the declarations, the union did not. On the real vault
+  //   the picker goes 391 -> 5,037 rows and undeclared falls 4,646 -> 0 of 5,026.
   const built = build(fixture());
   const pairs = built.picker.map((r) => [r.model, r.behavesAs ?? null]).sort();
 
@@ -477,8 +510,8 @@ test("widening routing leaves the {model, behavesAs} declaration channel intact"
     ["gorouter/claude-opus-4-8", "claude-sonnet-4-5"],
     ["listed/listed-probe", "claude-sonnet-4-5"],
     ["tabiai/claude-opus-4-8", "claude-sonnet-4-5"],
-    ...Array.from({ length: 9 }, (_, i) =>
-      [`wide/wide-m0${i}`, "claude-sonnet-4-6"]),
+    ...Array.from({ length: 40 }, (_, i) =>
+      [`wide/wide-m${String(i).padStart(2, "0")}`, "claude-sonnet-4-6"]),
     ["wide/wide-probe", "claude-sonnet-4-5"],
   ], "the declaration channel, pair for pair");
 
@@ -487,14 +520,21 @@ test("widening routing leaves the {model, behavesAs} declaration channel intact"
   assert.ok(built.picker.every((r) => typeof r.behavesAs === "string" && r.behavesAs),
     "an absent declaration resolves to the MAXIMAL assumption set, never to none");
 
-  // The gap the pin is a statement ABOUT: routing carries more than three times
-  // what the picker declares, so "the declarations did not change" is a claim
-  // with content rather than a restatement of an unchanged build.
+  // WHAT THIS PIN IS A STATEMENT ABOUT, RESTATED BECAUSE ITS OLD PREMISE IS NOW
+  // FALSE. It used to close with `routing > picker` and the note that "if
+  // routing did not widen, this test proves nothing" -- true while a cap held
+  // the picker to a fraction of routing. Uncapped, routing and the picker are
+  // the SAME population here (44 and 44), so that assertion would now fail on a
+  // correct build. The claim worth pinning survives in a stronger form: the
+  // declaration channel covers routing exactly, one row per routable id.
   const routing = built.providers.reduce((n, p) => n + p.models.length, 0);
   assert.equal(routing, 44);
-  assert.equal(built.picker.length, 13);
-  assert.ok(routing > built.picker.length,
-    "if routing did not widen, this test proves nothing about widening");
+  assert.equal(built.picker.length, 44,
+    "uncapped, the declaration channel is the same size as routing");
+  assert.deepEqual(
+    built.providers.flatMap((p) => p.models.map((id) => `${p.name}/${id}`)).sort(),
+    built.picker.map((r) => r.model).sort(),
+    "one declared row per routable id, no id on either side alone");
 });
 
 // ---- capability precedence -------------------------------------------------
@@ -1033,20 +1073,37 @@ test("R13b: `kind` outranks provenance -- evidence never promotes a non-chat row
   assert.deepEqual(provIds(noCap).slice(1), ["gen", "chatchat"]);
 });
 
-test("R13b: the cap is 10, and it bounds the PICKER without touching routing", () => {
-  assert.equal(MAX_PICKER_MODELS_PER_PROVIDER, 10,
-    "sized 2026-09-08 from the five-candidate parse/byte measurement; see the table at the constant");
-  // 1 testModel + 14 catalogue ids: past the cap, so the bound is observable.
+test("R13b reopened: the cap defaults to UNBOUNDED, and routing is untouched", () => {
+  // THE SIZING DECISION, pinned as a value so a silent revert to a finite cap
+  // fails here rather than as a quiet loss of 4,646 capability declarations.
+  // R13b first landed 10 under a "parse <= 2x today's" ceiling; #91 established
+  // that Claude Code enforces NO size limit on `options[]` and that no alternate
+  // channel can carry `behavesAs`, so the ceiling was buying nothing and the cap
+  // was costing declarations. Measured cost of uncapping, on the real vault:
+  // settings.json 80,379 -> 1,069,088 B and parse 0.21 -> 2.51 ms, against
+  // undeclared 4,646 -> 0 of 5,026. See the table at the constant.
+  assert.equal(MAX_PICKER_MODELS_PER_PROVIDER, Infinity,
+    "uncapped 2026-09-08 (#91); `options[]` is the only channel that carries behavesAs");
+  // 1 testModel + 14 catalogue ids. Under the old cap of 10 this fixture existed
+  // to make the BOUND observable; it now makes its ABSENCE observable, which is
+  // the same fixture proving the opposite property.
   const f = provFixture();
   f.catalog.byProvider.set("prov", Array.from({ length: 14 }, (_, i) =>
     ({ provider: "prov", model: `m${String(i).padStart(2, "0")}`,
        id: `prov/m${i}`, ...text({}) })));
   const built = buildProviders(f.chosen, f.vault, f.catalog, () => "sk-test");
-  assert.equal(provIds(built).length, MAX_PICKER_MODELS_PER_PROVIDER);
   assert.equal(byName(built, "prov").models.length, 15, "routing keeps every id, uncapped");
-  // The picker is a PREFIX of routing, not a re-ranking -- the two must not
-  // disagree about which rows a provider's best ten are.
-  assert.deepEqual(provIds(built), byName(built, "prov").models.slice(0, 10));
+  assert.equal(provIds(built).length, 15, "and so does the picker, at the default cap");
+  // Still a PREFIX of routing rather than a re-ranking -- the property that kept
+  // the two lists agreeing when they were different sizes, asserted here at the
+  // one size where it is easiest to satisfy by accident, so the mechanism is
+  // pinned rather than the coincidence.
+  assert.deepEqual(provIds(built), byName(built, "prov").models);
+  // AND THE TWO LISTS ARE NOT THE SAME ARRAY. `pickerModels` is a `slice`, so an
+  // edit that aliased them to save the copy would still pass every assertion
+  // above while making the picker impossible to filter independently
+  // (`--verified-only` prunes the picker and returns routing by identity).
+  assert.notEqual(built.picker, built.providers);
 });
 
 // ---- the four invariants a larger picker can break -------------------------

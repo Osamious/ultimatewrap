@@ -2213,6 +2213,12 @@ test("UW_BEHAVES_AS is retired: no env var can flatten the table", () => {
 // counts are unchanged precisely because nothing here was being truncated. A
 // reader who believed the old sentence would expect these numbers to move under
 // R11, and would look for the bug in the wrong place when they did not.
+//
+// THE SAME TRAP, A SECOND TIME. R13b reopened (#91) removed the picker cap
+// entirely -- `MAX_PICKER_MODELS_PER_PROVIDER` is now `Infinity` -- and the 83
+// below still does not move, for the same reason: no provider here holds more
+// than three catalogue entries, so no cap between three and unbounded was ever
+// binding on this fixture.
 const E = (model, o) => ({ provider: o.provider, model, ...o.entry });
 function capabilityFixture() {
   const chosen = [];

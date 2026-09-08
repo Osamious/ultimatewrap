@@ -323,50 +323,78 @@ export function resolveProtocol(vaultProvider) {
 // name says which one it governs; the old `MAX_MODELS_PER_PROVIDER` did not, and
 // that ambiguity is what let one number stand in for two decisions.
 //
-// This is the DEFAULT. `pickerCapFrom` resolves `UW_MAX_MODELS` against it.
+// This is the DEFAULT. `pickerCapFrom` resolves `UW_MAX_MODELS` against it, so
+// an operator can still re-impose a finite cap without a source edit.
 //
-// SIZED FROM MEASUREMENT, 2026-09-08 (R13b). Two budgets, both stated here so a
-// later edit argues against numbers rather than against taste:
+// UNBOUNDED, 2026-09-08 (R13b reopened after #91). R13b first landed 10, chosen
+// as the largest candidate inside a "parse time <= 2x today's" ceiling. That
+// ceiling was growth discipline, never a measured stall threshold -- R13b's own
+// report said the absolute cost was sub-millisecond at EVERY candidate including
+// `inf`. Two binary-level facts then removed the reason to spend anything on it:
 //
-//   PARSE CEILING  <= 2x today's median `JSON.parse` of the WHOLE settings.json.
-//                  Claude Code parses that file at every launch, so this is a
-//                  growth discipline on the startup path, not a stall guard.
-//   BYTE BUDGET    `modelPicker.options` <= 100 KB serialized. The resolver plan
-//                  already names "past 200 KB" as the failure retiring this cap
-//                  outright would cause; 100 KB keeps a full doubling in hand.
+//   1. CLAUDE CODE ENFORCES NO SIZE LIMIT ON `modelPicker.options[]`. `Ato`, its
+//      options builder, iterates the array with no slice and no length check.
+//      The only enforced ceiling is 10 VISIBLE rows with 1-row scroll, and the
+//      picker's search/filter is dead code -- `"Search models"` / `"Type to
+//      filter"` sit behind `canEnter:!1`. That ceiling was already blown at 391
+//      rows, so widening makes native browsing no worse than it already was.
+//      uwpick, not the native `/model` menu, is the surface meant to go wide.
+//   2. NO ALTERNATE DECLARATION CHANNEL EXISTS. `availableModels` is an
+//      allowlist with no capability field; `modelOverrides` is structurally
+//      capped by its own key-uniqueness (one provider id per KNOWN Anthropic
+//      model) and cannot fan many third-party ids onto a shared profile;
+//      `ANTHROPIC_CUSTOM_MODEL_OPTION` takes one entry; CCR's own config carries
+//      protocol detection and no capability surface back to the client. So
+//      `options[]` is the ONLY channel that can carry `behavesAs`, and every row
+//      the cap withheld was a lost capability declaration, not a menu slot.
 //
-// MEASURED against the real vault (44 providers, 1,584 routing ids), median of 7
-// trials x 1,500 parses each, trial spread under 1%:
+// MEASURED against the real vault, 2026-09-08, both configurations built from
+// the same run (45 providers, 5,026 third-party routing ids). `settings.json` is
+// the WHOLE file as `atomicWriteJson` writes it -- `JSON.stringify(_, null, 2)`,
+// pretty-printed, which is the only basis that matches disk. Parse is the median
+// of 7 trials x 1,500 `JSON.parse` of that exact blob:
 //
-//   cap   picker rows   options bytes   settings.json   parse ms   x today   undeclared
-//     3            94          12,965          23,447     0.0539     1.00x        1,501
-//    10           200          27,126          43,332     0.1005     1.86x        1,395
-//    25           379          52,424          78,296     0.1803     3.35x        1,216
-//    50           586          82,490         119,540     0.2709     5.03x        1,009
-//   inf         1,595         245,679         337,215     0.7202    13.36x            0
+//   cap   picker rows   picker block   settings.json   parse ms   x cap-10   undeclared of 5,026
+//    10           391         74,913          80,379     0.2113      1.00x                 4,646
+//   inf         5,037      1,063,622       1,069,088     2.5063     11.86x                     0
 //
-// 10 is the largest cap inside BOTH budgets: parse binds first (25 is 3.35x), and
-// the byte budget would have allowed 50. So the parse ceiling is the operative
-// one and the byte budget is slack -- stated anyway, because it is the budget the
-// plan's "past 200 KB" was about and the one that stops `inf`.
+// (Non-picker settings content is 5,466 B in both. 5,037 = 5,026 third-party
+// rows + the relay's 11.)
 //
-// WHAT THIS DOES NOT CLAIM. The absolute cost is sub-millisecond at EVERY
-// candidate -- 0.72 ms uncapped -- so no candidate here is perceptible at launch
-// and this cap is not rescuing anyone from a stall. It bounds unbounded growth of
-// a startup-path file, which is a different and smaller claim.
+// THE COST IS 1.07 MB AND 2.5 ms PER LAUNCH, AND THAT IS NOT SMALL -- state it
+// plainly rather than inherit "negligible" from a smaller estimate. The resolver
+// plan's reopen amendment tabled 57,415 B / 0.1708 ms for this configuration;
+// that figure is NOT reproducible here and is internally inconsistent with its
+// own row count (391 rows cannot fit in the 17,608 B it calls "today" at ~192 B
+// per pretty-printed row). It also blows the 100 KB budget R13b originally wrote
+// above this line, and the plan's own "past 200 KB" named failure, by 5x.
 //
-// WHAT WOULD BIND FIRST IF IT WERE MEASURED. Not bytes and not parse: the native
-// `/model` menu renders 10 rows with 1-row scrolling and NO FILTER (resolver plan
-// D4 step 2), and this raises it from 94 rows to 200. `orderNativePickerOptions`
-// keeps the relay's rows at the head, which is what keeps the top of a 200-row
-// menu useful; uwpick is the surface meant to go wide. A future task that wants a
-// larger cap should measure the menu, not re-argue the parse ceiling.
+// IT IS SPENT ANYWAY, DELIBERATELY, and the reason is fact 2 rather than the
+// size: `options[]` is the only channel that can carry `behavesAs`, so every row
+// the cap withheld cost a capability declaration -- 4,646 of 5,026 ids resolving
+// through `lH()` to the maximal assumption set. 2.5 ms of startup parse against
+// 4,646 recovered declarations is the trade, made with the number known. A future
+// task that wants the bytes back should reduce ROW SIZE (211 B/row in-blob) or
+// prune stale ids, not restore the cap -- the cap is the one lever here that
+// pays for bytes in declarations.
 //
-// THE UNDECLARED POPULATION IS NOT WHAT SIZED THIS. It falls 1,501 -> 1,395 of
-// 1,584 (7.1%), which is a by-product and NOT a fix. The residual population is
-// filed as its own [LIMIT] issue; no number is cited here because it did not
-// exist when this shipped, and a guessed one is worse than none.
-export const MAX_PICKER_MODELS_PER_PROVIDER = 10;
+// ROW SHAPE STAYS FULL -- `{model, label, description, behavesAs}` -- and that is
+// a REVERSAL of a minimal-shape (`model`+`behavesAs`) draft that would have cut
+// 57,415 bytes to 30,360. The saving was chosen on the byte metric alone, before
+// "no hard limit exists" was established; once it was, there was no threshold the
+// minimal shape rescued anything from. `description` carries the ANSWERING
+// HOSTNAME (run.mjs), the disambiguator for one provider serving visually
+// identical ids across several keys or endpoints, and Claude Code's auto-fill
+// ("Custom model (id)") cannot reproduce it. `label` likewise carries the
+// formatted `provider > model` string. Both are free at this size.
+//
+// THIS RE-MERGES ROUTING AND PICKER IN OUTPUT SIZE, and that is stated rather
+// than left to be discovered. R11 decoupled them so the picker could stay small
+// while routing grew; uncapped, the picker tracks routing 1:1 in practice. They
+// remain two constants and two slice points in code -- staleness filtering still
+// applies to each independently, and the divergence stays available for whenever
+// a real reason to use it returns.
+export const MAX_PICKER_MODELS_PER_PROVIDER = Infinity;
 
 /**
  * `UW_MAX_MODELS` -> a usable positive integer, or the default.
@@ -379,6 +407,18 @@ export const MAX_PICKER_MODELS_PER_PROVIDER = 10;
  * keeping the coercion reproduces that exactly: the rename passes every other
  * check in this file and the picker goes unbounded on one typo'd env value,
  * which is why this has its own test rather than riding on the rename's.
+ *
+ * WHAT THE VALIDATION IS STILL FOR NOW THAT THE DEFAULT IS UNBOUNDED. The
+ * failure above was "a typo silently uncaps the picker", and uncapped is now
+ * where the default already sits -- so on the DEFAULT path a loose parse is no
+ * longer observable. The direction that still matters is the operator's: someone
+ * who types `UW_MAX_MODELS=5` is deliberately re-imposing a cap, and a loose
+ * parse of a typo'd value near it (`"5.0"`, `"0x5"`) would silently give them a
+ * DIFFERENT cap than the one they typed, or none. `Number.isSafeInteger` is the
+ * weakest of these now: its only failure mode was unbounding, which the default
+ * already does, so it is retained as belt-and-braces rather than as a guard
+ * carrying weight. This is stated so the next reader does not infer more from
+ * the test below it than the test can now prove.
  *
  * `/^\d+$/` on the TRIMMED string, not `Number.isInteger(Number(s))`: the latter
  * accepts `"3.0"`, `"0x3"`, `" 3 "`, `"3e0"` and `""` (which is 0). A cap is an
@@ -1208,9 +1248,15 @@ export function buildProviders(chosen, providers, catalog, keyReader, discovery 
       continue;
     }
     // THE SPLIT. `models` routes in full; `pickerModels` is the prefix the flat
-    // `/model` menu can carry. Taking a PREFIX of one ordered list rather than
+    // `/model` menu carries. Taking a PREFIX of one ordered list rather than
     // re-ranking is what keeps the two from disagreeing about which rows a
-    // provider's best three are.
+    // provider's best ones are.
+    //
+    // `pickerCap` DEFAULTS TO `Infinity`, so this is a full copy unless an
+    // operator set `UW_MAX_MODELS`. It stays a slice, and a COPY rather than the
+    // same array: the two lists are still separately filterable downstream
+    // (`--verified-only` prunes the picker and returns routing by identity), and
+    // aliasing them here would make that asymmetry impossible to express.
     const pickerModels = models.slice(0, pickerCap);
 
     const name = reg.provider;
