@@ -36,6 +36,19 @@ function toCatalog(models, at) {
   const ids = new Set();
   const contextById = new Map();
   for (const m of models ?? []) {
+    // #24, AT THE SITE THAT HAS THE GAP rather than only at the one that does
+    // not. These ids are never passed through `admitId` or `admitRemoteModels`
+    // (menu/sanitize.mjs, menu/denylist.mjs) -- not here, and not by any
+    // consumer downstream: run.mjs takes this set through `routableCatalogIds`
+    // -> `deriveAnthropicSets` -> `Providers[].models` unsanitised. So a hostile
+    // id arriving from the relay is NOT currently refused before it reaches the
+    // routing config, and nothing on this path would reject one.
+    //
+    // Tracked as #24 and deliberately out of scope for the sanitizer hardening
+    // (#52/#51): do not "fix" it by adding a call here without taking that
+    // issue. The only other note about this gap lives in denylist.mjs's JSDoc --
+    // the module that HAS the guard -- which is exactly where a reader of THIS
+    // file would never look.
     const id = String(m?.id ?? "");
     if (!id) continue;
     ids.add(id);

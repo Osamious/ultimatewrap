@@ -138,12 +138,22 @@ const refusal = (raw, reason) => {
  *                  returns raw provider strings instead of a curated bundle.
  * @returns {{kept: string[], rejected: {id: string, reason: string, removed: number}[]}}
  *                  `rejected` holds the DISPLAY-SAFE form of each refused name,
- *                  never the raw one, plus the reason code (#51) and `removed`,
- *                  the number of code points the raw string had that the display
- *                  form does not. `removed` counts stripping, NFC composition and
- *                  the 80-code-point cap together -- all three are ways what was
- *                  advertised differs from what is shown, which is the one thing
- *                  a reader of the withheld list needs told.
+ *                  never the raw one, plus the reason code (#51) and `removed`.
+ *
+ *                  `removed` is the NET code-point delta between the raw name and
+ *                  its display form -- stripping, NFC normalisation and the
+ *                  80-code-point cap measured together, not a count of stripped
+ *                  characters. All three are ways what was advertised differs
+ *                  from what would be shown, which is what a future reader of a
+ *                  withheld list would need told; but because NFC can LENGTHEN a
+ *                  string (U+0958 and its composition-exclusion family), the
+ *                  three can offset each other. MEASURED: raw `"\x07क़"`
+ *                  reports `removed: 0` with the BEL genuinely stripped, the
+ *                  clamp having absorbed a -1/+1 cancellation. So `removed > 0`
+ *                  means the forms differ in length; `removed === 0` does NOT
+ *                  mean nothing was stripped, and no caller may read it that way.
+ *                  The reason code, not this number, is what says why a name was
+ *                  refused.
  *
  * THE BOUNDARY OF THIS GUARANTEE, stated because the claim is what makes it
  * dangerous (#24). One safe representation means this path cannot acquire a new
@@ -197,7 +207,18 @@ export function admitRemoteModels(providerName, ids, { trusted = "anthropic", wa
     kept.push(id);
   }
   if (warn && rejected.length) {
-    console.warn(`SECURITY: provider "${providerName}" advertised ${rejected.length} ` +
+    // THE PROVIDER NAME IS PROVIDER-CONTROLLED TOO (#52). Every `r.id` on this
+    // line is display-safe because `refusal` is the only constructor of a
+    // rejection -- but the name interpolated beside them arrived from the same
+    // untrusted config and had, until this line existed, no such guarantee.
+    // MEASURED: a providerName carrying `\x1b[2J\x1b]52;c;<b64>\x07‮` put a
+    // real screen-clear and an OSC-52 clipboard write onto stderr THROUGH the
+    // warning that refused its models. Same class as the ids, same line, same
+    // fix. Sanitised HERE, at the point of display, and deliberately not at the
+    // top of the function: `exempt` above compares the RAW name against
+    // `trusted`, and normalising before that comparison would let a name that
+    // merely sanitises to "anthropic" inherit the relay's `uw/` exemption.
+    console.warn(`SECURITY: provider "${sanitizeDisplay(providerName)}" advertised ${rejected.length} ` +
       `rejected model name(s): ${rejected.slice(0, 10).map((r) => r.id).join(", ")}`);
   }
   return { kept, rejected };

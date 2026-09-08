@@ -53,11 +53,17 @@ export function sanitizeDisplay(s, max = 80) {
 // KNOWN LIMIT, deliberately not closed here, and stated precisely because an
 // earlier version of this comment claimed more than the code delivers.
 //
-// What the code-point cap DOES guarantee: a slice never splits a surrogate pair,
-// so a lone surrogate can never reach the renderer. What it does NOT guarantee is
-// display width. An East Asian wide glyph is one code point occupying two
-// terminal columns, so a CJK model id still under-fills its cell and shifts the
-// columns to its right.
+// What the code-point cap DOES guarantee: TRUNCATION never CREATES a lone
+// surrogate, because a slice by code point cannot cut a pair in half. What it
+// says nothing about is an input that already carries one -- an unpaired
+// surrogate in the provider's string is not a control, not invisible by this
+// file's class, and not split by the cap, so it passes straight through.
+// MEASURED: `admitId("\uD83D")` returns it unchanged. That is #86-adjacent
+// territory and is deliberately not closed here.
+//
+// The cap also does NOT guarantee display width. An East Asian wide glyph is one
+// code point occupying two terminal columns, so a CJK model id still under-fills
+// its cell and shifts the columns to its right.
 //
 // This cap is therefore only half of a width guarantee, and it is worth nothing
 // unless style.mjs measures the same way. It does: `vis()` there counts code

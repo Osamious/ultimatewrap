@@ -368,10 +368,23 @@ test("no id admitId admits can carry an escape, a control, or a listed invisible
 // classifyRefusal (#51): the discriminator admitId never had.
 // ---------------------------------------------------------------------------
 
-// One fixture per reason code, and each one is chosen to trip EXACTLY its own
-// rule -- no fixture here satisfies two rows of the table. That is what gives
-// this list its mutation property: collapse any two codes into one and exactly
-// that pair's cases fail, because no third case was covering for them.
+// At least one fixture per reason code, asserting the code the ORDERED table
+// actually reports.
+//
+// These rows are NOT mutually exclusive, and an earlier version of this comment
+// claimed they were. Several fixtures satisfy two rows at once and are resolved
+// by precedence alone: `"bad\x1b[2J"` and `"x\x1b]52;c;aGk=\x07y"` are
+// escape-sequence AND control-char (every ESC_SEQ alternative opens with \x1b,
+// which is 0x1B, inside CTRL), and `"a\tb"` is control-char AND whitespace
+// (`/\s/.test("\t")` is true, tab being both 0x09 and a space character). The
+// row order in REFUSAL_RULES is what decides which code comes back -- see the
+// "escape-sequence outranks control-char" test below, which asserts exactly
+// that.
+//
+// The mutation property survives, on ORDER rather than on disjointness: delete
+// or collapse any single row and the fixtures pinned to it report a different
+// code, so each rule stays independently killable. What the property does NOT
+// rest on is any claim that a fixture trips one rule only.
 //
 // The `code` is asserted, never merely "it was refused". A test that only
 // checked for refusal would pass against `admitId` alone and prove nothing this

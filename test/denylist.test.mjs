@@ -88,8 +88,11 @@ test("admitRemoteModels still rejects the uw/ namespace from a non-relay provide
   assert.deepEqual(r.kept, ["qwen3-max"]);
   // `uw-namespace` is the one reason `classifyRefusal` cannot produce: these ids
   // PASS `admitId`, and whether they are refused depends on the provider, which
-  // sanitize.mjs never sees. `removed` is 0 because nothing was stripped -- the
-  // name is reported in full, which is what makes the warning actionable.
+  // sanitize.mjs never sees. `removed` is 0 for THESE fixtures because they are
+  // plain ASCII that survives sanitising untouched, so the name is reported in
+  // full -- which is what makes the warning actionable. Read it no further than
+  // that: `removed` is a net delta, and a 0 elsewhere can also mean a strip that
+  // NFC growth cancelled out (see the `removed` note in denylist.mjs).
   assert.deepEqual(r.rejected, [
     { id: "uw/fast",   reason: "uw-namespace", removed: 0 },
     { id: "uw/slot-1", reason: "uw-namespace", removed: 0 },
@@ -98,19 +101,23 @@ test("admitRemoteModels still rejects the uw/ namespace from a non-relay provide
 
 test("the relay itself is exempt: uw/ from `anthropic` is no refusal at all", () => {
   // The other half of the same rule, and it must be "no entry", not "an entry
-  // with a benign reason" -- the withheld count in the picker is derived from
-  // `rejected.length`, so an exempt id appearing there at all would report our
-  // own relay as withholding models from us.
+  // with a benign reason". No consumer reads this yet -- R17 is the producer
+  // half, and #51's refusal drill-in is a separate task -- but a withheld count
+  // is the obvious thing to derive from `rejected.length`, and once something
+  // does, an exempt id appearing here at all would report our own relay as
+  // withholding models from us.
   const r = admitRemoteModels("anthropic", ["uw/fast", "uw/slot-1", "claude-opus-5"]);
   assert.deepEqual(r.rejected, []);
   assert.deepEqual(r.kept, ["uw/fast", "uw/slot-1", "claude-opus-5"]);
 });
 
 test("every admitId rule reaches `rejected` under its own reason code", () => {
-  // One fixture per code, asserting the CODE rather than the refusal. The pair
-  // (id, reason) is what the withheld overlay renders, so a collapsed pair of
-  // codes shows a user the wrong explanation for a missing model -- which is
-  // worse than #51's silence, because it is silence that looks like an answer.
+  // One fixture per code, asserting the CODE rather than the refusal. Nothing
+  // renders these yet; the pair (id, reason) is what a future withheld overlay
+  // would have to render, and once one exists, a collapsed pair of codes would
+  // show a user the wrong explanation for a missing model -- worse than #51's
+  // silence, because it is silence that looks like an answer. Pinning the codes
+  // now is what stops them collapsing before that consumer is written.
   //
   // `uw-namespace` is included here and nowhere in sanitize.test.mjs, because
   // this is the only layer that can produce it.
@@ -281,6 +288,61 @@ test("#52: real stderr from a warn:true call carries no ESC and no U+202E", () =
   assert.equal(out.stderr.includes("\u202E"), false, "U+202E reached the terminal");
   assert.equal(TERMINAL_HOSTILE.test(out.stderr.replace(/\r?\n/g, "")), false,
     `stderr carries a terminal-hostile code point: ${JSON.stringify(out.stderr)}`);
+});
+
+test("#52: the PROVIDER NAME on the SECURITY line is sanitised too", () => {
+  // THE HALF THE #52 TESTS STRUCTURALLY COULD NOT CATCH. Every other fixture in
+  // this file pins `provider: "tabiai"` -- a benign literal -- so they assert
+  // only that the IDS on that line are clean. The name interpolated beside them
+  // is provider-controlled from the same untrusted config and was, until the
+  // fix, printed raw.
+  //
+  // MEASURED BEFORE THE FIX, on this exact input: stderr carried
+  // `\x1b[2J` (erase display) and `\x1b]52;c;cHduZWQ=\x07` (OSC 52 -- a
+  // CLIPBOARD WRITE) plus U+202E. Same attack as the ids, same line, arriving
+  // through the other interpolated value.
+  //
+  // The ids here are deliberately BENIGN-but-refused (`uw/fast`), so the only
+  // possible source of a hostile byte on this line is the provider name. If the
+  // ids carried the attack too, a regression in the name path would be masked.
+  const src = `
+    import { admitRemoteModels } from ${JSON.stringify(
+      new URL("../menu/denylist.mjs", import.meta.url).href)};
+    admitRemoteModels(
+      "evil\\u001b[2J\\u001b]52;c;cHduZWQ=\\u0007\\u202Ecorp",
+      ["uw/fast"],
+      { warn: true });
+  `;
+  const out = spawnSync(process.execPath, ["--input-type=module"],
+    { input: src, encoding: "utf8" });
+
+  assert.equal(out.status, 0, `child failed: ${out.stderr}`);
+  assert.match(out.stderr, /SECURITY: provider ".*" advertised 1 rejected model name/,
+    "the warning must actually have been emitted, or this asserts nothing");
+  assert.equal(out.stderr.includes("\x1b"), false, "an ESC reached the terminal via providerName");
+  assert.equal(out.stderr.includes("\x07"), false, "a BEL reached the terminal via providerName");
+  assert.equal(out.stderr.includes("\u202E"), false, "U+202E reached the terminal via providerName");
+  assert.equal(TERMINAL_HOSTILE.test(out.stderr.replace(/\r?\n/g, "")), false,
+    `stderr carries a terminal-hostile code point: ${JSON.stringify(out.stderr)}`);
+  // The name must still be RECOGNISABLE after sanitising -- a guard that
+  // rendered every hostile name as an empty string would pass every assertion
+  // above while making the security line useless for identifying the provider.
+  assert.match(out.stderr, /evilcorp/,
+    "the sanitised name must still identify the provider");
+});
+
+test("sanitising the name for display does not move the `trusted` comparison", () => {
+  // The exemption at the top of admitRemoteModels compares the RAW providerName
+  // against `trusted`. Sanitising there instead of at the print site would let a
+  // name that merely SANITISES to "anthropic" inherit our own relay's `uw/`
+  // exemption -- turning a display fix into an authorisation bypass.
+  const spoof = admitRemoteModels("anthr\u200Bopic", ["uw/fast"], { warn: false });
+  assert.deepEqual(spoof.kept, [], "a zero-width-spoofed relay name must not be exempt");
+  assert.deepEqual(spoof.rejected.map((r) => r.reason), ["uw-namespace"]);
+  // ...while the genuine name still is.
+  const real = admitRemoteModels("anthropic", ["uw/fast"], { warn: false });
+  assert.deepEqual(real.kept, ["uw/fast"]);
+  assert.deepEqual(real.rejected, []);
 });
 
 test("a provider with no testModel produces no SECURITY warning", () => {
