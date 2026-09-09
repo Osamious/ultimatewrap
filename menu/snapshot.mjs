@@ -72,7 +72,32 @@ const ROUTABLE_TIMEOUT_MS = 5000;
  *                   the default is inert, so an un-updated caller (every
  *                   existing test) keeps behaving exactly as before.
  */
-export function buildSnapshot(built, { modalityOf = () => null } = {}) {
+export function buildSnapshot(built, { modalityOf = () => null, previous = null } = {}) {
+  // FREE-TIER LIMITS ARE CARRIED FORWARD, because they are MEASUREMENTS and
+  // this function only ever sees DERIVATIONS. `built` comes from `buildFrom`,
+  // which reads the catalogue and the discovery cache; nothing in it has ever
+  // talked to a provider about payload size. So `r.limit ?? null` read `null`
+  // on every build, and the first `--build` after a probe sweep silently threw
+  // the whole sweep away -- 16 providers, ~60 large requests and several
+  // bisects, destroyed by the next unrelated rebuild. MEASURED 2026-09-09:
+  // after `#107`'s rebuild, all 45 providers read `null`.
+  //
+  // Routability does NOT need this and is the instructive contrast: `main()`
+  // re-probes it on every build, so it is a derivation here too. A limit sweep
+  // costs minutes and hits third-party free tiers, so re-running it on every
+  // snapshot build is not an option -- carrying it is.
+  //
+  // KEYED BY PROVIDER AND BY MODEL ID, not by array position: a rebuild adds and
+  // removes rows (`#107` alone moved google 240 -> 194), so an index-based carry
+  // would attach one provider's measurement to another's row.
+  const priorRow = new Map();
+  const priorModel = new Map();
+  for (const r of previous?.rows ?? []) {
+    if (r?.provider) priorRow.set(r.provider, r.limit ?? null);
+    for (const m of r?.models ?? []) {
+      if (m?.id) priorModel.set(`${r.provider}/${m.id}`, m.limit ?? null);
+    }
+  }
   return {
     schemaVersion: SNAPSHOT_SCHEMA,
     generatedAt: built.generatedAt ?? null,
@@ -98,7 +123,7 @@ export function buildSnapshot(built, { modalityOf = () => null } = {}) {
       // reason `provenance` two literals down carries it: an own property,
       // always, so "not probed" survives `JSON.stringify` as a value rather
       // than vanishing as an absent key. The renderer draws `null` as `?`.
-      limit: r.limit ?? null,
+      limit: r.limit ?? priorRow.get(r.provider) ?? null,
       // ALWAYS AN ARRAY, never a missing key (#51, §2.5(a)) -- "withheld
       // nothing" and "this build did not compute it" are different claims, and
       // `?? []` is what keeps them distinguishable through `JSON.stringify`,
@@ -123,7 +148,7 @@ export function buildSnapshot(built, { modalityOf = () => null } = {}) {
         // Schema 4, and the per-MODEL half of the same field. The provider cell
         // is an aggregate of these, so this is the source of truth and `var` at
         // level 0 is what a disagreement among them renders as.
-        limit: m.limit ?? null,
+        limit: m.limit ?? priorModel.get(`${r.provider}/${m.id}`) ?? null,
         modality: modalityOf(r.provider, m.id) ?? null,
         // FOUND IN REVIEW: this file's own signature defect a third time --
         // `mode` is ALWAYS set by `buildFrom` (`menu/catalog.mjs:536-539`,
@@ -346,7 +371,14 @@ export async function main(argv = process.argv.slice(2),
   // task's WRITES, so the stamp is attached here, the same object shape
   // `buildSnapshot` already reads `routableAsOf` from.
   built.discoveredAsOf = discoveredAsOf;
-  const snap = buildSnapshot(built, { modalityOf });
+  // The snapshot being replaced, read for the measurements it holds that this
+  // build cannot re-derive. `loadSnapshot` rejects a wrong-schema or malformed
+  // file and returns `{ok:false}`, which is exactly the right outcome here: a
+  // file we cannot trust contributes nothing and the build proceeds with the
+  // limits unknown, rather than carrying values out of a shape we did not
+  // verify. A first-ever build has no previous file and takes the same path.
+  const prev = loadSnapshot(file);
+  const snap = buildSnapshot(built, { modalityOf, previous: prev.ok ? prev.snap : null });
   const written = writeSnapshotFile(snap, file);
   const models = snap.rows.reduce((n, r) => n + r.models.length, 0);
   log(`snapshot: ${written}`);

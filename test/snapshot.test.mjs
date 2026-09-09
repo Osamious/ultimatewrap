@@ -492,3 +492,59 @@ test("the snapshot carries no catalogue internals", () => {
     assert.equal(text.includes(leak), false, `snapshot leaked ${leak}`);
   }
 });
+
+// --- the free-tier limit survives a rebuild (2026-09-09) --------------------
+//
+// `limit` is a MEASUREMENT and `buildSnapshot` only ever sees DERIVATIONS, so
+// without a carry-forward the first `--build` after a probe sweep threw the
+// whole sweep away. MEASURED: after an unrelated rebuild, all 45 providers read
+// `null`. Routability is the instructive contrast -- `main()` re-probes it every
+// build, so it needs no carry; a limit sweep costs minutes and hits third-party
+// free tiers, so it must be carried.
+
+test("buildSnapshot carries a previous limit forward when the build cannot derive one", () => {
+  const previous = { rows: [
+    { provider: "acme", limit: { verdict: "unusable", bytes: 102400, at: "2026-09-09T00:00:00Z" },
+      models: [{ id: "m1", limit: { verdict: "unusable", bytes: 102400 } }] },
+  ] };
+  const s = buildSnapshot(BUILT, { previous });
+  const row = s.rows.find((r) => r.provider === "acme");
+  assert.ok(row, "fixture must contain the acme provider for this test to mean anything");
+  assert.equal(row.limit?.verdict, "unusable");
+  assert.equal(row.limit?.bytes, 102400);
+});
+
+test("buildSnapshot keys the carry by provider and model id, never by position", () => {
+  // A rebuild adds and removes rows -- #107 alone moved google 240 -> 194 -- so
+  // an index-based carry would attach one provider's measurement to another's.
+  const previous = { rows: [
+    { provider: "zzz-not-in-build", limit: { verdict: "ok" }, models: [] },
+    { provider: "acme", limit: { verdict: "locked" },
+      models: [{ id: "m-gone", limit: { verdict: "ok" } }] },
+  ] };
+  const s = buildSnapshot(BUILT, { previous });
+  assert.equal(s.rows.find((r) => r.provider === "acme")?.limit?.verdict, "locked",
+    "matched by name despite sitting at a different index");
+  for (const r of s.rows) {
+    if (r.provider !== "acme") {
+      assert.notEqual(r.limit?.verdict, "locked", `${r.provider} inherited a foreign measurement`);
+    }
+  }
+});
+
+test("buildSnapshot with no previous snapshot leaves every limit null", () => {
+  const s = buildSnapshot(BUILT);
+  for (const r of s.rows) {
+    assert.equal(r.limit, null, `${r.provider} invented a limit from nothing`);
+    for (const m of r.models) assert.equal(m.limit, null);
+  }
+});
+
+test("a fresh measurement in `built` outranks the carried one", () => {
+  // The carry is a FALLBACK. If a producer ever does put a limit on `built`,
+  // the older stored value must not shadow it.
+  const built = { ...BUILT, rows: BUILT.rows.map((r) => ({ ...r, limit: { verdict: "ok" } })) };
+  const previous = { rows: BUILT.rows.map((r) => ({ provider: r.provider, limit: { verdict: "locked" }, models: [] })) };
+  const s = buildSnapshot(built, { previous });
+  for (const r of s.rows) assert.equal(r.limit?.verdict, "ok");
+});
