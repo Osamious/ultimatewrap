@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { detectCaps, motionEnabled, glyphsFor, painter, badgeColour, proportionBar,
          healthDot, provenanceDot, padId, countCell, highlight, frame, confirmLine, sleepSync,
-         slideFrames, flashFrames, revealFrames, FRAME_W, W } from "../menu/style.mjs";
+         slideFrames, flashFrames, revealFrames, FRAME_W, FRAME_MIN, FRAME_MAX,
+         frameWidth, layoutFor, W } from "../menu/style.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const VT = detectCaps({ WT_SESSION: "1", COLORTERM: "truecolor" }, 120);
@@ -218,9 +219,15 @@ test("a coloured badge occupies exactly W.badge visible columns", () => {
   const s = strip(row);
   // R16: `1 + 2` (frame char + mark/space) is followed by the provenance
   // gutter (`W.prov` glyph + 1 space) before the id cell.
-  const badgeCol = 1 + 2 + (W.prov + 1) + W.id + W.ctx + 1 + W.price * 2 + 2;
-  assert.equal(s.slice(badgeCol, badgeCol + W.badge), "FREE  ");
-  assert.equal(s.indexOf("TVR"), badgeCol + W.badge);
+  //
+  // WIDTHS COME FROM THE LAYOUT THE RENDERER USED, not from the base table.
+  // `VT` reports 120 columns, so `id` absorbs the surplus and the badge sits
+  // that much further right; deriving the offset from the fixed `W` asserted a
+  // position the elastic frame never puts it in.
+  const LW = layoutFor(frameWidth(VT)).W;
+  const badgeCol = 1 + 2 + (LW.prov + 1) + LW.id + LW.ctx + 1 + LW.price * 2 + 2;
+  assert.equal(s.slice(badgeCol, badgeCol + LW.badge), "FREE  ");
+  assert.equal(s.indexOf("TVR"), badgeCol + LW.badge);
 });
 
 test("the capability cell has three glyphs, not two, and still occupies W.caps", () => {
@@ -270,18 +277,60 @@ test("an astral id cannot render a short frame", () => {
   }
 });
 
-test("every line of every frame is exactly FRAME_W visible columns", () => {
+test("every line of every frame is exactly the frame width for that terminal", () => {
+  // RETARGETED from a fixed `FRAME_W` when the frame became elastic. The
+  // invariant is unchanged in strength -- every line of a frame still measures
+  // exactly one width -- but that width is now `frameWidth(caps)` rather than
+  // the constant, so a 120-column terminal must produce 118-column lines and a
+  // test pinned to 78 would report correct output as a corrupt frame.
+  //
+  // The widths below straddle every branch of the clamp: below the floor, at
+  // the floor, between, and past the ceiling.
   for (const v of [V0, V1, { ...V0, empty: true, items: [], filter: "zzz" },
                    { ...V0, legend: true }]) {
-    for (const caps of [VT, PLAIN]) {
-      for (const l of frame(v, META, { caps })) {
-        // Code points, the same measure style.mjs pads with. Using .length here
-        // would let an astral row pass this test while rendering short.
-        const w = [...strip(l)].length;
-        assert.equal(w, FRAME_W, `width ${w}: ${strip(l)}`);
+    for (const base of [VT, PLAIN]) {
+      for (const cols of [40, 80, 100, 134, 400]) {
+        const caps = { ...base, cols };
+        const expected = frameWidth(caps);
+        for (const l of frame(v, META, { caps })) {
+          // Code points, the same measure style.mjs pads with. Using .length here
+          // would let an astral row pass this test while rendering short.
+          const w = [...strip(l)].length;
+          assert.equal(w, expected, `cols ${cols}: width ${w}: ${strip(l)}`);
+        }
       }
     }
   }
+});
+
+test("frameWidth clamps to [FRAME_MIN, FRAME_MAX] and keeps a two-column margin", () => {
+  // The margin is where the original 78 came from -- an 80-column terminal minus
+  // two -- so this pins that an 80-column terminal still renders exactly what it
+  // rendered before the frame became elastic. Without it every existing width
+  // fixture shifts by two and the change looks like a regression.
+  assert.equal(frameWidth({ cols: 80 }), 78, "the historical default is unchanged");
+  assert.equal(frameWidth({ cols: 100 }), 98);
+  assert.equal(frameWidth({ cols: 134 }), FRAME_MAX, "clamped at the ceiling");
+  assert.equal(frameWidth({ cols: 400 }), FRAME_MAX);
+  assert.equal(frameWidth({ cols: 40 }), FRAME_MIN, "never narrower than the floor");
+  assert.equal(frameWidth({}), FRAME_MIN, "a terminal that reports no width");
+  assert.equal(frameWidth({ cols: NaN }), FRAME_MIN);
+});
+
+test("layoutFor spends surplus width on the name columns and nothing else", () => {
+  const base = layoutFor(FRAME_MIN);
+  const wide = layoutFor(FRAME_MIN + 20);
+  assert.equal(base.W.id, W.id, "at the floor the table is unchanged");
+  assert.equal(base.W.keyId, W.keyId);
+  assert.equal(wide.W.id, W.id + 20, "the model id absorbs the surplus");
+  assert.equal(wide.W.keyId, W.keyId + 20, "so does the provider key id");
+  // Everything else holds a value of known maximum width and gains nothing from
+  // growing -- and a price cell that drifts as the terminal resizes is harder to
+  // scan, not easier.
+  for (const k of ["count", "bar", "free", "health", "ctx", "price", "badge", "caps", "prov"]) {
+    assert.equal(wide.W[k], W[k], `${k} must not absorb surplus`);
+  }
+  assert.equal(wide.inner, wide.frameW - 3, "inner tracks the frame, same arithmetic as before");
 });
 
 test("an over-wide cell clips the row instead of breaking the frame", () => {
@@ -383,8 +432,8 @@ test("slide frames measure VISIBLE width, so colour does not truncate a line", (
   const frames = slideFrames(settled);
   for (const [n, f] of frames.entries()) {
     for (const [i, l] of f.entries()) {
-      assert.ok(vis(l) <= FRAME_W,
-                `frame ${n} line ${i} is ${vis(l)} visible columns, over FRAME_W`);
+      assert.ok(vis(l) <= frameWidth(VT),
+                `frame ${n} line ${i} is ${vis(l)} visible columns, over the frame width`);
     }
   }
   // At rest the slide must be a no-op: the settled frame the user is left looking
@@ -804,7 +853,7 @@ test("every overlay line measures exactly FRAME_W, including at the 128-code-poi
       items: [{ id: longId, reason: "too-long", removed: 5 }], total: 1 } };
   for (const caps of [VT, PLAIN]) {
     for (const l of frame(V, META, { caps })) {
-      assert.equal([...strip(l)].length, FRAME_W, `caps ${caps.colours}: ${strip(l)}`);
+      assert.equal([...strip(l)].length, frameWidth(caps), `caps ${caps.colours}: ${strip(l)}`);
     }
   }
 });

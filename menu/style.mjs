@@ -18,8 +18,61 @@ import { sanitizeDisplay } from "./sanitize.mjs";
 // through `provenanceDot` and `healthDot` defined in this file.
 import { legendLines } from "./legend.mjs";
 
-export const FRAME_W = 78;
+// The floor, and what `FRAME_W` used to be unconditionally. Kept as the minimum
+// so no terminal renders narrower than it did before this became elastic: a
+// terminal below 78 columns already wrapped every line and corrupted the frame,
+// and clamping here leaves that exactly as bad as it was rather than quietly
+// changing a second thing in the same commit. Dropping columns by priority is
+// what would actually fix it, and it is deliberately NOT in this change.
+export const FRAME_MIN = 78;
+// The ceiling. Past roughly this width a row becomes physically hard to track
+// from the id on the left to the badge on the right -- the eye loses the line --
+// so surplus beyond it is left as margin rather than spent on a wider table.
+export const FRAME_MAX = 132;
+
+// The old constant, still exported and still 78. It is the BASE geometry every
+// fixed cell is measured against, and `test/style.test.mjs` uses it as the
+// reference width; `frameWidth(caps)` is what the renderer actually draws to.
+export const FRAME_W = FRAME_MIN;
 export const FRAME_MS = 30;
+
+// Two columns of the terminal are never drawn into. This is where the original
+// 78 came from -- an 80-column terminal minus this margin -- and keeping it is
+// what makes `cols: 80` still render exactly 78, so nothing about today's
+// default rendering changes. Drawing flush to the last column risks a wrap on
+// terminals that treat writing the final cell as advancing the line, and a
+// wrapped frame corrupts every row below it.
+export const FRAME_MARGIN = 2;
+
+/** The frame width for a terminal, clamped to [FRAME_MIN, FRAME_MAX]. */
+export function frameWidth(caps) {
+  const cols = Number(caps?.cols);
+  if (!Number.isFinite(cols)) return FRAME_MIN;
+  return Math.max(FRAME_MIN, Math.min(FRAME_MAX, Math.floor(cols) - FRAME_MARGIN));
+}
+
+/**
+ * The column table for a given frame width.
+ *
+ * SURPLUS GOES TO THE NAME COLUMNS, not spread across every cell. `id` and
+ * `keyId` are the two that elide today -- R16 widened `id` 34 -> 37 for exactly
+ * that reason and ran out of room -- while `ctx`, the prices and `badge` hold
+ * values of known maximum width that gain nothing from being wider, and would
+ * make a row harder to scan by floating its columns around as the terminal
+ * changes size.
+ *
+ * Returned fresh each call rather than memoised: it is a handful of integer
+ * additions on a path that already rebuilds every row, and a cache keyed on
+ * width is a second source of truth for the geometry.
+ */
+export function layoutFor(frameW) {
+  const w = Math.max(FRAME_MIN, Math.min(FRAME_MAX, Math.floor(frameW) || FRAME_MIN));
+  const surplus = w - FRAME_MIN;
+  // Split so both levels benefit. Level 0's `keyId` and level 1's `id` are
+  // independent cells on different screens, so each takes the whole surplus
+  // rather than half of it.
+  return { frameW: w, inner: w - 3, W: { ...W, keyId: W.keyId + surplus, id: W.id + surplus } };
+}
 
 // INNER is FRAME_W - 3, and the arithmetic is worth writing down because the
 // previous draft had it as FRAME_W - 4 and every single line came out at 77
@@ -348,14 +401,17 @@ const clipVisible = (body, n) => {
   return out + `${ESC}[0m`;
 };
 
-const bar = (g, body) => {
-  const clipped = clipVisible(body, INNER);
-  return `${g.frame.v}${clipped}${fill(INNER - vis(clipped))} ${g.frame.v}`;
+// `inner` is threaded rather than read from a module constant: the frame is now
+// elastic, and a helper that closes over one fixed width is how half the lines
+// would come out at 78 while the rest followed the terminal.
+const barAt = (g, body, inner) => {
+  const clipped = clipVisible(body, inner);
+  return `${g.frame.v}${clipped}${fill(inner - vis(clipped))} ${g.frame.v}`;
 };
 
-const title = (g, p, text) => {
+const titleAt = (g, p, text, frameW) => {
   const head = `${g.frame.tl}${g.frame.h} ${text} `;
-  return p.ramp(head) + g.frame.h.repeat(Math.max(0, FRAME_W - vis(head) - 1)) + g.frame.tr;
+  return p.ramp(head) + g.frame.h.repeat(Math.max(0, frameW - vis(head) - 1)) + g.frame.tr;
 };
 
 export const HELP0 = "[↑↓] move  [↵] open  [⇥] scope  [^f] fav  [?] all keys  [esc] back";
@@ -363,9 +419,9 @@ export const HELP1 = "[↑↓] move  [↵] select  [^f] fav  [?] all keys  [esc]
 const HELP0_A = "[up/dn] move [enter] open [tab] scope [^f] fav [?] all keys [esc] back";
 const HELP1_A = "[up/dn] move  [enter] select  [^f] fav  [?] all keys  [esc] back";
 
-const footer = (g, p, text) => {
+const footerAt = (g, p, text, frameW) => {
   const head = `${g.frame.bl} ${text} `;
-  return p.dim(head) + g.frame.h.repeat(Math.max(0, FRAME_W - vis(head) - 1)) + g.frame.br;
+  return p.dim(head) + g.frame.h.repeat(Math.max(0, frameW - vis(head) - 1)) + g.frame.br;
 };
 
 // The legend's CONTENT now lives in `legend.mjs` -- both the key binds (still
@@ -376,6 +432,21 @@ const footer = (g, p, text) => {
 
 export function frame(v, meta, { caps }) {
   const g = glyphsFor(caps), p = painter(caps);
+
+  // THE GEOMETRY FOR THIS TERMINAL, resolved once and shadowed over the module
+  // constants. Every `W.` and `INNER` below this line reads the elastic values
+  // rather than the fixed 78-column table, so the ~30 call sites did not each
+  // have to learn about width -- and, more importantly, none of them can be
+  // MISSED. A helper left closed over the module constant is how half a frame
+  // comes out at 78 while the rest follows the terminal, which the width
+  // invariant would report as a corrupt frame with no clue where it came from.
+  const layout = layoutFor(frameWidth(caps));
+  const W = layout.W;
+  const INNER = layout.inner;
+  const bar = (gg, body) => barAt(gg, body, INNER);
+  const title = (gg, pp, text) => titleAt(gg, pp, text, layout.frameW);
+  const footer = (gg, pp, text) => footerAt(gg, pp, text, layout.frameW);
+
   const L = [];
 
   // `flat` is a THIRD chrome, not a variant of level 0. Every branch below used
@@ -708,6 +779,10 @@ export function confirmLine(target, g, p) {
 
 export function slideFrames(lines, step = 6, frames = 3) {
   const out = [];
+  // Widest rendered line, which for a well-formed frame is every line. `max`
+  // rather than `lines[0]` so a caller passing a partial or ragged set still
+  // clips to the frame rather than to whatever happened to be first.
+  const width = lines.reduce((m, l) => Math.max(m, vis(l)), FRAME_MIN);
   for (let f = frames; f >= 1; f--) {
     const shift = " ".repeat(step * (f - 1));
     // clipVisible, not String.slice. `.slice(0, FRAME_W + shift.length)` counted
@@ -723,12 +798,18 @@ export function slideFrames(lines, step = 6, frames = 3) {
     // descend and every esc back, corrected by the next keypress because a
     // normal redraw does not go through here.
     //
-    // FRAME_W, not FRAME_W + shift.length: the shifted line is that much wider
-    // than the frame, and letting it through wraps in a terminal sized to the
-    // frame. Clipping to the frame's own width is what makes this a slide rather
-    // than an overflow, and at the last frame (shift 0) it is a no-op, so the
-    // settled frame is bit-for-bit the normal render.
-    out.push(lines.map((l) => clipVisible(shift + l, FRAME_W)));
+    // The frame's own width, not FRAME_W + shift.length: the shifted line is
+    // that much wider than the frame, and letting it through wraps in a terminal
+    // sized to the frame. Clipping to the frame's own width is what makes this a
+    // slide rather than an overflow, and at the last frame (shift 0) it is a
+    // no-op, so the settled frame is bit-for-bit the normal render.
+    //
+    // MEASURED FROM THE LINES, not from the constant. These are already-rendered
+    // frame lines, so their own visible width IS the frame width -- and since the
+    // frame became elastic, clipping to a fixed 78 cut a 118-column render down
+    // by 40 and the "settled frame is bit-for-bit the normal render" property
+    // above silently stopped holding.
+    out.push(lines.map((l) => clipVisible(shift + l, width)));
   }
   return out;
 }

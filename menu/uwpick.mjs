@@ -172,6 +172,17 @@ export function main() {
     }
   };
   const draw = () => {
+    // COLUMNS AS WELL AS ROWS. `caps.cols` was read once at startup and never
+    // again, which was harmless while the frame was a fixed 78 and is not now:
+    // widening the terminal would leave the frame at its launch width until the
+    // picker was restarted. Same cadence as the row re-read beside it -- there is
+    // no event loop here to hang a `resize` listener on, so both are refreshed on
+    // the keystroke that triggers the redraw.
+    //
+    // Mutated rather than rebuilt: `glyphsFor`/`painter`/`motionEnabled` were
+    // resolved from this object at startup and a fresh `detectCaps` would leave
+    // them pointing at the old one.
+    caps.cols = out.columns ?? caps.cols;
     state = reduce(state, { resize: out.rows || 30 }).state;
     paint(out, lines());
   };
