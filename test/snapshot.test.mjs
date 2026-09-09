@@ -39,15 +39,15 @@ test("buildSnapshot stamps the schema and keeps every display field", () => {
   assert.equal(typeof s.builtAt, "string");
   assert.equal(s.rows.length, 2);
   assert.deepEqual(Object.keys(s.rows[0]).sort(),
-                   ["free", "health", "keyId", "models", "planCount", "provider", "refused"]);
+                   ["free", "health", "keyId", "limit", "models", "planCount", "provider", "refused"]);
   // `routable` joined this list on 2026-09-06. The previous eight-key version of
   // this assertion was green while buildSnapshot dropped the field on every
   // build -- it stated the key set the code emitted and therefore certified the
   // drop as correct. A key-set assertion can only ever say "these keys and no
   // others"; the positive round-trip below is what says "and they carry values".
   assert.deepEqual(Object.keys(s.rows[0].models[0]).sort(),
-                   ["badge", "ctx", "id", "modality", "mode", "outputKind", "pin", "pout",
-                    "provenance", "reason", "routable", "tools", "vision"]);
+                   ["badge", "ctx", "id", "limit", "modality", "mode", "outputKind", "pin",
+                    "pout", "provenance", "reason", "routable", "tools", "vision"]);
 });
 
 test("schema 3: mode survives serialization -- the same drop this file already made twice", () => {

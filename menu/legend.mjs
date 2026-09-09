@@ -87,6 +87,35 @@ export function legendLines(g, p, { provenanceDot, healthDot }) {
   L.push("                      was built; it may still work -- try it");
 
   L.push("");
+  L.push(p.bold("FREE-TIER LIMIT  (the 'limit' column)"));
+  L.push(p.dim("  shown only when the terminal is wide enough to reserve it"));
+  L.push("    ok       accepts a real Claude Code request");
+  // A SIZE, not one of a fixed pair. `64KB`, `250KB` and `1.0MB` are all cells
+  // this column renders; the number is whatever that provider was measured to
+  // allow. Only the 153KB comparison point is fixed.
+  L.push("    <size>   the free tier caps a single request at that size,");
+  L.push("             and the colour says what that means for a session:");
+  L.push("               RED    under 153KB -- below the smallest request");
+  L.push("                      Claude Code can send, so it can never work,");
+  L.push("                      whichever MCP servers you turn off");
+  L.push("               YELLOW 153KB to 400KB -- the first message or two");
+  L.push("                      succeed, then the conversation outgrows the");
+  L.push("                      cap and every later turn fails");
+  L.push("               GREEN  over 400KB -- a real session fits");
+  L.push("    locked   refuses for a reason that is not size: the model is");
+  L.push("             unsupported, or the free tier is vendor-client only");
+  L.push("    unpaid   free allowance or credits are spent -- top up and retry");
+  L.push("    rate     rate limited right now; try again shortly");
+  L.push("    5xx      the provider errored; not your account");
+  L.push("    var      this provider's free rows DISAGREE -- open it and read");
+  L.push("             the per-model column, which is the source of truth");
+  L.push("    (blank)  no free rows here; the free-tier rule does not apply");
+  L.push("    ?        not probed yet");
+  // The colour rule is worth stating outright, because it is what makes the
+  // column scannable: red is "do not bother", yellow is "try later".
+  L.push(p.dim("  red = it will not work; yellow = it may work later; green = it works"));
+
+  L.push("");
   L.push(p.bold("PROVIDER HEALTH"));
   L.push(`  ${health("ok")}  ok        no breakage recorded`);
   L.push(`  ${health("needs $")}  needs $   the account needs a balance before it answers`);

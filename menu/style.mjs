@@ -17,6 +17,8 @@ import { sanitizeDisplay } from "./sanitize.mjs";
 // arguments, so this does not become a cycle even though the legend renders
 // through `provenanceDot` and `healthDot` defined in this file.
 import { legendLines } from "./legend.mjs";
+// The free-tier limit vocabulary. Also import-free, for the same no-cycle reason.
+import { limitCell } from "./payload-cap.mjs";
 
 // The floor, and what `FRAME_W` used to be unconditionally. Kept as the minimum
 // so no terminal renders narrower than it did before this became elastic: a
@@ -65,13 +67,34 @@ export function frameWidth(caps) {
  * additions on a path that already rebuilds every row, and a cache keyed on
  * width is a second source of truth for the geometry.
  */
+export const LIMIT_W = 7;
+
 export function layoutFor(frameW) {
   const w = Math.max(FRAME_MIN, Math.min(FRAME_MAX, Math.floor(frameW) || FRAME_MIN));
-  const surplus = w - FRAME_MIN;
-  // Split so both levels benefit. Level 0's `keyId` and level 1's `id` are
-  // independent cells on different screens, so each takes the whole surplus
-  // rather than half of it.
-  return { frameW: w, inner: w - 3, W: { ...W, keyId: W.keyId + surplus, id: W.id + surplus } };
+  let surplus = w - FRAME_MIN;
+
+  // THE LIMIT COLUMN IS RESERVED BEFORE `id` TAKES THE REST, and it is the one
+  // cell whose PRESENCE depends on width -- at BOTH levels, not just level 1.
+  //
+  // An earlier draft gave level 0 the column unconditionally, on a reading of
+  // "12 spare columns" taken from a rendered ROW. The level-0 HEADER spends more
+  // than its rows do, so the column overflowed at the 78-column floor and
+  // `clipVisible` truncated the line and appended a reset -- which surfaced as
+  // an escape sequence in a `colours: 0` render, not as a width failure. Both
+  // levels now share one rule, so the floor renders exactly what it rendered
+  // before this column existed.
+  //
+  // Dropping a column rather than shrinking every other one is deliberate: a
+  // `$out` cell that loses a digit is wrong, where an absent column is merely
+  // absent -- and the legend says where it went.
+  const showLimit = surplus >= LIMIT_W + 1;
+  if (showLimit) surplus -= LIMIT_W + 1;
+
+  // Whatever is left goes to the two name cells. Level 0's `keyId` and level 1's
+  // `id` are independent cells on different screens, so each takes the whole
+  // remainder rather than half of it.
+  return { frameW: w, inner: w - 3, showLimit,
+           W: { ...W, keyId: W.keyId + surplus, id: W.id + surplus, limit: LIMIT_W } };
 }
 
 // INNER is FRAME_W - 3, and the arithmetic is worth writing down because the
@@ -204,6 +227,24 @@ export function healthDot(health, g, p) {
 // renders a single blank column, not one of the four glyphs: the disclosure
 // this needs is the header's `discovered` stamp (Q1.3's pattern, restated for
 // this field), not a fifth mark competing with the other four for meaning.
+/**
+ * The free-tier limit cell, padded and coloured, for a model row or a provider.
+ *
+ * COLOURED AFTER PADDING, for the reason the badge cell records at its own call
+ * site: `pad` runs `sanitizeDisplay`, which strips CSI by design, so colouring
+ * first deletes the colour and then pads the bare text to the wrong width.
+ *
+ * Red is not the only carrier of "this will not work". `100KB`, `locked` and
+ * `unpaid` are three different words, distinguishable with `colours: 0`, which is
+ * the same doctrine `healthDot` and `provenanceDot` follow -- and the reason this
+ * renders a word rather than the glyph an earlier draft proposed.
+ */
+export function limitOut(entry, p, width = W.limit) {
+  const { text, colour } = limitCell(entry);
+  const cell = pad(text, width);
+  return colour ? p[colour](cell) : cell;
+}
+
 export function provenanceDot(provenance, g, p) {
   if (provenance === "call-verified") return p.grn(g.provCV);
   if (provenance === "config-asserted") return p.cya(g.provCA);
@@ -612,10 +653,11 @@ export function frame(v, meta, { caps }) {
   // already carrying that disclosure at the header line above.
   L.push(bar(g, p.dim(!flat && v.level === 0
     ? "  " + pad("key id", W.keyId) + rpad("models", W.count) + "   " +
-      pad("free", W.bar + W.free) + "  " + pad("health", W.health)
+      pad("free", W.bar + W.free) + "  " + pad("health", W.health) + (layout.showLimit ? pad("limit", W.limit) : "")
     : "  " + "  " + pad(flat ? "provider/model" : "model", W.id) + rpad("ctx", W.ctx) + " " +
       rpad("$in", W.price) + rpad("$out", W.price) + "  " +
-      pad("badge", W.badge) + pad("TVR", W.caps))));
+      pad("badge", W.badge) + pad("TVR", W.caps) +
+      (layout.showLimit ? " " + pad("limit", W.limit) : ""))));
 
   if (v.empty) {
     // The instruction comes FIRST, and the query is clipped to 20.
@@ -681,7 +723,13 @@ export function frame(v, meta, { caps }) {
              // cell renamed to a wider role (revision 11).
              rpadCount(countCell(total, r.refused?.length ?? 0), W.count) + "   " +
              proportionBar(r.free, total, g) + " " + pad(freeTxt, W.free - 1) +
-             healthDot(r.health, g, p) + " " + pad(r.health, W.health);
+             healthDot(r.health, g, p) + " " + pad(r.health, W.health) +
+             // The free-tier limit, aggregated over this provider's free rows.
+             // `r.limit` is absent on a snapshot written before schema 4, and
+             // `limitCell(undefined)` renders `?` -- "not probed", which is
+             // exactly what an older snapshot means, and distinct from the `n/a`
+             // a provider with no free rows earns.
+             (layout.showLimit ? limitOut(r.limit, p, W.limit) : "");
     } else if (it.kind === "pinned") {
       body = `${mark} ` + (it.mark === "*" ? p.yel(g.fav) : p.dim(g.recent)) + " " +
              highlight(pad(it.target, W.keyId + W.count), v.filter, p);
@@ -733,7 +781,11 @@ export function frame(v, meta, { caps }) {
              rpad(ctxCell, W.ctx) + " " +
              rpad(money(m.pin), W.price) + rpad(money(m.pout), W.price) + "  " +
              badgeOut +
-             cap(m.tools, "T", "cya") + cap(m.vision, "V", "mag") + cap(m.reason, "R", "yel");
+             cap(m.tools, "T", "cya") + cap(m.vision, "V", "mag") + cap(m.reason, "R", "yel") +
+             // Only when the frame is wide enough to have reserved it. At the
+             // 78-column floor level 1 has three spare columns and the column is
+             // not drawn at all -- see `layoutFor`.
+             (layout.showLimit ? " " + limitOut(m.limit, p, W.limit) : "");
       // Q1.3: `routable` is a value on the row, baked in by the refresher. `false`
       // dims; `null` -- nobody checked -- does not, because dimming everything the
       // one time the gateway was unreachable says "nothing works" when the truth

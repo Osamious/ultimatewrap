@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { detectCaps, motionEnabled, glyphsFor, painter, badgeColour, proportionBar,
          healthDot, provenanceDot, padId, countCell, highlight, frame, confirmLine, sleepSync,
          slideFrames, flashFrames, revealFrames, FRAME_W, FRAME_MIN, FRAME_MAX,
-         frameWidth, layoutFor, W } from "../menu/style.mjs";
+         frameWidth, layoutFor, LIMIT_W, W } from "../menu/style.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const VT = detectCaps({ WT_SESSION: "1", COLORTERM: "truecolor" }, 120);
@@ -322,8 +322,13 @@ test("layoutFor spends surplus width on the name columns and nothing else", () =
   const wide = layoutFor(FRAME_MIN + 20);
   assert.equal(base.W.id, W.id, "at the floor the table is unchanged");
   assert.equal(base.W.keyId, W.keyId);
-  assert.equal(wide.W.id, W.id + 20, "the model id absorbs the surplus");
-  assert.equal(wide.W.keyId, W.keyId + 20, "so does the provider key id");
+  // The limit column is reserved out of surplus BEFORE the name cells take the
+  // rest, so 20 spare columns buy the column (7 + 1 separator) and 12 of id --
+  // not 20. Asserting the full 20 here is what caught the reservation being
+  // silently skipped.
+  const reserved = LIMIT_W + 1;
+  assert.equal(wide.W.id, W.id + 20 - reserved, "the model id absorbs what the limit column leaves");
+  assert.equal(wide.W.keyId, W.keyId + 20 - reserved, "so does the provider key id");
   // Everything else holds a value of known maximum width and gains nothing from
   // growing -- and a price cell that drifts as the terminal resizes is harder to
   // scan, not easier.
@@ -959,4 +964,60 @@ test("the recents disclosure is distinct wording from the bottom overflow line, 
   assert.ok(lines.some((l) => l.includes("2 more recents")));
   assert.ok(lines.some((l) => l.includes("7 more") && !l.includes("7 more recents")),
     "the bottom overflow line must read plain \"more\", never \"more recents\"");
+});
+
+// --- the free-tier limit column (2026-09-09) --------------------------------
+
+test("the limit column appears only when the frame has room to reserve it", () => {
+  // At the floor it must not be drawn AT ALL. An earlier draft gave level 0 the
+  // column unconditionally on a mis-read of the spare space, and the level-0
+  // HEADER -- which spends more than its rows do -- overflowed and was clipped.
+  // The symptom was an escape sequence in a `colours: 0` render, not a width
+  // failure, which is why this asserts the header text rather than the width.
+  const atFloor = frame(V0, META, { caps: { ...PLAIN, cols: 80 } });
+  assert.ok(!atFloor.some((l) => strip(l).includes("limit")),
+    "no limit column at the 78-column floor");
+  assert.equal(atFloor.join("").includes("\x1b"), false,
+    "and nothing is clipped, so no reset escape leaks into a colourless render");
+
+  const wide = frame(V0, META, { caps: { ...PLAIN, cols: 110 } });
+  assert.ok(wide.some((l) => strip(l).includes("limit")), "drawn once there is room");
+});
+
+test("the limit cell distinguishes not-probed from does-not-apply, and colours by actionability", () => {
+  const caps = { ...VT, cols: 110 };
+  const row = (limit) => ({
+    kind: "provider",
+    row: { keyId: "p", provider: "p", free: 1, planCount: 0, health: "ok", limit,
+           models: [{ id: "a", routable: null }] },
+  });
+  const cellFor = (limit) => {
+    const v = { ...V0, items: [row(limit)] };
+    return strip(frame(v, META, { caps }).find((l) => strip(l).includes("p ")) ?? "");
+  };
+  // A snapshot written before this field existed renders `?`, not a blank: "we
+  // never looked" and "the rule does not apply here" are different claims.
+  assert.match(cellFor(undefined), /\?/);
+  assert.match(cellFor({ verdict: "none" }), / {7} *\|?$|ok|/);
+  assert.match(cellFor({ verdict: "unusable", bytes: 102400 }), /100KB/);
+  assert.match(cellFor({ verdict: "locked" }), /locked/);
+  assert.match(cellFor({ verdict: "unpaid" }), /unpaid/);
+  assert.match(cellFor({ verdict: "var" }), /var/);
+  assert.match(cellFor({ verdict: "ok" }), /ok/);
+});
+
+test("every line still measures the frame width with the limit column drawn", () => {
+  const withLimit = { ...V0, items: [{ kind: "provider", row: {
+    keyId: "p", provider: "p", free: 2, planCount: 0, health: "needs $",
+    limit: { verdict: "unusable", bytes: 102400 },
+    models: [{ id: "a", routable: null }] } }] };
+  for (const cols of [100, 120, 134]) {
+    for (const base of [VT, PLAIN]) {
+      const caps = { ...base, cols };
+      const expected = frameWidth(caps);
+      for (const l of frame(withLimit, META, { caps })) {
+        assert.equal([...strip(l)].length, expected, `cols ${cols}: ${strip(l)}`);
+      }
+    }
+  }
 });

@@ -23,7 +23,12 @@ import { writeAtomic } from "./atomic.mjs";
 // "nothing was refused" / "nobody looked" distinction §2.5(a) exists to keep,
 // so the bump forces a rebuild rather than serving a file that cannot tell the
 // two apart.
-export const SNAPSHOT_SCHEMA = 3;
+// 4 adds the free-tier `limit` field, on rows AND on models. Bumped rather than
+// added silently because the picker draws a missing field as `?` ("not probed"),
+// and an OLD snapshot really has not been probed -- so a stale schema-3 file
+// must be rejected and rebuilt rather than read as a set of unknowns that will
+// never resolve.
+export const SNAPSHOT_SCHEMA = 4;
 
 // The closed vocabulary schema 3 persists (revision 6, #59). Named here so a
 // test can assert the FULL set -- both that nothing legal is missing and that
@@ -88,6 +93,12 @@ export function buildSnapshot(built, { modalityOf = () => null } = {}) {
     rows: built.rows.map((r) => ({
       keyId: r.keyId, provider: r.provider, free: r.free,
       planCount: r.planCount, health: r.health,
+      // Schema 4. The free-tier limit, aggregated over this provider's free
+      // rows by `menu/payload-cap.mjs`'s `aggregate`. `?? null` for the same
+      // reason `provenance` two literals down carries it: an own property,
+      // always, so "not probed" survives `JSON.stringify` as a value rather
+      // than vanishing as an absent key. The renderer draws `null` as `?`.
+      limit: r.limit ?? null,
       // ALWAYS AN ARRAY, never a missing key (#51, §2.5(a)) -- "withheld
       // nothing" and "this build did not compute it" are different claims, and
       // `?? []` is what keeps them distinguishable through `JSON.stringify`,
@@ -109,6 +120,10 @@ export function buildSnapshot(built, { modalityOf = () => null } = {}) {
         // same way. An own property, always, even when unknown -- the
         // `Object.hasOwn` distinction this schema bump is asserted against.
         provenance: m.provenance ?? null,
+        // Schema 4, and the per-MODEL half of the same field. The provider cell
+        // is an aggregate of these, so this is the source of truth and `var` at
+        // level 0 is what a disagreement among them renders as.
+        limit: m.limit ?? null,
         modality: modalityOf(r.provider, m.id) ?? null,
         // FOUND IN REVIEW: this file's own signature defect a third time --
         // `mode` is ALWAYS set by `buildFrom` (`menu/catalog.mjs:536-539`,
