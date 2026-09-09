@@ -1446,7 +1446,23 @@ export function buildProviders(chosen, providers, catalog, keyReader, discovery 
       // against it tolerantly (it already accepts a suffixed id there) but
       // FORWARDS the id verbatim, so the suffix belongs on the selector the user
       // picks, never on the routing list. Same split the relay already uses.
-      const shown = tagOneM(name, m.id, m.contextTokens, oneMVerdicts);
+      //
+      // THE JOIN IS CONSULTED FOR THE TAG, and it has to be. `menu/catalog.mjs`
+      // resolves a row's window through `joinCatalogEntry` and this loop reads
+      // `m.contextTokens`, which is absent for a handful of discovery-sourced
+      // ids the join does resolve -- measured: 5 rows, among them
+      // `nvidia/deepseek-ai/deepseek-v4-flash-0731` at 1,310,720. Two writers
+      // with different windows produce two different SPELLINGS of one row, and
+      // uwpick emits the snapshot's, so the picker would lack the very target
+      // the user just selected. That is #111 again, one data path over.
+      //
+      // Read for the tag ONLY, never written back to `row.contextTokens`:
+      // that field feeds `bucketFor` and would move `behavesAs` classifications
+      // on rows this change has no evidence about.
+      const ctxForTag = m.contextTokens
+        ?? joinCatalogEntry(joinIndex(), name, m.id)?.limits?.contextTokens
+        ?? null;
+      const shown = tagOneM(name, m.id, ctxForTag, oneMVerdicts);
       const row = {
         model: `${name}/${shown}`,
         label: `${name} > ${shown}`
