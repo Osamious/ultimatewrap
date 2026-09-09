@@ -165,6 +165,150 @@ test("badgeOf: G2 runs before the cadence branches, not after", () => {
   assert.equal(badgeOf(GENUINE_FREE, { providerName: "mistral", cadence: "recurring" }), "FREE");
 });
 
+// ------------------------------------------ the free-tailed id (2026-09-09)
+//
+// G2 refuses to read a `0/0` as free because the bundle records "not priced per
+// token" the same way. A `:free` / `-free` / `/free` tail on the id the PROVIDER
+// published is the contrast G2 lacks, and it comes from the listing rather than
+// from the bundle -- so it answers G2's question without weakening G2 for any
+// row that does not carry the tail.
+//
+// MEASURED against the live snapshot 2026-09-09, before this rule: 169 rows had
+// `free` in the id and NONE of them carried a badge -- 168 blank, 1 PAID. They
+// split 107 with no price record, 61 with a `0/0` G2 blanked, and 1 genuinely
+// priced at 0.3/1.2. The last of those is why the tail must never outrank a
+// positive price.
+
+// The two rungs that let a tail speak on the no-price path, and the one that
+// does not. Named here so every test below states which it is exercising.
+const LISTED = "listing-verified";
+const CONFIGURED = "config-asserted";
+const CATALOGUE = "catalogue-only";
+
+test("badgeOf: an unvouched free tail stays blank, even with no price to contradict it", () => {
+  // THE DEFECT THIS GATE EXISTS FOR. `priceOf(entry, provider)` returns null when
+  // the catalogue holds no offer FOR THAT PROVIDER -- which is how it says "this
+  // host does not offer this model", not "nobody prices this model". The bundle
+  // files a model under its VENDOR namespace, so `openai/gpt-5.5:free` is another
+  // host's free tier sitting in the `openai` group. MEASURED 2026-09-09: 10 live
+  // rows (openai 2, google 2, deepseek 3, alibaba 2, cohere 1), every one
+  // `catalogue-only` and every one `routable: true`, so nothing dimmed them.
+  // Badging those FREE? tells a user holding a direct OpenAI key that OpenAI has
+  // a free model, on the axis they make cost decisions with.
+  assert.equal(badgeOf(byId["blank-a"], { id: "gpt-5.5:free", provenance: CATALOGUE }), "");
+  assert.equal(badgeOf(byId["blank-a"], { id: "gpt-5.5:free", provenance: null }), "");
+  assert.equal(badgeOf(byId["blank-a"], { id: "gpt-5.5:free" }), "",
+    "provenance defaults to null, so an un-threaded caller must not badge either");
+  // Both vouching rungs DO speak: the provider's own listing, and our own config.
+  assert.equal(badgeOf(byId["blank-a"], { id: "gpt-5.5:free", provenance: LISTED }), "FREE?");
+  assert.equal(badgeOf(byId["blank-a"], { id: "gpt-5.5:free", provenance: CONFIGURED }), "FREE?");
+});
+
+test("badgeOf: the provenance gate applies to the no-price path ONLY, never to G2", () => {
+  // On the G2 path `priceOf` already matched an offer belonging to THIS host, so
+  // the host is known to serve the model and the tail only has to say what that
+  // host's own 0/0 means. Gating that on provenance too would drop the 61 live
+  // rows the fix exists for (opencode 20, openrouter 18, kilo 16, aihubmix 4,
+  // zenmux 3), most of which are catalogue-only.
+  assert.equal(badgeOf(ALL_ZERO, { providerName: "openai", id: "omni:free", provenance: CATALOGUE }), "FREE?");
+  assert.equal(badgeOf(ALL_ZERO, { providerName: "openai", id: "omni:free", provenance: null }), "FREE?");
+});
+
+test("badgeOf: a free-tailed id badges FREE? where the catalogue holds no price", () => {
+  // The 107-row population: `badgeOf` reaches `if (!p)` and used to stop there.
+  assert.equal(badgeOf(byId["blank-a"], { id: "some-model:free", provenance: LISTED }), "FREE?");
+  assert.equal(badgeOf(byId["acme-legacy-1"], { id: "some-model:free", provenance: LISTED }), "FREE?");
+  // Same entries, no tail: unchanged. This pair is what proves the branch is
+  // keyed on the id and has not simply started badging every priceless row.
+  assert.equal(badgeOf(byId["blank-a"], { id: "some-model", provenance: LISTED }), "");
+  assert.equal(badgeOf(byId["acme-legacy-1"]), "");
+});
+
+test("badgeOf: a free-tailed id resolves the ambiguity G2 refuses to guess at", () => {
+  // The 61-row population: a `0/0` with no priced sibling to contrast against.
+  assert.equal(badgeOf(ALL_ZERO, { providerName: "openai", id: "omni:free" }), "FREE?");
+  // G2 itself is untouched for everything else -- if this regressed to FREE?,
+  // #67 and #55 would both be reopened.
+  assert.equal(badgeOf(ALL_ZERO, { providerName: "openai" }), "");
+  assert.equal(badgeOf(ALL_ZERO, { providerName: "openai", id: "omni-moderation-latest" }), "");
+});
+
+test("badgeOf: a positive price outranks the tail, so a mislabelled id stays PAID", () => {
+  // `kilo/minimax/minimax-m3:free`, MEASURED live at 0.3/1.2 -- the one row of
+  // the 169 where the provider's own naming contradicts the provider's own
+  // price. The fixture carries the same 0.3/1.2 shape.
+  assert.equal(badgeOf(byId["acme-pro-1"], { id: "minimax-m3:free" }), "PAID");
+});
+
+test("badgeOf: the tail is END-anchored, so a mid-id 'free' claims nothing", () => {
+  // `provenance: LISTED` throughout, so every blank below is the REGEX refusing
+  // and not the provenance gate -- otherwise this test would pass with the
+  // anchoring deleted.
+  assert.equal(badgeOf(byId["blank-a"], { id: "freeway-7b", provenance: LISTED }), "");
+  assert.equal(badgeOf(byId["blank-a"], { id: "free-lunch-13b", provenance: LISTED }), "");
+  assert.equal(badgeOf(byId["blank-a"], { id: "codefree-instruct", provenance: LISTED }), "",
+    "no separator before `free` -- not a variant marker");
+  // Both MEASURED live and both must stay blank: the word is present, the tail
+  // is not. `pollinations/AkshayCoder48/free-voice` and `indeedwebid/ineed/freetier`.
+  assert.equal(badgeOf(byId["blank-a"], { id: "AkshayCoder48/free-voice", provenance: LISTED }), "");
+  assert.equal(badgeOf(byId["blank-a"], { id: "ineed/freetier", provenance: LISTED }), "");
+});
+
+test("badgeOf: all three published tail forms are recognised, case-insensitively", () => {
+  for (const id of ["m:free", "m-free", "m/free", "m:FREE", "m-Free"]) {
+    assert.equal(badgeOf(byId["blank-a"], { id, provenance: LISTED }), "FREE?", `tail form ${id}`);
+  }
+});
+
+test("badgeOf: an id that is exactly 'free' is a tail, because its selector ends in /free", () => {
+  // `openrouter/free` and `kilo/free`, both MEASURED live at 0/0. The separator
+  // sits on the provider side, so a rule demanding one INSIDE the id would badge
+  // `orcarouter/free` and refuse `free` -- the same shape read two ways.
+  assert.equal(badgeOf(byId["blank-a"], { id: "free", provenance: LISTED }), "FREE?");
+  assert.equal(badgeOf(byId["blank-a"], { id: "FREE", provenance: LISTED }), "FREE?");
+  assert.equal(badgeOf(ALL_ZERO, { providerName: "openai", id: "free" }), "FREE?");
+  // And the multi-segment form that already worked stays working.
+  assert.equal(badgeOf(byId["blank-a"], { id: "orcarouter/free", provenance: LISTED }), "FREE?");
+});
+
+test("badgeOf: G1 and PLAN both still outrank the tail", () => {
+  // A non-text model billed per image is not made token-free by its name, and
+  // G1 must keep winning: FREE? is a claim about a TOKEN price.
+  assert.equal(badgeOf(byId["acme-image-1"], { id: "sdxl:free", provenance: LISTED }), "");
+  // PLAN is the first branch and stays first.
+  assert.equal(badgeOf(byId["blank-a"], { id: "m:free", planCovered: true }), "PLAN");
+});
+
+test("badgeOf: a non-text model with NO price record is blanked too, not just a zero-priced one", () => {
+  // The case the test above cannot reach. `acme-image-1` HAS a 0/0 price, so it
+  // enters the zero branch and meets G1 there. A non-text entry with no price at
+  // all returns from the `!p` branch, which G1 sits below and never sees -- so
+  // without its own `isTextOut` call that branch badges an audio model FREE?.
+  // Live shape: `vercel/s1-free`, `s2-pro-free`, `s2.1-pro-free`, all
+  // `output: ["audio"]` with no offer for the host.
+  const AUDIO_NO_PRICE = { modalities: { output: ["audio"] } };
+  assert.equal(priceOf(AUDIO_NO_PRICE, "vercel"), null,
+    "the fixture really does take the no-price branch -- otherwise this proves nothing");
+  assert.equal(badgeOf(AUDIO_NO_PRICE, { providerName: "vercel", id: "s1-free", provenance: LISTED }), "");
+  // And the same entry WITH text output does badge, so the blank above is G1's
+  // doing and not the entry being rejected for some other reason.
+  assert.equal(badgeOf({ modalities: { output: ["text"] } },
+    { providerName: "vercel", id: "s1-free", provenance: LISTED }), "FREE?");
+});
+
+test("badgeOf: a non-string id is coerced without throwing, and an array does not sneak through", () => {
+  // `String(id ?? "")` means an array of one string coerces to that string, so
+  // `["m:free"]` would otherwise test TRUE. Nullish inputs are covered here too,
+  // but they are the weak half: they return "" under the pre-feature code as
+  // well, so on their own they would pass with the whole branch deleted.
+  assert.equal(badgeOf(byId["blank-a"], { id: 123, provenance: LISTED }), "");
+  assert.equal(badgeOf(byId["blank-a"], { id: ["m:free"], provenance: LISTED }), "",
+    "an array must not coerce into a free tail");
+  assert.equal(badgeOf(byId["blank-a"], { id: {}, provenance: LISTED }), "");
+  assert.equal(badgeOf(byId["blank-a"], {}), "");
+  assert.equal(badgeOf(byId["blank-a"]), "");
+});
+
 test("badgeOf: G2 changes only the zero branch -- PAID, PLAN and G1 are untouched", () => {
   // The diff is provably one branch wide. Each of the other paths is asserted on
   // a shape that carries the G2 subject (an all-zero offer array) wherever it

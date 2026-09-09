@@ -50,18 +50,84 @@ export function isTextOut(entry) {
 
 // The whole badge set. Nothing else may ever be rendered.
 //   FREE   price 0 AND a curated recurring grant cadence  (the governing rule)
-//   FREE?  price 0, cadence unknown -- honest, and this will be the common case
+//   FREE?  EITHER price 0 with the cadence unknown, OR the provider published
+//          the id with a `:free`/`-free`/`/free` tail and holds no price that
+//          contradicts it -- see `isFreeSuffixed`. Both are "zero, on evidence
+//          we cannot fully confirm", which is what the `?` has always carried;
+//          the second is a claim about the NAME rather than about a recorded
+//          price, and it is gated so that only the provider's own listing or
+//          our own config can make it. MEASURED 2026-09-09: of 183 FREE? rows,
+//          17 come from a recorded price and 156 from a vouched tail.
 //   PLAN   subscription-covered: marginal price 0 because a plan was paid for
 //   PAID   any non-zero token price
-//   ""     no evidence, guard G1, guard G2, or price 0 with a ONE-TIME grant
+//   ""     no evidence, guard G1, guard G2, an unvouched free tail, or price 0
+//          with a ONE-TIME grant
 //
 // The last case deserves its own sentence: a one-time signup wallet is not free
 // under the governing definition, and it is not paid either, because the
 // marginal price really is zero. Blank is the only honest rendering.
-export function badgeOf(entry, { cadence = "", planCovered = false, providerName = null } = {}) {
+// A `:free`, `-free` or `/free` TAIL on the id the provider itself published.
+// END-ANCHORED: `qwen3.6-plus-free` and `dots-3-note-preview:free` are variant
+// markers, and an id merely CONTAINING the word (`freeway-7b`, `free-voice`,
+// `ineed/freetier`) is not making a claim about price.
+//
+// `^` IS ONE OF THE ACCEPTED LEFT BOUNDARIES, so a bare id of exactly `free`
+// matches. Two live rows need it -- `openrouter` and `kilo` each publish an id
+// that is just `free` -- and their full selectors, `openrouter/free` and
+// `kilo/free`, are the same `/free` form as every other row here; the separator
+// simply falls on the provider side of the id this function is given. Requiring
+// a separator INSIDE the id would badge `orcarouter/free` and refuse `free`,
+// which is the same string being read two ways.
+//
+// This is provider convention, not a verified fact. `badgeOf` consumes it on two
+// different paths under DIFFERENT gates, and the difference is load-bearing: on
+// the G2 path `priceOf` already matched an offer belonging to this host, so the
+// tail only has to resolve what that host's own `0/0` means; on the no-price path
+// nothing is known about this host at all, so the tail is additionally gated on
+// provenance. Neither path lets the tail outrank a positive price.
+const FREE_SUFFIX = /(?:^|[:\-/])free$/i;
+// `typeof`, not `String(id ?? "")`. That coercion accepted a one-element array --
+// `String(["m:free"])` is `"m:free"` -- so a non-string leaking in from a future
+// caller could badge a row. An id is a string or it is not an id.
+export const isFreeSuffixed = (id) => typeof id === "string" && FREE_SUFFIX.test(id);
+
+// THE ID ALONE IS NOT ENOUGH ON THE `!p` PATH, and the reason is `priceOf`'s
+// own contract. `priceOf(entry, providerName)` matches offers belonging to MY
+// provider, so `null` does not mean "the catalogue holds no price" -- it most
+// often means "the catalogue holds no offer from THIS host for this model".
+// The catalogue files a model under its VENDOR namespace, so `openai/gpt-5.5:free`
+// is some router's free tier sitting in the `openai` group, and a user holding a
+// direct OpenAI key would be told OpenAI has a free model. MEASURED 2026-09-09:
+// 10 such rows (openai 2, google 2, deepseek 3, alibaba 2, cohere 1), every one
+// `catalogue-only`, every one `routable: true` so nothing dims it. That is the
+// exact lie `priceOf`'s comment names as the one to prevent.
+//
+// So the tail counts on that path only when the PROVIDER vouched for the id:
+// `listing-verified` (its own listing named it) or `config-asserted` (our own
+// vault config names it). `catalogue-only` means only the offline bundle knows
+// the id, which is precisely the vendor-namespace case above.
+//
+// A FUNCTION, not a module-level Set: this file declares `CONFIG_ASSERTED`
+// further down, so a top-level `const` reading it here would evaluate inside its
+// temporal dead zone and throw on import.
+const vouchedForFreeTail = (rung) => rung === "listing-verified" || rung === CONFIG_ASSERTED;
+
+export function badgeOf(entry, { cadence = "", planCovered = false, providerName = null,
+                                 id = "", provenance = null } = {}) {
   if (planCovered) return "PLAN";
   const p = priceOf(entry, providerName);
-  if (!p) return "";
+  // NO PRICE FOR THIS PROVIDER. Blank stays the answer for an ordinary row, and
+  // for a free-tailed one the tail is honoured only under the two gates above
+  // it: `isTextOut` because FREE? is a claim about a TOKEN price and an audio
+  // model billed per second is not made token-free by its name (this is G1,
+  // which lives inside the zero branch below and so is unreachable from here --
+  // `vercel/s1-free` and two siblings declare `output: ["audio"]` and would
+  // badge FREE? without it), and the vouching rung because of the vendor-
+  // namespace defect described above.
+  if (!p) {
+    return isFreeSuffixed(id) && isTextOut(entry) && vouchedForFreeTail(provenance)
+      ? "FREE?" : "";
+  }
   if (p.in === 0 && p.out === 0) {
     if (!isTextOut(entry)) return "";        // G1
     // GUARD G2 (#67): a zero the bundle never actually recorded. #55 found that
@@ -89,7 +155,20 @@ export function badgeOf(entry, { cadence = "", planCovered = false, providerName
     // Blank means "we are not telling you this is free", which is honest in both
     // cases; it does not mean "this is not free". Telling them apart needs
     // row-type information the entry does not carry -- #75, not this guard.
-    if (!hasPricedOffer(entry)) return "";   // G2
+    //
+    // THE FREE-TAILED EXCEPTION. G2 blanks a `0/0` because the catalogue holds
+    // no non-zero offer to prove that zero is a fact rather than a hole. A
+    // free-tailed id is exactly the contrast G2 is missing, sourced from the
+    // provider's own listing instead of from the bundle -- so it resolves the
+    // ambiguity G2 exists to refuse to guess at, and it does so without
+    // weakening G2 for any row that lacks the tail. MEASURED 2026-09-09: 61 of
+    // the 169 free-tailed rows reach this line (opencode 20, openrouter 18,
+    // kilo 16, aihubmix 4, zenmux 3).
+    //
+    // "FREE?" and never "FREE": the tail is a naming convention, and the `?`
+    // is what this badge set already uses for a zero price whose grant terms
+    // are unconfirmed. A hard FREE still requires a curated recurring cadence.
+    if (!hasPricedOffer(entry)) return isFreeSuffixed(id) ? "FREE?" : "";   // G2
     if (cadence === "recurring") return "FREE";
     if (cadence === "one-time" || cadence === "none") return "";
     return "FREE?";
@@ -483,6 +562,10 @@ export function buildFrom({ chosen, providers, catalog, relay,
     // belongs to a DIFFERENT provider's catalogue entry).
     const rowFor = (id, entry, capabilityOverride) => {
       const p = entry ? priceOf(entry, cred.provider) : null;
+      // Read ONCE, for the same reason `capability` below is: the badge and the
+      // row's own `provenance` field must answer about the same rung. Two calls
+      // is how they start disagreeing about one row after an edit to either.
+      const provenance = provenanceOf(cred.provider, id);
       // Read ONCE and passed to both classifiers. `outputKind` and `modeOf` must
       // answer about the same evidence: a second lookup is how the pair starts
       // disagreeing about one row after an edit to either.
@@ -511,7 +594,15 @@ export function buildFrom({ chosen, providers, catalog, relay,
         // pool -- `morph/auto` really costs 0.85/1.55, and a free auto mode keeps
         // whatever badge `badgeOf` already gives it.
         pin: p ? p.in : null, pout: p ? p.out : null,
-        badge: entry ? badgeOf(entry, opts) : (opts.planCovered ? "PLAN" : ""),
+        // ALWAYS `badgeOf`, including when there is no catalogue entry. The
+        // caller used to short-circuit a null entry to PLAN-or-blank, which was
+        // the same answer `badgeOf(null, ...)` already gives -- but it also meant
+        // a rule keyed on the ID rather than the entry could never see the rows
+        // that have no entry, and those are the majority of the free-tailed ones.
+        // `provenance` is hoisted above this object (not read twice) because the
+        // badge now depends on it: a free-tailed id is only honoured on the
+        // no-price path when the provider itself vouched for the id.
+        badge: badgeOf(entry, { ...opts, id, provenance }),
         ...(mode ? MODE_CAPS : capsOf(entry)),
         // `outputKind`, not `kind`. pick-state.mjs already spends `item.kind` on
         // "model" | "provider" | "pinned", so `item.model.kind` would put two
@@ -539,7 +630,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
         mode,
         // Q1.3: a value, not a promise. null means nobody checked and does not dim.
         routable: routableOf(`${cred.provider}/${id}`),
-        provenance: provenanceOf(cred.provider, id),
+        provenance,
       };
     };
 
@@ -628,7 +719,14 @@ export function buildFrom({ chosen, providers, catalog, relay,
       // picker this way, which made it the largest single source of the coercion
       // capsOf removes.
       models.unshift({ id: tm, ctx: null, pin: null, pout: null,
-                       badge: opts.planCovered ? "PLAN" : "",
+                       // Same call as site 2's, for the same reason: this row has
+                       // no catalogue entry, so an id-keyed rule is the only one
+                       // that can reach it. `badgeOf(null, ...)` returns exactly
+                       // the PLAN-or-blank this line used to compute itself.
+                       // `provenance` matches the field this same object sets
+                       // below: a testModel is a config literal, so a free tail
+                       // on one is vouched for by our own vault config.
+                       badge: badgeOf(null, { ...opts, id: tm, provenance: CONFIG_ASSERTED }),
                        tools: null, vision: null, reason: null, outputKind: null,
                        // A configured testModel is the model this vault probes
                        // with, so it is a model by construction. It also cannot
