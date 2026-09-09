@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildJoinIndex, joinCatalogEntry, priceOf,
-         hasPricedOffer } from "../keysync/catalog-join.mjs";
+         hasPricedOffer, hasAggregateContextClaim,
+         trustedContextTokens } from "../keysync/catalog-join.mjs";
 import { priceOf as priceOfViaMenu } from "../menu/catalog.mjs";
 // The REAL bundle reader. Every other test in this file feeds `buildJoinIndex` a
 // hand-built fixture, which is why nothing here could see whether production
@@ -427,4 +428,84 @@ test("hasPricedOffer's absolute verdicts, pinned: an unparseable offer is not a 
   assert.equal(hasPricedOffer({ pricing: { offers: [
     { provider: "x", per1MTokens: { input: "0", output: "0.3" } } ] } }), true,
     "a non-zero OUTPUT alone is still a price");
+});
+
+// --------------------------------------------------------------- #20 / #113
+// OpenRouter's own `/models` API reports `topProvider.context_length` as the
+// BEST of several backends it load-balances a model id across, not a number
+// for any specific one. `openrouter/mimo-v2.5-pro` is the measured case: the
+// bundle's merged `limits.contextTokens` is 1,050,000 while OpenRouter's own
+// worst live backend serves 262,144.
+
+test("hasAggregateContextClaim: true only for an openrouter ROW whose entry carries topProvider", () => {
+  const entry = { sourceRecords: [{ source: "openrouter", metadata: { topProvider: { context_length: 1048576 } } }] };
+  assert.equal(hasAggregateContextClaim("openrouter", entry), true);
+  assert.equal(hasAggregateContextClaim("OpenRouter", entry), true, "case-insensitive");
+  // THE OVER-BROAD VERSION THIS REPLACED: the SAME merged entry is what
+  // `anthropic/claude-opus-5` joins to when openrouter also resells it, and
+  // withholding by entry alone poisoned the direct relay's own row for a
+  // number that is not actually ambiguous there. Scoping to the row's own
+  // provider is what keeps this fixed.
+  assert.equal(hasAggregateContextClaim("anthropic", entry), false,
+    "a different reseller's row is not OpenRouter's routing ambiguity");
+  assert.equal(hasAggregateContextClaim("tokenrouter", entry), false);
+
+  assert.equal(hasAggregateContextClaim("openrouter", {
+    sourceRecords: [{ source: "litellm", metadata: {} }, { source: "models.dev" }],
+  }), false, "no sourceRecord carries topProvider");
+  assert.equal(hasAggregateContextClaim("openrouter", { sourceRecords: [] }), false);
+  assert.equal(hasAggregateContextClaim("openrouter", {}), false, "no sourceRecords array at all");
+  assert.equal(hasAggregateContextClaim("openrouter", null), false);
+  assert.equal(hasAggregateContextClaim(undefined, entry), false, "no provider named at all");
+});
+
+test("trustedContextTokens: withholds an aggregate claim for openrouter's OWN row, passes the same entry through for another provider", () => {
+  // openrouter/mimo-v2.5-pro, #20's measured case: merged limits.contextTokens
+  // is 1,050,000 (OpenRouter's own best-backend claim) against a measured
+  // worst live backend of 262,144.
+  const aggregate = { limits: { contextTokens: 1050000 },
+    sourceRecords: [{ source: "openrouter", metadata: { topProvider: { context_length: 1048576 } } }] };
+  assert.equal(trustedContextTokens("openrouter", aggregate), null,
+    "1,050,000 is OpenRouter's best-backend claim -- the measured worst backend is 262,144");
+
+  // anthropic/claude-opus-5, MEASURED: the merged entry's topProvider.context_length
+  // (1,000,000) is an EXACT match to limits.contextTokens -- Anthropic
+  // publishes one fixed window, and 28 other resellers besides openrouter
+  // join to this identical bundle row. Only openrouter's OWN row carries the
+  // real per-request routing ambiguity; a different reseller's row does not
+  // inherit it just because the bundle happens to merge them.
+  const claude = { limits: { contextTokens: 1000000 },
+    sourceRecords: [{ source: "openrouter", metadata: { topProvider: { context_length: 1000000 } } }] };
+  assert.equal(trustedContextTokens("anthropic", claude), 1000000,
+    "the direct relay's row is unaffected by openrouter also reselling the same model");
+  assert.equal(trustedContextTokens("tokenrouter", claude), 1000000);
+  assert.equal(trustedContextTokens("openrouter", claude), null,
+    "openrouter's OWN row for the same model still withholds -- the ambiguity is about ITS routing");
+
+  const single = { limits: { contextTokens: 200000 },
+    sourceRecords: [{ source: "groq", metadata: {} }] };
+  assert.equal(trustedContextTokens("groq", single), 200000, "a single-backend provider's number is unaffected");
+});
+
+test("trustedContextTokens: undefined passes through unchanged, never coerced to null", () => {
+  // Existing callers (normalizeModel's `contextTokens` field, per its own
+  // tests) distinguish `undefined` ("not applicable: no entry, or the bundle
+  // states no window at all") from `null` ("known: withheld"). Coercing the
+  // first into the second would be a silent behavior change on every entry
+  // with no `limits` block at all, not just the openrouter-aggregate ones.
+  assert.equal(trustedContextTokens("openrouter", undefined), undefined);
+  assert.equal(trustedContextTokens("openrouter", null), undefined);
+  assert.equal(trustedContextTokens("openrouter", {}), undefined);
+  assert.equal(trustedContextTokens("openrouter", { limits: {} }), undefined);
+});
+
+test("trustedContextTokens: never claims a smaller number in place of the withheld one", () => {
+  // No per-backend figure survives the bundle's own merge -- the fix must not
+  // invent one. null is the whole of the withholding, never a guessed floor.
+  const aggregate = { limits: { contextTokens: 1050000 },
+    sourceRecords: [{ source: "openrouter", metadata: { topProvider: {} } },
+                     { source: "litellm", metadata: {} }] };
+  const v = trustedContextTokens("openrouter", aggregate);
+  assert.equal(v, null);
+  assert.notEqual(v, 262144, "no invented worst-case number either");
 });

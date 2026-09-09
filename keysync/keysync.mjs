@@ -20,7 +20,8 @@ import { admitRemoteModels } from "../menu/denylist.mjs";
 // dynamic), so importing back from it closes a circular import and drags
 // `ccr-client.mjs`/`atomic.mjs` into keysync's transitive graph. Both lanes
 // import from `keysync/catalog-join.mjs`, which imports neither.
-import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry } from "./catalog-join.mjs";
+import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry,
+         trustedContextTokens } from "./catalog-join.mjs";
 
 // ---------------------------------------------------------------- vault load
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -1041,7 +1042,10 @@ export function normalizeModel(id, entry, providerName = null, capability = null
   return {
     id,
     tier: entry ? inferTier(entry, providerName) : "unknown",
-    contextTokens: entry?.limits?.contextTokens,
+    // Withheld, never the raw bundle number, when this is an OpenRouter row
+    // and the number is only OpenRouter's own best-of-several-backends claim
+    // (#20) -- see `trustedContextTokens`.
+    contextTokens: trustedContextTokens(providerName, entry),
     reason: entry?.capabilities?.reasoning ?? null,
     kind: outputKind(entry, capability)
   };
@@ -1459,8 +1463,12 @@ export function buildProviders(chosen, providers, catalog, keyReader, discovery 
       // Read for the tag ONLY, never written back to `row.contextTokens`:
       // that field feeds `bucketFor` and would move `behavesAs` classifications
       // on rows this change has no evidence about.
+      // `m.contextTokens` already went through `trustedContextTokens` inside
+      // `normalizeModel`; the join fallback below must go through the same
+      // gate (#20) or it would re-admit an OpenRouter aggregate claim this
+      // very check exists to withhold.
       const ctxForTag = m.contextTokens
-        ?? joinCatalogEntry(joinIndex(), name, m.id)?.limits?.contextTokens
+        ?? trustedContextTokens(name, joinCatalogEntry(joinIndex(), name, m.id))
         ?? null;
       const shown = tagOneM(name, m.id, ctxForTag, oneMVerdicts);
       const row = {

@@ -31,7 +31,8 @@ import * as K from "../keysync/keysync.mjs";
 // drags `ccr-client.mjs`, `atomic.mjs` and their graph into keysync's. One owner
 // of the rule, reachable from both sides; the import path is incidental. The
 // reasoning about WHICH offer to trust moved with the function.
-import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry } from "../keysync/catalog-join.mjs";
+import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry,
+         trustedContextTokens } from "../keysync/catalog-join.mjs";
 export { priceOf };
 
 export const SLOT = path.join(os.homedir(), ".uw", "state", "slot.json");
@@ -578,7 +579,13 @@ export function buildFrom({ chosen, providers, catalog, relay,
         ? capabilityOverride
         : (listingOf.get(id)?.capabilityRaw ?? null);
       const mode = modeOf(entry, capability);
-      const ctx = mode ? null : (entry?.limits?.contextTokens ?? null);
+      // Withheld, never the raw bundle number, when it is only OpenRouter's
+      // own best-of-several-backends claim (#20): `openrouter/mimo-v2.5-pro`
+      // carries 1,050,000 here while its worst live backend serves 262,144.
+      // This same value feeds `K.tagOneM` below -- an aggregate claim treated
+      // as ground truth there turns a HUD misreport into a session that
+      // believes it has a 1M window and sends a request sized for one.
+      const ctx = mode ? null : (trustedContextTokens(cred.provider, entry) ?? null);
       return {
         // THE SELECTED id, which is not always the provider's own spelling:
         // uwpick emits this verbatim as `/model <provider>/<id>`, and a

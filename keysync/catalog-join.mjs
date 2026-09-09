@@ -324,3 +324,71 @@ export function hasPricedOffer(entry) {
     return inn !== 0 || out !== 0;
   });
 }
+
+// ---------------------------------------------------------- #20 / #113
+
+/**
+ * Does REQUESTING THIS ROW go through OpenRouter's own multi-backend gateway,
+ * where `limits.contextTokens` is a "top provider" claim -- the BEST of
+ * several backends OpenRouter load-balances a model id across, not a number
+ * for any specific one a real request can land on?
+ *
+ * SCOPED TO `provider === "openrouter"`, DELIBERATELY, not to "does this
+ * bundle entry carry an OpenRouter sourceRecord anywhere". The merged bundle
+ * entry is shared across every reseller that lists a model under the same
+ * identity: `anthropic/claude-opus-5` is served by ~29 providers including
+ * `anthropic` (the direct relay) and `openrouter`, and ALL of them join to
+ * ONE bundle row. MEASURED: for that row `topProvider.context_length` is
+ * 1,000,000, an EXACT match to the merged `limits.contextTokens` -- Anthropic
+ * publishes one fixed window regardless of who resells API access to it, and
+ * the ambiguity this guards against does not exist there. Withholding by
+ * entry alone poisoned 262 of 419 marked entries this way (measured), only
+ * 157 of which are actually openrouter-exclusive.
+ *
+ * The ambiguity is a property of OpenRouter's OWN routing, not of the model:
+ * a request sent to `openrouter/xiaomi/mimo-v2.5-pro` genuinely can land on
+ * any of OpenRouter's configured backends for it, at up to 262,144 against a
+ * "top provider" claim of 1,050,000 (#20's measured case) -- but that same
+ * model id requested from a DIFFERENT reseller does not inherit OpenRouter's
+ * routing, and nothing here has evidence either way about it.
+ *
+ * WHY THIS MATTERS BEYOND DISPLAY. `keysync/keysync.mjs`'s `tagOneM` (#113)
+ * reads this same `contextTokens` to decide whether a row's Claude Code
+ * session BELIEVES it has a 1,000,000-token window. An aggregate-claim number
+ * treated as ground truth turns a HUD misreport into oversized requests that
+ * get rejected upstream. "Guess downward or not at all" (buildAnthropicPickerRows'
+ * own rule) applies identically: a number known to be sometimes 4x optimistic
+ * for OpenRouter's OWN rows is not evidence for those rows.
+ *
+ * @param {string} provider  the UW-side provider the row is being built for
+ * @param {object} entry     a raw bundle/join entry (carries `sourceRecords`)
+ * @returns {boolean}
+ */
+export function hasAggregateContextClaim(provider, entry) {
+  if (String(provider ?? "").toLowerCase() !== "openrouter") return false;
+  const recs = entry?.sourceRecords;
+  return Array.isArray(recs) && recs.some((r) => r?.metadata?.topProvider != null);
+}
+
+/**
+ * `entry.limits.contextTokens`, withheld when it is only an OpenRouter
+ * aggregate claim FOR AN OPENROUTER ROW (see `hasAggregateContextClaim`). The
+ * one function both writers call, so `settings.json`'s picker and uwpick's
+ * snapshot cannot disagree about which numbers are trustworthy -- the same
+ * reason `tagOneM` itself is shared (#111, #113).
+ *
+ * PASSES THROUGH `undefined` UNCHANGED, deliberately: an absent `entry` or a
+ * bundle record with no stated `contextTokens` at all is "not applicable",
+ * which existing callers (and their tests) already distinguish from `null`'s
+ * "known small/no window". Only the ambiguous-claim case is overridden to
+ * `null` -- never to a smaller guessed number, since no per-backend figure
+ * survives the bundle's own merge for this function to fall back to.
+ *
+ * @param {string} provider  the UW-side provider the row is being built for
+ * @param {object} entry
+ * @returns {number|null|undefined}
+ */
+export function trustedContextTokens(provider, entry) {
+  if (hasAggregateContextClaim(provider, entry)) return null;
+  return entry?.limits?.contextTokens;
+}
