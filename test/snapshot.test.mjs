@@ -650,8 +650,12 @@ test("#113: tagOneM tags a 1M Claude row, and leaves everything else alone", () 
     "anthropic/claude-opus-5[1m]");
   assert.equal(K.tagOneM("openrouter", "anthropic/claude-haiku-4.5", 200000, v),
     "anthropic/claude-haiku-4.5", "a 200k row is not a 1M row");
+  // NOT scoped to Claude names: the suffix acts through `behavesAs`, which
+  // every third-party row carries and which always names a Claude model whose
+  // profile declares `supports_1m_suffix`. Neither half of the lever consults
+  // the model's own name, so a 1M qwen row takes the same window.
   assert.equal(K.tagOneM("openrouter", "qwen/qwen3.8-max", 1000000, v),
-    "qwen/qwen3.8-max", "scoped to Claude-shaped ids; widening needs its own measurement");
+    "qwen/qwen3.8-max[1m]");
   assert.equal(K.tagOneM("openrouter", "anthropic/claude-opus-5", null, v),
     "anthropic/claude-opus-5", "an unstated window has confirmed nothing");
 });
@@ -702,4 +706,28 @@ test("#113: a tagged row keeps its modality, which is keyed on the bare id", () 
   assert.equal(snap.rows[0].models[0].modality, "text->text");
   assert.equal(snap.rows[0].models[0].id, "anthropic/claude-opus-5[1m]",
     "the selected spelling is what uwpick emits, and keeps its tag");
+});
+
+test("#113: the tag follows the window, not the model's name", () => {
+  // The suffix acts through `behavesAs`, which every third-party row carries and
+  // which always names a Claude model whose profile declares
+  // `supports_1m_suffix`. Neither half of the lever reads the model's own name.
+  const v = new Map([["p", "accepts"]]);
+  assert.equal(K.tagOneM("p", "qwen/qwen3.8-max", 1000000, v), "qwen/qwen3.8-max[1m]");
+  assert.equal(K.tagOneM("p", "google/gemini-3-pro", 2000000, v), "google/gemini-3-pro[1m]");
+  assert.equal(K.tagOneM("p", "mistral-small", 32000, v), "mistral-small");
+});
+
+test("#113: a router pool never buys a 1M claim from its pool's window", () => {
+  // #75's own sentence, applied to this lever: `kilo/auto` carries 2,000,000
+  // because that is the widest model in its POOL, which is evidence about no
+  // model at all. The four ids here are the ones #75's corpus test pins.
+  const v = new Map([["kilo", "accepts"], ["openrouter", "accepts"]]);
+  assert.equal(K.tagOneM("kilo", "auto", 2000000, v), "auto");
+  assert.equal(K.tagOneM("openrouter", "auto", 2000000, v), "auto");
+  assert.equal(K.tagOneM("openrouter", "router", 2000000, v), "router");
+  assert.equal(K.tagOneM("p", "vendor/auto", 2000000, v), "vendor/auto",
+    "the pool name is matched on the id's last segment, not just the whole string");
+  assert.equal(K.tagOneM("p", "autobot-9", 2000000, v), "autobot-9[1m]",
+    "and it is anchored, so a real model whose name merely starts with 'auto' still tags");
 });

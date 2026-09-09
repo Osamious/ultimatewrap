@@ -895,31 +895,39 @@ export function loadOneMVerdicts(file = ONEM_PROBE_FILE) {
   return out;
 }
 
-// Claude-SHAPED, deliberately, and NOT a real-id test. The suffix acts through
-// `behavesAs`, which every third-party row carries -- so a 1M non-Claude model
-// would take the same 1M window from the same flag. Scoped to Claude names
-// anyway: that is the population this was measured over, and widening it to
-// 4,700 rows on an untested inference is the guess this file keeps refusing to
-// make. Widening is a separate change with its own measurement.
-const CLAUDE_SHAPED = /claude/i;
+// The last segment of a router-pool id. `openrouter/auto`, `kilo/auto`,
+// `orcarouter/auto` and `openrouter/router` are the four #75 pins, and each
+// carries its POOL's window (2,000,000 on two of them) rather than a model's.
+const POOL_IDS = /(^|\/)(auto|router|default)$/i;
 
 /**
- * The id a reseller row is DISPLAYED and SELECTED under.
+ * The id a row is DISPLAYED and SELECTED under.
  *
- * Tags iff all three hold: the id is Claude-shaped, the row's own context
- * window is at least 1M, and the provider has not been measured to REJECT the
- * suffix. An unmeasured provider is tagged -- a deliberate risk posture, and
- * the one place this file guesses upward: of the six resellers that could
- * answer the probe all six accepted, and the six that could not are failing
- * every request on billing or auth anyway, so their rows do not work today
- * regardless. Re-running the probe demotes any provider that turns out to
- * reject, which is what makes the guess reversible rather than permanent.
+ * NOT SCOPED TO CLAUDE NAMES, and that is the mechanism rather than an
+ * ambition. The suffix acts through `behavesAs`, which EVERY third-party row
+ * carries and which always names a Claude model -- and all four entries in
+ * ALLOWED_BEHAVES_AS declare `supports_1m_suffix: true`. The lever reads the
+ * suffix off the selector and the flag off the borrowed profile; neither
+ * consults the model's own name. So a 1M qwen row and a 1M Claude row take the
+ * same window from the same flag, and restricting this to `/claude/i` would
+ * leave the qwen row believing 200k for no reason either half of the mechanism
+ * can state.
  *
- * `rejects` is still honoured absolutely: a measured no is never overridden.
+ * Tags iff both hold: the row's own context window is at least 1M, and the
+ * provider has not been measured to REJECT the suffix. An unmeasured provider
+ * is tagged -- the one place this file guesses upward, and a deliberate posture:
+ * every provider that could answer the probe accepted, none rejected, and the
+ * few that could not answer are failing every request on billing or auth
+ * anyway, so their rows do not work today regardless. Re-running
+ * `probe-1m-suffix.mjs` demotes a provider that turns out to reject, which is
+ * what makes the guess reversible rather than permanent.
+ *
+ * `rejects` is honoured absolutely: a measured no is never overridden.
  *
  * IDEMPOTENT. An id that already carries the suffix is returned unchanged --
- * both writers call this, and `claude-opus-5[1m][1m]` resolves to nothing in
- * the one place a wrong string is silent.
+ * both writers call this, `claude-opus-5[1m][1m]` resolves to nothing in the
+ * one place a wrong string is silent, and teamorouter really does serve a model
+ * whose own name ends in `[1M]`.
  *
  * @param {string} provider
  * @param {string} id           the provider's own bare spelling
@@ -929,8 +937,14 @@ const CLAUDE_SHAPED = /claude/i;
  */
 export function tagOneM(provider, id, ctx, verdicts) {
   const s = String(id ?? "");
-  if (!CLAUDE_SHAPED.test(s)) return s;
   if (/\[1m\]$/i.test(s)) return s;
+  // #75, AND THE SAME SENTENCE IT ALREADY WRITES ABOUT `bucketFor`. A router
+  // pool's window belongs to the pool, so `kilo/auto`'s 2,000,000 is "evidence
+  // about no model at all" -- it must not buy a 1M claim any more than it may
+  // buy a capable classification. The row's own `mode` flag is the proper
+  // signal and is measured false for all four of these live, so the flag alone
+  // does not reach them; these are the ids #75's own corpus test pins.
+  if (POOL_IDS.test(s)) return s;
   // "Not stated" is not "small", but it is not 1M either. An unknown window has
   // confirmed nothing, and over-claiming lets a session send a prompt larger
   // than the model can hold -- the asymmetry buildAnthropicPickerRows names.

@@ -388,7 +388,12 @@ test("buildFrom carries the tri-state through, and synthetic rows do not invent 
     relay: { provider: "anthropic", models: ["claude-opus-5"] },
   }));
   const acme = rows.find((r) => r.provider === "acme");
-  const row = Object.fromEntries(acme.models.map((m) => [m.id, m]));
+  // Indexed by the provider's BARE spelling, which is what this test means: a
+  // row's `id` is the SELECTED spelling and carries `[1m]` once the row's window
+  // reaches 1M (#113 -- `acme-pro-1` does). This test is about the capability
+  // tri-state, not about what the row is called.
+  const row = Object.fromEntries(
+    acme.models.map((m) => [String(m.id).replace(/\[1m\]$/i, ""), m]));
 
   // capabilities: {toolCalling: true, imageInput: false, reasoning: true}
   assert.equal(row["acme-chat-1"].tools, true);
