@@ -310,8 +310,44 @@ export function resolveProtocol(vaultProvider) {
   if (base.includes("anthropic")) {
     return { type: "anthropic_messages", baseUrl: vaultProvider.baseUrl };
   }
+  // DIRECT OpenAI GETS THE RESPONSES TRANSPORT, and only direct OpenAI (#108).
+  //
+  // `gpt-5.x` and the o-series refuse function tools on /v1/chat/completions
+  // outright -- "Function tools with reasoning_effort are not supported for
+  // gpt-5.6 in /v1/chat/completions. To use function tools, use the Responses
+  // API." MEASURED 2026-09-09 down to a SINGLE tool, so it is not the 128-tool
+  // cap and not the one tool whose schema OpenAI rejects; those bite later.
+  // Claude Code always sends tools, so chat-completions can never serve these
+  // rows -- 153 of 340 `openai/` rows.
+  //
+  // THE HOST-REGISTRY NOTE ABOVE NO LONGER HOLDS, and that is why this is
+  // possible. It records, measured 2026-09-01, that CCR derives the protocol
+  // from the base-URL host and overrides an explicit `type`. Re-MEASURED
+  // 2026-09-09 against v3.0.22 with an additive probe provider: `type:
+  // openai_responses` on `api.openai.com` is honoured, and gpt-5.6 answers WITH
+  // tools through it. The older note is left in place because it is still true
+  // of the other two branches, which is why they pair host and type.
+  //
+  // VERIFIED NOT TO REGRESS THE ROWS THAT ALREADY WORK: `gpt-4o-mini` answers
+  // on the Responses transport as well as on chat-completions, so the 187
+  // GPT-4-era rows are not being traded for the 153.
+  //
+  // MATCHED ON THE HOST, never on the provider name, so a vault entry that
+  // points at OpenAI under any label gets the same treatment, and a router
+  // merely RESELLING OpenAI models keeps chat-completions -- which is correct,
+  // since those speak it natively.
+  // `openAiHost` parses and compares the HOST, never `includes()`, so a router
+  // whose path or query mentions api.openai.com -- or a lookalike domain that
+  // merely ends with it -- keeps chat-completions.
+  if (openAiHost(vaultProvider.baseUrl)) {
+    return { type: "openai_responses", baseUrl: vaultProvider.baseUrl };
+  }
   return { type: "openai_chat_completions", baseUrl: vaultProvider.baseUrl };
 }
+
+const openAiHost = (u) => {
+  try { return new URL(u).hostname.toLowerCase() === "api.openai.com"; } catch { return false; }
+};
 
 // --------------------------------------------------------------- build plan
 //

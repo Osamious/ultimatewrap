@@ -56,3 +56,41 @@ test("discoveryIndex still rejects a non-string or empty id, as before", () => {
   ] } });
   assert.deepEqual(idx.get("google").map((m) => m.id), ["ok"]);
 });
+
+// --- #108: the transport for direct OpenAI ----------------------------------
+//
+// gpt-5.x refuses function tools on /v1/chat/completions entirely (MEASURED
+// down to one tool), and Claude Code always sends tools, so those rows can only
+// work on the Responses transport.
+
+import { resolveProtocol } from "../keysync/keysync.mjs";
+
+test("direct OpenAI gets the Responses transport, matched on host", () => {
+  assert.equal(resolveProtocol({ baseUrl: "https://api.openai.com/v1" }).type, "openai_responses");
+  assert.equal(resolveProtocol({ baseUrl: "https://API.OpenAI.com/v1" }).type, "openai_responses",
+    "host match is case-insensitive");
+});
+
+test("a router reselling OpenAI models keeps chat completions", () => {
+  // They speak it natively, and the Responses shape would be wrong for them.
+  for (const base of ["https://openrouter.ai/api/v1", "https://api.orcarouter.ai/v1",
+                      "https://api.groq.com/openai/v1", "https://api.deepseek.com/v1"]) {
+    assert.equal(resolveProtocol({ baseUrl: base }).type, "openai_chat_completions", base);
+  }
+});
+
+test("the OpenAI host match cannot be fooled by a path or query mentioning it", () => {
+  // `includes("api.openai.com")` would have accepted all three.
+  for (const base of ["https://evil.example.com/api.openai.com/v1",
+                      "https://router.example.com/v1?upstream=api.openai.com",
+                      "https://api.openai.com.evil.example.com/v1"]) {
+    assert.equal(resolveProtocol({ baseUrl: base }).type, "openai_chat_completions", base);
+  }
+});
+
+test("the other two protocol branches are unchanged", () => {
+  assert.equal(resolveProtocol({ baseUrl: "https://generativelanguage.googleapis.com/v1beta" }).type,
+    "gemini_generate_content");
+  assert.equal(resolveProtocol({ baseUrl: "https://api.anthropic.com" }).type, "anthropic_messages");
+  assert.equal(resolveProtocol({ baseUrl: "http://127.0.0.1:4517" }).type, "openai_chat_completions");
+});
