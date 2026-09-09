@@ -104,9 +104,32 @@ for (const row of rows) {
     continue;
   }
   const one = await post(`${row.provider}/${answered}[1m]`);
-  const verdict = one.ok ? "accepts" : "rejects";
-  verdicts[row.provider] = { verdict, id: answered, why: one.msg };
-  console.log(`${verdict.padEnd(8)} ${row.provider.padEnd(14)} ${answered}${one.ok ? "" : "   " + one.msg.slice(0, 70)}`);
+  let verdict = one.ok ? "accepts" : "rejects", why = one.msg;
+  if (!one.ok) {
+    // THE SECOND CONTROL, and the first run needed it. A suffixed request can
+    // fail for a reason the suffix had nothing to do with: `agnes` answered
+    // bare and then returned "You've reached the API rate limit for free
+    // users" -- a rate limit recorded as a parser refusal, and `rejects` is
+    // honoured absolutely, so a false one silences a provider's rows for good.
+    //
+    // Re-ask BARE. Still working means the suffix really is the only
+    // difference; failing too means the window moved under both and this run
+    // measured nothing.
+    await pause(1200);
+    const again = await post(`${row.provider}/${answered}`);
+    if (!again.ok) {
+      verdict = "unknown";
+      why = `suffixed failed (${one.msg.slice(0, 60)}) but bare stopped working too (${again.msg.slice(0, 60)})`;
+    }
+  }
+  const kept = prev[row.provider];
+  if (verdict === "unknown" && kept && kept.verdict !== "unknown") {
+    console.log(`kept     ${row.provider.padEnd(14)} inconclusive this run; keeping measured "${kept.verdict}"`);
+    await pause(500);
+    continue;
+  }
+  verdicts[row.provider] = { verdict, id: answered, why };
+  console.log(`${verdict.padEnd(8)} ${row.provider.padEnd(14)} ${answered}${one.ok ? "" : "   " + why.slice(0, 80)}`);
   await pause(500);
 }
 
