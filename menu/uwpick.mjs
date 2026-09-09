@@ -207,7 +207,7 @@ export function main() {
 
   // Selection only. Every non-selection path goes through abort(), which
   // truncates the buffer and exits non-zero (Q2.1, Q2.3a).
-  const finish = (target) => {
+  const finish = (target, routable) => {
     let wrote = false;
     try {
       fs.writeFileSync(FILE, modelCommand(...target.split(/\/(.*)/s)));
@@ -221,7 +221,17 @@ export function main() {
     }
     // Q3.3: the frame collapses to one line, which is what the user is left
     // looking at for the instant before Claude Code repaints.
-    out.write(CLEAR + SHOW + confirmLine(target, g, p) + "\n");
+    //
+    // #48, "surface, do not block": the selection above already went through
+    // unconditionally -- this only adds a second line when the picker itself
+    // knew, at build time, that CCR had no route for this id. `routable` is
+    // `false` (known dead), `true` (known live) or `null`/`undefined`
+    // (never resolved, e.g. the gateway did not answer that build) -- only
+    // the first warns; D9 forbids treating "unknown" as "dead".
+    const warn = routable === false
+      ? `\n${p.dim(`not in CCR's routing table as of ${loaded.snap.routableAsOf ?? "unknown"}; it may not respond`)}`
+      : "";
+    out.write(CLEAR + SHOW + confirmLine(target, g, p) + warn + "\n");
     recordHandoff({ argv2: FILE ?? null, existed: !!FILE && fs.existsSync(FILE), wrote });
     process.exit(CONTRACT.handoff.acceptExit);      // 0: CC accepts the content
   };
@@ -292,7 +302,7 @@ export function main() {
       if (exited.target) {
         recordRecent(exited.target);
         run("select", view(state).cursor - view(state).top + 4);
-        finish(exited.target);
+        finish(exited.target, exited.routable);
       }
       quit("esc-or-ctrl-c");
     }

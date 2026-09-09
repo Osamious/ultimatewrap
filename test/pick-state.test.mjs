@@ -111,7 +111,22 @@ test("enter descends into a provider and clears the model filter", () => {
 
 test("enter on a model exits with the /model line", () => {
   const { exit } = drive(initState(ROWS), [ENTER, DOWN, ENTER]);
-  assert.deepEqual(exit, { target: "acme/acme-pro-1" });
+  // #48: the exit signal now carries `routable` so `finish()` can warn
+  // without blocking. `M()`'s fixture rows don't set it, so it reads `null`
+  // here (never resolved) -- distinct from `false` (known dead), which is
+  // the only value that warns.
+  assert.deepEqual(exit, { target: "acme/acme-pro-1", routable: null });
+});
+
+test("#48: a row the picker knows is dead still selects (D9), and the exit signal says so", () => {
+  // D9's own rule, unchanged: dim, do not block. What's new is that the
+  // selection this permits now carries enough information for the caller to
+  // warn AFTER letting it through -- the "surface, do not block" framing this
+  // issue's own comment history settles on.
+  const deadRows = [{ keyId: "d", provider: "dead", free: null, planCount: 0, health: "ok",
+    models: [M("dead-model")].map((m) => ({ ...m, routable: false })) }];
+  const { exit } = drive(initState(deadRows), [ENTER, ENTER]);
+  assert.deepEqual(exit, { target: "dead/dead-model", routable: false });
 });
 
 test("arrows wrap at both ends", () => {
@@ -157,7 +172,7 @@ test("tab toggles the flat scope and searches provider/model", () => {
   s = drive(s, ["z", "e", "t", "a", "/", "z", "e", "t", "a", "-", "t"]).state;
   assert.deepEqual(view(s).items.map((i) => i.target), ["zeta/zeta-two"]);
   const { exit } = reduce(s, ENTER);
-  assert.deepEqual(exit, { target: "zeta/zeta-two" });
+  assert.deepEqual(exit, { target: "zeta/zeta-two", routable: null });
 });
 
 test("esc leaves the flat scope before it quits", () => {
@@ -183,7 +198,11 @@ test("recents and favourites are pinned at level 0 as visible duplicates", () =>
 test("enter on a pinned row selects immediately, without descending", () => {
   const s = initState(ROWS, { recents: ["zeta/zeta-two"] });
   const { exit } = reduce(s, ENTER);
-  assert.deepEqual(exit, { target: "zeta/zeta-two" });
+  // A pin carries no `model` reference at all (by design, see initState's own
+  // comment) -- `routable` reads `undefined` here, not `null`, and #48's
+  // warning is intentionally silent on a pin for the same reason: a target
+  // the `known` filter already excludes if it stopped being selectable.
+  assert.deepEqual(exit, { target: "zeta/zeta-two", routable: undefined });
 });
 
 test("a pinned row is filtered by its full target string", () => {
@@ -475,7 +494,7 @@ test("a recents entry naming a non-chat model produces no pinned row", () => {
   const v = view(s);
   assert.deepEqual(v.items.map((i) => i.target ?? i.row.provider),
                    ["mix/mix-chat-2", "mix"]);
-  assert.deepEqual(reduce(s, ENTER).exit, { target: "mix/mix-chat-2" },
+  assert.deepEqual(reduce(s, ENTER).exit, { target: "mix/mix-chat-2", routable: undefined },
     "a chat-model pin must still select immediately");
 });
 

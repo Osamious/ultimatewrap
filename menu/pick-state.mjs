@@ -461,7 +461,12 @@ export function reduce(state, ev) {
     // refusal silent and cheap, which is right -- the row is already dimmed and
     // already labelled, so the screen has said why before the key was pressed.
     if (!isSelectable(focused)) return { ...NONE, state };
-    return { ...NONE, state, exit: { target: focused.target } };
+    // #48: SURFACE, DO NOT BLOCK. `isSelectable` deliberately excludes
+    // `routable` (D9) -- a stale snapshot must not become a functional
+    // outage -- so a row the picker itself dimmed as not-currently-routable
+    // is still selectable here. `finish()` reads this to warn AFTER letting
+    // the selection through, never to refuse it.
+    return { ...NONE, state, exit: { target: focused.target, routable: focused.model?.routable } };
   }
 
   if (c0 === 127 || c0 === 8) {                                                // backspace
