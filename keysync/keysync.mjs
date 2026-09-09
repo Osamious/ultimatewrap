@@ -928,6 +928,27 @@ export function normalizeModel(id, entry, providerName = null, capability = null
  * retired. Routing on it would advertise ids nothing has confirmed this run; the
  * `testModel` half of the union is what keeps such a provider present.
  */
+// A listing that returns API RESOURCE NAMES rather than model ids (#107).
+//
+// Google's `GET /v1beta/models` answers `models/gemini-3.8-flash`, because that
+// is the resource's own name. Routed back as a model id it is rejected outright:
+// `generateContent` already carries `models/` in its URL path, so the prefix
+// arrives doubled -- MEASURED 2026-09-09, `google/models/gemini-3.8-flash`
+// returns `400 * GenerateContentRequest.model: unexpected model name format`
+// while the bare `google/gemini-3.5-flash-lite` answers normally.
+//
+// STRIPPED HERE, at the one normalisation both lanes already share, rather than
+// in `admitRemoteModels`: that function's subject is security -- hostile strings
+// and terminal escapes -- and its docstring pins that guarantee. A vendor's
+// naming convention is not a threat, and mixing the two would make the security
+// contract harder to read for a reason unrelated to security.
+//
+// PROVIDER-SCOPED, deliberately. Only google does this today (55 of 4,298
+// catalogue-plus-listing ids, all google, measured), and a blanket strip would
+// silently rewrite any future provider that legitimately serves a model whose
+// name begins `models/`. When a second such provider appears this becomes a set.
+const RESOURCE_PREFIX = new Map([["google", /^models\//]]);
+
 export function discoveryIndex(discovery) {
   const out = new Map();
   if (!discovery) return out;
@@ -938,7 +959,22 @@ export function discoveryIndex(discovery) {
     const models = Array.isArray(record) ? record
       : (Array.isArray(record?.models) ? record.models : null);
     if (!models) continue;
-    out.set(provider, models.filter((m) => typeof m?.id === "string" && m.id !== ""));
+    const strip = RESOURCE_PREFIX.get(provider);
+    const usable = models.filter((m) => typeof m?.id === "string" && m.id !== "");
+    if (!strip) { out.set(provider, usable); continue; }
+    // DEDUPED AFTER STRIPPING. 46 of google's 55 prefixed ids collapse onto a
+    // bare row the catalogue already carries, so without this the picker would
+    // show the same model twice under one name. First writer wins, which keeps
+    // the catalogue's own spelling when both exist.
+    const seen = new Set();
+    const kept = [];
+    for (const m of usable) {
+      const id = m.id.replace(strip, "");
+      if (id === "" || seen.has(id)) continue;
+      seen.add(id);
+      kept.push(id === m.id ? m : { ...m, id });
+    }
+    out.set(provider, kept);
   }
   return out;
 }
