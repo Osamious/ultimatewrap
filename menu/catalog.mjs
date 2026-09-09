@@ -469,7 +469,8 @@ export function buildFrom({ chosen, providers, catalog, relay,
                             cadenceOf = () => ({}),
                             routableOf = () => null,
                             discovery = { byProvider: new Map() },
-                            provenanceOf = () => null }) {
+                            provenanceOf = () => null,
+                            oneMVerdicts = K.loadOneMVerdicts() }) {
   const rows = [];
   // LAZY, and built at most once per call -- keysync.mjs's own `buildProviders`
   // uses the identical pattern (`joinIndex`, keysync.mjs:976-977) for the exact
@@ -577,8 +578,19 @@ export function buildFrom({ chosen, providers, catalog, relay,
         ? capabilityOverride
         : (listingOf.get(id)?.capabilityRaw ?? null);
       const mode = modeOf(entry, capability);
+      const ctx = mode ? null : (entry?.limits?.contextTokens ?? null);
       return {
-        id,
+        // THE SELECTED id, which is not always the provider's own spelling:
+        // uwpick emits this verbatim as `/model <provider>/<id>`, and a
+        // Claude-shaped 1M row needs its `[1m]` here or the session silently
+        // runs at 200k (#113). Through `tagOneM` and never a second rule, so
+        // this list and `settings.json`'s picker cannot disagree about what the
+        // same row is called -- the failure #111 was.
+        //
+        // EVERY LOOKUP BELOW STAYS ON THE BARE `id`. `routableOf` asks CCR,
+        // which routes on the bare spelling, and `provenanceOf` above asks a
+        // listing that never named a suffixed id.
+        id: K.tagOneM(cred.provider, id, ctx, oneMVerdicts),
         // POOL PROPERTIES ARE NOT MODEL FACTS (#75). A router's window belongs to
         // its pool, so on a mode row `ctx` is nulled rather than carried -- and
         // `null` is load-bearing at the far end: `bucketFor` reads
@@ -592,7 +604,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
         // existing consumer already reads as `number | null`. A consumer that has
         // not learned about modes reads `null` and renders unknown -- honest, and
         // the safe direction to be wrong in.
-        ctx: mode ? null : (entry?.limits?.contextTokens ?? null),
+        ctx,
         // PRICE SURVIVES, and it is the one property that does. It is what the
         // user is actually billed for selecting this row, not a property of the
         // pool -- `morph/auto` really costs 0.85/1.55, and a free auto mode keeps

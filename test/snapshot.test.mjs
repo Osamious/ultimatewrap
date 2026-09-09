@@ -637,3 +637,69 @@ test("a fresh measurement in `built` outranks the carried one", () => {
   const s = buildSnapshot(built, { previous });
   for (const r of s.rows) assert.equal(r.limit?.verdict, "ok");
 });
+
+// --------------------------------------------------------------- #113
+// `[1m]` on RESELLER rows. The relay strips the suffix at its own last hop;
+// CCR does NOT (measured: an upstream 404 echoes it back verbatim), so on a
+// reseller the suffix reaches the provider's own id parser and tagging a
+// provider that rejects it turns a working row into a dead one.
+
+test("#113: tagOneM tags a 1M Claude row, and leaves everything else alone", () => {
+  const v = new Map([["openrouter", "accepts"]]);
+  assert.equal(K.tagOneM("openrouter", "anthropic/claude-opus-5", 1000000, v),
+    "anthropic/claude-opus-5[1m]");
+  assert.equal(K.tagOneM("openrouter", "anthropic/claude-haiku-4.5", 200000, v),
+    "anthropic/claude-haiku-4.5", "a 200k row is not a 1M row");
+  assert.equal(K.tagOneM("openrouter", "qwen/qwen3.8-max", 1000000, v),
+    "qwen/qwen3.8-max", "scoped to Claude-shaped ids; widening needs its own measurement");
+  assert.equal(K.tagOneM("openrouter", "anthropic/claude-opus-5", null, v),
+    "anthropic/claude-opus-5", "an unstated window has confirmed nothing");
+});
+
+test("#113: a measured rejection is absolute, an unmeasured provider is tagged", () => {
+  const v = new Map([["good", "accepts"], ["bad", "rejects"], ["blocked", "unknown"]]);
+  assert.equal(K.tagOneM("bad", "claude-opus-5", 1000000, v), "claude-opus-5",
+    "a measured no is never overridden");
+  assert.equal(K.tagOneM("blocked", "claude-opus-5", 1000000, v), "claude-opus-5[1m]",
+    "unknown is tagged: a deliberate, probe-reversible risk posture");
+  assert.equal(K.tagOneM("never-probed", "claude-opus-5", 1000000, new Map()),
+    "claude-opus-5[1m]", "an absent provider reads exactly like unknown");
+});
+
+test("#113: tagOneM is idempotent", () => {
+  // Both writers call it, and `claude-opus-5[1m][1m]` resolves to nothing in
+  // the one place a wrong model string is silent.
+  const v = new Map([["p", "accepts"]]);
+  const once = K.tagOneM("p", "claude-opus-5", 1000000, v);
+  assert.equal(K.tagOneM("p", once, 1000000, v), once);
+});
+
+test("#113: loadOneMVerdicts reads no file as every-provider-unknown, never as a crash", () => {
+  const missing = K.loadOneMVerdicts(scratch("no-such-probe.json"));
+  assert.equal(missing instanceof Map, true);
+  assert.equal(missing.size, 0);
+  // "never probed" and "probed but blocked on billing" must take ONE path.
+  assert.equal(K.tagOneM("anything", "claude-opus-5", 1000000, missing),
+    "claude-opus-5[1m]");
+});
+
+test("#113: a tagged row keeps its modality, which is keyed on the bare id", () => {
+  // The regression this guards: `modalityOf` reads the discovery cache, which
+  // only ever recorded the provider's own bare spelling. Without the strip in
+  // buildSnapshot every tagged row reports modality unknown -- a claim about
+  // evidence that does exist.
+  const built = {
+    generatedAt: null, routableAsOf: null, rows: [{
+      keyId: "k", provider: "openrouter", free: null, planCount: 0, health: "ok", refused: [],
+      models: [{ id: "anthropic/claude-opus-5[1m]", ctx: 1000000, pin: null, pout: null,
+                 badge: "", tools: true, vision: true, reason: true, outputKind: "text",
+                 routable: true, provenance: "listing-verified", mode: false }],
+    }],
+  };
+  const snap = buildSnapshot(built, {
+    modalityOf: (p, id) => (id === "anthropic/claude-opus-5" ? "text->text" : null),
+  });
+  assert.equal(snap.rows[0].models[0].modality, "text->text");
+  assert.equal(snap.rows[0].models[0].id, "anthropic/claude-opus-5[1m]",
+    "the selected spelling is what uwpick emits, and keeps its tag");
+});

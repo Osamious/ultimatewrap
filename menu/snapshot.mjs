@@ -149,7 +149,12 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null 
         // is an aggregate of these, so this is the source of truth and `var` at
         // level 0 is what a disagreement among them renders as.
         limit: m.limit ?? priorModel.get(`${r.provider}/${m.id}`) ?? null,
-        modality: modalityOf(r.provider, m.id) ?? null,
+        // STRIPPED BEFORE THE LOOKUP. `m.id` is the SELECTED spelling and may
+        // carry `[1m]` (#111, #113); `modalityOf` is keyed on the discovery
+        // cache, which only ever recorded the provider's own bare id. Without
+        // the strip every tagged row silently reports modality unknown -- a
+        // claim about evidence that does exist.
+        modality: modalityOf(r.provider, String(m.id).replace(/\[1m\]$/i, "")) ?? null,
         // FOUND IN REVIEW: this file's own signature defect a third time --
         // `mode` is ALWAYS set by `buildFrom` (`menu/catalog.mjs:536-539`,
         // "ALWAYS PRESENT, never a missing key") and this literal dropped it

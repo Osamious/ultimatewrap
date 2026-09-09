@@ -855,6 +855,90 @@ export function buildAnthropicPickerRows(ids, contextById, fallbackTags = ANTHRO
   });
 }
 
+// ------------------------------------------------- `[1m]` on RESELLER rows
+//
+// The relay can tag freely because it strips `[1m]` at its own last hop. CCR
+// does NOT -- MEASURED: an upstream 404 echoes the suffix back verbatim
+// (`Model "groq/llama-3.3-70b-versatile[1m]" is not configured`). So on a
+// reseller the suffix reaches the provider's own id parser, and whether that
+// parser tolerates it is a PER-PROVIDER FACT rather than a property of the
+// model. Tagging a row whose provider rejects it turns a working row into a
+// dead one, which is strictly worse than the 200k window it was trying to fix.
+//
+// WHY THE SUFFIX IS THE LEVER AT ALL. A third-party row borrows its believed
+// context window from the model named in `behavesAs`, and all four entries in
+// ALLOWED_BEHAVES_AS declare `window: 200000` WITH `supports_1m_suffix: true`.
+// The 200000 is why a 1M reseller model runs at 200k; the flag is what the
+// suffix acts on. MEASURED end to end: a probe row
+// `tokenrouter/anthropic/claude-sonnet-5[1m]` (behavesAs `claude-sonnet-4-6`)
+// was accepted by Claude Code and its RAW statusline payload -- captured
+// before hud-shim, so it is Claude Code's own belief and not a HUD correction
+// -- reported `context_window_size: 1000000`, against 200000 unsuffixed.
+export const ONEM_PROBE_FILE = path.join(os.homedir(), ".uw", "state", "onem-suffix-probe.json");
+
+/**
+ * The measured per-provider verdicts, as `provider -> "accepts"|"rejects"|"unknown"`.
+ *
+ * Written by `keysync/probe-1m-suffix.mjs`. A missing or malformed file yields
+ * an EMPTY map, never null: the tagging rule below reads an absent provider the
+ * same way it reads `unknown`, so "never probed" and "probed but blocked on
+ * billing" take one path rather than two.
+ */
+export function loadOneMVerdicts(file = ONEM_PROBE_FILE) {
+  const out = new Map();
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
+    for (const [provider, v] of Object.entries(raw?.verdicts ?? {})) {
+      if (typeof v?.verdict === "string") out.set(provider, v.verdict);
+    }
+  } catch { /* no probe yet: every provider reads as unknown */ }
+  return out;
+}
+
+// Claude-SHAPED, deliberately, and NOT a real-id test. The suffix acts through
+// `behavesAs`, which every third-party row carries -- so a 1M non-Claude model
+// would take the same 1M window from the same flag. Scoped to Claude names
+// anyway: that is the population this was measured over, and widening it to
+// 4,700 rows on an untested inference is the guess this file keeps refusing to
+// make. Widening is a separate change with its own measurement.
+const CLAUDE_SHAPED = /claude/i;
+
+/**
+ * The id a reseller row is DISPLAYED and SELECTED under.
+ *
+ * Tags iff all three hold: the id is Claude-shaped, the row's own context
+ * window is at least 1M, and the provider has not been measured to REJECT the
+ * suffix. An unmeasured provider is tagged -- a deliberate risk posture, and
+ * the one place this file guesses upward: of the six resellers that could
+ * answer the probe all six accepted, and the six that could not are failing
+ * every request on billing or auth anyway, so their rows do not work today
+ * regardless. Re-running the probe demotes any provider that turns out to
+ * reject, which is what makes the guess reversible rather than permanent.
+ *
+ * `rejects` is still honoured absolutely: a measured no is never overridden.
+ *
+ * IDEMPOTENT. An id that already carries the suffix is returned unchanged --
+ * both writers call this, and `claude-opus-5[1m][1m]` resolves to nothing in
+ * the one place a wrong string is silent.
+ *
+ * @param {string} provider
+ * @param {string} id           the provider's own bare spelling
+ * @param {?number} ctx         the row's context window, or null if unknown
+ * @param {Map<string,string>} [verdicts]
+ * @returns {string}
+ */
+export function tagOneM(provider, id, ctx, verdicts) {
+  const s = String(id ?? "");
+  if (!CLAUDE_SHAPED.test(s)) return s;
+  if (/\[1m\]$/i.test(s)) return s;
+  // "Not stated" is not "small", but it is not 1M either. An unknown window has
+  // confirmed nothing, and over-claiming lets a session send a prompt larger
+  // than the model can hold -- the asymmetry buildAnthropicPickerRows names.
+  if (!(Number.isFinite(ctx) && ctx >= ONE_M_TOKENS)) return s;
+  if (verdicts?.get(provider) === "rejects") return s;
+  return `${s}[1m]`;
+}
+
 export const ANTHROPIC_RELAY = {
   name: "anthropic",
   provider: "anthropic",
@@ -1031,7 +1115,7 @@ export function discoveryIndex(discovery) {
  *   sort rather than a reordering.
  */
 export function buildProviders(chosen, providers, catalog, keyReader, discovery = null,
-                               verified = null) {
+                               verified = null, oneMVerdicts = loadOneMVerdicts()) {
   const out = [];
   const picker = [];
   const notes = [];
@@ -1344,9 +1428,14 @@ export function buildProviders(chosen, providers, catalog, keyReader, discovery 
     });
 
     for (const m of pickerModels) {
+      // `Providers[].models` above stays BARE and must: CCR matches a request
+      // against it tolerantly (it already accepts a suffixed id there) but
+      // FORWARDS the id verbatim, so the suffix belongs on the selector the user
+      // picks, never on the routing list. Same split the relay already uses.
+      const shown = tagOneM(name, m.id, m.contextTokens, oneMVerdicts);
       const row = {
-        model: `${name}/${m.id}`,
-        label: `${name} > ${m.id}`
+        model: `${name}/${shown}`,
+        label: `${name} > ${shown}`
       };
       // The answering HOSTNAME, appended to the description.
       //
