@@ -308,19 +308,88 @@ test("the refusals overlay never exceeds termRows at a full page, down to the fl
   }
 });
 
-test("the legend's fixed size and its DISCLOSED floor are pinned, so the next entry someone adds is a deliberate choice (N3)", () => {
-  // The legend is the one chrome in `frame()` that never consults
-  // `rowsAvail` -- adding R18's own `ctrl+r` entry moved its fixed size from
-  // 15 to 16 lines, which is a real, disclosed, pre-existing-in-shape
-  // tradeoff (see the comment at `style.mjs`'s `if (v.legend)` branch), not
-  // a regression to chase here. Pinning the CURRENT size means the next
-  // entry added to `LEGEND` fails this test and forces the same deliberate
-  // choice, rather than silently narrowing the floor by one more row.
-  const s = reduce(initState([{ keyId: "p", provider: "p", free: null, planCount: 0,
-    health: "ok", models: [M("m0")] }]), "?").state;
-  const lines = linesFor(s);
-  assert.equal(lines.length, 16, "the legend's fixed size changed -- update the floor deliberately");
-  assert.ok(lines.length <= 16, "sanity: it must fit exactly at its own disclosed floor");
+// REPLACES "the legend's fixed size and its DISCLOSED floor are pinned (N3)".
+// That test asserted `lines.length === 16` because the legend was the one chrome
+// in `frame()` that never consulted `rowsAvail`, and pinning the number forced
+// the next person who added an entry to re-make the overflow tradeoff
+// deliberately. The legend now paginates, so a fixed size is no longer the
+// invariant worth holding -- and the tradeoff it was guarding is gone rather
+// than renegotiated. What replaces it is the stronger property: the legend fits
+// whatever terminal it is given, which is what the old constant was a proxy for.
+test("the legend fits the terminal at every height, including shorter than its content", () => {
+  const rows = [{ keyId: "p", provider: "p", free: null, planCount: 0,
+                  health: "ok", models: [M("m0")] }];
+  for (const termRows of [40, 30, 24, 12, 10]) {
+    const s = reduce(initState(rows, { termRows }), "?").state;
+    const lines = linesFor(s);
+    assert.ok(lines.length <= termRows,
+      `legend at termRows ${termRows} rendered ${lines.length} lines`);
+  }
+});
+
+test("the legend scrolls, clamps at both ends, and shows every line across the scroll", () => {
+  const rows = [{ keyId: "p", provider: "p", free: null, planCount: 0,
+                  health: "ok", models: [M("m0")] }];
+  const DOWN = "\x1b[B", UP = "\x1b[A";
+  let s = reduce(initState(rows, { termRows: 24 }), "?").state;
+  assert.equal(view(s).legendTop, 0, "opens at the top");
+
+  // Up at the top is a clamp, not a wrap and not a close.
+  s = reduce(s, UP).state;
+  assert.equal(view(s).legend, true, "up at the top must not close the legend");
+  assert.equal(view(s).legendTop, 0);
+
+  // Scrolling to the bottom reaches the last line and stops there.
+  const total = view(s).legendTotal, avail = view(s).legendAvail;
+  assert.ok(total > avail, "this test is only meaningful when the content overflows");
+  for (let i = 0; i < total + 5; i++) s = reduce(s, DOWN).state;
+  assert.equal(view(s).legendTop, total - avail, "clamps at the last full page");
+  assert.equal(view(s).legend, true, "over-scrolling must not close it");
+
+  // Every line is reachable: collect the union of pages across a full scroll.
+  let t = reduce(initState(rows, { termRows: 24 }), "?").state;
+  const seen = new Set();
+  for (let i = 0; i <= total; i++) {
+    for (const line of linesFor(t)) seen.add(line);
+    t = reduce(t, DOWN).state;
+  }
+  for (const probe of ["call-verified", "catalogue-only", "FREE?", "PAID",
+                       "needs $", "broken", "not a chat model", "not listed now",
+                       "ctrl+r", "backspace"]) {
+    assert.ok([...seen].some((l) => l.includes(probe)),
+      `scrolling the legend never revealed "${probe}"`);
+  }
+});
+
+test("any key still closes the legend, and arrows are the only exception", () => {
+  const rows = [{ keyId: "p", provider: "p", free: null, planCount: 0,
+                  health: "ok", models: [M("m0")] }];
+  const open = () => reduce(initState(rows, { termRows: 24 }), "?").state;
+  // The pre-glossary muscle memory: press anything, it goes away.
+  for (const key of [" ", "\r", "\x1b", "z", "\t"]) {
+    assert.equal(view(reduce(open(), key).state).legend, false, `key ${JSON.stringify(key)}`);
+  }
+  // A CSI final that is not an arrow is a no-op everywhere else in this picker,
+  // so it must not be the one place that convention breaks.
+  for (const key of ["\x1b[C", "\x1b[D", "\x1b[H", "\x1b[6~"]) {
+    assert.equal(view(reduce(open(), key).state).legend, true, `CSI ${JSON.stringify(key)}`);
+  }
+});
+
+test("a resize while the legend is scrolled re-clamps it, leaving no blank tail", () => {
+  const rows = [{ keyId: "p", provider: "p", free: null, planCount: 0,
+                  health: "ok", models: [M("m0")] }];
+  let s = reduce(initState(rows, { termRows: 12 }), "?").state;
+  const DOWN = "\x1b[B";
+  for (let i = 0; i < 200; i++) s = reduce(s, DOWN).state;   // pin to the bottom
+  const tallTop = view(s).legendTotal - view(s).legendAvail;
+  assert.equal(view(s).legendTop, tallTop);
+  // Growing the terminal shows more lines at once, so the old offset is now past
+  // the end. Without the re-clamp the page renders with blank space below it.
+  s = reduce(s, { resize: 60 }).state;
+  const v = view(s);
+  assert.equal(v.legendTop, Math.max(0, v.legendTotal - v.legendAvail));
+  assert.ok(linesFor(s).length <= 60);
 });
 
 test("recordStartup keeps a bounded sample set and a median", () => {

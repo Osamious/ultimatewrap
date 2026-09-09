@@ -13,6 +13,10 @@
 // than a spin on Date.now() (Q7.2, Q7.3).
 
 import { sanitizeDisplay } from "./sanitize.mjs";
+// Content only. `legend.mjs` imports nothing and takes the glyph renderers as
+// arguments, so this does not become a cycle even though the legend renders
+// through `provenanceDot` and `healthDot` defined in this file.
+import { legendLines } from "./legend.mjs";
 
 export const FRAME_W = 78;
 export const FRAME_MS = 30;
@@ -364,26 +368,11 @@ const footer = (g, p, text) => {
   return p.dim(head) + g.frame.h.repeat(Math.max(0, FRAME_W - vis(head) - 1)) + g.frame.br;
 };
 
-// The legend is the ONLY complete list of keys. The footer is one line inside a
-// 78-column frame and cannot hold them all, so it carries the common ones and
-// points here -- which is why it reads "all keys" rather than "keys".
-//
-// Typing and backspace were missing, and they are the two the user reaches for
-// first: the filter has no visible affordance saying it accepts text, so a user
-// who opens the legend to find out how to search found every key EXCEPT the one
-// that searches.
-const LEGEND = [
-  "up / down      move the cursor (wraps at either end)",
-  "a-z 0-9 etc    type to filter; the filter is per level",
-  "backspace      delete one character from the filter",
-  "enter          open a provider, or select a model",
-  "tab            toggle flat provider/model search",
-  "ctrl+f         add or remove a favourite",
-  "ctrl+r         show withheld models for this provider",
-  "esc            clear the filter, then go back, then quit",
-  "ctrl+c         quit without changing the chat input",
-  "?              this legend",
-];
+// The legend's CONTENT now lives in `legend.mjs` -- both the key binds (still
+// the only complete list, which is why the footer reads "all keys" and points
+// here) and the glossary that explains the gutter, the badges, the dimming and
+// the health labels. It moved so the reducer can know its length without
+// importing this renderer; see that file's own header.
 
 export function frame(v, meta, { caps }) {
   const g = glyphsFor(caps), p = painter(caps);
@@ -511,19 +500,29 @@ export function frame(v, meta, { caps }) {
   L.push(bar(g, ""));
 
   if (v.legend) {
-    // The one chrome in this function that never consults `rowsAvail` or
-    // `termRows` -- it is a fixed-size block (currently `LEGEND.length + 4` =
-    // 16 lines: title, meta bar, blank, `LEGEND`, blank, "any key returns",
-    // footer), so it overflows a terminal shorter than that. Pre-existing in
-    // shape and DISCLOSED rather than silently accepted: adding the `ctrl+r`
-    // entry (R18) moved the threshold from 15 to 16, the same
-    // usable-with-a-floor tradeoff `rowsAvail`'s own `Math.max(3, ...)`
-    // floor makes elsewhere in this file, not a new defect. Paginating the
-    // legend, or giving it its own budget, is future work -- not required
-    // for a screen whose entire content is a fixed, short reference list.
-    for (const line of LEGEND) L.push(bar(g, "  " + line));
+    // PAGINATED, which this block previously was not. It used to emit every
+    // legend line unconditionally -- a fixed 16-line block that overflowed any
+    // terminal shorter than 16, disclosed at the time as an accepted tradeoff
+    // and left as future work. The glossary is what made that future arrive:
+    // the content is now ~40 lines, so an unpaginated legend would overflow a
+    // standard 24-row terminal rather than only a very short one.
+    //
+    // The offset comes from the reducer (`v.legendTop`), clamped there against
+    // this same `avail` arithmetic, so the two can never disagree about how many
+    // lines a page holds -- the discipline the refusals overlay already follows.
+    const all = legendLines(g, p, { provenanceDot, healthDot });
+    const avail = Math.max(1, v.legendAvail ?? all.length);
+    const top = Math.min(Math.max(0, v.legendTop ?? 0), Math.max(0, all.length - avail));
+    for (const line of all.slice(top, top + avail)) L.push(bar(g, "  " + line));
     L.push(bar(g, ""));
-    L.push(bar(g, p.dim("  any key returns")));
+    // The hint has to say scrolling exists, and say so only when it does: on a
+    // terminal tall enough to show every line, "up/down scrolls" is an
+    // instruction to press keys that do nothing visible.
+    const more = Math.max(0, all.length - (top + avail));
+    L.push(bar(g, p.dim(more > 0 || top > 0
+      ? `  ${top + 1}-${top + Math.min(avail, all.length - top)} of ${all.length}   ` +
+        (caps.unicode ? "[↑↓] scroll  [any key] returns" : "[up/dn] scroll  [any key] returns")
+      : "  any key returns")));
     L.push(footer(g, p, caps.unicode ? HELP0 : HELP0_A));
     return L;
   }

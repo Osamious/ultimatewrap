@@ -5,6 +5,12 @@
 // harness. Keeping every decision here -- filtering, cursor, scope, the Esc
 // ladder -- means the behaviour is testable by feeding it strings, and the
 // renderer left behind is a formatter with no logic to get wrong.
+//
+// The ONE import, and it is content rather than rendering: the legend scrolls,
+// so the reducer must know how many lines it has to clamp against. `legend.mjs`
+// imports nothing itself -- it takes the glyph renderers as arguments -- so this
+// cannot become a cycle back through `style.mjs`.
+import { LEGEND_LENGTH } from "./legend.mjs";
 
 const asTarget = (providerName, modelId) => `${providerName}/${modelId}`;
 
@@ -128,7 +134,11 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30 }
     // `recentsHidden` is what lets style.mjs render "... N more" rather than
     // silently rendering fewer rows than the user remembers saving.
     recentsHidden: knownRecents.length - shownRecents.length,
-    level: 0, scope: "tree", legend: false,
+    // `null` closed, `{ top }` open -- the same nullable-object shape
+    // `refusals` uses, now that the legend scrolls too. `view()` still projects
+    // a BOOLEAN `legend` for the renderer and its tests, with the offset beside
+    // it as `legendTop`, so nothing downstream has to learn the new shape.
+    level: 0, scope: "tree", legend: null,
     q: ["", "", ""], cur: [0, 0, 0], top: [0, 0, 0],
     provider: null, termRows,
     // #51 (§2.5(b)/(c)), R18: null when closed, otherwise
@@ -294,6 +304,14 @@ export function reduce(state, ev) {
       const top = Math.max(0, Math.min(next.refusals.top, maxTop));
       next = { ...next, refusals: { ...next.refusals, top } };
     }
+    // The legend scrolls too, so it needs the identical re-clamp for the
+    // identical reason (L1): left alone, growing the terminal while the legend
+    // is scrolled to the bottom leaves `top` past the new maximum, and the page
+    // renders with blank space below it until one keystroke snaps it back.
+    if (next.legend) {
+      const maxTop = Math.max(0, LEGEND_LENGTH - rowsAvail(next));
+      next = { ...next, legend: { top: Math.max(0, Math.min(next.legend.top, maxTop)) } };
+    }
     return { ...NONE, state: next };
   }
   const key = String(ev ?? "");
@@ -335,11 +353,30 @@ export function reduce(state, ev) {
     return { ...NONE, state: { ...state, refusals: null } };
   }
 
-  // The legend is modal and swallows exactly one key, including enter and esc.
-  // Swallowing is the point: a user who opens it to find out what esc does should
-  // not have esc quit the picker on the way out.
-  if (state.legend) return { ...NONE, state: { ...state, legend: false } };
-  if (key === "?") return { ...NONE, state: { ...state, legend: true } };      // Q3.6
+  // The legend is modal and swallows the key that closes it, including enter and
+  // esc. Swallowing is the point: a user who opens it to find out what esc does
+  // should not have esc quit the picker on the way out.
+  //
+  // ARROWS NOW SCROLL RATHER THAN CLOSE, which is the same two-branch grammar
+  // the refusals overlay above uses and for the same reason: the legend grew a
+  // glossary and no longer fits one screen, so it is scrollable content, and a
+  // modal with scrollable content establishes no precedent for eating the keys
+  // that would scroll it. Every other key still closes, so the pre-glossary
+  // muscle memory (press anything to dismiss) is unchanged.
+  if (state.legend) {
+    if (key.length >= 3 && c0 === 27 && key[1] === "[") {
+      if (key[2] === "A" || key[2] === "B") {
+        const maxTop = Math.max(0, LEGEND_LENGTH - rowsAvail(state));
+        const top = key[2] === "A"
+          ? Math.max(0, state.legend.top - 1)
+          : Math.min(maxTop, state.legend.top + 1);
+        return { ...NONE, state: { ...state, legend: { top } } };
+      }
+      return { ...NONE, state };                        // other CSI finals: no-op, stays open
+    }
+    return { ...NONE, state: { ...state, legend: null } };
+  }
+  if (key === "?") return { ...NONE, state: { ...state, legend: { top: 0 } } };  // Q3.6
 
   if (key === "\t") {                                                          // scope toggle
     return { ...NONE, state: clamp({ ...state, scope: state.scope === "flat" ? "tree" : "flat" }) };
@@ -460,7 +497,18 @@ export function view(state) {
                  items: list.slice(top, top + avail), total: list.length };
   }
   return {
-    level: state.level, scope: state.scope, filter: state.q[i], legend: state.legend,
+    // BOOLEAN, deliberately, though the reducer now holds `null | {top}`. Every
+    // consumer of `v.legend` asks "is the overlay up", and widening that to an
+    // object would make `if (v.legend)` keep working while `=== true` silently
+    // stopped -- the worst shape of change. The offset rides beside it.
+    level: state.level, scope: state.scope, filter: state.q[i], legend: !!state.legend,
+    legendTop: state.legend?.top ?? 0,
+    legendTotal: LEGEND_LENGTH,
+    // The page size, from the SAME `rowsAvail` the arrow-scroll clamp above
+    // uses. Projected rather than recomputed in the renderer so the clamp and
+    // the paging cannot disagree about how many lines fit -- the identical
+    // reason `refusals.items` is sliced here rather than in style.mjs.
+    legendAvail: avail,
     items: shown, cursor: state.cur[i], top: state.top[i],
     empty: all.length === 0, provider: state.provider,
     more: Math.max(0, all.length - (state.top[i] + shown.length)),
