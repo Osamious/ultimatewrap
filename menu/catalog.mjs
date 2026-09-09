@@ -432,7 +432,11 @@ const CONFIG_ASSERTED = "config-asserted";
  * @param {Array}    i.chosen      one credential per provider
  * @param {Map}      i.providers   provider name -> profile
  * @param {object}   i.catalog     {byProvider: Map, generatedAt: string}
- * @param {object}  [i.relay]      {provider, models[]} injected, not a vault credential
+ * @param {object}  [i.relay]      {provider, models[]} injected, not a vault credential.
+ *                  Each `models[]` entry is EITHER a bare id string (the static
+ *                  `ANTHROPIC_RELAY.models` literal) OR `{id, ctx?, provenance?}`
+ *                  resolved from the live catalog by the caller. `id` may carry a
+ *                  `[1m]` suffix; routability is keyed on the bare form.
  * @param {Function}[i.cadenceOf]  provider name -> {cadence?, planCovered?}
  * @param {object}  [i.discovery]  {byProvider: Map|object} of the provider's OWN
  *                  listing, keyed by provider name. Defaulted empty, and the
@@ -767,21 +771,49 @@ export function buildFrom({ chosen, providers, catalog, relay,
     // Anthropic subscription models, whose tool use, vision and reasoning are known
     // first-hand from ANTHROPIC_FULL rather than looked up. Every other all-true or
     // all-false literal here was a coercion; this one is a measurement.
-    const models = (relay.models ?? []).map((id) => ({
-      id, ctx: null, pin: null, pout: null, badge: "PLAN",
-      tools: true, vision: true, reason: true, outputKind: "text",
-      // The four Claude models are models, known first-hand from ANTHROPIC_RELAY
-      // in the same way the capability set beside this is known. The relay reads
-      // no catalogue entry and no listing, so neither signal can speak here.
-      mode: false,
-      routable: routableOf(`${relay.provider}/${id}`),
-      // The capability set beside this is a MEASUREMENT and the provenance is
-      // not: these four ids are in the list because ANTHROPIC_RELAY names them,
-      // and nothing re-probes that. `config-asserted`, never `call-verified`
-      // (#59) -- the distinction is exactly that one of these is first-hand
-      // knowledge about the models and the other is a config literal about the
-      // list.
-      provenance: CONFIG_ASSERTED }));
+    // TWO ENTRY SHAPES, and the second exists because this row is the picker's
+    // ONLY input. A bare string is the static `ANTHROPIC_RELAY.models` literal
+    // and keeps its original meaning exactly. An object is the live catalog,
+    // resolved by whoever has an event loop (menu/snapshot.mjs) and handed in
+    // as a plain value -- the same injection pattern `routableOf` and
+    // `provenanceOf` already use, for the same reason: this builder is
+    // synchronous and must not learn to fetch.
+    //
+    // Without the object form the picker showed the curated four while
+    // `settings.json` showed the live eleven, and uwpick emits its selection
+    // as the snapshot's id verbatim -- so a bare `claude-opus-5` row selected
+    // here left the session on 200k while the same model chosen from `/model`
+    // got 1M (#111).
+    const models = (relay.models ?? []).map((entry) => {
+      const e = typeof entry === "string" ? { id: entry } : (entry ?? {});
+      const id = String(e.id ?? "");
+      // ROUTABILITY IS KEYED ON THE BARE ID, ALWAYS. `[1m]` is Claude Code's
+      // client-side context lever and nothing else; CCR routes on the bare id
+      // (`Providers[].models`, verified live), so asking the routable set about
+      // a suffixed id answers "no" for every relay row and dims all of them.
+      const bare = id.replace(/\[1m\]$/i, "");
+      return {
+        id, ctx: Number.isFinite(e.ctx) ? e.ctx : null,
+        pin: null, pout: null, badge: "PLAN",
+        tools: true, vision: true, reason: true, outputKind: "text",
+        // The Claude models are models, known first-hand from ANTHROPIC_RELAY
+        // in the same way the capability set beside this is known. The relay reads
+        // no catalogue entry and no listing, so neither signal can speak here.
+        mode: false,
+        routable: routableOf(`${relay.provider}/${bare}`),
+        // The capability set beside this is a MEASUREMENT and the provenance is
+        // not: a string id is in the list because ANTHROPIC_RELAY names it, and
+        // nothing re-probes that. `config-asserted`, never `call-verified`
+        // (#59) -- the distinction is exactly that one of these is first-hand
+        // knowledge about the models and the other is a config literal about the
+        // list.
+        //
+        // A live entry may carry its own rung instead, and it must come from the
+        // CALLER: `listing-verified` and `catalogue-only` are the caller's to
+        // assign (see CONFIG_ASSERTED's note above), because only the caller
+        // knows which listing was read and when.
+        provenance: e.provenance ?? CONFIG_ASSERTED };
+    });
     rows.push({
       keyId: "relay.anthropic.subscription", provider: relay.provider, models,
       free: null, planCount: models.length, health: "ok",
@@ -809,7 +841,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
  * and both belong to whoever did the work rather than to whoever reads it.
  */
 export function build({ routableOf, routableAsOf = null,
-                        discovery, provenanceOf } = {}) {
+                        discovery, provenanceOf, relay = K.ANTHROPIC_RELAY } = {}) {
   const { registry, providers } = K.loadVault();
   const chosen = K.chooseKeys(K.filterRegistry(registry, providers));
   return {
@@ -820,8 +852,13 @@ export function build({ routableOf, routableAsOf = null,
     // loop -- the refresher, or `menu/snapshot.mjs` -- resolves both and hands in
     // plain values. Passing `undefined` restores buildFrom's inert defaults, so
     // an un-updated caller keeps today's behaviour exactly.
+    // `relay` is FORWARDED for the same reason `discovery` and `provenanceOf`
+    // are: resolving the live Anthropic catalog means awaiting a fetch, and
+    // this function is synchronous because uwpick's input loop is a blocking
+    // `readSync` whose microtask queue never drains. Omitting it restores the
+    // static `ANTHROPIC_RELAY`, so an un-updated caller keeps today's behaviour.
     ...buildFrom({
-      chosen, providers, catalog: K.loadCatalog(), relay: K.ANTHROPIC_RELAY, routableOf,
+      chosen, providers, catalog: K.loadCatalog(), relay, routableOf,
       discovery, provenanceOf,
     }),
     routableAsOf,

@@ -310,7 +310,7 @@ export function buildProvenanceIndex(discovery, catalog, { buildJoinIndex, joinC
 
 export async function main(argv = process.argv.slice(2),
                            { rpc, file = SNAPSHOT_FILE, log = (s) => console.log(s),
-                             loadDiscovery } = {}) {
+                             loadDiscovery, loadRelayCatalog } = {}) {
   if (!argv.includes("--build")) {
     log("usage: node menu/snapshot.mjs --build");
     process.exit(2);
@@ -361,11 +361,67 @@ export async function main(argv = process.argv.slice(2),
   const { provenanceOf, modalityOf, discoveredAsOf } =
     buildProvenanceIndex(discovery, K.loadCatalog(), { buildJoinIndex, joinCatalogEntry });
 
+  // THE RELAY'S LIVE MODEL LIST (#111), guarded exactly like the discovery block
+  // above and degrading to the same place: `relay = null` leaves `build()` on the
+  // static `ANTHROPIC_RELAY` and the snapshot keeps today's curated four.
+  //
+  // This snapshot is uwpick's ONLY input, and uwpick emits its selection as the
+  // id it reads here, verbatim. So the ids must be the ones `settings.json`'s
+  // picker carries -- which is why the tags come from `buildAnthropicPickerRows`,
+  // the same function `keysync/run.mjs` uses for that file, rather than from a
+  // second rule that would be free to disagree with it.
+  let relay = null, relayLine;
+  try {
+    // Injectable for the same reason `loadDiscovery` above is: the real function
+    // reads a live cache file and falls back to a live fetch against the relay,
+    // so a test that could not stub it would take its result from whatever the
+    // developer's machine happened to be serving.
+    const fetchCatalog = loadRelayCatalog
+      ?? (await import("../keysync/anthropic-catalog.mjs")).fetchAnthropicCatalog;
+    const { routableCatalogIds } = await import("../keysync/run.mjs");
+    const live = await fetchCatalog();
+    // The SAME seven-day ceiling routing uses. Past it an id may name a model
+    // Anthropic has retired, and here that is not a dead route but a dead
+    // selection: the row is offered, `/model` is emitted, and the session lands
+    // on nothing. Below the ceiling, `routableCatalogIds` returns the id set;
+    // past it, null -- and null takes the curated fallback.
+    const ids = routableCatalogIds(live);
+    if (ids?.size) {
+      const bare = [...ids];
+      const tagged = K.buildAnthropicPickerRows(bare, live.contextById, K.ANTHROPIC_FALLBACK_TAGS);
+      relay = {
+        ...K.ANTHROPIC_RELAY,
+        models: tagged.map((id, i) => ({
+          id,
+          // The live `max_input_tokens`, keyed on the bare id it was stated for.
+          // `contextIndex` below only indexes a model with a finite `ctx`, so
+          // this is also what lets `hud-shim.mjs` correct the context window for
+          // an Anthropic session at all -- it never could while these were null.
+          ctx: live.contextById.get(bare[i]) ?? null,
+          // The rung is assigned HERE and not in `catalog.mjs` because that file
+          // may only write `config-asserted`: `listing-verified` is the caller's
+          // to give, and only this caller knows a listing was read. `/v1/models`
+          // through our own relay is that listing.
+          provenance: "listing-verified",
+        })),
+      };
+      relayLine = `  relay: ${tagged.length} live id(s), ` +
+        `${tagged.filter((id) => /\[1m\]$/i.test(id)).length} tagged [1m]`;
+    } else {
+      relayLine = `  relay: no usable live catalog (${live ? "too stale to route on" : "relay down and no cache"}); ` +
+        `using the curated ${K.ANTHROPIC_RELAY.models.length}`;
+    }
+  } catch (e) {
+    relayLine = `  relay: live catalog could not be read (${e.message}); ` +
+      `using the curated ${K.ANTHROPIC_RELAY.models.length}`;
+  }
+
   const built = build({
     routableOf: makeRoutableOf(set, fresh),
     routableAsOf: fresh ? new Date().toISOString() : null,
     discovery: { byProvider: discovery ?? new Map() },
     provenanceOf,
+    ...(relay ? { relay } : {}),
   });
   // Not routed through `build()` -- catalog.mjs's signature is outside this
   // task's WRITES, so the stamp is attached here, the same object shape
@@ -384,6 +440,7 @@ export async function main(argv = process.argv.slice(2),
   log(`snapshot: ${written}`);
   log(`  ${snap.rows.length} providers, ${models} models, catalogue ${snap.generatedAt}`);
   log(discoveryLine);
+  log(relayLine);
 
   // Two degraded readings, two distinct lines, and both PRINT rather than throw.
   // A snapshot with unknown routability is honest and usable -- null renders

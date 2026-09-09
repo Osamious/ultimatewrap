@@ -6,6 +6,7 @@ import os from "node:os";
 import { buildSnapshot, writeSnapshotFile, loadSnapshot, contextIndex, main,
          SNAPSHOT_SCHEMA, PROVENANCE_RUNGS, buildProvenanceIndex } from "../menu/snapshot.mjs";
 import { buildJoinIndex, joinCatalogEntry } from "../keysync/catalog-join.mjs";
+import * as K from "../keysync/keysync.mjs";
 
 const scratch = (name) => {
   const d = path.join(os.homedir(), ".uw", "harness", "scratch", "snapshot");
@@ -289,12 +290,29 @@ test("contextIndex maps provider/model to context tokens and skips unknowns", ()
 // handle, an unreachable gateway would make the check fail indistinguishably
 // from a broken build. The live non-uniformity check belongs to T9.
 
-const runBuild = async (rpc, name, loadDiscovery) => {
+// `loadRelayCatalog` defaults to "no live catalog", never to the real fetcher:
+// that one reads a live cache file and falls back to an HTTP call against the
+// relay, so leaving it unstubbed would take each assertion's input from whatever
+// the developer's machine was serving that minute. Null is also the honest
+// default here -- these fixtures describe an offline build -- and it keeps the
+// relay on its curated `config-asserted` rows, which is what every assertion
+// written before #111 was written against.
+const runBuild = async (rpc, name, loadDiscovery, loadRelayCatalog = async () => null) => {
   const said = [];
   const file = scratch(name);
-  await main(["--build"], { rpc, file, loadDiscovery, log: (s) => said.push(String(s)) });
+  await main(["--build"], { rpc, file, loadDiscovery, loadRelayCatalog,
+                            log: (s) => said.push(String(s)) });
   return { said: said.join("\n"), snap: loadSnapshot(file) };
 };
+
+// A canned `fetchAnthropicCatalog`-shaped result. `at: Date.now()` so
+// `routableCatalogIds`' seven-day ceiling admits it; a test that wants the
+// stale branch passes its own older stamp.
+const relayCatalogOf = (contextById, at = Date.now()) => async () => ({
+  ids: new Set(Object.keys(contextById)),
+  contextById: new Map(Object.entries(contextById).filter(([, v]) => Number.isFinite(v))),
+  at,
+});
 
 // A canned `loadDiscoveryCache`-shaped function, so these tests never touch
 // the real, ACL-protected cache directory the live function reads from.
@@ -484,6 +502,77 @@ test("R15: a discovery-cache read failure degrades to no discovery, never an unw
     assert.equal(m.provenance, null, `${m.id} claimed provenance from a discovery read that never happened`);
     assert.equal(m.modality, null, `${m.id} claimed modality from a discovery read that never happened`);
   }
+});
+
+// --------------------------------------------------------------- #111
+// uwpick reads ONLY this snapshot, and emits its selection as the id it finds
+// here, verbatim. So these assertions are about a routing outcome, not a label:
+// a bare `claude-opus-5` row lands the session on 200k while the same model
+// picked from `/model` gets 1M.
+
+const relayModelsOf = (snap) =>
+  snap.rows.find((r) => r.provider === "anthropic").models;
+
+test("#111: the relay row carries every live id, tagged from its real context window", async () => {
+  const { snap } = await runBuild(async () => ({ Providers: [] }), "relay-live.json", undefined,
+    relayCatalogOf({
+      "claude-opus-5": 1000000,
+      "claude-opus-4-6": 1000000,
+      "claude-haiku-4-5-20251001": 200000,
+    }));
+  const models = relayModelsOf(snap.snap);
+  assert.deepEqual(models.map((m) => m.id).sort(),
+    ["claude-haiku-4-5-20251001", "claude-opus-4-6[1m]", "claude-opus-5[1m]"],
+    "a 1M window tags, a 200k window does not, and an id outside the curated four still appears");
+  // The whole point of the ctx column, and of hud-shim's ability to correct an
+  // Anthropic session's context window at all: `contextIndex` skips a model
+  // whose ctx is not finite, and every relay row used to be null.
+  assert.equal(models.find((m) => m.id === "claude-opus-5[1m]").ctx, 1000000);
+  assert.equal(models.find((m) => m.id === "claude-haiku-4-5-20251001").ctx, 200000);
+});
+
+test("#111: routability is asked about the BARE id, never the tagged one", async () => {
+  // CCR routes on `Providers[].models`, which is bare. Asking the routable set
+  // about `anthropic/claude-opus-5[1m]` answers false for every relay row and
+  // dims the entire provider -- the failure this keys the lookup to avoid.
+  const rpc = async () => ({
+    Providers: [{ name: "anthropic", models: ["claude-opus-5"] }],
+  });
+  const { snap } = await runBuild(rpc, "relay-routable.json", undefined,
+    relayCatalogOf({ "claude-opus-5": 1000000 }));
+  const m = relayModelsOf(snap.snap)[0];
+  assert.equal(m.id, "claude-opus-5[1m]", "the emitted id keeps its tag");
+  assert.equal(m.routable, true, "and is still recognised as routable");
+});
+
+test("#111: a live id claims listing-verified, the curated fallback stays config-asserted", async () => {
+  const { snap: live } = await runBuild(async () => ({ Providers: [] }), "relay-prov-live.json",
+    undefined, relayCatalogOf({ "claude-opus-5": 1000000 }));
+  assert.equal(relayModelsOf(live.snap)[0].provenance, "listing-verified",
+    "the relay's own /v1/models IS a listing, and saying config-asserted would be the false claim #59 is about");
+
+  const { snap: none } = await runBuild(async () => ({ Providers: [] }), "relay-prov-none.json");
+  assert.equal(relayModelsOf(none.snap).every((m) => m.provenance === "config-asserted"), true,
+    "with no live catalog the rows are a config literal again, and must say so");
+});
+
+test("#111: a catalog too stale to route on falls back to the curated set, and says which", async () => {
+  const EIGHT_DAYS = 8 * 24 * 60 * 60 * 1000;
+  const { said, snap } = await runBuild(async () => ({ Providers: [] }), "relay-stale.json", undefined,
+    relayCatalogOf({ "claude-opus-4-6": 1000000 }, Date.now() - EIGHT_DAYS));
+  const ids = relayModelsOf(snap.snap).map((m) => m.id);
+  assert.equal(ids.includes("claude-opus-4-6[1m]"), false,
+    "past the ceiling an id may name a retired model, and here that is a dead selection");
+  assert.deepEqual(ids, [...K.ANTHROPIC_RELAY.models]);
+  assert.match(said, /too stale to route on/);
+});
+
+test("#111: a failed relay read degrades to the curated set, never an unwritten snapshot", async () => {
+  const { said, snap } = await runBuild(async () => ({ Providers: [] }), "relay-throws.json", undefined,
+    async () => { throw new Error("simulated relay failure"); });
+  assert.equal(snap.ok, true, "a degraded relay reading is still a valid snapshot");
+  assert.deepEqual(relayModelsOf(snap.snap).map((m) => m.id), [...K.ANTHROPIC_RELAY.models]);
+  assert.match(said, /live catalog could not be read \(simulated relay failure\)/);
 });
 
 test("the snapshot carries no catalogue internals", () => {
