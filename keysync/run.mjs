@@ -1901,8 +1901,21 @@ if (!noProfileDone) {
     // from a one-off /model switch becomes the permanent default for new
     // sessions). Surface the disagreement rather than silently honouring it.
     if (pin.pinned.toLowerCase() !== tiers.model.toLowerCase()) {
+      // MEASURED (#74, #47), and the opposite of what this line said until
+      // now: a NEW session defaults to `env.ANTHROPIC_MODEL` (the anchor),
+      // not `settings.model` (the pin), while the anchor is set -- which
+      // keysync always sets. The old text's remedy ("remove model to follow
+      // the anchor") was doubly wrong: removing the pin does not change
+      // which one new sessions follow, since the anchor already wins
+      // regardless of whether a pin is present. Claude Code now says this
+      // itself on every `/model`: "new sessions use that while it is set."
+      // The pin is NOT inert, though -- switching `/model` inside an
+      // ALREADY-RUNNING session does reach the wire immediately (confirmed
+      // by upstream error identity a reseller-specific 403 could not have
+      // come from the anchor).
       console.log(`  NOTE: that pin differs from the profile anchor (${tiers.model}).\n` +
-        `  New sessions will default to the pin. Remove "model" from settings.json to follow the anchor.`);
+        `  New sessions use the ANCHOR, not the pin, while ANTHROPIC_MODEL is set -- this is normal.\n` +
+        `  The pin still applies immediately if you /model-switch within an already-running session.`);
     }
   }
   if (pin.action === "cleared") console.log(`cleared stale /model pin "${pin.pinned}" (no longer a picker row)`);
