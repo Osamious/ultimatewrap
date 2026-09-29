@@ -219,3 +219,42 @@ export function admitId(id) {
   const s = String(id ?? "");
   return classifyRefusal(s) === null ? s : null;
 }
+
+// DISPLAY WIDTH, closed at DRAW time (the half the cap above cannot do).
+//
+// The frame's padders count code points, so a string that is not one column per code
+// point breaks every column to its right: a wide or fullwidth glyph is two columns (the
+// row runs past the frame), an emoji is two, and a combining mark or a format character
+// (soft hyphen, Arabic number signs, word joiners) is zero (the row runs short and the
+// column rules shift left). Real data hits this: bench records carry CJK previews and
+// emoji ids.
+//
+// AN ALLOWLIST, not a denylist. A denylist of wide/zero-width ranges keeps having gaps (a scan
+// of the whole BMP found 67 characters a first table let through); the safe shape is to name
+// the ranges KNOWN to be exactly one column and turn everything else into `?`. That costs
+// legibility for scripts outside the list (Arabic, Hebrew, Indic, CJK, emoji) in DRAWN text only.
+//
+// `sanitizeCells` = `sanitizeDisplay`, then every code point outside the list becomes `?`. It is
+// a DISPLAY transformation: ids used for selection, matching and routing are never touched.
+const ONE_COLUMN = new RegExp(
+  "^[" +
+  "\\u0020-\\u007E" +                    // Basic Latin, printable
+  "\\u00A0-\\u00AC\\u00AE-\\u02FF" +      // Latin-1 (minus U+00AD soft hyphen), Latin Extended A/B, IPA, modifier letters
+  "\\u0370-\\u03FF" +                    // Greek and Coptic
+  "\\u0400-\\u0482\\u048A-\\u052F" +      // Cyrillic and its supplement (minus the combining U+0483-0489)
+  "\\u1E00-\\u1FFF" +                    // Latin Extended Additional, Greek Extended
+  "\\u2010-\\u2027\\u202F-\\u205E" +      // general punctuation, minus the format characters
+  "\\u2070-\\u209F\\u20A0-\\u20C0" +      // super/subscripts, currency
+  "\\u2100-\\u218F" +                    // letterlike symbols, number forms
+  "\\u2190-\\u22FF" +                    // arrows, mathematical operators
+  "\\u2500-\\u25FC\\u25FF" +             // box drawing, blocks, geometric shapes (minus the wide U+25FD-25FE)
+  "]$", "u");
+const PLAIN_ASCII = /^[\x20-\x7E]*$/;
+
+export function sanitizeCells(s, max = 80) {
+  const clean = sanitizeDisplay(s, max);
+  if (PLAIN_ASCII.test(clean)) return clean;          // the overwhelmingly common case
+  let out = "";
+  for (const ch of clean) out += ONE_COLUMN.test(ch) ? ch : "?";
+  return out;
+}
