@@ -12,6 +12,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
+import { CONTRACT as CC } from "./cc-contract.mjs";
 
 const APPDATA = process.env.APPDATA ?? "";
 
@@ -199,3 +201,37 @@ export function routableFromConfig(cfg) {
 }
 
 export function bundledCataloguePath() { return CONTRACT.bundledCatalogue; }
+
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+/**
+ * Where Claude Code sends its traffic, and the key it sends it with -- read from
+ * Claude Code's own settings, so a benchmark measures the path a real session
+ * takes. Returns `{ base, key }`, or `null` when either half is missing.
+ *
+ * TWO GUARDS, both because this hands back a live credential:
+ *   - the base URL must be a LOOPBACK address. The gateway key exists to
+ *     authenticate to the local gateway and nothing else; if the settings file
+ *     were ever edited to point at a remote host, a caller must not be able to
+ *     send that key there by trusting this function.
+ *   - the key helper is run, never read from a file, and its output is returned
+ *     only to the caller. Nothing here logs it.
+ *
+ * `run` is injectable so the tests never execute anything.
+ */
+export function gatewayConnection({ settingsFile = CC.paths.settings, run = null } = {}) {
+  let settings;
+  try { settings = JSON.parse(fs.readFileSync(settingsFile, "utf8").replace(/^﻿/, "")); }
+  catch { return null; }
+  const base = String(settings?.env?.ANTHROPIC_BASE_URL ?? "").trim().replace(/\/+$/, "");
+  const helper = typeof settings?.apiKeyHelper === "string"
+    ? settings.apiKeyHelper.trim().replace(/^"(.*)"$/, "$1") : "";
+  if (!base || !helper) return null;
+  try { if (!LOOPBACK.has(new URL(base).hostname)) return null; } catch { return null; }
+  let key = "";
+  try {
+    key = String(run ? run(helper)
+      : execFileSync(`"${helper}"`, [], { encoding: "utf8", shell: true, timeout: 10000, windowsHide: true })).trim();
+  } catch { return null; }
+  return key ? { base, key } : null;
+}
