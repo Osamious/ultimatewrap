@@ -26,6 +26,17 @@
 // copies (default 30, at least 1; the new one always survives). It saves bench.json only, not an unfolded bench.jsonl.
 // A failure only prints a warning. There is deliberately NO --no-history: the safety net is not optional.
 //
+// A finished --live run ENDS BY REBUILDING THE PICKER SNAPSHOT (`node menu/snapshot.mjs --build`, as a child
+// process: no import of menu/snapshot.mjs), after the end-of-run compaction and before the lock is released, so the
+// provider-level counts, status and dates never lag bench.json. It runs whenever the run recorded anything (also
+// after Ctrl-C, the time limit or an outage), is skipped when nothing was recorded, and can NEVER fail the run or
+// change its exit code: a failure prints one warning (`bench: warning: snapshot not rebuilt (...)`) and the run ends
+// as before. It is skipped when the sweep gave up on a dead gateway or /health does not answer (a build then re-stamps
+// routability as unknown), and a build whose output says routability was unknown is reported as a WARNING. Ctrl-C during
+// the rebuild kills the child (exit code unchanged; a second Ctrl-C exits at once). Only the summary line(s) of the
+// child's output are printed, redacted. --reclassify-notices, --redact and --compact
+// do NOT rebuild: run `node menu/snapshot.mjs --build` after them. There is deliberately no --no-snapshot flag.
+//
 // EACH PROBE MAY TAKE 4 MINUTES (--timeout, default 240 s, both modes). Slow models and slow gateways
 // are the reason; the cost is that a provider whose rows all hang can take hours, so --max-minutes
 // (150 by default) is the real backstop. Nothing waits out a hung probe: Ctrl-C, the wall-clock stop
@@ -78,11 +89,13 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn as childSpawn } from "node:child_process";
+import { redactClip } from "../menu/redact.mjs";
 import { loadSnapshot } from "../menu/snapshot.mjs";
 import { gatewayConnection } from "../menu/ccr-client.mjs";
 import { BENCH_MAX_TOKENS, BENCH_FILE, BENCH_FRESH_MS, benchKeyOf } from "../menu/bench-data.mjs";
 import { buildTargets, probeOne, runSweep, billedCost, STREAM_CUT_FACTOR, UNPRICED_PER_M } from "./bench.mjs";
-import { createLogWriter, loadExisting, isFresh, compact, redactBench, reclassifyNotices, archiveBench } from "./bench-store.mjs";
+import { createLogWriter, loadExisting, isFresh, compact, redactBench, reclassifyNotices, archiveBench, readBench } from "./bench-store.mjs";
 import fs from "node:fs";
 import { acquireLock, sweepStatus } from "./bench-lock.mjs";
 
@@ -422,6 +435,102 @@ function saveHistory(o, deps) {
   else console.error(`bench: warning: history not saved (${r.reason}); continuing`);
 }
 
+const SNAPSHOT_SCRIPT = fileURLToPath(new URL("../menu/snapshot.mjs", import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const REBUILD_CMD = "node menu/snapshot.mjs --build";
+const REBUILD_TIMEOUT_MS = 5 * 60000;
+const CAPTURE_MAX = 256 * 1024;                  // per stream: only the tail is ever needed (the summary is the last lines)
+const outLines = (t) => String(t ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+const DEGRADED = /routability: the gateway did not answer/;
+const dur = (ms) => (ms >= 60000 && ms % 60000 === 0 ? `${ms / 60000} min` : `${Math.round(ms / 1000)}s`);
+
+/** Why a failed build failed, in one line: the first `Error:`-looking stderr line, else its last line, never Node's version footer. */
+function failureLine(stderr) {
+  const lines = outLines(stderr).filter((l) => !/^Node\.js v/.test(l));
+  return lines.find((l) => /(^|\s)\w*Error\b.*:|^Error:/.test(l)) ?? lines[lines.length - 1] ?? "";
+}
+
+/**
+ * The success line from the child's stdout (`menu/snapshot.mjs` prints `snapshot: <path>`, `  bench: ...`, then
+ * `  N providers, M models, catalogue <date>`, discovery/relay lines and `  routability: ...`): the providers line and
+ * the routability line, not just whatever came last. Falls back to the last line when the format is not recognised.
+ */
+function summaryLine(stdout) {
+  const lines = outLines(stdout);
+  const prov = lines.find((l) => /providers, .* models/.test(l));
+  const rout = lines.find((l) => /^routability:/.test(l));
+  return [prov, rout].filter(Boolean).join("; ") || lines[lines.length - 1] || "";
+}
+
+/**
+ * The default snapshot rebuild: the command the user runs by hand, as an ASYNC child process, so the event loop
+ * (and the SIGINT handler) stays live for up to `timeoutMs`. `signal` aborts it (Ctrl-C); the child is killed on
+ * abort or timeout. Resolves `{ ok, line, degraded }` or `{ ok: false, reason }`; NEVER throws or rejects. Output is
+ * captured tail-only up to a bound. `spawn` is injectable so tests never start a real build.
+ */
+export function buildSnapshotChild({ spawn = childSpawn, timeoutMs = REBUILD_TIMEOUT_MS, signal } = {}) {
+  return new Promise((resolve) => {
+    let settled = false, out = "", err = "", child = null;
+    const stop = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      stop.removeEventListener("abort", onAbort);
+      resolve(r);
+    };
+    const onAbort = () => {
+      try { child?.kill(); } catch { /* already gone */ }
+      finish({ ok: false, reason: signal?.aborted ? "interrupted (Ctrl-C)" : `timed out after ${dur(timeoutMs)}` });
+    };
+    try {
+      child = spawn(process.execPath, [SNAPSHOT_SCRIPT, "--build"], { cwd: REPO_ROOT, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      child.stdout?.on("data", (d) => { out = (out + d).slice(-CAPTURE_MAX); });
+      child.stderr?.on("data", (d) => { err = (err + d).slice(-CAPTURE_MAX); });
+      child.on("error", (e) => finish({ ok: false, reason: e?.code ?? e?.message ?? "could not start" }));
+      child.on("close", (status, sig) => {
+        if (status === 0) finish({ ok: true, line: summaryLine(out), degraded: DEGRADED.test(out) });
+        else { const why = failureLine(err); finish({ ok: false, reason: `exit ${status ?? sig ?? "unknown"}${why ? `: ${why}` : ""}` }); }
+      });
+      if (stop.aborted) onAbort(); else stop.addEventListener("abort", onAbort, { once: true });
+    } catch (e) { finish({ ok: false, reason: e?.code ?? e?.message ?? String(e) }); }
+  });
+}
+
+/**
+ * The last step of a --live run that wrote records: rebuild the picker snapshot and say so in one line. Nothing
+ * written -> nothing to catch up, so nothing runs. `ctx.healthy` (async, true when the gateway answers `/health`) is
+ * asked right before the child starts: the build also re-stamps ROUTABILITY from the live gateway, so one made during
+ * an outage would degrade the picker; it is skipped, with a hint, instead. `ctx.signal` aborts a running build
+ * (Ctrl-C). Whatever happens (failure, throw, hang to the timeout, a closed stdout), the caller's exit code is not
+ * affected: this only prints, and every print is guarded. Everything printed is redacted, and only the summary
+ * lines of the child's output are ever used (the build reads vault-derived configuration).
+ */
+export async function rebuildAfterRun(recorded, deps = {}, ctx = {}) {
+  if (!recorded) return null;
+  const say = (stream, text) => { try { console[stream](text); } catch { /* a closed pipe must not fail a good sweep */ } };
+  try {
+    let up = true;
+    try { up = ctx.healthy ? await ctx.healthy() : true; } catch { up = false; }
+    if (!up) {
+      say("log", `bench: snapshot not rebuilt (gateway not answering); run: ${REBUILD_CMD} when it is back`);
+      return "skipped";
+    }
+    let r;
+    try { r = await (deps.rebuildSnapshot ?? buildSnapshotChild)({ signal: ctx.signal }); }
+    catch (e) { r = { ok: false, reason: e?.message ?? String(e) }; }
+    if (r?.ok && (r.degraded || DEGRADED.test(r.line ?? ""))) {
+      say("error", `bench: warning: snapshot rebuilt WITHOUT routability (gateway did not answer); rebuild when it is back: ${REBUILD_CMD}`);
+      return "degraded";
+    }
+    if (r?.ok) say("log", `bench: snapshot rebuilt (${redactClip(r.line || "done", 120)})`);
+    else say("error", `bench: warning: snapshot not rebuilt (${redactClip(r?.reason || "unknown reason", 120)}); run: ${REBUILD_CMD}`);
+    return r?.ok ? "rebuilt" : "failed";
+  } catch { return "failed"; }
+}
+
+/** A comparable signature of the records bench.json holds (null when unreadable, which counts as "changed"). */
+export const modelsSig = (file = BENCH_FILE) => { try { return JSON.stringify([...readBench(file)]); } catch { return null; } };
+
 /** Exit code for "another sweep is running" (and for a --compact refused because of one). */
 export const EXIT_BUSY = 5;
 
@@ -574,8 +683,10 @@ async function runMain(o, lockDeps, deps = {}) {
   console.log("");
 
   const ac = new AbortController();
-  let interrupts = 0;
+  let interrupts = 0, rebuilding = null;
   process.on("SIGINT", () => {
+    // During the closing snapshot rebuild the first Ctrl-C kills the child build (the exit code stays as decided); a second forces the exit.
+    if (rebuilding) { if (rebuilding.signal.aborted) process.exit(130); rebuilding.abort(); return; }
     if (++interrupts > 1) process.exit(130);
     console.error("\nbench: stopping -- probes still in flight are dropped (not recorded; they are re-probed on resume) " +
       "and what finished is saved (Ctrl-C again to force)");
@@ -583,6 +694,7 @@ async function runMain(o, lockDeps, deps = {}) {
   });
 
   saveHistory(o, deps);      // the lock is held and nothing has been written yet
+  const before = modelsSig();
   const writer = createLogWriter();
   const tally = {}; let done = 0;
   const started = Date.now();
@@ -635,6 +747,15 @@ async function runMain(o, lockDeps, deps = {}) {
   const code = sweepExit(result);
   if (code === 3) console.log("  NO model answered ok in this run: check the gateway and the provider keys (exit code 3)");
   if (code === 4) console.log("  exit code 4: the gateway did not come back");
+  // Last: after the history copy, the log and the compaction; the lock is still held. `done` counts records APPENDED; a run
+  // whose only results were transient ones that `mergeRecord` dropped in favour of older real records leaves bench.json's
+  // records as they were, and then there is nothing for the snapshot to catch up on: compare the records before and after.
+  const wrote = done > 0 && (before === null || modelsSig() !== before);
+  rebuilding = new AbortController();
+  await rebuildAfterRun(wrote ? done : 0, deps, {
+    signal: rebuilding.signal,
+    healthy: async () => !result.outage?.gaveUp && (await gatewayUp(gw.base)),      // an outage is exactly when a rebuild would degrade routability
+  });
   return code;
 }
 
