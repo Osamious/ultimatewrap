@@ -14,6 +14,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { writeAtomic } from "./atomic.mjs";
+import { loadBench, countStatuses, providerFlags, BENCH_FRESH_MS, benchKey, isFresh } from "./bench-data.mjs";
+import { modalityWord } from "./modality.mjs";
+import { payFreeNote, aliasMap, providerAlive } from "./route-hints.mjs";
 
 // 3 since 2026-09-08 (R15). Bumped for three additions riding one migration:
 // `provenance` and `modality` per model, `refused[]` and the new
@@ -36,7 +39,15 @@ import { writeAtomic } from "./atomic.mjs";
 // provider as "ok" or vice versa. Bumped so a stale schema-4 file is rejected
 // and rebuilt rather than served with a health column whose meaning changed
 // out from under it.
-export const SNAPSHOT_SCHEMA = 5;
+// 6 adds `bench` on each row (per-status model counts from the #114 sweep),
+// `benchFlags` (its dead / needs-money verdicts) and `benchAsOf` beside the other stamps. Bumped for the same reason as 4: an old
+// file has no counts, and the provider list would draw blanks that read as
+// "nothing was benched" when the truth is "this file predates the column".
+// 7 adds `benchFlags.alive` (the provider list's `status` cell) and `outModality` / `outModalitySrc` on each model (the
+// model list's `modality` cell). Bumped rather than added quietly: a schema-6 file has neither, and the picker would
+// draw a blank `status` and `?` modality on every row -- "nobody looked" and "this file predates the column" are not
+// the same claim, and the second must be rebuilt, not read as the first.
+export const SNAPSHOT_SCHEMA = 7;
 
 // The closed vocabulary schema 3 persists (revision 6, #59). Named here so a
 // test can assert the FULL set -- both that nothing legal is missing and that
@@ -80,7 +91,28 @@ const ROUTABLE_TIMEOUT_MS = 5000;
  *                   the default is inert, so an un-updated caller (every
  *                   existing test) keeps behaving exactly as before.
  */
-export function buildSnapshot(built, { modalityOf = () => null, previous = null } = {}) {
+const withAlive = (flags, alive) => (flags ? { ...flags, alive } : null);
+
+/**
+ * The picker's `modality` column (schema 7): `outModality` is one word from the closed list in
+ * `menu/modality.mjs` or `null` (unknown), `outModalitySrc` names the evidence (`listing`, `mode`, `output`,
+ * `kind`, `bench-ok`) and is absent when the value is null. `catalog.mjs` decided the first four from the
+ * listing and the catalogue; the last rung is here because only here is the bench in hand: a route that
+ * answered a chat probe with text, inside the freshness window, and has no other evidence, is `chat?`.
+ * A route that FAILED a probe says nothing about modality and is never used.
+ */
+const modalityFields = (m, provider, bench, nowMs) => {
+  let v = modalityWord(m.outModality ?? null);
+  let src = v ? (m.outModalitySrc ?? null) : null;
+  if (v == null && bench) {
+    const rec = bench.get(benchKey(provider, m.id ?? ""));
+    if (rec?.s === "ok" && isFresh(rec, nowMs)) { v = "chat?"; src = "bench-ok"; }
+  }
+  return { outModality: v, ...(v && src ? { outModalitySrc: src } : {}) };
+};
+
+export function buildSnapshot(built, { modalityOf = () => null, previous = null, bench = null,
+                                       nowMs = Date.now() } = {}) {
   // FREE-TIER LIMITS ARE CARRIED FORWARD, because they are MEASUREMENTS and
   // this function only ever sees DERIVATIONS. `built` comes from `buildFrom`,
   // which reads the catalogue and the discovery cache; nothing in it has ever
@@ -106,6 +138,18 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null 
       if (m?.id) priorModel.set(`${r.provider}/${m.id}`, m.limit ?? null);
     }
   }
+  // A build with NO usable bench data (a missing, corrupt or wrong-schema bench.json) must not
+  // silently erase the counts the previous build had: they are carried forward, per row (by key
+  // id), together with the stamp they belong to, and `main()` says so. A first-ever build, or a
+  // previous snapshot without counts, has nothing to carry and stores `null` as before.
+  // Carried counts are RE-AGED against the same 14-day window every reader uses: counts older than
+  // that (relative to their own stamp) are not carried, because a figure drawn without a fresh
+  // sweep behind it would claim more than it knows.
+  const prevAt = Date.parse(previous?.benchAsOf ?? "");
+  const carry = !bench && Number.isFinite(prevAt) && nowMs - prevAt <= BENCH_FRESH_MS && nowMs >= prevAt
+    && (previous?.rows ?? []).some((r) => r?.bench);
+  const priorBench = new Map();
+  if (carry) for (const r of previous.rows) priorBench.set(r.keyId, { bench: r.bench ?? null, flags: r.benchFlags ?? null });
   return {
     schemaVersion: SNAPSHOT_SCHEMA,
     generatedAt: built.generatedAt ?? null,
@@ -122,10 +166,25 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null 
     // every other stamp here -- an absent key and an honest `null` are not the
     // same claim to a reader of the file.
     discoveredAsOf: built.discoveredAsOf ?? null,
+    // #114. When the sweep the per-row `bench` counts came from was taken; `null`
+    // when no bench data was loaded, which the picker draws as a dash.
+    benchAsOf: carry ? (previous.benchAsOf ?? null) : (bench?.generatedAt ?? null),
     builtAt: new Date().toISOString(),
     rows: built.rows.map((r) => ({
       keyId: r.keyId, provider: r.provider, free: r.free,
       planCount: r.planCount, health: r.health,
+      // #114. Raw per-status model counts, or `null` when there was no bench data
+      // (an own property either way, so "no sweep" survives JSON.stringify).
+      bench: bench ? countStatuses(r.provider, r.models, bench.get, nowMs) : (priorBench.get(r.keyId)?.bench ?? null),
+      // `{dead, needsMoney}` booleans from the sweep's skip decisions, or `null` when
+      // there is no data or nothing fresh to judge from (drawn blank, never "no").
+      // `{dead, needsMoney, alive}`. `alive` (#114 redesign) is what the provider list draws: true when
+      // the provider RESPONDED in any shape (errors included), false only when every fresh probe was a
+      // no-response failure (route-hints.mjs), null with nothing fresh. `dead` and `needsMoney` stay in
+      // the snapshot for other readers but are no longer drawn. Additive: an older file lacks `alive`.
+      benchFlags: bench ? withAlive(providerFlags(r.provider, r.models, bench.get, nowMs),
+                                    providerAlive(r.provider, r.models, bench.get, nowMs))
+                        : (priorBench.get(r.keyId)?.flags ?? null),
       // Schema 4. The free-tier limit, aggregated over this provider's free
       // rows by `menu/payload-cap.mjs`'s `aggregate`. `?? null` for the same
       // reason `provenance` two literals down carries it: an own property,
@@ -138,8 +197,20 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null 
       // which would otherwise drop an `undefined` array entirely rather than
       // round-trip it as `[]`.
       refused: r.refused ?? [],
-      models: r.models.map((m) => ({
-        id: m.id, ctx: m.ctx, pin: m.pin, pout: m.pout, badge: m.badge,
+      models: ((aliases) => r.models.map((m) => {
+        // BADGE HONESTY (bench-study 3.1): a `FREE?` route whose FRESH probe says payment is
+        // required is not "(possibly) free"; the badge goes blank (the "no evidence we will stand
+        // behind" value, still inside the closed vocabulary) and `badgeNote` says why. `FREE`, `PLAN`
+        // and `PAID` are never touched, and neither is anything on a stale or future-dated record.
+        const note = bench ? payFreeNote(m, r.provider, bench.get, nowMs) : null;
+        const alias = aliases.get(m.id) ?? null;
+        return {
+        ...(note ? { badgeNote: note } : {}),
+        // ALIAS (bench-study 4b): a fresh-`gone` route with a fresh-`ok` sibling in the same
+        // provider points at it. Optional and additive: absent everywhere else.
+        ...(alias ? { aliasOf: alias } : {}),
+        ...modalityFields(m, r.provider, bench, nowMs),
+        id: m.id, ctx: m.ctx, pin: m.pin, pout: m.pout, badge: note ? "" : m.badge,
         tools: m.tools, vision: m.vision, reason: m.reason,
         // An explicit literal, so every field the picker draws has to be named
         // here to survive. That is not a hypothetical property: `routable` was
@@ -174,7 +245,8 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null 
         // claim (catalog.mjs's own distinction), and a malformed/undefined
         // input has not earned that claim.
         mode: m.mode ?? null,
-      })),
+        };
+      }))(bench ? aliasMap(r.provider, r.models, bench.get, nowMs) : new Map()),
     })),
   };
 }
@@ -323,7 +395,7 @@ export function buildProvenanceIndex(discovery, catalog, { buildJoinIndex, joinC
 
 export async function main(argv = process.argv.slice(2),
                            { rpc, file = SNAPSHOT_FILE, log = (s) => console.log(s),
-                             loadDiscovery, loadRelayCatalog } = {}) {
+                             loadDiscovery, loadRelayCatalog, benchLoader = loadBench } = {}) {
   if (!argv.includes("--build")) {
     log("usage: node menu/snapshot.mjs --build");
     process.exit(2);
@@ -447,10 +519,25 @@ export async function main(argv = process.argv.slice(2),
   // limits unknown, rather than carrying values out of a shape we did not
   // verify. A first-ever build has no previous file and takes the same path.
   const prev = loadSnapshot(file);
-  const snap = buildSnapshot(built, { modalityOf, previous: prev.ok ? prev.snap : null });
+  // `state/bench.json` is folded in HERE, at build time, so the provider list never
+  // reads it at startup. An absent file is an empty result, which stores `bench: null`.
+  const benchData = benchLoader();
+  const snap = buildSnapshot(built, { modalityOf, previous: prev.ok ? prev.snap : null,
+                                      bench: benchData.size ? benchData : null });
   const written = writeSnapshotFile(snap, file);
   const models = snap.rows.reduce((n, r) => n + r.models.length, 0);
   log(`snapshot: ${written}`);
+  // Always say what the provider columns were built from: a silent `null` is indistinguishable
+  // from "nothing was benched".
+  const hadCounts = prev.ok && prev.snap.rows.some((r) => r?.bench);
+  const kept = !benchData.size && snap.rows.some((r) => r.bench);
+  log(benchData.size
+    ? `  bench: ${benchData.size} records as of ${benchData.generatedAt ?? "an unknown time"}`
+    : kept
+      ? `  bench: no usable bench data; kept the previous counts as of ${prev.snap.benchAsOf}`
+      : hadCounts
+        ? `  bench: no usable bench data, and the previous counts (as of ${prev.snap.benchAsOf ?? "an unknown time"}) are older than 14 days and were dropped; provider columns will be blank`
+        : "  bench: no usable bench data, provider columns will be blank");
   log(`  ${snap.rows.length} providers, ${models} models, catalogue ${snap.generatedAt}`);
   log(discoveryLine);
   log(relayLine);

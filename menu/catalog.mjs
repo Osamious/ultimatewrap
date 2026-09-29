@@ -16,6 +16,7 @@ import { admitRemoteModels } from "./denylist.mjs";
 import { writeAtomic } from "./atomic.mjs";
 import * as CCR from "./ccr-client.mjs";
 import { readHealth, makeHealthOf } from "./health.mjs";
+import { outputModalityOf } from "./modality.mjs";
 
 // A static import, not `await import()`. There is no dynamic reason for a dynamic
 // import here -- the path is a constant -- and the top-level await it forces makes
@@ -654,6 +655,11 @@ export function buildFrom({ chosen, providers, catalog, relay,
         // reason `refused` is: `false` is a definite "this is a model" and
         // `undefined` is a build that did not compute it.
         mode,
+        // The primary OUTPUT modality as one short word, and the source that decided it (`menu/modality.mjs`).
+        // Both `null` when nothing positive is known: unknown stays unknown. The snapshot builder may add the
+        // last, bench-based rung (`chat?`), which needs the bench data this function does not have.
+        ...((mm) => ({ outModality: mm?.v ?? null, outModalitySrc: mm?.src ?? null }))(
+          outputModalityOf(entry, capability, mode ? null : K.outputKind(entry, capability))),
         // Q1.3: a value, not a promise. null means nobody checked and does not dim.
         routable: routableOf(`${cred.provider}/${id}`),
         provenance,

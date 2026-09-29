@@ -180,11 +180,20 @@ export const BENCH_FRESH_MS = 14 * 24 * 3600 * 1000;
  * THE freshness rule, used by every reader (the rows, the counts, the flags, the header, the
  * ok-only filter): the record has a timestamp, it is NOT in the future (a clock that ran ahead
  * or a hand edit is not evidence), and it is at most `BENCH_FRESH_MS` old.
+ *
+ * "In the future" is judged against the LATER of the caller's `nowMs` and the real clock, plus a
+ * small skew allowance. The picker freezes `nowMs` when it starts, and a sweep in another window
+ * keeps writing records after that: a record written a minute after the picker opened is newer
+ * than `state.now`, and dropping it as "future" would blank a model that was just measured.
+ * A record more than `FUTURE_SKEW_MS` beyond even the real clock is still refused (a hand edit, a
+ * clock that ran ahead); age is still measured from `nowMs`, so the 14-day window is unchanged.
  */
+export const FUTURE_SKEW_MS = 5 * 60 * 1000;
 export function isFresh(rec, nowMs = Date.now()) {
   if (!rec || !Number.isFinite(rec.a)) return false;
-  const age = nowMs - rec.a * 1000;
-  return age >= 0 && age <= BENCH_FRESH_MS;
+  const at = rec.a * 1000;
+  if (at - Math.max(nowMs, Date.now()) > FUTURE_SKEW_MS) return false;
+  return nowMs - at <= BENCH_FRESH_MS;
 }
 
 /**
