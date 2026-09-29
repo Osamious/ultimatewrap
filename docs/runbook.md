@@ -172,9 +172,13 @@ node refresh/cli.mjs --live
 `--live` is real, authenticated traffic against every provider in the vault —
 that's why it's never the default and never scheduled.
 
-### 6c. Health — probe results feeding the picker's health column
+### 6c. Health — probe results feeding the snapshot's `health` field
 
-The picker's health column (`ok` / `needs $` / `broken` / `stale`) is
+> The picker no longer draws a health column: the provider list shows a `status`
+> (alive / dead) and benchmark counts (6d). The `health` string is still resolved and
+> stored on every snapshot row for other readers, and everything below still applies to it.
+
+The snapshot's `health` field (`ok` / `needs $` / `broken` / `stale`) is
 resolved from `~/.uw/state/health.json`, which is folded from a probe results
 file — not derived live from vault notes alone. Fold whatever probe file you
 have (the shape is `{at, results: [{id, state, ...}]}` with
@@ -207,6 +211,465 @@ so it can never overwrite a probe's `broken`).
 discovery runs would update health.json on their own). Today, health only
 updates when you run the fold command above by hand. This is a deliberate,
 tracked deferral, not an oversight.
+
+### 6d. Bench — measured speed per model (always-on columns in the picker)
+
+Every model list in the picker (a provider's models, and flat scope) shows, next to
+the catalogue columns, per model: **status, TTFT, total time, tok/s and a preview of
+the reply**. There is no toggle (the old `^b` bench view is gone and `^b` does
+nothing): it is one view, with every column shown when the terminal is wide enough.
+The columns read `state/bench.json` **lazily, once**, the first time a model list is
+drawn, never at startup and never while only the provider list is used. The numbers come from one
+real streamed chat request per model, sent **through the CCR gateway** (the path
+a real session takes), so they include routing overhead.
+
+```powershell
+# Dry (default): the plan — rows, providers, free/paid split, spend, wall time. Sends nothing.
+node refresh/bench-cli.mjs
+
+# Live: probe every routable text row, the probe-all way (below). Real requests, so
+# never the default and never scheduled. `--probe-all` is accepted and does nothing.
+node refresh/bench-cli.mjs --live
+
+# Opt in to the old budget and breakers: skip dead/unfunded providers, $0.01 a row, $2 total.
+node refresh/bench-cli.mjs --live --economy
+
+# A sample (round-robin, so every provider's first row is in it) or specific providers/models.
+node refresh/bench-cli.mjs --live --limit 40
+node refresh/bench-cli.mjs --live --only aihubmix,openrouter/some-model
+
+# Fold an interrupted run's log into bench.json without probing.
+node refresh/bench-cli.mjs --compact
+
+# Re-probe exactly the rows in a list (one provider/id per line, # comments; combinable with --only).
+# The study's lists are in plans/bench-study/lists/ (regenerate: node plans/bench-study/scripts/make-lists.mjs).
+node refresh/bench-cli.mjs --only-file plans/bench-study/lists/empty55.txt --force --max-tokens 1024
+node refresh/bench-cli.mjs --only-file plans/bench-study/lists/timeout42.txt --force
+
+# One-shot maintenance: redact provider text already stored (refuses while a sweep runs).
+node refresh/bench-cli.mjs --redact
+
+# One-shot maintenance: turn `ok` records whose reply is really an error/account notice into auth/pay/error.
+# --dry previews the change and writes nothing; the plain run takes the sweep lock (refuses under a running sweep).
+node refresh/bench-cli.mjs --reclassify-notices --dry
+node refresh/bench-cli.mjs --reclassify-notices
+```
+
+What a live run does, so its cost is predictable:
+
+- **Scope:** every routable, text-output row in the snapshot (~5,800). Rows
+  measured in the last `--ttl` days (default 7) are skipped, so a re-run resumes;
+  `rate`, `timeout`, `error` and `skip` results are always retried. `--force`
+  re-probes everything.
+- **Concurrency:** 8 in flight overall, 2 per provider, round-robin across
+  providers, one canary probe per provider before the rest (chat-looking models
+  first: moderation, embedding and "labs" ids go last). A 429 pauses only that
+  provider, honouring a usable `Retry-After` (seconds or an HTTP date); with none, or a
+  `0`, it backs off 1 s, 2 s, 4 s ... (max 60 s), so a provider answering 429 without a
+  header is never hit again at once.
+- **Per-probe timeout: 240 s (`--timeout`, both modes).** Slow models and gateways get four
+  minutes; the price is that a provider whose rows all hang can take hours, so
+  **`--max-minutes` (150 by default) is the real backstop**: the plan prints the
+  worst case next to it. Nothing waits out a hung probe: Ctrl-C, the wall-clock stop and
+  a confirmed gateway outage each abort the probes in flight (dropped, not recorded,
+  re-probed on the next run), and a probe sent before an outage that only fails after it
+  began is put back rather than recorded. A timed-out row is **not retried** (it already
+  waited the whole deadline; an `error` still gets its one retry). A timed-out record stores
+  `d` = the deadline (the picker shows `240s`) and stays transient. Because 30 consecutive failures can take a
+  quarter of an hour to arrive at 240 s each, a full timeout plus a minute with not one
+  `ok` anywhere also triggers the gateway check. `--economy` keeps the 240 s (its
+  breakers already stop a hanging provider after three failures) but has no wall-clock
+  limit unless you add `--max-minutes`.
+- **Probe-all is the default: no provider is skipped.** Every row gets its own answer
+  (the way to find every operational model), so a run is never followed by a second
+  pass: no provider is ever recorded `skip:provider-dead` or `skip:unfunded`, however
+  many of its models are refused or error. Politeness replaces skipping, to avoid key
+  suspension or abuse detection: after `--cool-after` (default 10) consecutive
+  `auth`/`pay`/`error`/`timeout` results with no `ok`, that provider drops to one
+  request in flight with at least `--cool-gap-ms` (default 400) between dispatches, and
+  returns to normal on its next `ok`, with no second attempt at a row that failed while
+  cooled. `gone`, `rate` and `empty` neither count nor reset that run. Other providers
+  are unaffected. A message that says the model does not exist or was retired is
+  `gone`, so it is not retried, in two tiers: a 4xx (providers answer 400/422 for it)
+  accepts the looser wordings ("no longer available", "retired", "invalid model",
+  "is not supported"), while a **5xx accepts only the strong anchors** (`model_not_found`,
+  "does not exist", "no such model", "unknown model", "Model not exist", a named or
+  quoted model that is missing, removed or decommissioned), because 5xx texts like "model
+  not found in KV cache" or "model was retired from pool, retrying" are transient faults
+  of a working model. A sentence about a request parameter ("invalid model parameter")
+  is never `gone`. Likewise a **5xx that merely mentions** billing, quota, payment, a
+  purchase, a deposit or a recharge is a transient `error`, not `pay` (only words about an
+  empty account count at a 5xx: balance, credits, top up, "requires a paid plan"); "Insufficient
+  permissions" is `auth`; and a message that names the plan ("not found in your plan") is
+  `pay` even on a 404. At a 5xx a sentence that carries a **transient marker** (retry, try again,
+  temporarily, worker, pool, cache, shard, replica, queue, reload, capacity, rotation, node,
+  region, unavailable) is never `gone` and never `pay`: "model 'x' was removed from the pool,
+  retrying", "Insufficient GPU capacity" and "balance check service unavailable" stay `error`. "Insufficient"
+  needs a money noun (credits, balance, funds, quota); "Invalid model output/format/parameter/type"
+  is never `gone`.
+  The status vocabulary is closed, so account state uses an existing status: "no longer
+  available to new users" (google) and "free models are not available to this account
+  yet" (orcarouter) are `auth` (the account is refused, the model exists); an empty
+  balance in words ("Insufficient credits ... top up") is `pay` even on a 429 whose body
+  also says rate limit; "cannot be served at the moment" and the gateway's opaque
+  "Upstream request failed." stay `error` (or the status the HTTP code names: 402
+  `pay`, 404 `gone`, 401 `auth`), with the sentence kept in `m`.
+  A run also stops itself after `--max-minutes` (default 150) and resumes where it left off.
+- **`--economy` (opt-in) restores the old budget and breakers** (the engine underneath is
+  the current one: token-based billing, worst-case admission, the outage hold, exit
+  codes 3 and 4): a provider that gets three
+  consecutive refusals with no success (`auth`, or `pay` on a free row) or three
+  consecutive errors is marked dead and its remaining rows are recorded `skip` with
+  **no further requests**; five consecutive `pay` results on paid rows stop that
+  provider's paid rows. The defaults go back to $0.01 a row, $2.00 total and no
+  wall-clock limit, and there is no cooling. Use it for a cheap first look; a
+  later default run re-probes every `skip`. The picker's provider `status` ignores `skip`
+  records (they are not probe results); the default probe-all mode records none.
+- **A dead gateway is not a provider failure** (both modes). Every live run watches for
+  it: after `--outage-after` (default 30) consecutive final `auth`/`pay`/`error`/`timeout`
+  results with no `ok` anywhere, it checks the gateway's `/health`. If it is down, the
+  run pauses, the rows it hit are put back **unrecorded** (not logged as errors),
+  it polls every 10 s, and it resumes when the gateway answers. After
+  `--outage-wait-min` (default 10) down it stops like Ctrl-C (exit code 4) and a re-run
+  picks those rows up.
+- **Spend caps:** `--max-spend` (default $5.00 across the run; $2.00 under `--economy`)
+  and `--max-row-cost` (default $0.10 per row; $0.01 under `--economy`; judged on the
+  worst case at the full 96-token budget). Explicit flags always win over either
+  mode's default. Rows over the ceiling are recorded `skip` (`row-cost`), and paid rows
+  past the cap `skip` (`spend-cap`). A row being retried faces the cap again (a cap
+  leak: retries used to bypass it, and a $2.00 cap reached an estimated $2.12; a retry
+  that no longer fits is recorded `skip:spend-cap`). **The cap is an estimate, not a
+  hard bound on the invoice**: each probe is charged from the output tokens the
+  provider reported (a timeout at its worst case), and each probe in flight holds its
+  worst case (the full `max_tokens`) until it finishes, so concurrency cannot push the
+  estimate past the cap. A row that fits only until those holds are released waits
+  instead of being skipped. Refused or errored requests (401/402/404/5xx) are normally
+  not billed; a stream that fails after tokens flowed can be, and is charged when
+  reported. The dry run says which mode it is (`probe-all (default)` or `economy`),
+  prints both the typical-answer estimate and the worst case (every paid row at full
+  `max_tokens`), and when the cap can bind says it cuts the late, expensive rows (paid
+  rows are queued cheapest-first within each provider). It lists the costliest rows
+  over the ceiling, and a finished run prints how many rows remain unprobed and why,
+  by count (`row-cost`, `spend-cap`). Re-run to resume; skips are always re-probed.
+- **One sweep at a time.** A live run holds an exclusive lock file
+  (`~/.uw/state/bench.lock`: pid, start time, mode). A second `--live`, or a
+  `--compact` while a sweep runs, is refused (`another sweep is running (pid N since
+  HH:MM); nothing was sent`, exit code 5) before anything is sent or written, and the
+  dry plan says so too. A lock whose process is gone, or that outlived its
+  `--max-minutes` plus 10 min, is taken over with a printed notice; it is released on a
+  normal finish, Ctrl-C, an outage stop and an uncaught error. A `bench-cli.mjs --live`
+  process started before the lock existed is looked for through the OS (best effort)
+  and blocks a new run as well. The cap and ceiling are **per invocation**: a resumed
+  run starts with a fresh budget, and the plan prints what the answers already on
+  record would have cost (an estimate from the latest record per model).
+- **Runaway streams are cut (`--stream-cut N`, default 4 x `--max-tokens` = 384; 0 = off).**
+  Many reasoning models ignore `max_tokens: 96` and stream thousands of tokens over minutes
+  (measured: 7,559 tokens over 163 s). The probe needs only the first token, a preview and a
+  rate, so once a stream is past the allowance the request is aborted and the row recorded
+  as the `ok` it is, with the marker `x: 1`; `o` is then the larger of the provider's own
+  count (if it arrived) and characters / 4, never below the allowance (an estimate: that is
+  what `x` says), and `r` is computed over the window seen before the cut. Nothing is cut
+  before the first content delta, and `empty` is unchanged. The cut allowance is also the
+  ceiling on what one probe can bill: `--max-row-cost` and the in-flight reservation use it. The token
+  estimate counts a CJK, kana or Hangul character as about one token (other text as chars / 4). A stream
+  `error` event that arrives AFTER content keeps the row `ok` (its first-token time is real) and records
+  "stream error after first token: ..." in `m`. Readers get the cut marker as `x` on the record from `loadBench`.
+  Rows whose worst case at the 4x allowance exceeds the ceiling are recorded `skip:row-cost` and keep their
+  earlier records (empty55 at `--max-tokens 1024`: o1-pro, o1-pro-2025-03-19, o1, o1-2024-12-17, gpt-5-pro);
+  probe them with `--stream-cut 1024` (or `--max-row-cost 3`).
+- **Unpriced rows** (no catalogue price) are charged a documented conservative price on the
+  tokens the probe saw: $0.60 in / $3.00 out per million (printed in the plan). The old flat
+  guess, scaled linearly by tokens, made a 7,559-token unpriced answer cost about $0.78
+  instead of about $0.02 and turned a $0.06 plan into a $5.24 estimate. Unpriced rows are probed AFTER the
+  priced rows of their provider (an unknown cost goes last), and the plan states how many there are and that
+  their cost is an assumption.
+- **A 200 that is really a notice is not an `ok`.** If the WHOLE streamed text (short, and not
+  greeting-led) reads as an error or account notice ("The account behind this API key
+  doesn't ..."), the row is `auth` (account/key wording), `pay` (credit/balance/quota
+  wording), `rate` ("Rate limited", "Too many requests"), `gone` ("Model not found") or `error`, with the
+  sentence in `m` (all 106 pollinations `ok` rows were this). Any text that says "hello" is never a notice;
+  the wordings are English only, added when a real provider notice plausibly starts that way.
+  Records written before that rule existed are fixed once by `--reclassify-notices` (bench.json
+  and the log; `t`, `r`, `o` and `k` are dropped, `a`, `d`, `p` kept, `m` = "reclassified from ok
+  (HTTP 200 notice): ..."; idempotent; combines with none of `--live`, `--compact`, `--redact`).
+- **Empty filters never widen a run.** `--only` / `--only-file` with no usable entry is an
+  error, and an empty list selects nothing. An `--only-file` that contributes no probeable row is an error
+  even beside `--only`; when both contribute, the selection is their union and the plan prints both counts.
+- **Start-up health gate:** the first `/health` call gets 10 s and one retry after 2 s
+  before the run refuses to start ("the gateway is not answering; nothing was sent").
+- **Exit code:** 0 for a normal outcome or a Ctrl-C; 3 when probes were sent and not
+  one model answered `ok` (check the gateway and the keys); 4 when the gateway never
+  came back; 5 when another sweep is running.
+- **Ctrl-C** stops scheduling, **drops the probes still in flight** (they are not
+  recorded and are re-probed on resume), saves what finished and compacts; run again
+  to resume. A second Ctrl-C exits immediately (the log is still on disk and
+  `--compact` recovers it).
+- **Files:** `~/.uw/state/bench.jsonl` (append-only checkpoint) is folded into
+  `~/.uw/state/bench.json` (latest record per `provider/id`, about 120 bytes/row, plus
+  the provider's own message `m` on a non-ok one). **The stored reply preview `p` is
+  120 characters** (`PREVIEW_CHARS`; it was 40): the head of the answer on an `ok`, the head
+  of the provider's sentence otherwise (a non-ok record whose `p` is just the first 120
+  characters of its `m` stores only `m` and derives `p` on load). **Records written before
+  the change keep their 40-character previews until they are re-probed.** Measured for 6,000
+  records: about 0.76 MB typical, 1.37 MB with a third of the rows at a full 120-character
+  preview and the rest at the 160-character message cap, 1.30 MB with every row an answer at
+  120 characters (the size test asserts under 1.5 MB / 2 MB). "Latest" has one exception: a
+  transient result (`rate`/`timeout`/`error`/`skip`) never replaces an older real one
+  (`ok`, `empty`, `auth`, `pay`, `gone`) that is still fresh (14 days, or `--ttl` if
+  longer), so a `--force` run in a flaky hour cannot erase a good measurement. Only what
+  compaction keeps changes; the log still records every result. **Provider text is
+  redacted** before it is stored and again when loaded (`m` and the head of a non-ok
+  `p`): masked or elided key fragments (`7f3a9c*****e21d`, `sk-abc••••wxyz`,
+  `sk-abcd...wxyz`), key shapes (`sk-`, `hf_`, `gsk_`, `Bearer`, JWTs whole, `api_key=` and
+  JSON-quoted secrets, letters-only ones included), URLs, e-mail addresses and opaque
+  request ids (`req_...`, UUIDs) become `[masked-key]`, `[key]`, `[url]`, `[email]`,
+  `[id]`, and the readable sentence stays. `--redact` applies this once to an
+  existing `bench.json` (and a non-empty log); it takes the sweep lock, writes atomically
+  and prints how many records changed. It is idempotent: run again after the rules grow,
+  it only changes records the new patterns newly match. A probe sent with a non-default `--max-tokens`
+  stores that budget as `b` on its record, so a 1024-token `ok` is not read as a
+  96-token one (nothing reads `params.maxTokens`, which stays the 96 default). A
+  `--force` re-probe of an `empty` that now answers replaces it; a newer `error` or
+  `timeout` does not overwrite an older `empty`. For re-probes of a list, note that
+  the plan's dollar *estimate* assumes a typical short answer, but the routes in
+  `empty55.txt` spend their whole budget: read the **worst case** line for them, and
+  rows whose worst case at the larger budget exceeds `--max-row-cost` are recorded
+  `skip:row-cost` (at 1024 tokens: openai o1-pro, o1-pro-2025-03-19 and gpt-5-pro; raise
+  `--max-row-cost` to 0.65 to include them).
+  Neither is part of the catalogue snapshot, so a snapshot rebuild never discards a
+  sweep. (A rebuild *reads* `bench.json` to count, below; it never writes it.)
+
+**How to read it.** TTFT is request-sent → first streamed token; total is
+request-sent → stream closed; tok/s is provider-reported output tokens divided by
+the generation window, shown `-` when the reply was too short to measure (never
+estimated). A blank row means *not benched*, not zero. `empt` means no text came
+back — most often a reasoning model spent all 96 tokens thinking (raise
+`--max-tokens` to see its answer; a `~` in the preview marks reasoning text shown
+because no answer arrived). **The probe is a bare chat message with no tools**, so a
+model can pass it and still fail a real Claude Code session (tool schemas, large
+prompts). It is one sample taken under sweep load: read it as a ranking.
+`--only provider/model` re-probes one row in isolation.
+
+**The model list.** One view, left to right: provenance gutter, id, `stat` (the probe
+status), `ttft`, `total`, `tok/s`, `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR`,
+`output`. The `limit` column is gone (it only ever showed `?`). The id column is only as wide as the provider's longest id (capped at 40;
+longer ids are elided in the middle), so the other columns sit beside it, and what is
+left over is empty space at the right. The id keeps at least 22 columns before any
+optional column is dropped. Narrow terminals drop columns in a fixed order: `output`
+first, then `tok/s`, then `total`; `modality` is always drawn, so it outlasts all three; the id
+grows toward its full width only once every column that fits is showing. At 80 columns you
+get id (22, its floor), `stat`, `ttft`, `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR`; `total`,
+`tok/s` and `output` do not fit (a short id, about 10 characters, still leaves room for
+`total` and `tok/s`). **Every column shows from a 103-column terminal** (101 when the
+longest id is 20 characters or fewer), with the id at 22 columns; a wider terminal
+first lets the id grow to its content, then widens the preview. Prices are at most
+five columns (`180.0` above 100, whole numbers above 1000).
+
+**Cut and broken streams.** A record with `x` (the probe cut the stream of a model that ignored
+`max_tokens`) has no honest `total`, which would be the time to the cut: that cell is blank, its
+`tok/s` is an estimate over the part seen and draws with a leading `~` (`~56`), and the `reply:` line
+starts `[cut]`. An `ok` record carrying `m` (a stream error after the first token) keeps its cells and
+its `reply:` line starts `[stream error]` followed by the message in parentheses.
+
+**The `modality` column** is what the route outputs, as one word, decided when the snapshot is
+built (`node menu/snapshot.mjs --build`) from the best positive evidence, in this order: the
+provider's own capability token from the discovery listing (`listing`); the catalogue entry's
+LiteLLM `mode` (`mode`); the entry's `modalities.output` when it names ONE modality
+(`output`); an `outputKind` of `nontext` with nothing more (`kind` -> `other`); and last, a
+fresh `ok` probe with no other evidence (`bench-ok` -> `chat?`). The words are `chat`,
+`chat?`, `image`, `audio`, `video`, `embed`, `rank`, `mod`, `stt` (speech to text), `ocr`,
+`live` (a realtime voice model) and `other`; **`?` means unknown and is never a guess**. The
+listing outranks the catalogue for the same reason `outputKind` does (a live `image` demotes a
+bundle entry that says `text`), so the two labels cannot contradict each other. Nothing comes
+from the id, and a failed probe (for example `not a chat model`, `/v1/chat/completions`) is
+never used: it says the request failed, not what the model is. A mixed output list
+(`audio` + `text`) is not treated as primary evidence. A route the picker already treats as not-chat
+(`outputKind` `nontext`, which dims it and shows `nochat` in `ctx`) is never labelled `chat`: a rung that
+would say so is skipped, and the next rung, or `other`, decides. The column is 8 wide (the size of its header; the words are at most 5), left-aligned like
+the badge, dim for `chat`, `chat?` and `?`, cyan for every other word so non-chat rows stand
+out. The snapshot stores it as `outModality` (always present, `null` when unknown) and the
+deciding source as `outModalitySrc` (present only when known); both arrived with snapshot
+schema 7 (a schema-6 file is rejected and rebuilt rather than drawn with blank `status` and `?`). The existing `modality` field is unchanged: it
+is still the listing's raw capability token. On the real 2026-09-29 data (6,032 routes) this
+gives: `chat` 3,672 (`mode` 2,097, `output` 1,346, `listing` 229), `chat?` 628 (`bench-ok`),
+`image` 106, `embed` 87, `video` 44, `audio` 33, `stt` 31, `live` 20, `rank` 11, `ocr` 9,
+`mod` 6, `other` 5, and `?` 1,380 (22.9%; every one of those has only failed probes).
+
+A long id is **elided to keep what differs**: for each provider the picker picks the
+head/tail split that leaves the fewest rows drawing an identical cell (then re-splits
+any group that still collides), so `gemini-3.6-flash:batch` and `...3.8...` stay
+distinguishable; in flat scope the `provider/` prefix stays whole whenever the model
+part alone can be made distinct. Measured on the real snapshot (terminal 80 / 90 /
+101 / 110 / 134 columns), rows drawing a cell shared with another row went from
+22 / 27 / 27 / 13 / 1 providers to 0 / 1 / 1 / 0 / 0 in a provider's list, and in flat
+scope from 644 / 1116 / 1116 / 227 / 26 targets to 84 / 188 / 188 / 5 / 0. The line
+above the footer, `id: ...`, always shows the selected row's **full** id (level 1 the
+model id, flat `provider/model`, provider list the whole key id including the omitted
+bucket) and is blank when the row cannot be selected; it costs one list row. On a model
+list (and in flat scope) a second line, `reply: ...`, sits under it: the selected row's
+full stored reply (or `skipped: <reason>`), sanitised, clipped with an ellipsis only at
+the frame edge, blank for an unbenched or stale row; it costs one more list row (the
+reducer and renderer share `rowsAvail`, so no screen exceeds the terminal height). The
+withheld-models overlay (`ctrl+r`) sizes its own id column (up to the longest
+withheld id). Wide (CJK), emoji and combining characters are drawn as `?` in every
+column so they cannot push a row past the frame; the underlying id is untouched.
+The `K ok` figure on a model list is counted live from `bench.json`, so it always
+matches the `benched` stamp and the `ctrl+o` list; the provider list keeps the
+snapshot's counts. The output column takes all the width that is left (the frame
+follows the terminal up to 260 columns): the stored reply, not the layout, limits it.
+
+Two filters apply to model lists only (`ctrl+o` and `ctrl+l`).
+Both are toggles, they combine with each other and with typed text (logical AND),
+they stay on when you go back a level, open another provider or switch to flat
+scope, and the header shows a chip for each (`[ok]`, `[1M+]`):
+
+- `ctrl+o` **ok-only**: only models whose latest *fresh* (last 14 days) bench status
+  is exactly `ok`. Unbenched, `empt`, `pay` and stale-`ok` models are out. With no
+  bench data at all the list is empty and says so.
+- `ctrl+l` **1M+**: `ctx >= 1,000,000` **or** an id ending in `[1m]` (any case).
+  Both are needed: in the real catalogue 1,062 ids carry the tag, one of them
+  (`teamorouter/kimi-k3[1M]`) with a null ctx, and two reach 1M without the tag.
+
+The header's right side is **counts only**: `N of M | K ok (P%)` on a provider
+(N = models matching the filters, M = the provider's models, K = that provider's
+models whose latest fresh bench result is `ok`, whatever the filters say, P = K as a
+share of M), `N of M models | K ok (P%)` in flat scope, and `P providers | M models |
+K ok (P%)` on the provider list; thousands take a separator from 1,000. `- ok` (a dash)
+means nothing was benched, never `0 ok`: it is shown when the bench reader has no
+records at all, and at level 1 also for a provider with no fresh record; `0 ok` appears
+only when the provider has at least one fresh record and none is `ok`. The **data
+stamps** (`routable`, `benched`, `discovered`) moved to the right end of the `id:` line
+of the selected row: the fullest candidate that fits after the id is drawn, then the
+next, else none, never a fragment. With no row selected there is no `id:` line and so
+no stamps. The `id:` line also carries `= alias` (a working sibling of a `gone` route)
+or `N plan` (plan-covered models) after the id when it fits.
+
+**Baked versus live.** The provider list (level 0) is BAKED: its counts, verdicts and
+its `(K ok)` total come from the snapshot and are as of the last `node menu/snapshot.mjs
+--build` (the header's `bench MM-DD` is that date). Model lists (level 1 and flat scope)
+are LIVE: their rows, `benched` stamp, `K ok` and the ok-only filter all read
+`bench.json` on first draw. After a new sweep the two can therefore disagree (for
+example `1396 ok` on the provider list and `1404 ok` in flat scope) until the snapshot
+is rebuilt.
+
+**The provider list's sweep columns.** Level 0 is, left to right: `key id`, `models`,
+`status`, `ok`, `free` (only from a 91-column terminal), then seven raw counts in this
+order: `empt`, `auth`, `pay`, `rate`, `gone`, `t/o`, `err`. The `dead`, `needs $`,
+`skip` and `limit` columns and the health label are gone.
+
+- `status` is **alive** when anything on the provider responded and **dead** when
+  nothing did. It is by *response*, not by result: an `ok`, an `empt`, an `auth` or `gone`
+  (an HTTP answer refusing the key or the model), a `pay`, a `rate`, and a provider-side
+  error body all count as a response. Only a `timeout` that got no first token back and a
+  transport-level `err` (`fetch failed`, `Failed to reach upstream provider`, `terminated`, a socket reset: the
+  `NO_RESPONSE` pattern in `menu/route-hints.mjs`) are no-response, and a provider is dead
+  only when it has at least one fresh probe result and *every* one is a no-response
+  failure. `skip` records are not probe results and are ignored. It is blank when the
+  provider has no fresh record (a provider nobody benched has no verdict). It is baked as
+  `benchFlags.alive` at snapshot build (snapshot schema 7).
+  On the real 2026-09-29 data every one of the 57 providers is alive; the previous `dead`
+  rule (no `ok`/`empt` and every record a refusal or failure) flagged 8.
+- `ok` and `free` are `COUNT (PCT%)` of the provider's models: the nearest whole
+  percent, but a non-zero count never reads 0% (it is `<1%`) and 100% reads `(100%)`.
+  `-` is a known zero; blank is unknown (no bench data, or a provider with no free-tier
+  data). The plan-covered count moved to the `id:` line (`N plan`).
+- Each raw count is how many of that provider's models had that status on their latest
+  probe, with no grouping. Only probes from the last 14 days count everywhere above, so
+  a model that was never benched (or not recently) is in **no** column and the counts can
+  add up to less than `models`. A count cell reads `-` for zero and `2k` from a thousand up.
+- **Pinned rows** (favourites `*` and recents) are drawn *above* the column header, closed
+  by a dim rule, so the cursor starts on them and the table below stays aligned. With no
+  pins there is no strip and no rule.
+
+The frame is the terminal width minus two, clamped between a **78-column floor** and 260. So the
+supported minimum is an 80-column terminal: on a narrower one the frame is wider than the terminal and
+wraps. Columns are separated by dim vertical rules (`┆` on Unicode terminals, `:` on ASCII ones), on the provider
+list and on model lists; each rule replaces the one-column gap the cell already had,
+so it costs no width and the header labels can never touch.
+
+Key ids are drawn **without the bucket segment** (`personal.`) when at least 80% of
+the rows share it and the shortened ids stay unique; the title says so (`ids shown
+without personal.`). A row in another bucket (`relay.`, `personal_maestro.`, ...)
+keeps its full id. Selection and filtering use the full id, so typing `personal`
+still matches every row (there is just nothing to highlight). Example (the 2026-09-29
+snapshot, 57 providers): this freed 9 characters on 53 of the 57 rows and the drawn
+ids were all unique.
+
+Width: the key id column is only as wide as the longest id **as drawn** (30 in that
+snapshot, set by the four rows in other buckets) and is **not** stretched on wide
+terminals, so the other columns sit next to it. At the 78-column floor the other level-0
+columns leave the key id 16 columns; `free` is drawn from a 91-column terminal and the
+key id reaches its full 30 from 105. An id that does not fit is **elided with a visible
+marker** using the same distinctness-aware split as model ids (so `openrouter-x-1` and
+`openrouter-x-2` stay different), never hard-cut.
+
+**Rules that keep the numbers honest.**
+- *Freshness:* a bench record is used only if it is at most 14 days old and not dated in
+  the future (judged against the later of the picker's start time and the real clock, plus 5 minutes of
+  skew, so a record a sweep wrote after the picker opened still counts, while a genuinely future one does not). That one rule is applied to the counts, the verdicts, the `K ok` figures,
+  the `ctrl+o` filter **and the cells drawn on a model row**, so a 30-day-old
+  measurement draws blank instead of a stale status.
+- *One dedupe rule, routes:* an `x` and an `x[1m]` are two selectable routes that share
+  one probe record. Both count, everywhere (counts, verdicts, the model-level and
+  provider-list figures, the ok-only list), so a count always equals the list it
+  describes. (The provider list's `ok`..`err` columns can therefore add up to more than
+  the number of distinct ids.)
+- *Stamps are UTC* and say so: `benched 09-29 12:35Z`, `routable ...Z`, `discovered
+  ...Z`. The provider list's `bench MM-DD` is a date only.
+- *Cells never lie:* a count of 100,000 or more draws `big` (never a truncated number),
+  and a duration over 9999 s draws `long`.
+- *Snapshot builds:* `node menu/snapshot.mjs --build` prints one line saying what the
+  provider columns were built from: `bench: N records as of <stamp>`, or `bench: no usable
+  bench data, provider columns will be blank`. If `bench.json` is missing, corrupt or the
+  wrong schema and the **previous** snapshot had counts, the build keeps the previous
+  counts and their stamp and says `bench: no usable bench data; kept the previous counts
+  as of <stamp>` instead of silently blanking them. Carried counts are re-aged against the
+  same 14-day window: if the previous stamp is older than that they are dropped, and the
+  notice says so.
+- *Font fallback:* the column rule is `┆`, which some fonts (Consolas, for one) lack. Set
+  `UW_PICKER_COLSEP=ascii` for `:` or `UW_PICKER_COLSEP=latin` for `¦` (U+00A6, in every
+  font). Anything else, and any ASCII terminal, keeps the default.
+
+The counts and verdicts are a snapshot of the last sweep, **baked into the
+snapshot**, not read live: the provider list never opens `bench.json` at startup. After a sweep, refresh them by rebuilding
+the snapshot, which also adds `bench MM-DD` (the sweep's date) to the header
+where it fits:
+
+```powershell
+node menu/snapshot.mjs --build
+```
+
+A snapshot built before this change is schema 5 and is refused (the picker says
+to rebuild); a rebuild with no `bench.json` shows blank cells.
+
+### 6e. Route hints baked at snapshot build: blank `FREE?` badges and alias labels
+
+Two hints are computed by `node menu/snapshot.mjs --build` from the bench data it already
+loads (`menu/route-hints.mjs`; the same 14-day freshness rule as everything else, so a stale
+or future-dated record changes nothing). Both are **additive optional fields** on a model row
+(an older snapshot simply has none and renders as before; the schema is 7 since `alive` and `outModality` joined the file).
+
+- **A `FREE?` badge whose fresh probe says `pay` is blanked.** `FREE?` means "zero price, or a
+  provider-published `:free` name"; a provider that answers "this request requires more
+  credits" is not (possibly) free. The badge becomes blank (still inside the closed set
+  `FREE` / `FREE?` / `PLAN` / `PAID` / blank) and the row gets `badgeNote: "probe: payment
+  required"`. `FREE` (real zero price and a grant), `PLAN` and `PAID` are never touched.
+  Example (the 2026-09-29 snapshot and bench file): 12 routes change (kilo 2, xkiro 4,
+  commandcode 2, teamorouter 3, tokenrouter 1). Refreshed on every rebuild, so a provider
+  that is funded later gets its `FREE?` back once the probe stops saying `pay`.
+- **Dead aliases point at the working route.** A route whose own fresh status is `gone`, and
+  whose sibling in the same provider is freshly `ok`, gets `aliasOf: "<sibling id>"`. Siblings
+  are found by the bench study's rules (plans/bench-study, section 4b): an org prefix
+  (`org/x` for `x`), the bare id, punctuation or case (`qwen3-5-27b` ~ `qwen3.5-27b`), or a
+  stripped suffix (`:free`, `:thinking`, `@eu`, `@us`, `-free`, `-latest`, `:nitro`,
+  `:floor`); a `:batch` id is a different route and never gets an alias, and `x` / `x[1m]`
+  is one model, not an alias. On a model list the output cell of such a row reads
+  `= <sibling> (works)` (dim), and the `id:` line reads `id: <id>  = <sibling>` when it fits.
+  The pointer is baked, but it is honoured only while both records are still fresh **now**
+  (a sibling that has since stopped answering shows nothing). It is a label: enter still
+  selects the row you are on. Example (same data): 59 routes (alibaba 26, openai 22, google
+  7, nousresearch 2, openrouter 1, cohere 1), exactly the study's count; the test replays
+  the study's frozen table (`plans/bench-study/models.csv`) to keep that true.
 
 ## 7. Troubleshooting
 

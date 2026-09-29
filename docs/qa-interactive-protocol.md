@@ -61,13 +61,36 @@ instead, you pressed ctrl+g on an empty prompt; the sentinel goes in first.
 
 **Do:** read the header row and the rows beneath it.
 
-**Expected:** `key id`, `models`, `free`, `health` in that order; rows show ids of
-the shape `personal.google.free`; at least one row shows `—` in the free column
-and at least one shows a number; `anthropic` shows `relay.anthropic.subscription`.
+**Expected:** `key id`, `models`, `status`, `ok`, then (from a 91-column terminal) `free`,
+then seven raw status columns `empt` `auth` `pay` `rate` `gone` `t/o` `err` in that
+order. There is no `health`, `dead`, `needs $`, `skip` or `limit` column. At about 80
+columns there is no `free` column and long key ids are clipped (16 characters); on a wide
+terminal the key id column is only as wide as the longest id (30 at most), the other
+columns sit right beside it (not pushed to the far edge), and spare width is empty space
+at the right. Every column is introduced by a dim vertical rule (`┆` on a Unicode terminal,
+`:` on an ASCII one), in the header and in every row, in the same screen columns. The title says
+`ids shown without personal.` and rows read `google.free` (not `personal.google.free`);
+a row in another bucket keeps its full id, and typing `personal` still matches the rows.
 
-**Fail means:** a `0` where `—` belongs is the failure that matters most — it is
-the design lying. `—` means "not yet determined"; `0` is a claim that the provider
-has no free models.
+`status` says `alive` (green) when anything on the provider responded (an `ok`, an
+empty reply, a refusal for payment or rate, an auth or not-found answer, a provider-side
+error), `dead` (red) only when every fresh probe got no response at all (a timeout with nothing
+back, or a connection failure), and is blank when nothing was benched. `ok` and `free` read
+`COUNT (PCT%)` (for example `236 (50%)`; `<1%` for a small non-zero count; `(100%)` whole);
+`-` is a known zero; blank is unknown. The other cells are counts, `-` for zero, or blank
+when the provider has no benchmark data (a snapshot built without a sweep is all blank,
+including `status`). Favourites and recents sit **above** the column header, closed by a
+thin rule; with none, there is no strip and no rule. The header's right end reads
+`P providers | M models | K ok (P%)` (`- ok` when nothing was benched) and nothing else;
+the line above the footer reads `id: <full key id>`, then `N plan` when that provider has
+plan-covered models, with `routable ...` / `bench ...` dates at its right end.
+
+**Fail means:** a `0` where `-` or blank belongs is the failure that matters most: it is
+the design lying (a blank means "not determined"; a `0` is a claim). A `dead` on a provider
+that answered anything, an `alive` or `dead` on a provider nobody benched, a status label
+touching its neighbour or a cell wider than its label plus a gap, a huge gap between
+`key id` and `models`, a pinned row below the column header, a stamp cut in half, or a
+ragged frame.
 
 ---
 
@@ -110,12 +133,21 @@ list slides in from the right, and it shows models rather than providers.
 
 **Do:** read the header and rows.
 
-**Expected:** `model`, `ctx`, `$in`, `$out`, `badge`, `caps`; context values render
+**Expected:** `model`, `stat`, `ttft`, then (as width allows) `total`, `tok/s`, then
+`ctx`, `$in`, `$out`, `badge`, `modality`, `TVR` (and later `output`); there is no `limit` column;
+context values render
 as `163k` or `1M`; prices show two decimals; badges are only ever `FREE`, `FREE?`,
 `PLAN`, `PAID` or blank; caps render as three characters drawn from `T`, `V`, `R`
 and `-`; models CCR cannot resolve are visibly dimmer than the rest.
 
-**Fail means:** any badge outside the five-value set, or a price with no decimals.
+A route whose last fresh probe said payment is required never shows `FREE?` (its badge is
+blank; `?` explains it). On a wide terminal a `gone` route that has a working sibling in the
+same provider shows `= <sibling> (works)` in its output cell and `id: <id>  = <sibling>` on
+the id line; enter on that row still selects the row itself.
+
+**Fail means:** any badge outside the five-value set, a `FREE?` on a route the bench says needs
+money, an alias that points at a sibling that does not answer, enter selecting the sibling,
+or a price with no decimals.
 
 ---
 
@@ -385,3 +417,70 @@ POSIX-ish shell Claude Code runs the statusline through ate the unguarded
 backslashes, and the child failed silently. If this step fails, read
 `statusLine.command` out of `settings.json` and check its quotes before
 suspecting `hud-shim.mjs`.
+
+---
+
+### P16-bench-view
+
+**Do:** open any provider (or press tab for flat scope). Look at the header and
+rows, then resize the terminal to about 80, about 100 and about 130 columns. Press
+`ctrl+b` (nothing should happen). Press `ctrl+o`, then `ctrl+l`, then each again.
+Press `?` and read the MODALITY, HEADER, ID LINE AND REPLY LINE, and BENCH COLUMNS sections.
+
+**Expected:** there is no toggle: one view shows the catalogue columns (`ctx`,
+`$in`, `$out`, `badge`, `modality`, `TVR`) **and** the measured ones (`stat`, `ttft`,
+`total`, `tok/s`, `output`) together, in that reading order (id, stat, ttft,
+total, tok/s, ctx, $in, $out, badge, modality, TVR, output), each column introduced by a
+dim vertical rule and the id column only as wide as the longest id (the columns sit
+beside it, spare width is empty space at the right). At about 80 columns you see
+everything up to `TVR` except `total`, `tok/s` and `output` (ids elided in the middle past
+22 characters); wider terminals add `total`, `tok/s` and finally `output`, in that
+order, and from about 103 columns every column shows. `modality` is present at every width. It
+reads one of `chat`, `chat?`, `image`, `audio`, `video`, `embed`, `rank`, `mod`, `stt`,
+`ocr`, `live`, `other` or `?` (unknown), dim for `chat`, `chat?` and `?` and cyan for the
+rest, left-aligned under the header `modality`, and a route that no evidence describes reads `?`,
+never `chat`; a route the picker already dims as not-chat is never labelled `chat`. The frame is never
+wider than the terminal, down to an 80-column terminal: the frame has a **78-column floor**, so on a terminal
+narrower than 80 columns it is wider than the terminal and wraps (80 columns is the supported minimum). The header's right end reads `N of M | K ok (P%)`
+(flat: `N of M models | K ok (P%)`; `- ok` when nothing was benched) and carries no
+dates: `routable`, `benched` and `discovered` sit at the right end of the `id:` line,
+whole or dropped, never cut. Under it a `reply:` line shows the selected row's full stored
+reply (`~` marks reasoning text; `skipped: <reason>` for a skip; blank when unbenched),
+clipped with an ellipsis only at the frame edge; it changes no frame height. The output
+column uses all the width there is (up to a 260-column frame). `ctrl+o` adds a
+`[ok]` chip and keeps only models whose last benchmark was `ok`; `ctrl+l` adds
+`[1M+]` and keeps ctx >= 1M or `[1m]`-tagged models; both together AND with each
+other and with typed text, `N of M` follows them, the cursor returns to the top, and
+an empty result says which toggles are on (and `no benchmark data yet` for ok-only
+without a bench file). Benched rows show a coloured status and timings, unbenched
+rows are **blank, not zero**, `empt` rows show no timings. `ctrl+b`, `ctrl+o` and
+`ctrl+l` do nothing at the provider list, and never type a character into the
+filter. `b` typed as a letter still filters.
+
+Column rules are dim, differ from the frame's own line, and appear in the header and
+every row at the same columns; pinned rows, the `... N more` line, the withheld row
+and the empty state carry none, and a selected row is inverted across the whole row.
+
+The `id:` line (above the `reply:` line at a model list) reads `id: <full id>` for the selected row (level 1 the
+model id, flat `provider/model`, the provider list the full key id with the omitted
+`personal.`), is blank on a row that cannot be selected, and is clipped from the left
+with an ellipsis only when longer than the frame. Long ids in the list elide keeping the
+part that differs (versions and suffixes stay visible) and CJK or emoji in an id or
+preview show as `?` without moving any column. `ctrl+r` on a provider with withheld
+models shows the whole withheld id where the terminal allows.
+
+Header stamps end in `Z` (UTC). A model row whose newest bench record is older than 14
+days draws blank measured cells. On a terminal whose font lacks `┆`, `UW_PICKER_COLSEP=ascii`
+(or `latin`) swaps the rule without moving any column.
+
+A row whose stream was cut for ignoring `max_tokens` draws a blank `total`, a `~`-prefixed `tok/s`
+and a `reply:` line starting `[cut]`; an ok row with a stream error after the first token has a
+`reply:` line starting `[stream error]`.
+
+**Fail means:** a stale (30-day) status drawn on a row, a cut row showing a `total`, two rows drawing the same id cell
+when the width allows better, a
+row wider than the frame after a non-Latin id, a header `K ok` that disagrees with the
+`ctrl+o` list length, a ragged or wrapped frame at any width, columns touching, a big gap
+between the id and the next column, zeros on unbenched rows, a `modality` that says `chat` for an image, audio or embedding model or a guessed value where `?` belongs, a `limit` column, a chip missing while a
+filter is on, an `ok` figure showing `0 ok` for no data, a `reply:` line that changes the frame height or shows escape characters, a preview that shows escape
+characters or garbles the frame, or a control key appearing in the filter text.

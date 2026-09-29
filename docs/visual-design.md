@@ -15,39 +15,45 @@ invariant test asserts for every frame in both glyph sets.
 ## Level 0 — providers
 
 ```text
-╭─ UW ▸ providers ───────────────────────────────────────────────────────────╮
-│  filter: gem▏                      44 providers ▸ 1584 models ▸ routable — │
+╭─ UW ▸ providers ▸ ids shown without personal. ─────────────────────────────╮
+│  filter: ▏                      44 providers · 1,584 models · 610 ok (39%) │
 │                                                                            │
-│  key id                         models   free                health        │
 │▶ ★ google/gemini-3.5-flash-lite                                            │
-│  ↺ groq/llama-4-scout                                                      │
-│  personal.google.free                3   ▰▰▰▰▰▰ 3          ● ok            │
-│  personal.openrouter.free          324   ▰▱▱▱▱▱ 41 +4 plan ● ok            │
-│  personal.acme.paid                 12   ▱▱▱▱▱▱ 0          ◐ needs $       │
-│  personal.dead.free                  7          —          ✖ broken        │
-│  … 38 more                                                                 │
-╰ [↑↓] move  [⇥] scope  [^f] fav  [?] keys  [esc] back ──────────────────────╯
+│  ───────────────────────────────────────────────────────────────────────   │
+│  key id          ┆models┆status┆        ok┆empt┆auth┆pay┆rate┆gone┆t/o┆err │
+│  google.free     ┆     3┆ alive┆   2 (67%)┆   -┆   -┆  -┆   -┆   1┆  -┆  - │
+│  openrouter.free ┆    12┆ alive┆   5 (42%)┆   1┆   1┆  3┆   -┆   2┆  -┆  - │
+│  acme.paid       ┆     1┆ alive┆         -┆   -┆   -┆  1┆   -┆   -┆  -┆  - │
+│  dead.free       ┆     1┆  dead┆         -┆   -┆   -┆  -┆   -┆   -┆  1┆  - │
+│  id: google/gemini-3.5-flash-lite                       bench 09-29 19:26Z │
+╰ [↑↓] move  [↵] open  [⇥] scope  [^f] fav  [?] all keys  [esc] back ────────╯
 ```
 
-`routable —` means the refresher has never resolved routability, so nothing on
-screen is dimmed. The stamp is printed rather than implied because an undimmed
-row means either "routable" or "nobody checked", and those are different claims.
-
-`personal.dead.free` shows `—` in the free column rather than `0`: it has no
-price data at all, and "no measurement" is not the same fact as "zero free".
+Columns, left to right: `key id`, `models`, `status` (`alive` green, `dead` red, blank when nothing was
+benched), `ok` and `free` as `COUNT (PCT%)` (`free` only from a 91-column terminal), then the seven raw status
+counts `empt auth pay rate gone t/o err` (`-` is a known zero, blank is unknown). Every column is introduced by
+a dim rule (`┆`, `:` in ASCII). Favourites and recents sit above the column header, closed by a thin rule.
+The header's right side is counts only; the dates (`routable`, `bench`) sit at the right end of the `id:` line,
+which shows the selected row in full. A blank `status`/`ok` means "not measured", never "zero".
 
 ## Level 1 — a provider's models
 
 ```text
 ╭─ UW ▸ personal.google.free ▸ models ───────────────────────────────────────╮
-│  filter: flash▏                                                    3 of 34 │
+│  filter: ▏                                             3 of 3 · 2 ok (67%) │
 │                                                                            │
-│  model                                ctx     $in   $out  badge TVR        │
-│▶ gemini-3.5-flash-lite                 1M    0.00   0.00  FREE  TVR        │
-│  gemini-3.5-flash                      1M    0.30   2.50  PAID  TVR        │
-│  gemini-3.5-flash-thinking             1M    0.30   2.50  PAID  TV-        │
-╰ [↑↓] move  [↵] select  [^f] fav  [?] keys  [esc] back ─────────────────────╯
+│    model                ┆stat┆ ttft┆   ctx┆  $in┆ $out┆badge┆modality┆TVR  │
+│▶ ◇ gemini-3.5-flash-lite┆ok  ┆842ms┆    1M┆ 0.00┆ 0.00┆FREE ┆chat    ┆TVR  │
+│  ◇ gemini-3.5-flash     ┆ok  ┆910ms┆    1M┆ 0.30┆ 2.50┆PAID ┆chat    ┆TVR  │
+│  ◇ veo-3.1              ┆gone┆     ┆    1M┆ 0.00┆ 0.00┆     ┆video   ┆TVR  │
+│  id: gemini-3.5-flash-lite             benched 09-29 19:26Z · discovered — │
+│  reply: Hello there!                                                       │
+╰ [↑↓] move  [↵] select  [^f] fav  [^o] ok  [^l] 1M+  [?] keys  [esc] back ──╯
 ```
+
+The `modality` column says what the route outputs (`chat` dim, everything else cyan, `?` unknown). Under the
+`id:` line, `reply:` shows the selected row's stored reply in full. `total`, `tok/s` and `output` join from
+wider terminals (every column shows from 103 columns).
 
 ## Empty state
 
@@ -79,11 +85,8 @@ both sets, which the frame-width invariant depends on.
 | cursor | `▶` | `>` |
 | favourite | `★` | `*` |
 | recent | `↺` | `~` |
-| health ok | `●` | `*` |
-| health needs $ | `◐` | `$` |
-| health broken | `✖` | `x` |
-| health stale | `○` | `o` |
-| bar filled / empty | `▰` `▱` | `#` `.` |
+| column rule | `┆` | `:` |
+| counts separator | `·` | `|` |
 | confirm | `✔` | `OK` |
 | arrow | `→` | `->` |
 | breadcrumb separator | `▸` | `>` |
@@ -105,10 +108,10 @@ both sets, which the frame-width invariant depends on.
 | vision `V` | magenta |
 | reasoning `R` | yellow |
 | absent capability `-` | dim |
-| health ok | green |
-| health needs $ | yellow |
-| health broken | red |
-| health stale | dim |
+| status `alive` / `dead` | green / red |
+| `ok` count / `free` count | green / cyan |
+| modality `chat` | dim |
+| modality, any other known word | cyan |
 | title | 256-colour ramp, degrading to cyan at 16 colours |
 
 An unroutable row (`routable === false`) is dimmed whole. `routable === null`

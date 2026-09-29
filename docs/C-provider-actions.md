@@ -48,7 +48,7 @@ Total routes covered: 117 of the 3,931 routes that did not answer (3.0%; the ope
 
 ## 2. Before you start
 
-**What the picker and its columns mean.** Open the picker with `m` (or `model`) then `ctrl+g` inside Claude Code. The model list shows, per route, the status of its last probe (`ok`, `auth`, `pay`, `gone`, `err`, `rate`, `t/o`, `empt`), timings, and a preview of the reply. `ctrl+o` toggles an ok-only filter. The provider list has two verdict columns, `dead` and `needs $`, then one count per status. `dead: yes` means nothing on that provider answered and every probe was refused or failed. `needs $: yes` means every benched route was refused for payment and none answered.
+**What the picker and its columns mean.** Open the picker with `m` (or `model`) then `ctrl+g` inside Claude Code. The model list shows, per route, the status of its last probe (`ok`, `auth`, `pay`, `gone`, `err`, `rate`, `t/o`, `empt`), timings, and a preview of the reply. `ctrl+o` toggles an ok-only filter. The provider list has a `status` column, then `ok` and `free` as COUNT (PCT%) of the provider's models, then one count per status (`empt`, `auth`, `pay`, `rate`, `gone`, `t/o`, `err`). `status` reads `alive` when anything on that provider responded at all, including a refusal for the key, the model or payment; it reads `dead` only when every fresh probe got no response (a timeout with nothing back, or a connection failure), and is blank when nothing was benched. There is no `needs $` column: a provider that needs money shows its routes in the `pay` count.
 
 **How to read `auth` versus `pay`.**
 - `auth` means the provider refused the credential or the account's entitlement (HTTP 401 or 403, or a sentence saying the account is not eligible). The model exists; this account cannot use it yet.
@@ -57,7 +57,7 @@ Total routes covered: 117 of the 3,931 routes that did not answer (3.0%; the ope
 
 **When a fix shows up in the picker.** Two separate things, and you need both for the provider list:
 1. A re-probe writes new records to `state/bench.json`. Model lists read `bench.json` live, so a re-probed route shows its new status the next time you open that model list.
-2. The provider list (the `dead` and `needs $` columns and the per-status counts) and the route hints are baked into the snapshot. Rebuild it with `node menu/snapshot.mjs --build`. Until you do, the provider list keeps showing the old verdict. (Source: `menu/legend.mjs`, "every figure and row on this LIST is BAKED into the snapshot".)
+2. The provider list (the `status` column, the `ok` / `free` counts and the per-status counts) and the route hints are baked into the snapshot. Rebuild it with `node menu/snapshot.mjs --build`. Until you do, the provider list keeps showing the old figures. (Source: `menu/legend.mjs`, "every figure and row on this LIST is BAKED into the snapshot".)
 
 **Expiry.** The picker stops treating a bench record as current after 14 days (`BENCH_FRESH_MS` in `menu/bench-data.mjs`). The oldest records here are from 2026-09-29T10:26Z, so they expire from the picker at 2026-10-13T10:26Z. A default re-probe skips records younger than 7 days.
 
@@ -133,7 +133,7 @@ How to read the status code (this table is reused by sections 4.2b, 4.8, 4.9 and
 **What it means.** Three facts, in order.
 1. The sweep goes through CCR, which held an OLD sambanova key. SambaNova answered 401 "Incorrect API key": it did not recognise that credential at all.
 2. You replaced the stored key in the vault. A direct test of the NEW key returned HTTP 402 Payment Required. A 402 is a different kind of answer: SambaNova recognised the key (identity is fine) and refused because the account has no usable credit. So 401 to 402 is progress: the key problem is solved and what remains is a money problem. This is now a MONEY case, not a key case.
-3. The new key is only in the vault. CCR still holds the old key until you push it, so a re-probe today would still say "Incorrect API key". Once it is pushed AND the routes are re-probed, the 7 routes change from `auth` to `pay` and the provider from `dead` to `needs $` (after a snapshot rebuild).
+3. The new key is only in the vault. CCR still holds the old key until you push it, so a re-probe today would still say "Incorrect API key". Once it is pushed AND the routes are re-probed, the 7 routes change from `auth` to `pay`, so the provider's `auth` count drops to 0 and its `pay` count reads 7 (after a snapshot rebuild; `status` is `alive` throughout, because an `auth` or `pay` answer is a response).
 SambaNova's plans page says the Free plan requires adding a payment method and purchasing credits before requests run (https://cloud.sambanova.ai/plans, checked 2026-09-29). Community threads report that billing can lag or misbehave after adding a card (https://community.sambanova.ai/t/developer-tier-free-models-not-working/1717 and https://community.sambanova.ai/t/a-payment-method-is-required-to-use-minimax-m2-7-please-set-up-a-payment-method-to-continue/1671), so a card added today may need up to about 20 minutes, per a staff reply in the second thread.
 
 **What you need to do.**
@@ -153,7 +153,7 @@ SambaNova's plans page says the Free plan requires adding a payment method and p
    node C:\Users\osami\.uw\menu\snapshot.mjs --build
    ```
 
-**How to check it worked.** After the push but before any credit: the 7 routes read `pay` (message about payment or credits), and the provider list shows `needs $: yes`. After credit is added: the routes read `ok`, the provider shows `dead: no`, and `ok` count 7. Model lists update at once; the provider list after `--build`.
+**How to check it worked.** After the push but before any credit: the 7 routes read `pay` (message about payment or credits), and the provider list shows `pay` 7. After credit is added: the routes read `ok` and the `ok` count reads 7 (100%). Model lists update at once; the provider list after `--build`.
 
 **Expected recovery.** Up to 7 routes, only if credit is added. Even then not guaranteed: a community report says a specific model (MiniMax-M2.7) kept saying a payment method was required after adding a card. Without money: 0 routes recover, but the picker becomes accurate (7 x `pay`).
 
@@ -400,7 +400,7 @@ SambaNova's plans page says the Free plan requires adding a payment method and p
 
 #### kktoken (1 route) and justdowork (1 route)
 
-**Current state.** `kktoken/gpt-4o-mini` (sentence "kktoken: Upstream request failed.") and `justdowork/claude-opus-4-8` (sentence "justdowork: Upstream request failed."), each the only route of its provider, each `auth` (HTTP 401 or 403) with the reason hidden by the gateway, both probed 2026-09-29T10:44Z. Both providers are in the `dead` verdict.
+**Current state.** `kktoken/gpt-4o-mini` (sentence "kktoken: Upstream request failed.") and `justdowork/claude-opus-4-8` (sentence "justdowork: Upstream request failed."), each the only route of its provider, each `auth` (HTTP 401 or 403) with the reason hidden by the gateway, both probed 2026-09-29T10:44Z. Both providers read `alive` (an `auth` answer is a response), each with its one route in the `auth` count.
 
 **What it means.** Unknown. No public documentation of these providers was found. It could be an invalid key, an inactive account, or a model not enabled.
 
@@ -412,7 +412,7 @@ SambaNova's plans page says the Free plan requires adding a payment method and p
    node C:\Users\osami\.uw\refresh\bench-cli.mjs --live --force --only kktoken/gpt-4o-mini,justdowork/claude-opus-4-8
    ```
 
-**How to check it worked.** The route reads `ok` and the provider shows `dead: no` after `node menu\snapshot.mjs --build`.
+**How to check it worked.** The route reads `ok` and the provider shows `ok` 1 (100%) after `node menu\snapshot.mjs --build`.
 
 **Expected recovery.** 0 to 2.
 
@@ -422,7 +422,7 @@ SambaNova's plans page says the Free plan requires adding a payment method and p
 
 ### 4.9 indeedwebid (1 route)
 
-**Current state.** 1 route `auth`: `indeedwebid/ineed/freetier`, sentence "indeedwebid: Invalid or inactive API key". Its discovery call also returned 401 (providers.csv). Host is `ineed.web.id`. The provider is `dead`.
+**Current state.** 1 route `auth`: `indeedwebid/ineed/freetier`, sentence "indeedwebid: Invalid or inactive API key". Its discovery call also returned 401 (providers.csv). Host is `ineed.web.id`. The provider reads `alive` with `auth` 1.
 
 **What it means.** A key or account problem, and the only remaining clear key problem in the whole `auth` set now that sambanova has turned out to be a money case. I found no public documentation for this provider.
 
@@ -516,7 +516,7 @@ node C:\Users\osami\.uw\refresh\bench-cli.mjs --live --only google/gemini-3.6-fl
    node C:\Users\osami\.uw\refresh\bench-cli.mjs --live --force --only kiosapi/deepseek-v4.1-flash-free,tokenrouter/qwen/qwen3.8-max-free
    ```
 
-**How to check it worked.** seekai, tabiai, gorouter: the routes read `ok` (and `dead` turns to `no` after `node menu\snapshot.mjs --build`). kiosapi and tokenrouter: `ok`.
+**How to check it worked.** seekai, tabiai, gorouter: the routes read `ok` (and the provider's `ok` count rises after `node menu\snapshot.mjs --build`). kiosapi and tokenrouter: `ok`.
 
 **Expected recovery.** seekai up to 12, tabiai and gorouter up to 1 each, when the provider is back; they may also stay down. kiosapi and tokenrouter up to 1 each.
 
@@ -530,8 +530,8 @@ One provider at a time, in this order. Before any `--live`, run the same command
 
 1. **Dry plan** (sends nothing): the command with the exact `--only` list from the provider's section, plus `--force` for `auth`, `pay` and `gone` rows.
 2. **Live re-probe:** the same command with `--live`. Read the summary line; a run that gives exit code 3 means requests were sent and nothing answered `ok`; exit code 4 means the gateway went down (re-run later).
-3. **Rebuild the snapshot:** `node C:\Users\osami\.uw\menu\snapshot.mjs --build`. Needed for the provider-list columns (`dead`, `needs $`, counts) and route hints.
-4. **Verify in the picker:** open the picker (`m`, then `ctrl+g`). On the provider list, check the `dead` and `needs $` columns and the per-status counts (`ok`, `auth`, `pay`) for that provider. Open the provider, press `ctrl+o` for the ok-only filter, and confirm the recovered routes appear.
+3. **Rebuild the snapshot:** `node C:\Users\osami\.uw\menu\snapshot.mjs --build`. Needed for the provider-list columns (`status`, `ok` / `free`, the per-status counts) and route hints.
+4. **Verify in the picker:** open the picker (`m`, then `ctrl+g`). On the provider list, check the `status` column and the `ok` and per-status counts (`auth`, `pay`, ...) for that provider. Open the provider, press `ctrl+o` for the ok-only filter, and confirm the recovered routes appear.
 
 Per-provider re-probe commands are in each section. Quick reference (dry plans first):
 
