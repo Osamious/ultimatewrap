@@ -263,6 +263,39 @@ export function checkCcrPatch({ file, read = null }) {
 }
 
 /**
+ * The slow-startup regression, checked rather than remembered. With
+ * CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY set, Claude Code fetches the whole
+ * gateway model list at every launch and processes the cache it writes; at UW's
+ * ~6,000 models that was ~100 s of CPU against ~16 s (MEASURED 2026-09-09,
+ * re-confirmed 2026-09-29: 10.4 s once removed).
+ *
+ * CCR writes the variable back on every profile apply, so this fails again
+ * whenever something OTHER than `keysync/run.mjs` (which strips it) re-applied
+ * CCR's profile -- the CCR web UI, a restart -- and that is exactly the case
+ * this exists to catch. `envValue` is the raw value or undefined; `cacheBytes` is
+ * the cache file's size or null when absent.
+ */
+export const GATEWAY_DISCOVERY_CACHE_WARN_BYTES = 200_000;
+export function checkGatewayDiscovery({ envValue, cacheBytes }) {
+  const name = "startup-discovery";
+  if (envValue !== undefined) {
+    return { name, ok: false, verdict: "red",
+      evidence: `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set (${JSON.stringify(envValue)}) in ` +
+                `Claude Code's settings env. CCR re-adds it on every profile apply and it makes ` +
+                `launch ~10x slower at this model count. Re-run \`node keysync/run.mjs --target ` +
+                `live --i-know\` (it strips the variable), or delete the env entry by hand` };
+  }
+  if (cacheBytes != null && cacheBytes > GATEWAY_DISCOVERY_CACHE_WARN_BYTES) {
+    return { name, ok: false, verdict: "amber",
+      evidence: `the variable is unset but a ${Math.round(cacheBytes / 1024)} KB gateway-models.json ` +
+                `cache remains from an earlier session. A launch that inherits the variable from a ` +
+                `parent shell regenerates it; rename the file to set it aside` };
+  }
+  return { name, ok: true, verdict: "green",
+    evidence: "gateway model discovery is off; no oversized gateway-models cache" };
+}
+
+/**
  * The CCR RPC surface, probed rather than assumed.
  *
  * Report 10, P1 #14: RPC method names are WIRE STRINGS, not minified identifiers
@@ -367,12 +400,13 @@ export function checkBundled({ dir, catalogue, version, verified }) {
 }
 
 export function diagnose({ env, handoff, current, pinned, contracts, hud, handoffOpts,
-                           bundled, ccrPatch, rpcSurface }) {
+                           bundled, ccrPatch, rpcSurface, gatewayDiscovery }) {
   const checks = [checkEnv(env), checkHandoff(handoff, handoffOpts),
                   checkFingerprint(current, pinned)];
   if (contracts) checks.push(checkContracts(contracts));
   if (bundled) checks.push(checkBundled(bundled));
   if (ccrPatch) checks.push(checkCcrPatch(ccrPatch));
+  if (gatewayDiscovery) checks.push(checkGatewayDiscovery(gatewayDiscovery));
   if (rpcSurface) checks.push(checkRpcSurface(rpcSurface));
   if (hud) checks.push(checkHud(hud));
   const verdict = checks.reduce((w, c) => (RANK[c.verdict] > RANK[w] ? c.verdict : w), "green");
@@ -423,6 +457,22 @@ function hudRoundTrip() {
   } catch (e) { return { ok: false, why: String(e.message).slice(0, 80) }; }
 }
 
+// Paths come from the Claude Code contract module, never spelled here: the
+// cache lives beside settings under the same config directory.
+function gatewayDiscoveryInputs() {
+  const settingsFile = CC.CONTRACT.paths.settings;
+  let envValue;
+  try {
+    const s = JSON.parse(fs.readFileSync(settingsFile, "utf8").replace(/^﻿/, ""));
+    envValue = s?.env?.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY;
+  } catch { /* unreadable settings: report the variable as absent, not as a crash */ }
+  let cacheBytes = null;
+  try {
+    cacheBytes = fs.statSync(path.join(path.dirname(settingsFile), "cache", "gateway-models.json")).size;
+  } catch { /* no cache file */ }
+  return { envValue, cacheBytes };
+}
+
 export async function main() {
   const current = readClaudeFingerprint();
   const pinned = readJson(CAPABILITIES).fingerprint ?? {};
@@ -441,6 +491,7 @@ export async function main() {
     bundled: { dir: CCR.CONTRACT.installDir, catalogue: CCR.CONTRACT.bundledCatalogue,
                version: CCR.ccrVersion(), verified: CCR.CONTRACT.verifiedVersion },
     ccrPatch: { file: CCR.CONTRACT.gatewayBundle },
+    gatewayDiscovery: gatewayDiscoveryInputs(),
     rpcSurface: await CCR.probeRpcSurface(),
     hud: install && {
       install,
