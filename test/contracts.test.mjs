@@ -207,6 +207,11 @@ const BOUNDARY_ALLOW = new Map([
   // reads. Keyed to those two needles only, so a NEW settings path, APPDATA
   // reference or hard-coded loopback address in the doctor still trips the guard.
   ["doctor.mjs", /claude-code-router|node_modules/],
+  // catalog-store.mjs is the one place the CCR bundle's node_modules path is
+  // allowed to live at all (B4) -- the fallback resolveCatalogPath() logs
+  // when it takes. Keyed to that needle only, so any OTHER hardcode here
+  // (a settings path, an APPDATA reference, a loopback address) still trips.
+  ["catalog-store.mjs", /claude-code-router|node_modules/],
 ]);
 
 test("no file outside the two contract modules names Claude Code or CCR", () => {

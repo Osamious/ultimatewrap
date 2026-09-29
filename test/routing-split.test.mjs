@@ -149,7 +149,11 @@ test("MUTATION: reverting the candidate set to discovery-only DELETES tabiai and
     .replace('from "../menu/denylist.mjs"',
       `from ${JSON.stringify(new URL("../menu/denylist.mjs", import.meta.url).href)}`)
     .replace('from "./catalog-join.mjs"',
-      `from ${JSON.stringify(new URL("../keysync/catalog-join.mjs", import.meta.url).href)}`);
+      `from ${JSON.stringify(new URL("../keysync/catalog-join.mjs", import.meta.url).href)}`)
+    .replace('from "../menu/atomic.mjs"',
+      `from ${JSON.stringify(new URL("../menu/atomic.mjs", import.meta.url).href)}`)
+    .replace('from "../refresh/catalog-store.mjs"',
+      `from ${JSON.stringify(new URL("../refresh/catalog-store.mjs", import.meta.url).href)}`);
   assert.notEqual(mutated, src, "the mutation must actually change the source");
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r11-mutant-"));

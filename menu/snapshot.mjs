@@ -28,7 +28,15 @@ import { writeAtomic } from "./atomic.mjs";
 // and an OLD snapshot really has not been probed -- so a stale schema-3 file
 // must be rejected and rebuilt rather than read as a set of unknowns that will
 // never resolve.
-export const SNAPSHOT_SCHEMA = 4;
+// 5: `health`'s MEANING changes, not its shape -- still a string on each row,
+// but now resolved from probe history (menu/health.mjs) instead of derived
+// live from the vault's notes/requiresBalance fields alone (Task B7). A
+// schema-4 row's `health` value was computed under the old rule; reading it
+// as if it came from the new one would silently misreport an unmeasured
+// provider as "ok" or vice versa. Bumped so a stale schema-4 file is rejected
+// and rebuilt rather than served with a health column whose meaning changed
+// out from under it.
+export const SNAPSHOT_SCHEMA = 5;
 
 // The closed vocabulary schema 3 persists (revision 6, #59). Named here so a
 // test can assert the FULL set -- both that nothing legal is missing and that

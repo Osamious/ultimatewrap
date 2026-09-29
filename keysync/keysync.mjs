@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { admitRemoteModels } from "../menu/denylist.mjs";
+import { readJsonOr } from "../menu/atomic.mjs";
 // The offer-matching rule and the has-a-price-at-all predicate, from the module
 // that owns them. NOT from `menu/catalog.mjs`: that file statically imports THIS
 // one (`menu/catalog.mjs:25`, deliberately, with a comment saying why it is not
@@ -22,6 +23,7 @@ import { admitRemoteModels } from "../menu/denylist.mjs";
 // import from `keysync/catalog-join.mjs`, which imports neither.
 import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry,
          trustedContextTokens } from "./catalog-join.mjs";
+import { resolveCatalogPath } from "../refresh/catalog-store.mjs";
 
 // ---------------------------------------------------------------- vault load
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -65,17 +67,27 @@ export function filterRegistry(registry, providers) {
 
 // --------------------------------------------------------------- tie-breaks
 // The plan requires multi-key providers resolve to a DELIBERATELY CHOSEN key by
-// name, never by an unexamined timestamp. Only two providers survive the filter
-// with multiple keys. Both choices are recorded here with their reason.
-export const KEY_CHOICES = {
-  // 19-second timestamp gap would otherwise silently route the user's personal
-  // traffic through an institutional (university) key. Prefer the personal one.
-  groq: "personal.groq.free",
-  // Both are personal buckets; pick the primary one explicitly.
-  deepseek: "personal_maestro.deepseek.paid"
-};
+// name, never by an unexamined timestamp. #21: this choice used to be a
+// hardcoded object here (`KEY_CHOICES`), which meant adding a second key for
+// any new provider was a source edit and redeploy. It now lives in
+// ~/.llmkeys/key-choices.json -- identical shape, read at runtime -- so
+// `keysync/key.mjs add` can write a choice without touching this file. The
+// object's uniqueness property (one value per provider key) is preserved
+// exactly: a JS object cannot express two choices for one key any more than
+// the old literal could, which is why this stays a map and not a per-entry
+// flag on the registry rows.
+//
+// Absent or missing file both mean "no choices recorded yet" -- not an error.
+// A provider with no recorded choice still resolves fine as long as it has at
+// most one key after filterRegistry; the throw below only fires on genuine
+// ambiguity, exactly as it always did.
+export const KEY_CHOICES_FILE = path.join(LLMKEYS, "key-choices.json");
 
-export function chooseKeys(filtered) {
+export function loadKeyChoices(file = KEY_CHOICES_FILE) {
+  return readJsonOr(file, {});
+}
+
+export function chooseKeys(filtered, choices = loadKeyChoices()) {
   const byProvider = new Map();
   for (const r of filtered) {
     if (!byProvider.has(r.provider)) byProvider.set(r.provider, []);
@@ -85,21 +97,25 @@ export function chooseKeys(filtered) {
   const ambiguous = [];
   for (const [provider, entries] of byProvider) {
     if (entries.length === 1) { chosen.push(entries[0]); continue; }
-    const want = KEY_CHOICES[provider];
+    const want = choices[provider];
     const pick = entries.find((e) => e.id === want);
     if (!pick) { ambiguous.push({ provider, ids: entries.map((e) => e.id) }); continue; }
     chosen.push(pick);
   }
   if (ambiguous.length) {
-    throw new Error(`multi-key provider(s) with no deliberate choice in KEY_CHOICES: ` +
+    throw new Error(`multi-key provider(s) with no deliberate choice in ${KEY_CHOICES_FILE}: ` +
       `${JSON.stringify(ambiguous)} — decide by name, do not let a timestamp decide.`);
   }
   return chosen;
 }
 
 // ------------------------------------------------------------------ catalog
-const CATALOG_FILE = "C:\\nvm4w\\nodejs\\node_modules\\@musistudio\\claude-code-router\\dist\\models.json";
-
+// B4: the path is resolved through `refresh/catalog-store.mjs` rather than
+// hardcoded here -- a local flat copy if one exists, else the node_modules
+// bundle with a logged warning. A global `npm i -g` has already silently
+// wiped a local patch once; a bare, fallback-less hardcode had no way to
+// notice that happening short of an ENOENT crash.
+//
 // Returns the two groupings the FILE declares about itself. `byProvider` is the
 // grouping every caller already had; `byAlias` is the bundle's own `aliases[]`
 // field, which this function used to discard (report 12 §1) -- 10,184 strings
@@ -112,7 +128,7 @@ const CATALOG_FILE = "C:\\nvm4w\\nodejs\\node_modules\\@musistudio\\claude-code-
 // nothing. A collision would still be first-wins, which is the same rule
 // `byProvider` push order already follows.
 export function loadCatalog() {
-  const doc = readJson(CATALOG_FILE);
+  const doc = readJson(resolveCatalogPath());
   const byProvider = new Map();
   const byAlias = new Map();
   for (const m of doc.models ?? []) {
@@ -1807,6 +1823,36 @@ export function stripOneMSuffix(settings) {
     stripped += 1;
   }
   return stripped;
+}
+
+/**
+ * Claude Code's gateway model discovery: with this env var set it fetches
+ * `GET /v1/models` at every startup and writes the result to
+ * `cache/gateway-models.json`. UW routes thousands of models, so that cache
+ * reached 688 KB (~4,990 entries) and Claude Code's own startup processing of it
+ * took ~100 s of CPU against ~16 s without it. MEASURED 2026-09-09 via Claude
+ * Code's `[event-loop-stall]` diagnostic; re-confirmed 2026-09-29 (cache 868 KB,
+ * clean launch 10.4 s once the variable was gone).
+ *
+ * The feature is a pure cost here: `modelPicker.replaceBuiltInOptions: true`
+ * erases every discovered row, and UW carries its rows in `modelPicker.options[]`.
+ *
+ * WHY THIS IS A GUARD AND NOT A ONE-OFF EDIT: CCR owns the variable. Its claude-code
+ * profile defaults `env` to `{CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1"}`
+ * (`K0` in cli.js) and writes that into settings.json on every profile apply --
+ * i.e. on every `--target live` run. Hand-removing it (2026-09-09) held only until
+ * the next apply. Configuration cannot turn it off: Claude Code gates on raw
+ * truthiness (`if(!a.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY)`, so "0" is
+ * still ON) and CCR's env sanitizer drops empty values, then re-defaults "1".
+ * Removal after CCR's write is the only lever this repo owns.
+ *
+ * @returns {boolean} whether the variable was present and removed
+ */
+export const GATEWAY_DISCOVERY_ENV = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
+export function stripGatewayDiscovery(settings) {
+  if (!settings?.env || !(GATEWAY_DISCOVERY_ENV in settings.env)) return false;
+  delete settings.env[GATEWAY_DISCOVERY_ENV];
+  return true;
 }
 
 /**

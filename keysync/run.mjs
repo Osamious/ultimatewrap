@@ -6,6 +6,8 @@
 //
 // --target live writes the REAL ~/.claude/settings.json and will change how any
 // running Claude Code session routes. It refuses unless --i-know is also passed.
+// Add --no-restart to make it refuse (writing nothing) if the change would
+// restart the gateway.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -16,7 +18,7 @@ import { RESERVED } from "../menu/denylist.mjs";
 import { fetchAnthropicCatalog } from "./anthropic-catalog.mjs";
 import {
   loadVault, filterRegistry, chooseKeys, loadCatalog, buildProviders,
-  validate, stripOneMSuffix, reconcileUserModelPin, KEY_CHOICES, ANCHOR_PREFERENCE,
+  validate, stripOneMSuffix, stripGatewayDiscovery, reconcileUserModelPin, loadKeyChoices, ANCHOR_PREFERENCE,
   ANTHROPIC_RELAY, ANTHROPIC_TIERS, ANTHROPIC_FULL, ANTHROPIC_FALLBACK_TAGS,
   ANTHROPIC_ALIASES, buildAnthropicPickerRows
 } from "./keysync.mjs";
@@ -35,7 +37,32 @@ const val = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] :
 const target = val("--target", "dry");
 const dry = has("--dry") || target === "dry";
 
-const EXPECTED_PROVIDERS = 44;
+// 45 since 2026-09-13: vyncai (vyceai.com) added, discovery-admitted (7 ids).
+// 46 since 2026-09-13: apinex (api.apinex.bond) added, discovery-admitted (25 ids).
+// 47 since 2026-09-13: kiraai (kiraai.vn) added, discovery-admitted (44 ids).
+// 48 since 2026-09-19: anymodel (anymodel.org) added, testModel="auto" (unconfirmed
+// placeholder -- account has $0 balance, /v1/models 402s, no real ids recoverable yet).
+// 49 since 2026-09-19: kiosapi (kiosapi.com) added, testModel="gpt-oss-20b" (from their
+// own docs). router.kiosapi.com currently NXDOMAIN -- documented value kept as-is,
+// not guessed; will sit at health=stale until their DNS resolves. LATER CORRECTED:
+// real base URL is https://kiosapi.com/v1 (their docs point at the wrong subdomain).
+// 50 since 2026-09-19: experientiallabs (experientiallabs.ai) added, discovery-admitted
+// (289 ids). Added as a normal routed provider only, per user's own explicit request
+// after declining the unsafe parts of a separate ask (session-auth redirection).
+// 51 since 2026-09-19: xkiro (xkiro.com) added, discovery-admitted (111 ids).
+// 52 since 2026-09-19: hcnsec (hcnsec.cn) added, discovery-admitted (27 ids).
+// 53 since 2026-09-19: kktoken (kktoken.cc) added, testModel="gpt-4o-mini" UNPROVEN --
+// key authenticates on GET /v1/models but every POST /v1/chat/completions returns a
+// bare Cloudflare 403 regardless of model/headers tried. Added anyway per explicit
+// user request; will 403 live until their WAF config changes.
+// 54 since 2026-09-19: justdowork (api.justwoker.icu) added, discovery-listed
+// (claude-opus-4-8) but UNPROVEN -- same Cloudflare-WAF-blocks-completions symptom
+// as kktoken; added anyway, consistent with that call.
+// 55 since 2026-09-19: infron (backend llm.onerouter.pro) added, discovery-admitted
+// (456 ids).
+// 56 since 2026-09-19: inceptionlabs (inceptionlabs.ai) added, discovery-admitted
+// (2 ids, mercury-2.5/mercury-2).
+const EXPECTED_PROVIDERS = 56;
 const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
 
 /**
@@ -1309,7 +1336,7 @@ const chosen = chooseKeys(filtered);
 const catalog = loadCatalog();
 console.log(`vault: ${registry.length} keys -> ${filtered.length} after filter -> ${chosen.length} distinct providers`);
 console.log(`catalog: ${catalog.byProvider.size} providers, generated ${catalog.generatedAt}`);
-console.log(`deliberate multi-key choices: ${JSON.stringify(KEY_CHOICES)}`);
+console.log(`deliberate multi-key choices: ${JSON.stringify(loadKeyChoices())}`);
 
 // Credentials are read one at a time from Windows Credential Manager and are
 // never logged. Only ids and counts appear in output.
@@ -1770,6 +1797,31 @@ if (cfg.Router?.builtInRules?.["claude-code"]) cfg.Router.builtInRules["claude-c
 
 if (guards) guards.assertPayloadIsolated(cfg, { allowProviders: true });
 
+// Content-diff-and-skip. CCR restarts the gateway on a CONTENT diff of
+// Providers/agent/virtualModelProfiles, not on "a write happened" — so an
+// unchanged config can be re-applied for free, and a changed one restarts.
+// Skipping when nothing changed is what makes frequent refresh cheap.
+//
+// Computed HERE, before any restore point is taken, because `--no-restart` must
+// be able to refuse without leaving a settings backup or a config.sqlite
+// snapshot behind for a run that wrote nothing.
+const afterFingerprint = restartRelevantFingerprint(cfg);
+const willRestart = beforeFingerprint !== afterFingerprint;
+
+// --no-restart turns the prediction from advisory into a gate. The fingerprint
+// mirrors CCR's own restart predicate but cannot be perfect (CCR also restarts
+// on its own `configChanged`, e.g. when it regenerates a gateway key during
+// applyProfile), so this narrows the risk rather than proving it away -- the
+// unconditional health poll below remains the backstop for a mispredict. It
+// exists so an unattended or agent-driven apply can be made unable to take the
+// gateway down on the changes it CAN predict.
+if (has("--no-restart") && willRestart) {
+  console.error("refusing (--no-restart): this config differs from CCR's in a way that restarts " +
+    "the gateway (Providers, agent or virtualModelProfiles changed). Nothing was written and no " +
+    "restore point was created. Re-run without --no-restart when a restart is acceptable.");
+  process.exit(2);
+}
+
 // ---- step 0: restore points, BEFORE anything is written -------------------
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const backup = `${SETTINGS}.uw-backup-${stamp}`;
@@ -1793,12 +1845,6 @@ if (target === "live") {
 // without changing how any running Claude Code session routes.
 const applyProfile = !has("--no-profile");
 
-// Content-diff-and-skip. CCR restarts the gateway on a CONTENT diff of
-// Providers/agent/virtualModelProfiles, not on "a write happened" — so an
-// unchanged config can be re-applied for free, and a changed one restarts.
-// Skipping when nothing changed is what makes frequent refresh cheap.
-const afterFingerprint = restartRelevantFingerprint(cfg);
-const willRestart = beforeFingerprint !== afterFingerprint;
 console.log(willRestart
   ? "config changed -> CCR will restart the gateway"
   : "config identical -> no gateway restart expected");
@@ -1877,6 +1923,13 @@ if (!noProfileDone) {
   const settingsBefore = JSON.parse(settingsRaw);
   const stripped = stripOneMSuffix(settings);
   if (stripped) console.log(`stripped [1m] suffix from ${stripped} third-party model env var(s)`);
+  // CCR re-adds this on every profile apply, so it is removed HERE, on the file
+  // CCR just wrote. See stripGatewayDiscovery for the measured cost.
+  const droppedDiscovery = stripGatewayDiscovery(settings);
+  if (droppedDiscovery) {
+    console.log("removed CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY (CCR re-adds it on every apply; " +
+      "it makes Claude Code startup ~10x slower with this many models)");
+  }
 
   // `/model` persists the user's pick into this same file. Respect it while it
   // still points at a live row; clear it once stale so a pruned row cannot
@@ -1945,6 +1998,19 @@ if (!noProfileDone) {
     `${optionRows.length - anthropicRows.length} third-party row(s) carrying behavesAs)`);
   // Temp + rename: a crash mid-write must not truncate the real settings file.
   atomicWriteJson(SETTINGS, settings);
+
+  // The cache is the other half of the slowdown (see stripGatewayDiscovery): a
+  // session started while the variable was set -- or inherited from a parent
+  // shell that loaded the old settings -- regenerates it. Set aside, never
+  // deleted, so this is reversible; the fixed suffix means repeated runs replace
+  // one file rather than accumulating dated copies.
+  const gwCache = path.join(path.dirname(SETTINGS), "cache", "gateway-models.json");
+  if (fs.existsSync(gwCache)) {
+    const aside = `${gwCache}.disabled-too-slow`;
+    fs.rmSync(aside, { force: true });
+    fs.renameSync(gwCache, aside);
+    console.log(`set aside ${gwCache} (${aside})`);
+  }
 
   // ---- step 5: verify all three landed together ----------------------------
   const final = JSON.parse(fs.readFileSync(SETTINGS, "utf8").replace(/^﻿/, ""));

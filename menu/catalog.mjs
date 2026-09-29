@@ -15,6 +15,7 @@ import { sanitizeDisplay, admitId } from "./sanitize.mjs";
 import { admitRemoteModels } from "./denylist.mjs";
 import { writeAtomic } from "./atomic.mjs";
 import * as CCR from "./ccr-client.mjs";
+import { readHealth, makeHealthOf } from "./health.mjs";
 
 // A static import, not `await import()`. There is no dynamic reason for a dynamic
 // import here -- the path is a constant -- and the top-level await it forces makes
@@ -471,7 +472,9 @@ export function buildFrom({ chosen, providers, catalog, relay,
                             routableOf = () => null,
                             discovery = { byProvider: new Map() },
                             provenanceOf = () => null,
-                            oneMVerdicts = K.loadOneMVerdicts() }) {
+                            oneMVerdicts = K.loadOneMVerdicts(),
+                            healthOf: healthFn = null }) {
+  const resolveHealthOf = healthFn ?? ((name) => healthOf(providers.get(name) ?? {}));
   const rows = [];
   // LAZY, and built at most once per call -- keysync.mjs's own `buildProviders`
   // uses the identical pattern (`joinIndex`, keysync.mjs:976-977) for the exact
@@ -767,7 +770,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
       // NULLABLE: "0 free" is a measurement, "no price data" is the absence of one.
       free: priced ? models.filter((m) => FREEISH.has(m.badge)).length : null,
       planCount: models.filter((m) => m.badge === "PLAN").length,
-      health: healthOf(prof),
+      health: resolveHealthOf(cred.provider),
       // ALWAYS AN ARRAY, never a missing key: absent and empty are different
       // claims, and a consumer that has to tell "withheld nothing" from "this
       // build did not compute it" cannot do so from `undefined`. The count cell
@@ -879,6 +882,7 @@ export function build({ routableOf, routableAsOf = null,
     ...buildFrom({
       chosen, providers, catalog: K.loadCatalog(), relay, routableOf,
       discovery, provenanceOf,
+      healthOf: makeHealthOf(providers, readHealth()),
     }),
     routableAsOf,
   };
