@@ -165,6 +165,12 @@ export function loadBench(file = BENCH_FILE) {
     return Object.hasOwn(models, k) ? cleanRecord(models[k]) : null;
   };
   get.records = size;
+  // The raw stamp only (no record cleaning): what `oldestStampOf` reads for every listed route.
+  get.stamp = (target) => {
+    const k = benchKeyOf(target);
+    const a = Object.hasOwn(models, k) ? models[k]?.a : null;
+    return Number.isFinite(a) ? a : null;
+  };
   return {
     // A stamp is drawn, so it must LOOK like one: anything else is no stamp at all.
     generatedAt: typeof raw.generatedAt === "string" && ISO_STAMP.test(raw.generatedAt) ? raw.generatedAt : null,
@@ -173,35 +179,136 @@ export function loadBench(file = BENCH_FILE) {
   };
 }
 
-/** A measurement older than this is not shown as a current fact (matches the health age limit). */
+/**
+ * The sweep engine's own retention window (refresh/ imports it for its keep-recent-records rule). The PICKER no longer has any
+ * age limit: every reader uses a record whatever its age (see `isUsable`), and an old list is announced by the outdated
+ * notice instead (`BENCH_OUTDATED_DAYS`).
+ */
 export const BENCH_FRESH_MS = 14 * 24 * 3600 * 1000;
+/** A record is outdated when it is more than this many days old: the sweep's default `--ttl` (7). */
+export const BENCH_OUTDATED_DAYS = 7;
+/** The list is called outdated when MORE than this share of its records is outdated (strictly more: exactly half is not). */
+export const BENCH_OUTDATED_SHARE = 0.5;
+const DAY_S = 24 * 3600;
+const OUTDATED_S = BENCH_OUTDATED_DAYS * DAY_S;
+/**
+ * The `oldest probe` column's colour bands, as ages in seconds, all derived from `BENCH_OUTDATED_DAYS` (T): green under
+ * 2/7 T (2 days), yellow under 4/7 T (4 days), orange under T (7 days), red from T. The age TEXT carries the meaning.
+ */
+export const PROBE_AGE_BANDS_S = Object.freeze({ yellow: (BENCH_OUTDATED_DAYS * 2 / 7) * DAY_S, orange: (BENCH_OUTDATED_DAYS * 4 / 7) * DAY_S, red: OUTDATED_S });
+/** The band of a probe age in seconds: `grn`, `yel`, `ora` or `red`. */
+export const probeAgeTone = (ageS) => (ageS >= PROBE_AGE_BANDS_S.red ? "red" : ageS >= PROBE_AGE_BANDS_S.orange ? "ora"
+  : ageS >= PROBE_AGE_BANDS_S.yellow ? "yel" : "grn");
 
 /**
- * THE freshness rule, used by every reader (the rows, the counts, the flags, the header, the
- * ok-only filter): the record has a timestamp, it is NOT in the future (a clock that ran ahead
- * or a hand edit is not evidence), and it is at most `BENCH_FRESH_MS` old.
+ * THE usability rule, used by every reader (the rows, the counts, the flags, the header, the filters): the record
+ * has a timestamp and it is NOT in the future (a clock that ran ahead or a hand edit is not evidence). There is NO age
+ * limit: an old result stays visible and counts; the outdated notice says when the list needs a new sweep.
  *
  * "In the future" is judged against the LATER of the caller's `nowMs` and the real clock, plus a
  * small skew allowance. The picker freezes `nowMs` when it starts, and a sweep in another window
  * keeps writing records after that: a record written a minute after the picker opened is newer
  * than `state.now`, and dropping it as "future" would blank a model that was just measured.
  * A record more than `FUTURE_SKEW_MS` beyond even the real clock is still refused (a hand edit, a
- * clock that ran ahead); age is still measured from `nowMs`, so the 14-day window is unchanged.
+ * clock that ran ahead).
  */
 export const FUTURE_SKEW_MS = 5 * 60 * 1000;
-export function isFresh(rec, nowMs = Date.now()) {
+export function isUsable(rec, nowMs = Date.now()) {
   if (!rec || !Number.isFinite(rec.a)) return false;
   const at = rec.a * 1000;
-  if (at - Math.max(nowMs, Date.now()) > FUTURE_SKEW_MS) return false;
-  return nowMs - at <= BENCH_FRESH_MS;
+  return at - Math.max(nowMs, Date.now()) <= FUTURE_SKEW_MS;
+}
+
+/**
+ * When the list was last FULLY updated: the stamp (ISO, UTC) of the OLDEST usable record among the routes of `rows` that
+ * have one (every listed route was probed at least then). `get.stamp(target)` is the cheap raw-stamp reader `loadBench`
+ * provides; any other reader falls back to the record's own `a`. `null` when no route has a record.
+ */
+const routeStamp = (get, target) => (typeof get.stamp === "function" ? get.stamp(target) : get(target)?.a);
+export function oldestStampOf(rows, get, nowMs = Date.now()) {
+  if (typeof get !== "function") return null;
+  let oldest = Infinity;
+  for (const r of rows ?? []) {
+    for (const m of r?.models ?? []) {
+      const a = routeStamp(get, benchKey(r.provider, m?.id ?? ""));
+      if (Number.isFinite(a) && a > 0 && isUsable({ a }, nowMs) && a < oldest) oldest = a;
+    }
+  }
+  return Number.isFinite(oldest) ? new Date(oldest * 1000).toISOString() : null;
+}
+
+/**
+ * One provider's AGE HISTOGRAM: `[[epochHour, count], ...]`, oldest first, of the usable bench records among its listed
+ * routes (every status), each record's stamp floored to the hour. It is what the snapshot bakes on each row, so the picker
+ * can work out, at open time and against its own clock, the provider's oldest probe age and the share of records over
+ * `BENCH_OUTDATED_DAYS` old without reading bench.json. `null` for a reader that is not a function.
+ */
+export function ageHistOf(provider, models, get, nowMs = Date.now()) {
+  if (typeof get !== "function") return null;
+  const by = new Map();
+  for (const m of models ?? []) {
+    const a = routeStamp(get, benchKey(provider, m?.id ?? ""));
+    if (!Number.isFinite(a) || !(a > 0) || !isUsable({ a }, nowMs)) continue;
+    const h = Math.floor(a / 3600);
+    by.set(h, (by.get(h) ?? 0) + 1);
+  }
+  return [...by].sort((x, y) => x[0] - y[0]);
+}
+
+/** A histogram read from a FILE, made safe: an array of `[integer hour, positive integer count]` pairs, else `null` (no data). */
+export function cleanAgeHist(h) {
+  if (!Array.isArray(h)) return null;
+  const out = [];
+  for (const e of h) {
+    if (Array.isArray(e) && Number.isSafeInteger(e[0]) && e[0] > 0 && Number.isSafeInteger(e[1]) && e[1] > 0) out.push([e[0], e[1]]);
+  }
+  return out.sort((x, y) => x[0] - y[0]);
+}
+
+/** The age in seconds of a histogram's OLDEST record against `nowMs`: `null` for no records (or no histogram), never negative. */
+export function oldestAgeOf(hist, nowMs = Date.now()) {
+  const h = cleanAgeHist(hist);
+  if (!h || h.length === 0) return null;
+  return Math.max(0, Math.floor(nowMs / 1000 - h[0][0] * 3600));
+}
+
+/** `{ total, old }`: the records in these histograms, and how many are more than `BENCH_OUTDATED_DAYS` old at `nowMs`. */
+export function outdatedShare(hists, nowMs = Date.now()) {
+  let total = 0, old = 0;
+  for (const hist of hists ?? []) {
+    for (const [h, n] of cleanAgeHist(hist) ?? []) {
+      total += n;
+      if (nowMs / 1000 - h * 3600 > OUTDATED_S) old += n;
+    }
+  }
+  return { total, old };
+}
+
+/**
+ * The outdated notice's date, `YYYY-MM-DD` (UTC), or `null` when there is nothing to say. The notice shows when MORE than
+ * `BENCH_OUTDATED_SHARE` of the records (`hists`: every provider's age histogram) are more than `BENCH_OUTDATED_DAYS`
+ * old; the DATE is `oldestAt`, the OLDEST record (when the list was last fully updated). No records, or a stamp that is
+ * not an ISO date or lies in the future (the text comes from a file), say nothing.
+ */
+export function outdatedNotice(oldestAt, hists, nowMs = Date.now()) {
+  if (typeof oldestAt !== "string" || !ISO_STAMP.test(oldestAt)) return null;
+  const t = Date.parse(oldestAt);
+  if (!Number.isFinite(t) || t > nowMs + FUTURE_SKEW_MS) return null;
+  const { total, old } = outdatedShare(hists, nowMs);
+  return total > 0 && old / total > BENCH_OUTDATED_SHARE ? oldestAt.slice(0, 10) : null;
+}
+
+/** Whether a cleaned record says `gone` (the model is not found upstream) AND is fresh: what the hide-gone toggle hides. */
+export function isGone(rec, nowMs = Date.now()) {
+  return !!rec && rec.s === "gone" && isUsable(rec, nowMs);
 }
 
 /**
  * Whether a cleaned record says `ok` AND is fresh: the model-level `ok` filter and the header's
  * `ok` figures use this one definition.
  */
-export function freshOk(rec, nowMs = Date.now()) {
-  return !!rec && rec.s === "ok" && isFresh(rec, nowMs);
+export function isOk(rec, nowMs = Date.now()) {
+  return !!rec && rec.s === "ok" && isUsable(rec, nowMs);
 }
 
 /**
@@ -215,7 +322,7 @@ function freshRecords(provider, models, get, nowMs) {
   const out = [];
   for (const m of models ?? []) {
     const rec = get(benchKey(provider, m?.id ?? ""));
-    if (!rec || !STATUSES.includes(rec.s) || !isFresh(rec, nowMs)) continue;
+    if (!rec || !STATUSES.includes(rec.s) || !isUsable(rec, nowMs)) continue;
     out.push(rec);
   }
   return out;

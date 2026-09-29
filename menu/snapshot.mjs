@@ -14,9 +14,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { writeAtomic } from "./atomic.mjs";
-import { loadBench, countStatuses, providerFlags, BENCH_FRESH_MS, benchKey, isFresh } from "./bench-data.mjs";
+import { loadBench, countStatuses, providerFlags, benchKey, isUsable, oldestStampOf, ageHistOf, cleanAgeHist } from "./bench-data.mjs";
 import { modalityWord } from "./modality.mjs";
-import { payFreeNote, aliasMap, providerAlive } from "./route-hints.mjs";
+import { payFreeNote, aliasMap, providerAlive, providerStatus } from "./route-hints.mjs";
 
 // 3 since 2026-09-08 (R15). Bumped for three additions riding one migration:
 // `provenance` and `modality` per model, `refused[]` and the new
@@ -47,7 +47,15 @@ import { payFreeNote, aliasMap, providerAlive } from "./route-hints.mjs";
 // model list's `modality` cell). Bumped rather than added quietly: a schema-6 file has neither, and the picker would
 // draw a blank `status` and `?` modality on every row -- "nobody looked" and "this file predates the column" are not
 // the same claim, and the second must be rebuilt, not read as the first.
-export const SNAPSHOT_SCHEMA = 7;
+// 8: `benchFlags.status` (`alive` | `down` | `dead` | null), the provider list's three-state `status` cell. The
+// schema-7 flag was two-state (`alive` = anything answered) and read every provider as alive; a schema-7
+// file would draw a blank `status`, which is not the claim "nothing was benched". Rebuilt, not read.
+// 9: `benchOldestAt`, the stamp (ISO, UTC) of the OLDEST bench record among the listed routes: the date the provider list's
+// outdated notice quotes, and `benchAgeHist` on each row, that provider's age histogram `[[epochHour, count], ...]` over its
+// usable bench records (every status): the notice fires when more than half of ALL records are over 7 days old, and the
+// provider list's `oldest probe` column reads the provider's oldest one, both against the picker's own clock. A schema-8
+// file has neither and would silently never warn, so it is rebuilt, not read.
+export const SNAPSHOT_SCHEMA = 9;
 
 // The closed vocabulary schema 3 persists (revision 6, #59). Named here so a
 // test can assert the FULL set -- both that nothing legal is missing and that
@@ -91,7 +99,7 @@ const ROUTABLE_TIMEOUT_MS = 5000;
  *                   the default is inert, so an un-updated caller (every
  *                   existing test) keeps behaving exactly as before.
  */
-const withAlive = (flags, alive) => (flags ? { ...flags, alive } : null);
+const withAlive = (flags, alive, status) => (flags ? { ...flags, alive, status } : null);
 
 /**
  * The picker's `modality` column (schema 7): `outModality` is one word from the closed list in
@@ -106,7 +114,7 @@ const modalityFields = (m, provider, bench, nowMs) => {
   let src = v ? (m.outModalitySrc ?? null) : null;
   if (v == null && bench) {
     const rec = bench.get(benchKey(provider, m.id ?? ""));
-    if (rec?.s === "ok" && isFresh(rec, nowMs)) { v = "chat?"; src = "bench-ok"; }
+    if (rec?.s === "ok" && isUsable(rec, nowMs)) { v = "chat?"; src = "bench-ok"; }
   }
   return { outModality: v, ...(v && src ? { outModalitySrc: src } : {}) };
 };
@@ -142,14 +150,13 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null,
   // silently erase the counts the previous build had: they are carried forward, per row (by key
   // id), together with the stamp they belong to, and `main()` says so. A first-ever build, or a
   // previous snapshot without counts, has nothing to carry and stores `null` as before.
-  // Carried counts are RE-AGED against the same 14-day window every reader uses: counts older than
-  // that (relative to their own stamp) are not carried, because a figure drawn without a fresh
-  // sweep behind it would claim more than it knows.
+  // There is no age limit on carried counts: the picker's outdated notice (from `benchOldestAt`, carried with them) says
+  // when the list needs a new sweep. Only a missing or future stamp stops the carry.
   const prevAt = Date.parse(previous?.benchAsOf ?? "");
-  const carry = !bench && Number.isFinite(prevAt) && nowMs - prevAt <= BENCH_FRESH_MS && nowMs >= prevAt
+  const carry = !bench && Number.isFinite(prevAt) && nowMs >= prevAt
     && (previous?.rows ?? []).some((r) => r?.bench);
   const priorBench = new Map();
-  if (carry) for (const r of previous.rows) priorBench.set(r.keyId, { bench: r.bench ?? null, flags: r.benchFlags ?? null });
+  if (carry) for (const r of previous.rows) priorBench.set(r.keyId, { bench: r.bench ?? null, flags: r.benchFlags ?? null, hist: cleanAgeHist(r.benchAgeHist) });
   return {
     schemaVersion: SNAPSHOT_SCHEMA,
     generatedAt: built.generatedAt ?? null,
@@ -169,6 +176,9 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null,
     // #114. When the sweep the per-row `bench` counts came from was taken; `null`
     // when no bench data was loaded, which the picker draws as a dash.
     benchAsOf: carry ? (previous.benchAsOf ?? null) : (bench?.generatedAt ?? null),
+    // The date the outdated notice quotes: the OLDEST bench record among the listed routes (every route was probed at least
+    // then), or `null` with no bench data. Carried with the counts.
+    benchOldestAt: carry ? (previous.benchOldestAt ?? null) : (bench ? oldestStampOf(built.rows, bench.get, nowMs) : null),
     builtAt: new Date().toISOString(),
     rows: built.rows.map((r) => ({
       keyId: r.keyId, provider: r.provider, free: r.free,
@@ -178,13 +188,16 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null,
       bench: bench ? countStatuses(r.provider, r.models, bench.get, nowMs) : (priorBench.get(r.keyId)?.bench ?? null),
       // `{dead, needsMoney}` booleans from the sweep's skip decisions, or `null` when
       // there is no data or nothing fresh to judge from (drawn blank, never "no").
-      // `{dead, needsMoney, alive}`. `alive` (#114 redesign) is what the provider list draws: true when
-      // the provider RESPONDED in any shape (errors included), false only when every fresh probe was a
-      // no-response failure (route-hints.mjs), null with nothing fresh. `dead` and `needsMoney` stay in
-      // the snapshot for other readers but are no longer drawn. Additive: an older file lacks `alive`.
+      // `{dead, needsMoney, alive, status}`. `status` (schema 8) is what the provider list draws:
+      // `alive` (a fresh ok), `down` (answered, but nothing ok), `dead` (every fresh probe got no response at
+      // all), or null with nothing fresh (route-hints.mjs `providerStatus`). `alive` stays the two-state
+      // "responded in any shape" boolean, and `dead` / `needsMoney` the sweep's own flags, for other readers.
       benchFlags: bench ? withAlive(providerFlags(r.provider, r.models, bench.get, nowMs),
-                                    providerAlive(r.provider, r.models, bench.get, nowMs))
+                                    providerAlive(r.provider, r.models, bench.get, nowMs),
+                                    providerStatus(r.provider, r.models, bench.get, nowMs))
                         : (priorBench.get(r.keyId)?.flags ?? null),
+      // Schema 9. `[[epochHour, count], ...]` (see `ageHistOf`); `[]` for a provider with no records, `null` with no bench data.
+      benchAgeHist: bench ? ageHistOf(r.provider, r.models, bench.get, nowMs) : (priorBench.get(r.keyId)?.hist ?? null),
       // Schema 4. The free-tier limit, aggregated over this provider's free
       // rows by `menu/payload-cap.mjs`'s `aggregate`. `?? null` for the same
       // reason `provenance` two literals down carries it: an own property,
@@ -536,7 +549,7 @@ export async function main(argv = process.argv.slice(2),
     : kept
       ? `  bench: no usable bench data; kept the previous counts as of ${prev.snap.benchAsOf}`
       : hadCounts
-        ? `  bench: no usable bench data, and the previous counts (as of ${prev.snap.benchAsOf ?? "an unknown time"}) are older than 14 days and were dropped; provider columns will be blank`
+        ? `  bench: no usable bench data, and the previous counts (as of ${prev.snap.benchAsOf ?? "an unknown time"}) have no usable date and were dropped; provider columns will be blank`
         : "  bench: no usable bench data, provider columns will be blank");
   log(`  ${snap.rows.length} providers, ${models} models, catalogue ${snap.generatedAt}`);
   log(discoveryLine);

@@ -78,3 +78,31 @@ export function outputModalityOf(entry, capability, outputKind) {
 
 /** A stored value, validated: a word from the closed list, or null (drawn as `?`). */
 export const modalityWord = (v) => (MODALITY_WORDS.includes(v) ? v : null);
+
+/**
+ * One colour per known modality word, in ONE table (the rows, the legend and the docs read it). `c256` is an
+ * xterm-256 colour number (bright, mutually distinguishable on a dark background); `c16` is the SGR code used on a
+ * 16-colour terminal (the 8 + 8 ANSI colours, all twelve distinct, some as the bright variant of a shared hue).
+ * With no colour the word alone is drawn. Decoration only: the word carries the meaning. `?` (unknown) is not a
+ * type and stays dim.
+ *
+ *   word   256  hue           16-colour
+ *   chat    40  green         32  green
+ *   chat?   79  aquamarine    36  cyan
+ *   image  201  magenta       35  magenta
+ *   embed  208  orange        33  yellow (orange on most palettes)
+ *   video  196  red           91  bright red
+ *   audio  226  yellow        93  bright yellow
+ *   stt     33  azure blue    94  bright blue
+ *   live    51  bright cyan   96  bright cyan
+ *   rank   141  lavender      95  bright magenta
+ *   ocr    213  pink          31  red
+ *   mod    190  yellow-green  92  bright green
+ *   other  250  light grey    97  bright white
+ */
+export const MODALITY_COLOURS = Object.freeze({
+  chat: { c256: 40, c16: 32 }, "chat?": { c256: 79, c16: 36 }, image: { c256: 201, c16: 35 },
+  embed: { c256: 208, c16: 33 }, video: { c256: 196, c16: 91 }, audio: { c256: 226, c16: 93 },
+  stt: { c256: 33, c16: 94 }, live: { c256: 51, c16: 96 }, rank: { c256: 141, c16: 95 },
+  ocr: { c256: 213, c16: 31 }, mod: { c256: 190, c16: 92 }, other: { c256: 250, c16: 97 },
+});

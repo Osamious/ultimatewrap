@@ -8,9 +8,9 @@
 //   aliasMap      a `gone` route with a sibling route, in the same provider, that ANSWERED: the
 //                 picker can say where the working route is. It never changes what enter selects.
 //
-// Both use the ONE freshness rule (`isFresh`): a stale or future-dated record changes nothing.
+// Both use the ONE freshness rule (`isUsable`): a stale or future-dated record changes nothing.
 
-import { isFresh, benchKey } from "./bench-data.mjs";
+import { isUsable, benchKey } from "./bench-data.mjs";
 
 export const PAY_NOTE = "probe: payment required";
 
@@ -18,7 +18,7 @@ export const PAY_NOTE = "probe: payment required";
 export function payFreeNote(model, provider, get, nowMs = Date.now()) {
   if (typeof get !== "function" || model?.badge !== "FREE?") return null;
   const rec = get(benchKey(provider, model.id ?? ""));
-  return rec && rec.s === "pay" && isFresh(rec, nowMs) ? PAY_NOTE : null;
+  return rec && rec.s === "pay" && isUsable(rec, nowMs) ? PAY_NOTE : null;
 }
 
 const strip = (id) => String(id ?? "").replace(/\[1m\]$/i, "");
@@ -39,7 +39,7 @@ export function aliasMap(provider, models, get, nowMs = Date.now()) {
   if (typeof get !== "function") return out;
   const status = (id) => {
     const rec = get(benchKey(provider, id));
-    return rec && isFresh(rec, nowMs) ? rec.s : null;
+    return rec && isUsable(rec, nowMs) ? rec.s : null;
   };
   const okIds = new Map();                                // lowercase stripped id -> id as spelled
   const gone = [];
@@ -74,16 +74,18 @@ export function aliasMap(provider, models, get, nowMs = Date.now()) {
 export function liveAlias(provider, model, get, nowMs = Date.now()) {
   if (typeof get !== "function" || !model?.aliasOf) return null;
   const own = get(benchKey(provider, model.id ?? ""));
-  if (!own || own.s !== "gone" || !isFresh(own, nowMs)) return null;
+  if (!own || own.s !== "gone" || !isUsable(own, nowMs)) return null;
   const sib = get(benchKey(provider, model.aliasOf));
-  return sib && sib.s === "ok" && isFresh(sib, nowMs) ? String(model.aliasOf) : null;
+  return sib && sib.s === "ok" && isUsable(sib, nowMs) ? String(model.aliasOf) : null;
 }
 
 // ------------------------------------------------------------------ alive / dead
 
 /**
- * What a "no response" probe result looks like, in ONE named place. A provider is ALIVE if it
- * responded in ANY shape, including with an error; it is DEAD only when nothing came back at all.
+ * What a "no response" probe result looks like, in ONE named place. A probe that got NO response at all is the only
+ * kind that can make a provider read `dead` in the picker (see `providerStatus`: `alive` = a fresh `ok`, `down` =
+ * answered but nothing ok, `dead` = every fresh probe was one of these). `providerAlive` below is the LEGACY two-state
+ * flag (`benchFlags.alive`: "answered in any shape"), kept in the snapshot for other readers.
  * The wording below was built from the real records in state/bench.json (2026-09-29):
  *   `fetch failed`                      269  no HTTP response reached the probe
  *   `Failed to reach upstream provider`   7  the gateway could not reach the provider
@@ -114,7 +116,8 @@ export function isNoResponse(rec) {
 }
 
 /**
- * `true` (alive: something answered, errors included), `false` (dead: there is at least one fresh
+ * LEGACY two-state flag, NOT what the picker draws (that is `providerStatus`): `true` (something answered, errors
+ * included), `false` (nothing did: there is at least one fresh
  * probe result and EVERY one is a no-response failure) or `null` (nothing fresh to judge from: a
  * provider nobody probed has no verdict). `skip` records are not probe results and are ignored.
  */
@@ -123,9 +126,33 @@ export function providerAlive(provider, models, get, nowMs = Date.now()) {
   let seen = 0, answered = 0;
   for (const m of models ?? []) {
     const rec = get(benchKey(provider, m?.id ?? ""));
-    if (!rec || rec.s === "skip" || !isFresh(rec, nowMs)) continue;
+    if (!rec || rec.s === "skip" || !isUsable(rec, nowMs)) continue;
     seen += 1;
     if (!isNoResponse(rec)) answered += 1;
   }
   return seen === 0 ? null : answered > 0;
+}
+
+/**
+ * The provider list's `status`, over the provider's FRESH probe results (`skip` records are not probe
+ * results and are ignored; every reader uses a record whatever its age):
+ *   `alive`  at least one fresh `ok`: something on it works
+ *   `down`   at least one fresh record, none `ok`, and at least one is NOT a no-response (it answered: auth,
+ *            pay, gone, empty, rate, a provider-side error body, or a timeout that returned a first token)
+ *   `dead`   at least one fresh record and EVERY one is a no-response (`isNoResponse`: a connection-level
+ *            failure, or a timeout that got nothing back)
+ *   `null`   nothing fresh to judge from: a provider nobody probed has no verdict
+ * A label only: routing is untouched (a provider that answered is never pruned for reading `down`).
+ */
+export function providerStatus(provider, models, get, nowMs = Date.now()) {
+  if (typeof get !== "function") return null;
+  let seen = 0, ok = 0, answered = 0;
+  for (const m of models ?? []) {
+    const rec = get(benchKey(provider, m?.id ?? ""));
+    if (!rec || rec.s === "skip" || !isUsable(rec, nowMs)) continue;
+    seen += 1;
+    if (rec.s === "ok") ok += 1;
+    if (!isNoResponse(rec)) answered += 1;
+  }
+  return seen === 0 ? null : ok > 0 ? "alive" : answered > 0 ? "down" : "dead";
 }
