@@ -280,9 +280,13 @@ export function loadSnapshot(file = SNAPSHOT_FILE) {
   let snap;
   try { snap = JSON.parse(text); }
   catch (e) { return { ok: false, reason: "unreadable", detail: String(e.message).slice(0, 120) }; }
-  if (snap?.schemaVersion !== SNAPSHOT_SCHEMA || !Array.isArray(snap.rows)) {
+  if (snap?.schemaVersion !== SNAPSHOT_SCHEMA) {
     return { ok: false, reason: "schema",
              detail: `expected schemaVersion ${SNAPSHOT_SCHEMA}, found ${JSON.stringify(snap?.schemaVersion)}` };
+  }
+  // The right version with no rows is a damaged file, not an old one: the sentence must not say "expected 9, found 9".
+  if (!Array.isArray(snap.rows)) {
+    return { ok: false, reason: "schema", detail: `schemaVersion ${SNAPSHOT_SCHEMA} but no rows array (the file is damaged)` };
   }
   return { ok: true, snap };
 }

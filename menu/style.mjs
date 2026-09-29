@@ -16,7 +16,7 @@
 // wide, astral and combining characters are replaced by `?` at draw time (see sanitize.mjs).
 import { sanitizeCells as sanitizeDisplay } from "./sanitize.mjs";
 import { liveAlias } from "./route-hints.mjs";
-import { PREVIEW_CHARS, STATUSES, statusCode, statusTone, fmtMs, fmtTps, previewText, isUsable, probeAgeTone } from "./bench-data.mjs";
+import { PREVIEW_CHARS, STATUSES, statusCode, statusTone, fmtMs, fmtTps, previewText, isUsable, probeAgeTone, recordAge } from "./bench-data.mjs";
 // Content only. `legend.mjs` imports nothing and takes the glyph renderers as
 // arguments, so this does not become a cycle even though the legend renders
 // through `provenanceDot` defined in this file.
@@ -67,14 +67,18 @@ export function frameWidth(caps) {
  * the `free` block (10): a narrower terminal loses `free` first, then `oldest probe`, and the full key id before neither.
  *
  * MODEL LEVEL (level 1 and flat scope), ONE view showing every column when it fits:
- *   gutter, id, status, ttft, [total], [tok/s], ctx, $in, $out, badge, modality, TVR, [output]
+ *   gutter, id, stat, [probed], ttft, [total], [tok/s], ctx, $in, $out, badge, modality, TVR, [output]
  * Bracketed cells are optional. Priority, highest first: the always-drawn cells (stat,
  * ttft, ctx, $in, $out, badge, modality, TVR); the id up to MODEL_ID_MIN (elided in the middle
- * beyond that); then, in order, `total`, `tok/s` and the `output` preview at its minimum;
+ * beyond that); then, in order, `total`, `tok/s`, `probed` and the `output` preview at its minimum;
  * and only THEN does the id grow toward its content (capped at MODEL_ID_MAX), with the
- * preview taking ALL that is left. So every column is on screen as early as possible (the
- * id gives way first), and on a narrowing terminal the preview goes first, then `tok/s`,
- * then `total`; `modality` outlasts all three (it is one of the always-drawn cells).
+ * preview taking ALL that is left. `probed` was added LAST and makes no older column appear later or disappear: every older
+ * column appears at exactly the width it did before (`total` and `tok/s` first, `output` from the same all-columns width), the
+ * id is the same from that width up, and from 97 to 102 columns (where `probed` shows without `output`) the id gives up up
+ * to 7 columns of GROWTH beyond its floor for it, never the floor itself. And
+ * `output` pays for it by shrinking to a 3-character minimum (it was 10) and appearing only together with `probed`. So
+ * on a narrowing terminal the preview goes first, then `probed`, then `tok/s`, then `total`; `modality` outlasts all of
+ * them (it is one of the always-drawn cells).
  *
  * Returned fresh each call rather than memoised: it is a handful of integer
  * additions on a path that already rebuilds every row, and a cache keyed on
@@ -110,6 +114,8 @@ const PROBE_TXT_W = 12, PROBE_W = 1 + PROBE_TXT_W;
 const M_GUTTER = 4;                       // mark + space, provenance glyph + space
 const M_STATUS = 5, M_TTFT = 6, M_CTX = 7, M_PRICE = 6, M_BADGE = 6, M_MODALITY = 9, M_CAPS = 4;
 const M_TOTAL = 6, M_TPS = 6;
+// `probed`: the age of the model's own probe record, 6 wide (its header) plus the rule.
+const PROBED_TXT_W = 6, M_PROBED = 1 + PROBED_TXT_W;
 const M_FIXED = M_STATUS + M_TTFT + M_CTX + 2 * M_PRICE + M_BADGE + M_MODALITY + M_CAPS;   // 49
 // The id column never WANTS more than this, however long the longest id is (73 in the real
 // snapshot; 86 as a flat target; the median is 20, the 95th percentile 36): a few outliers
@@ -117,7 +123,9 @@ const M_FIXED = M_STATUS + M_TTFT + M_CTX + 2 * M_PRICE + M_BADGE + M_MODALITY +
 export const MODEL_ID_MAX = 40;
 // The id is guaranteed this much before any optional column is dropped (the median real id is 20).
 export const MODEL_ID_MIN = 22;
-const PREVIEW_MIN = 10;
+// The `output` preview's minimum text width (it was 10 before `probed` existed). It is drawn only together with `probed`,
+// and the two together need exactly the room the preview alone did (7 + 1 + 3 = 11 = 1 + 10), so no older column moves.
+const PREVIEW_MIN = 3;
 
 export function layoutFor(frameW, { keyW = W.keyId, idW = W.id } = {}) {
   const w = Math.max(FRAME_MIN, Math.min(FRAME_MAX, Math.floor(frameW) || FRAME_MIN));
@@ -141,14 +149,15 @@ export function layoutFor(frameW, { keyW = W.keyId, idW = W.id } = {}) {
   const take = (cost) => (free >= cost ? ((free -= cost), true) : false);
   const showTotal = take(M_TOTAL);
   const showTps = take(M_TPS);
-  const showPreview = take(1 + PREVIEW_MIN);          // the preview at its minimum, gap included
+  const showProbed = take(M_PROBED);
+  const showPreview = showProbed && take(1 + PREVIEW_MIN);          // the preview at its minimum, gap included
   const grow = Math.min(want - idMin, free);          // then the id grows toward its content
   free -= grow;
   const id = idMin + grow;
   // The output column takes ALL that is left (no cap): the stored reply is what limits it.
   const preview = showPreview ? PREVIEW_MIN + free : 0;
 
-  return { frameW: w, inner, showProbe, showFree, showTotal, showTps, showPreview,
+  return { frameW: w, inner, showProbe, showFree, showTotal, showTps, showProbed, showPreview,
            W: { ...W, keyId, id, preview } };
 }
 
@@ -384,8 +393,15 @@ const ageInk = (tone, text, p) => (tone === "ora" ? p.raw(p.depth >= 256 ? "38;5
 export function probeCell(ageS, p, lead = " ") {
   if (ageS === undefined) return lead + " ".repeat(PROBE_TXT_W);
   if (ageS === null || !Number.isFinite(ageS)) return lead + p.dim(rpad("-", PROBE_TXT_W));
-  const text = rpad(ageLabel(ageS), PROBE_TXT_W), tone = probeAgeTone(ageS);
-  return lead + ageInk(tone, text, p);
+  return lead + ageInk(probeAgeTone(ageS), rpad(ageLabel(ageS), PROBE_TXT_W), p);
+}
+/**
+ * The model-list `probed` cell: the age of THIS model's probe record (`recordAge`, exact seconds against the picker's
+ * clock), right-aligned in 6 and in the same colour bands as `oldest probe`. Blank when the model has no record (`null`).
+ */
+export function probedCell(ageS, p, lead = " ") {
+  if (!Number.isFinite(ageS)) return lead + " ".repeat(PROBED_TXT_W);
+  return lead + ageInk(probeAgeTone(ageS), rpad(ageLabel(ageS), PROBED_TXT_W), p);
 }
 /** The provider-list `status` cell: `alive` green, `down` yellow, `dead` red, blank when there is no verdict. */
 export function statusCell(status, p, lead = " ") {
@@ -1110,8 +1126,8 @@ export function frame(v, meta, { caps }) {
       const idCell = padId(idText, W.id, v.filter, g, p, plan?.get(idText) ?? null);
       // A row nobody measured draws BLANKS, not zeros: 0 ms would be a claim. `meta.benchOf`
       // is loaded lazily by uwpick the first time a model screen is drawn.
-      // Only a FRESH record is drawn (the same rule the counts and the filter use): a 30-day-old
-      // measurement is not shown as a current fact.
+      // Every USABLE record is drawn (the same rule the counts and the filter use: it has a timestamp and is not dated in
+      // the future; there is no age limit). An old measurement is drawn as measured: the `probed` cell says how old it is.
       const got = meta.benchOf ? meta.benchOf(it.target) : null;
       const rec = isUsable(got, v.now ?? Date.now()) ? got : null;
       const tone = rec ? statusTone(rec.s) : "dim";
@@ -1124,11 +1140,15 @@ export function frame(v, meta, { caps }) {
       // estimate over the part seen, drawn with a leading `~`. `reply:` says why (see below).
       const cut = timed && rec.x === 1;
       const sepd = p.dim(S);
+      // `output` can be a 3-character sliver beside a long id: a fragment of the alias hint (`= g`) or of `skipped: why` says
+      // nothing, so below 8 columns those two draw blank (the reply: line still carries the whole text).
+      const tiny = W.preview < 8;
       // A `gone` route with an `ok` sibling says WHERE the working route is, in the preview cell
       // (no new column); the baked `aliasOf` is honoured only while both records are still fresh.
       // Surface, never substitute: enter still selects THIS row.
       const alias = liveAlias(flat ? it.row?.provider : v.provider?.provider, m, meta.benchOf, v.now ?? Date.now());
       body = `${mark} ` + provenanceDot(m.provenance, g, p) + " " + idCell + sepd + statOut +
+             (layout.showProbed ? probedCell(rec ? recordAge(rec, v.now ?? Date.now()) : null, p, sepd) : "") +
              sepd + rpad(timed || (rec?.s === "timeout" && Number.isFinite(rec.t)) ? fmtMs(rec.t) : "", 5) +
              (layout.showTotal ? sepd + rpad(!cut && (timed || rec?.s === "timeout") ? fmtMs(rec.d) : "", 5) : "") +
              (layout.showTps ? sepd + rpad(timed ? (cut ? (Number.isFinite(rec.r) ? "~" + fmtTps(rec.r) : "-") : fmtTps(rec.r)) : "", 5) : "") +
@@ -1137,7 +1157,8 @@ export function frame(v, meta, { caps }) {
              sepd + cap(m.tools, "T", "cya") + cap(m.vision, "V", "mag") + cap(m.reason, "R", "yel") +
              // The optional cells exist only when `layoutFor` reserved them (see its priority list).
              (layout.showPreview
-               ? sepd + (alias ? p.dim(pad(`= ${alias} (works)`, W.preview)) : pad(previewText(rec, W.preview), W.preview))
+               ? sepd + (tiny && (alias || rec?.s === "skip") ? " ".repeat(W.preview)
+                 : alias ? p.dim(pad(`= ${alias} (works)`, W.preview)) : pad(previewText(rec, W.preview), W.preview))
                : "");
       // Q1.3: `routable` is a value on the row, baked in by the refresher. `false`
       // dims; `null` -- nobody checked -- does not, because dimming everything the
@@ -1176,7 +1197,7 @@ export function frame(v, meta, { caps }) {
     L.push(bar(g, p.dim("  " + g.frame.h.repeat(Math.max(0, INNER - 4)))));
   }
 
-  // MODEL LEVEL, one view (#114): gutter, id, then status / ttft / [total] / [tok/s], then
+  // MODEL LEVEL, one view (#114): gutter, id, then stat / [probed] / ttft / [total] / [tok/s], then
   // ctx / $in / $out / badge / modality / TVR, then the [output] preview LAST, since it is
   // the flexible column. Every cell carries its own leading space, so none can touch
   // another; `layoutFor` decides which optional cells exist, and the rows read the same
@@ -1193,6 +1214,7 @@ export function frame(v, meta, { caps }) {
       (layout.showFree ? S + rpad("free", CNT_W) + S + rpad("%", PCT_W) : "") +
       L0_STATUSES.map((st) => S + rpad(statusCode(st), statusCellW(st) - 1)).join("")
     : "  " + "  " + pad(flat ? "provider/model" : "model", W.id) + S + pad("stat", 4) +
+      (layout.showProbed ? S + rpad("probed", PROBED_TXT_W) : "") +
       S + rpad("ttft", 5) + (layout.showTotal ? S + rpad("total", 5) : "") +
       (layout.showTps ? S + rpad("tok/s", 5) : "") +
       S + rpad("ctx", 6) + S + rpad("$in", 5) + S + rpad("$out", 5) +
@@ -1219,9 +1241,12 @@ export function frame(v, meta, { caps }) {
     // Which toggles are on is the reason a list can be empty with nothing typed, so it gets a
     // line of its own (the line above is already at the frame's width).
     if (filterChips.length) {
-      const names = [v.okOnly ? "ok-only" : "", v.oneM ? "1M+ context only" : "", v.hideGone ? "gone routes hidden" : "", v.freeOnly ? "FREE / FREE? only" : ""].filter(Boolean).join(" + ");
-      const nodata = v.okOnly && !(meta.benchAsOf && meta.benchOf?.records !== 0) ? ` ${g.dash} no benchmark data yet` : "";
-      L.push(bar(g, `  filtered by ${names}${nodata}`));
+      // The long names when they fit the frame; with all four on they do not, so the chips' short names (never clipped mid-word).
+      const on = [[v.okOnly, "ok-only", "ok"], [v.oneM, "1M+ context only", "1M+"], [v.hideGone, "gone routes hidden", "no gone"], [v.freeOnly, "FREE / FREE? only", "free"]].filter((t) => t[0]);
+      const noBench = v.okOnly && !(meta.benchAsOf && meta.benchOf?.records !== 0);
+      const say = (i, tail) => `  filtered by ${on.map((t) => t[i]).join(" + ")}${noBench ? ` ${g.dash} ${tail}` : ""}`;
+      const text = [say(1, "no benchmark data yet"), say(2, "no benchmark data yet"), say(2, "no data")].find((t) => vis(t) <= INNER) ?? say(2, "no data");
+      L.push(bar(g, text));
       L.push(bar(g, p.dim("  toggles: ctrl+o ok, ctrl+l 1M+, ctrl+x gone, ctrl+e free")));
     }
   }

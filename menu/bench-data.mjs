@@ -165,11 +165,14 @@ export function loadBench(file = BENCH_FILE) {
     return Object.hasOwn(models, k) ? cleanRecord(models[k]) : null;
   };
   get.records = size;
-  // The raw stamp only (no record cleaning): what `oldestStampOf` reads for every listed route.
+  // The stamp of a PROBE result only, without cleaning the text: what `oldestStampOf` and `ageHistOf` read for every listed
+  // route. The validity rule is `cleanRecord`'s (a known status), and a `skip` is not a probe result (the sweep rewrites it on
+  // every run), so neither has a stamp.
   get.stamp = (target) => {
     const k = benchKeyOf(target);
-    const a = Object.hasOwn(models, k) ? models[k]?.a : null;
-    return Number.isFinite(a) ? a : null;
+    const rec = Object.hasOwn(models, k) ? models[k] : null;
+    if (!rec || typeof rec !== "object" || !STATUSES.includes(rec.s) || rec.s === "skip") return null;
+    return Number.isFinite(rec.a) ? rec.a : null;
   };
   return {
     // A stamp is drawn, so it must LOOK like one: anything else is no stamp at all.
@@ -196,6 +199,18 @@ const OUTDATED_S = BENCH_OUTDATED_DAYS * DAY_S;
  * 2/7 T (2 days), yellow under 4/7 T (4 days), orange under T (7 days), red from T. The age TEXT carries the meaning.
  */
 export const PROBE_AGE_BANDS_S = Object.freeze({ yellow: (BENCH_OUTDATED_DAYS * 2 / 7) * DAY_S, orange: (BENCH_OUTDATED_DAYS * 4 / 7) * DAY_S, red: OUTDATED_S });
+/**
+ * The age of ONE probe record in whole seconds against `nowMs` (never negative), or `null` when it has none to give: no timestamp
+ * (a stamp must be a positive number, like `oldestStampOf`'s), a `skip` (not a probe result: nothing was measured), a stamp dated beyond the clock-skew allowance, or an age of
+ * 100,000 days or more (it would not fit a cell). The model list's `probed` cell reads it; it is the single place the age of a record is decided, so a record that is later observed
+ * live (rather than probed) can change its age source here and nowhere else.
+ */
+export function recordAge(rec, nowMs = Date.now()) {
+  if (!rec || rec.s === "skip" || !Number.isFinite(rec.a) || !(rec.a > 0)) return null;
+  if (rec.a * 1000 - nowMs > FUTURE_SKEW_MS) return null;                    // dated in the future: not evidence of an age
+  const age = Math.max(0, Math.floor(nowMs / 1000 - rec.a));
+  return age < 100_000 * DAY_S ? age : null;
+}
 /** The band of a probe age in seconds: `grn`, `yel`, `ora` or `red`. */
 export const probeAgeTone = (ageS) => (ageS >= PROBE_AGE_BANDS_S.red ? "red" : ageS >= PROBE_AGE_BANDS_S.orange ? "ora"
   : ageS >= PROBE_AGE_BANDS_S.yellow ? "yel" : "grn");
@@ -224,7 +239,12 @@ export function isUsable(rec, nowMs = Date.now()) {
  * have one (every listed route was probed at least then). `get.stamp(target)` is the cheap raw-stamp reader `loadBench`
  * provides; any other reader falls back to the record's own `a`. `null` when no route has a record.
  */
-const routeStamp = (get, target) => (typeof get.stamp === "function" ? get.stamp(target) : get(target)?.a);
+// The stamp of a probe result: any other reader's record is already cleaned, and a `skip` is not a probe result.
+const routeStamp = (get, target) => {
+  if (typeof get.stamp === "function") return get.stamp(target);
+  const rec = get(target);
+  return rec && rec.s !== "skip" ? rec.a : null;
+};
 export function oldestStampOf(rows, get, nowMs = Date.now()) {
   if (typeof get !== "function") return null;
   let oldest = Infinity;

@@ -497,18 +497,33 @@ prompts). It is one sample taken under sweep load: read it as a ranking.
 `--only provider/model` re-probes one row in isolation.
 
 **The model list.** One view, left to right: provenance gutter, id, `stat` (the probe
-status), `ttft`, `total`, `tok/s`, `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR`,
+status), `probed`, `ttft`, `total`, `tok/s`, `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR`,
 `output`. The `limit` column is gone (it only ever showed `?`). The id column is only as wide as the provider's longest id (capped at 40;
 longer ids are elided in the middle), so the other columns sit beside it, and what is
 left over is empty space at the right. The id keeps at least 22 columns before any
 optional column is dropped. Narrow terminals drop columns in a fixed order: `output`
-first, then `tok/s`, then `total`; `modality` is always drawn, so it outlasts all three; the id
+first, then `probed`, then `tok/s`, then `total`; `modality` is always drawn, so it outlasts all three; the id
 grows toward its full width only once every column that fits is showing. At 80 columns you
 get id (22, its floor), `stat`, `ttft`, `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR`; `total`,
 `tok/s` and `output` do not fit (a short id, about 10 characters, still leaves room for
 `total` and `tok/s`). **Every column shows from a 103-column terminal** (101 when the
 longest id is 20 characters or fewer), with the id at 22 columns; a wider terminal
-first lets the id grow to its content, then widens the preview. Prices are at most
+first lets the id grow to its content, then widens the preview.
+
+`probed` (6 wide, right after `stat`) is the age of THAT model's own probe record: `<1m`, `45m`, `5h`, `3d`,
+`40d`, right-aligned, from the record's own timestamp (`recordAge` in `menu/bench-data.mjs`, the one place a
+record's age is decided) in exact seconds against the picker's frozen clock: no hour bucketing, since the model
+list reads `bench.json`. Same text rules and colour bands as the provider list's `oldest probe` (green under 2d,
+yellow under 4d, orange under 7d, red from 7d, from the same constants; orange is 256-colour 208, bright red 91 on
+16 colours; colour off shows the text). Blank means the model has no usable record. **It was added without moving
+any older column:** `total`, `tok/s` and `output` appear at exactly the widths they did (total from 86 columns,
+tok/s from 92, output from 103 for an id of 22 or more; 84 / 90 / 101 for 20), and the id column is unchanged
+from 103 columns up. `probed` itself first appears at 99 columns (97 for an id of 20, 98 for 21), after `total`
+and `tok/s`. `output` pays for it: its minimum shrank from 10 to 3 characters and it is drawn only together with
+`probed`, so between 103 and about 120 columns (while the id is still growing to its content) `output` is a
+narrow 3-character sliver, 16 at 134 columns, 122 at 240 (for an id of 40); its header is clipped to the width
+(`out` at 3); while it is narrower than 8 columns the `= <alias> (works)` hint and the `skipped: why` text draw blank rather than a fragment (the `id:` and `reply:` lines carry them whole). A `skip` record has no `probed` age (it is not a probe result; `recordAge` is null for it, for a non-positive stamp, for one dated in the future and for an age of 100,000 days or more). Between 99 and 102 columns `probed` shows without `output`, and the id gives up the few columns of
+growth beyond its 22-column floor that it would have had (it never goes below the floor). Prices are at most
 five columns (`180.0` above 100, whole numbers above 1000).
 
 **Cut and broken streams.** A record with `x` (the probe cut the stream of a model that ignored
@@ -658,7 +673,7 @@ and `needs $` *yes/no* columns, `skip`, `limit` and the health label are gone.
     `timeout` with no first token, or a transport-level `err` (`fetch failed`,
     `Failed to reach upstream provider`, `terminated`, a socket reset: the `NO_RESPONSE`
     pattern in `menu/route-hints.mjs`).
-  - **blank**: no fresh record (a provider nobody benched has no verdict).
+  - **blank**: no probe record (a provider nobody benched has no verdict).
   It is a label only: routing never prunes a provider for reading `down` or `dead`. It is
   baked as `benchFlags.status` at snapshot build (schema 8); the older two-state
   `benchFlags.alive` (answered in any shape) stays in the file for other readers. On the real
@@ -669,14 +684,14 @@ and `needs $` *yes/no* columns, `skip`, `limit` and the health label are gone.
 - `oldest probe` is the age of the provider's OLDEST probe record (the worst case, not the latest one: one
   stale model makes the provider read old), right-aligned in 12 under its lowercase header: `45m`, `5h`, `3d`,
   `12d`, `40d`. Whole minutes under an hour (`<1m` under a minute), whole hours under a day, whole days from a
-  day; every unit rounds down (`59m`, then `1h`; `23h`, then `1d`; `47h` reads `1d`; `6d23h` reads `6d`). `-`
+  day; every unit rounds down (`59m`, then `1h`; `23h`, then `1d`; `47h` reads `1d`; at the provider level ages come from hour-filed records, see below). `-`
   means the provider has no probe record, blank means there is no bench data. It is coloured as a hint by how
   close the age is to the outdated threshold T = `BENCH_OUTDATED_DAYS` (7 days): **green** under 2/7 T (2d),
   **yellow** under 4/7 T (4d), **orange** under T (7d), **red** from T (7d) on; the bands are computed from the
   constant, never repeated. Orange is 256-colour 208, and bright red (91) on a 16-colour terminal (beside yellow 33
   and red 31); with colour off only the age text shows, which carries the whole meaning. The age is computed
   against the picker's own clock (fixed when it opens, so it does not tick while open) from an **age histogram**
-  baked on each snapshot row (`benchAgeHist`, schema 9: `[[epochHour, count], ...]`, every status, the record's
+  baked on each snapshot row (`benchAgeHist`, schema 9: `[[epochHour, count], ...]`, every probe status (a `skip` is not a probe result and a record with an unknown status is invalid: both are left out), the record's
   stamp floored to the hour), so it reads no `bench.json` at level 0. Because records are filed under the start of
   their hour, an age can read up to an hour older than the exact one (a record from 11:50 seen at 12:00 reads
   `1h`); once `bench.json` has been loaded (first model screen) its own histograms replace the snapshot's. The

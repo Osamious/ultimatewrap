@@ -13,7 +13,7 @@
 // literal would be wrong on every ASCII terminal, and a colour copied here would go
 // stale the day the table changes).
 //
-// LAYOUT. Four sections, one blank line between them, each opened by a heading rule
+// LAYOUT. Five sections, one blank line between them, each opened by a heading rule
 // drawn from the glyph table: KEYS, PROVIDER LIST, MODEL LIST, STAMPS, PROBES. Inside a
 // section every entry is `term  meaning` in two aligned columns; the term is drawn in
 // the colour it has in the picker, and a meaning that needs more than one line wraps
@@ -107,7 +107,7 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   state("alive", p.grn("alive"), "at least one model answered ok");
   state("down", p.yel("down"), "answered, but nothing works: only refusals (key, payment, model, rate), empty replies, provider errors, or a timeout that got a first token");
   state("dead", p.red("dead"), "NO response at all: timeouts with nothing back, or connection failures");
-  state("blank", "blank", "nothing benched recently, so no verdict");
+  state("blank", "blank", "no probe record for this provider, so no verdict");
   entry("oldest probe", "oldest probe", "age of the provider's oldest probe result; green under 2d, yellow under 4d, orange under 7d, red 7d or older");
   L.push("  " + " ".repeat(TERM_W) + age("grn", "45m 5h") + "  " + age("yel", "2d 3d") + "  " + age("ora", "4d 6d") + "  " + age("red", "7d 12d 40d"));
   note("It is the OLDEST probe, not the latest: one stale model makes the provider read old, and a fresh one hides nothing. '-' the provider has no probe result, blank no bench data. Shown only on a wide terminal, after the whole key id.");
@@ -120,6 +120,7 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   L.push("  " + "counts".padEnd(TERM_W) + stat("empt") + " " + stat("auth") + " " + stat("pay") + " " + stat("rate") + " " + stat("gone") + " " + stat("t/o") + " " + stat("err"));
   L.push("  " + " ".repeat(TERM_W) + "one per probe result (defined under PROBES)");
   note("Each raw count is how many models had that result on their latest probe. '-' none, '2k' thousands, blank no bench data. Models never benched are in no count, so counts can add up to less than 'models'.");
+  note("The id: line under the list names the selected provider's full id and, when some of its models are covered by a subscription plan, ends with '  N plan' (how many).");
   note("Favourites (*) and recents sit above the column header, closed by a thin rule.");
 
   // -------------------------------------------------------------- 3. MODEL LIST
@@ -136,6 +137,8 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   entry("model", "model", "the model id, sized to the longest id; a longer one is elided in the middle, keeping the part that differs");
   entry("provider/model", "provider/model", "in flat search (tab) the first column reads provider/model: the full target, what enter selects");
   entry("stat", "stat", "what the last probe got back (see PROBES); blank = not benched");
+  entry("probed", "probed", "age of this model's own probe record, from its timestamp: how long ago stat, ttft and the rest of the row were measured. Same colour bands as oldest probe: green under 2d, yellow under 4d, orange under 7d, red 7d or older. Blank = never probed, or the record has no usable stamp (a skipped row has none). Sits right after stat on a wide terminal (from 97-99 columns depending on id length); output shrinks first to make room, and while it is under 8 columns wide it leaves the = alias hint and skipped text blank.");
+  L.push("  " + " ".repeat(TERM_W) + age("grn", "<1m 5h") + "  " + age("yel", "2d 3d") + "  " + age("ora", "4d 6d") + "  " + age("red", "7d 40d"));
   entry("ttft", "ttft", "request sent to first streamed token");
   entry("total", "total", "request sent to stream closed; blank for a cut stream");
   entry("tok/s", "tok/s", "output tokens per second as the provider reports; '-' when too short to measure; '~56' is an estimate for a cut stream");
@@ -168,7 +171,7 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   entry("id:", "id:", "the FULL id of the selected row (what enter or ctrl+f acts on), then the data dates: routable, benched, discovered");
   entry("reply:", "reply:", "the whole stored reply of the selected row; '[cut]' the probe stopped a stream that ignored its token limit; '[stream error]' it failed after the first token");
   note("A dimmed row is one of two things: 'not a chat model' (cannot be selected) or 'not listed now' (the gateway did not list it at snapshot time; it may still work).");
-  note("Columns drop as the terminal narrows: output first, then tok/s, then total. All show from 103 columns. The frame is never narrower than 78 (an 80-column terminal is the minimum).");
+  note("Columns drop as the terminal narrows: output first, then probed, then tok/s, then total. All show from 103 columns. The frame is never narrower than 78 (an 80-column terminal is the minimum).");
   note("A long id is elided keeping the part that differs; wide and emoji characters draw as '?'. A filter that matched inside the elided middle shows " + g.dashMatch + ".");
 
   // ----------------------------------------------------------------- 4. STAMPS

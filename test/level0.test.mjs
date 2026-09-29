@@ -441,11 +441,11 @@ test("a cut stream blanks total, draws tok/s as an estimate (~), and the reply l
     const caps = detectCaps(env, cols);
     const S = sepOf(env);
     const cellsOf = (name) => strip(frame(view(modelState(models, benchOf).st), metaFor(benchOf), { caps }).find((l) => strip(l).split(S)[0].trim().endsWith(name) && !l.includes("id:")));
-    const at = (row, n) => row.split(S)[n].trim();   // 0 id, 1 stat, 2 ttft, 3 total, 4 tok/s
-    assert.deepEqual([at(cellsOf("whole"), 3), at(cellsOf("whole"), 4)], ["1.50s", "40"]);
-    assert.deepEqual([at(cellsOf("cut"), 3), at(cellsOf("cut"), 4)], ["", "~56"], "no total for a cut stream; an estimated rate");
-    assert.deepEqual([at(cellsOf("cutnorate"), 3), at(cellsOf("cutnorate"), 4)], ["", "-"]);
-    assert.equal(at(cellsOf("broke"), 3), "2.00s", "an ok record with a stream error keeps its cells");
+    const at = (row, n) => row.split(S)[n].trim();   // 0 id, 1 stat, 2 probed, 3 ttft, 4 total, 5 tok/s
+    assert.deepEqual([at(cellsOf("whole"), 4), at(cellsOf("whole"), 5)], ["1.50s", "40"]);
+    assert.deepEqual([at(cellsOf("cut"), 4), at(cellsOf("cut"), 5)], ["", "~56"], "no total for a cut stream; an estimated rate");
+    assert.deepEqual([at(cellsOf("cutnorate"), 4), at(cellsOf("cutnorate"), 5)], ["", "-"]);
+    assert.equal(at(cellsOf("broke"), 4), "2.00s", "an ok record with a stream error keeps its cells");
   }
   const reply = (i) => {
     const { st } = modelState(models, benchOf);
@@ -547,11 +547,11 @@ test("a timeout that got its first token shows that ttft; one that got nothing s
   const models = ["slow", "dead"].map((id) => ({ ...mk(1)[0], id }));
   const caps = detectCaps(ASCII, 134);
   const rowOf = (name) => strip(frame(view(modelState(models, benchOf).st), metaFor(benchOf), { caps }).find((l) => strip(l).split(":")[0].trim().endsWith(name) && !l.includes("id:")));
-  const cell = (row, n) => row.split(":")[n].trim();   // 0 id, 1 stat, 2 ttft, 3 total
-  assert.equal(cell(rowOf("slow"), 2), "1.50s", "the first token did arrive");
-  assert.equal(cell(rowOf("slow"), 3), "35.0s");
-  assert.equal(cell(rowOf("dead"), 2), "", "nothing came back");
-  assert.equal(cell(rowOf("dead"), 3), "35.0s");
+  const cell = (row, n) => row.split(":")[n].trim();   // 0 id, 1 stat, 2 probed, 3 ttft, 4 total
+  assert.equal(cell(rowOf("slow"), 3), "1.50s", "the first token did arrive");
+  assert.equal(cell(rowOf("slow"), 4), "35.0s");
+  assert.equal(cell(rowOf("dead"), 3), "", "nothing came back");
+  assert.equal(cell(rowOf("dead"), 4), "35.0s");
 });
 
 // ------------------------------------------------ the three-state status

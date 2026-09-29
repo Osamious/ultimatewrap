@@ -140,7 +140,7 @@ list slides in from the right, and it shows models rather than providers.
 
 **Do:** read the header and rows.
 
-**Expected:** `model`, `stat`, `ttft`, then (as width allows) `total`, `tok/s`, then
+**Expected:** `model`, `stat`, then (from about 99 columns) `probed`, `ttft`, then (as width allows) `total`, `tok/s`, then
 `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR` (and later `output`); there is no `limit` column;
 context values render
 as `163k` or `1M`; prices show two decimals; badges are only ever `FREE`, `FREE?`,
@@ -560,7 +560,7 @@ blank, or the header total ignoring the `[no gone]` chip.
 **Do:** at about 134 columns read the provider list's `oldest probe` column; give it a snapshot whose providers
 have records of different ages (a re-probe of one provider's models, or edit the `benchAgeHist` of a copy), then
 open a provider and go back (the file's histograms replace the snapshot's). Resize down to about 106, 100 and 80
-columns and up again; run once with `NO_COLOR` or colour off.
+columns and up again; run once with `TERM=dumb` (no colour; the picker does not read `NO_COLOR`, and `TERM=dumb` also switches it to ASCII).
 
 **Expected:** between `status` and `models` a 12-wide column headed `oldest probe` (lowercase, whole) shows the
 age of each provider's OLDEST probe record, right-aligned: `45m`, `5h`, `3d`, `12d`, `40d`; `-` for a provider
@@ -572,3 +572,22 @@ before either. Header and rows line up at every width and the ages do not change
 
 **Fail means:** a header other than `oldest probe`, an age of the newest record instead of the oldest, a wrong colour at 2d, 4d or 7d,
 a ragged frame, or `free` shown without `oldest probe`.
+
+### P21-model-probed
+
+**Do:** open a provider whose models were probed at different times (re-probe one model with `--only` first, so
+one row is minutes old and others days old, and leave one never probed) at about 134 columns, then narrow the
+terminal through 110, 103, 100, 99 and 80 columns, then widen it again; run once with `TERM=dumb`.
+
+**Expected:** right after `stat` a 6-wide `probed` column shows how long ago each model's own record was
+written: `<1m`, `45m`, `5h`, `3d`, `40d`, right-aligned, blank for the never-probed model. Colours: under 2 days
+green, under 4 yellow, under 7 orange, 7 days or more red; with `TERM=dumb` the text alone. From 103 columns EVERY
+other column is still there (`total`, `tok/s`, `ctx`, `$in`, `$out`, `badge`, `modality`, `TVR`) and `output` is
+shortened (a sliver of 3 characters at 103, wider as the terminal widens; its header may read `out`, and while it is that narrow a `gone` route's `= sibling (works)` hint and a skipped row's text show blank, not a fragment) rather than any
+of them being dropped. Below 103 the `output` column goes first, then `probed` (below about 99 columns), then `tok/s`,
+then `total`; at 78 to 80 columns none of the four is drawn. Header and rows line up at every width and no frame is
+wider than the terminal.
+
+**Fail means:** any older column missing at 103 columns or wider, the id column narrower than 22 characters, an age
+that differs from the record's real age by more than a minute, a wrong colour at 2d, 4d or 7d, a ragged frame, or
+`probed` drawn for a model with no record.

@@ -55,7 +55,9 @@ const colsOf = (L) => {
   let at = 1 + 4 + L.W.id;
   const out = {};
   const put = (name, w) => { out[name] = at + 1; at += 1 + w; };
-  put("status", 4); put("ttft", 5);
+  put("status", 4);
+  if (L.showProbed) put("probed", 6);
+  put("ttft", 5);
   if (L.showTotal) put("total", 5);
   if (L.showTps) put("tps", 5);
   put("ctx", 6); put("in", 5); put("out", 5); put("badge", 5); put("modality", 8); put("caps", 3);
@@ -70,16 +72,17 @@ test("model layout: the optional cells give way in a fixed order, the preview fi
   for (const idW of [5, 12, 20, 30, 40, 500]) {
     for (let w = FRAME_MIN; w <= FRAME_MAX; w++) {
       const l = layoutFor(w, { idW });
-      // Priority, lowest last: preview goes first, then tok/s, then total; `modality` is always drawn.
-      if (l.showPreview) assert.ok(l.showTps, `tok/s outlives the preview (w ${w}, idW ${idW})`);
+      // Priority, lowest last: preview goes first, then probed, then tok/s, then total; `modality` is always drawn.
+      if (l.showPreview) assert.ok(l.showProbed, `probed outlives the preview (w ${w}, idW ${idW})`);
+      if (l.showProbed) assert.ok(l.showTps, `tok/s outlives probed (w ${w}, idW ${idW})`);
       assert.equal(Object.hasOwn(l, "showLimit"), false, "the limit column is gone");
       if (l.showTps) assert.ok(l.showTotal, `total outlives tok/s (w ${w}, idW ${idW})`);
-      const used = 4 + l.W.id + 46 + (l.showTotal ? 6 : 0) + (l.showTps ? 6 : 0)
+      const used = 4 + l.W.id + 49 + (l.showTotal ? 6 : 0) + (l.showTps ? 6 : 0) + (l.showProbed ? 7 : 0)
         + (l.showPreview ? 1 + l.W.preview : 0);
       assert.ok(used <= l.inner, `nothing exceeds the inner width (w ${w}, idW ${idW}): ${used} > ${l.inner}`);
       assert.ok(l.W.id <= Math.min(idW, MODEL_ID_MAX), "the id never takes more than its content");
       if (l.showPreview) {
-        assert.ok(l.W.preview >= 10, `preview ${l.W.preview} at ${w}`);   // no upper cap: the stored reply limits it
+        assert.ok(l.W.preview >= 3, `preview ${l.W.preview} at ${w}`);   // its minimum is 3 (it was 10 before `probed`); no upper cap
       }
       // What is left over is empty space at the right edge, never a gap between columns.
       assert.ok(l.inner - used >= 0);
@@ -95,7 +98,8 @@ test("the id column is sized to its content, capped, and keeps MODEL_ID_MIN befo
   assert.equal(layoutFor(FRAME_MIN, { idW: 500 }).showTps, false);
   const short = layoutFor(FRAME_MIN, { idW: 10 });
   assert.deepEqual([short.showTotal, short.showTps, short.showPreview], [true, true, false],
-    "a short id leaves room for total and tok/s at 78 columns");
+    "a short id leaves room for total and tok/s at 78 columns (and not for probed)");
+  assert.equal(short.showProbed, false);
   assert.equal(MODEL_ID_MIN, 22);
   for (let w = FRAME_MIN; w <= FRAME_MAX; w++) {
     assert.ok(layoutFor(w, { idW: 500 }).W.id >= MODEL_ID_MIN, "the id never drops below its floor");
@@ -106,21 +110,21 @@ test("the minimum terminal width at which EVERY column shows, and that the id gi
   const firstAll = (idW) => {
     for (let w = FRAME_MIN; w <= FRAME_MAX; w++) {
       const l = layoutFor(w, { idW });
-      if (l.showTotal && l.showTps && l.showPreview) return { cols: w + 2, id: l.W.id, w };
+      if (l.showTotal && l.showTps && l.showProbed && l.showPreview) return { cols: w + 2, id: l.W.id, w };
     }
     return null;
   };
-  // gutter 4 + id (at least 22) + fixed 49 (modality included) + total, tok/s 12 + the smallest preview 11 + frame 3 + margin 2.
-  assert.equal(firstAll(20).cols, 4 + 20 + 49 + 12 + 11 + 3 + 2);
-  assert.equal(firstAll(30).cols, 4 + 22 + 49 + 12 + 11 + 3 + 2, "a long id is elided to its floor rather than costing columns");
+  // gutter 4 + id (at least 22) + fixed 49 (modality included) + total, tok/s 12 + probed 7 + the smallest preview 4 + frame 3 + margin 2.
+  assert.equal(firstAll(20).cols, 4 + 20 + 49 + 12 + 7 + 4 + 3 + 2);
+  assert.equal(firstAll(30).cols, 4 + 22 + 49 + 12 + 7 + 4 + 3 + 2, "a long id is elided to its floor rather than costing columns");
   assert.equal(firstAll(MODEL_ID_MAX).cols, 103, "every column shows from a 103-column terminal");
   assert.equal(firstAll(30).id, 22);
   assert.equal(firstAll(20).cols, 101);
   // Wider: the id grows toward its content first, then the preview takes the rest.
   const at = (w) => layoutFor(w, { idW: 30 });
   assert.equal(at(firstAll(30).w + 8).W.id, 30);
-  assert.equal(at(firstAll(30).w + 8).W.preview, 10, "the id took the first 8 spare columns");
-  assert.ok(at(firstAll(30).w + 20).W.preview > 10);
+  assert.equal(at(firstAll(30).w + 8).W.preview, 3, "the id took the first 8 spare columns");
+  assert.ok(at(firstAll(30).w + 20).W.preview > 3);
 });
 
 // ---------------------------------------------------------- frame invariants
@@ -178,6 +182,8 @@ test("cells are aligned under their headers and show the measured values, all at
   const c = colsOf(L);
   assert.ok(L.showTotal && L.showTps && L.showPreview, "every column shows at 134");
   assert.equal(head.indexOf("stat"), c.status);
+  assert.ok(L.showProbed, "probed shows at 134");
+  assert.equal(head.slice(c.probed, c.probed + 6), "probed", "probed is right after stat");
   assert.equal(head.slice(c.ttft, c.ttft + 5).trim(), "ttft");
   assert.equal(head.slice(c.total, c.total + 5).trim(), "total");
   assert.equal(head.slice(c.tps, c.tps + 5).trim(), "tok/s");
@@ -192,6 +198,7 @@ test("cells are aligned under their headers and show the measured values, all at
 
   const row = lines.find((x) => x.includes("fast-one"));
   assert.equal(row.slice(c.status, c.status + 4).trim(), "ok");
+  assert.equal(row.slice(c.probed, c.probed + 6).trim(), "<1m", "the record was written just now");
   assert.equal(row.slice(c.ttft, c.ttft + 5).trim(), "842ms");
   assert.equal(row.slice(c.total, c.total + 5).trim(), "1.23s");
   assert.equal(row.slice(c.tps, c.tps + 5).trim(), "51");

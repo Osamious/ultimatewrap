@@ -373,7 +373,7 @@ test("the legend scrolls, clamps at both ends, and shows every line across the s
     t = reduce(t, DOWN).state;
   }
   for (const probe of ["call-verified", "catalogue-only", "FREE?", "PAID",
-                       "PROVIDER LIST", "nothing benched recently", "snapshot.mjs --build",
+                       "PROVIDER LIST", "no probe record for this provider", "snapshot.mjs --build",
                        "not a chat model", "not listed now",
                        "ctrl+r", "backspace"]) {
     assert.ok([...seen].some((l) => l.includes(probe)),
@@ -401,7 +401,7 @@ test("a resize while the legend is scrolled re-clamps it, leaving no blank tail"
                   health: "ok", models: [M("m0")] }];
   let s = reduce(initState(rows, { termRows: 12 }), "?").state;
   const DOWN = "\x1b[B";
-  for (let i = 0; i < 200; i++) s = reduce(s, DOWN).state;   // pin to the bottom
+  for (let i = 0; i < 400; i++) s = reduce(s, DOWN).state;   // pin to the bottom
   const tallTop = view(s).legendTotal - view(s).legendAvail;
   assert.equal(view(s).legendTop, tallTop);
   // Growing the terminal shows more lines at once, so the old offset is now past

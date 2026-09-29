@@ -20,7 +20,7 @@ import { loadSnapshot, SNAPSHOT_FILE } from "./snapshot.mjs";
 // NOTE: catalog.mjs is deliberately NOT imported here. It pulls in keysync and a
 // 19.7 MB catalogue parse, and the picker's whole input is the pre-built
 // snapshot (Q1.1). Routability arrives on the snapshot rows (Q1.3).
-import { initState, reduce, view, tokenize } from "./pick-state.mjs";
+import { initState, reduce, view, tokenize, carryAcrossRebuild } from "./pick-state.mjs";
 import { loadBench, oldestStampOf, ageHistOf } from "./bench-data.mjs";
 import { handoffTarget, modelCommand, CONTRACT } from "./cc-contract.mjs";
 import { loadPickerState, recordRecent, toggleFavourite, recordHandoff,
@@ -316,11 +316,9 @@ export function main() {
     }
     if (refav) {
       const next = toggleFavourite(refav);
-      // initState rebuilds everything, so what is not derived from the snapshot is
-      // carried across explicitly: the two model-level toggles and the bench reader.
-      state = { ...initState(loaded.snap.rows, { ...next, termRows: out.rows || 30, nowMs: state.now }),
-                okOnly: state.okOnly, oneM: state.oneM, hideGone: state.hideGone, freeOnly: state.freeOnly,
-                benchOf: state.benchOf, benchOldestAt: state.benchOldestAt, benchHist: state.benchHist };
+      // initState rebuilds everything, so what is not derived from the snapshot (the view toggles, the bench reader with
+      // its stamp and histograms) is carried across by `carryAcrossRebuild`.
+      state = carryAcrossRebuild(state, initState(loaded.snap.rows, { ...next, termRows: out.rows || 30, nowMs: state.now }));
     }
     // #114: bench.json is read ONCE, synchronously, the first time a MODEL screen (level 1
     // or flat scope) is about to be drawn -- never at startup and never while only the

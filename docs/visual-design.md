@@ -12,7 +12,9 @@ edit them in place.
 Every line is exactly `FRAME_W` = 78 code points wide, which the frame-width
 invariant test asserts for every frame in both glyph sets.
 
-## Level 0 — providers
+## The `?` screen, first page
+
+Page 1 of the legend at the 80-column floor (a 26-row page; the real renderer, 211 lines in all, five sections):
 
 ```text
 ╭─ UW ▸ providers ───────────────────────────────────────────────────────────╮
@@ -39,13 +41,13 @@ invariant test asserts for every frame in both glyph sets.
 │                                                                            │
 │  ── PROVIDER LIST ─────────────────────────────────────────────────────    │
 │    Read from the last benchmark sweep, baked into the snapshot (the date   │
-│    is on the id: line). Refresh it with: node menu/snapshot.mjs --build    │
+│    is on the id: line). A --live sweep rebuilds it itself. After           │
+│    --reclassify-notices, --redact, --compact or a skipped rebuild, run:    │
+│    node menu/snapshot.mjs --build                                          │
 │    key id     the key's FULL id, bucket included (e.g.                     │
 │               personal.openrouter.free), sized to the longest id. Only on  │
-│               a narrow terminal is it elided, with a marker (—), keeping   │
-│               the part that differs.                                       │
 │                                                                            │
-│  1-26 of 186   [↑↓] scroll  [any key] returns                              │
+│  1-26 of 211   [↑↓] scroll  [any key] returns                              │
 ╰ [↑↓] move [↵] open [⇥] scope [^f] fav [^x] gone [?] all keys [esc] back ───╯
 ```
 
@@ -93,6 +95,44 @@ is always whole). The date is the oldest record's:
 
 Old records stay visible and are never hidden or dimmed; this line and the `oldest probe` column show how old the
 data is. It costs one list row while it shows.
+
+## Model level, the `probed` column
+
+Right after `stat`, from about 99 columns: the age of that model's own record (exact, green under 2d, yellow under 4d,
+orange under 7d, red from 7d; blank when never probed). At 134 columns:
+
+```text
+╭─ UW ▸ personal.google.free ▸ models ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│  filter: ▏                                                                                                         5 of 5 · - ok │
+│                                                                                                                                  │
+│    model           ┆stat┆probed┆ ttft┆total┆tok/s┆   ctx┆  $in┆ $out┆badge┆modality┆TVR┆output                                   │
+│▶ ◇ gemini-3.5-flash┆ok  ┆    5h┆620ms┆1.10s┆   62┆  128k┆ 0.15┆ 0.60┆FREE ┆chat    ┆T--┆Hello! How can I help you today?         │
+│  ◇ gemini-3.5-pro  ┆ok  ┆    3d┆1.80s┆4.20s┆   31┆  128k┆ 1.25┆ 5.00┆PAID ┆chat    ┆T--┆Hi there, happy to help                  │
+│  ◇ gemma-4-27b     ┆gone┆    5d┆     ┆     ┆     ┆  128k┆ 0.15┆ 0.60┆FREE ┆chat    ┆T--┆model not found                          │
+│  ◇ gemini-2.0-flash┆auth┆    9d┆     ┆     ┆     ┆    1M┆ 0.15┆ 0.60┆FREE ┆chat    ┆T--┆API key not valid                        │
+│  ◇ imagen-4        ┆    ┆      ┆     ┆     ┆     ┆      ┆ 0.15┆ 0.60┆FREE ┆image   ┆T--┆                                         │
+│  id: gemini-3.5-flash                                                                        benched 10-07 08:00Z · discovered — │
+│  reply: Hello! How can I help you today?                                                                                         │
+╰ [↑↓] move [↵] pick [^f]fav [^o]ok [^l]1M+ [^x]gone [^e]free [?] keys [esc] ──────────────────────────────────────────────────────╯
+```
+
+At 103 columns every column is still there; `output` gives up its width to `probed` (here the id is short, so `output` keeps
+more than its 3-character minimum, which is what it shrinks to beside a long id):
+
+```text
+╭─ UW ▸ personal.google.free ▸ models ──────────────────────────────────────────────────────────────╮
+│  filter: ▏                                                                          5 of 5 · - ok │
+│                                                                                                   │
+│    model           ┆stat┆probed┆ ttft┆total┆tok/s┆   ctx┆  $in┆ $out┆badge┆modality┆TVR┆output    │
+│▶ ◇ gemini-3.5-flash┆ok  ┆    5h┆620ms┆1.10s┆   62┆  128k┆ 0.15┆ 0.60┆FREE ┆chat    ┆T--┆Hello! Ho │
+│  ◇ gemini-3.5-pro  ┆ok  ┆    3d┆1.80s┆4.20s┆   31┆  128k┆ 1.25┆ 5.00┆PAID ┆chat    ┆T--┆Hi there, │
+│  ◇ gemma-4-27b     ┆gone┆    5d┆     ┆     ┆     ┆  128k┆ 0.15┆ 0.60┆FREE ┆chat    ┆T--┆model not │
+│  ◇ gemini-2.0-flash┆auth┆    9d┆     ┆     ┆     ┆    1M┆ 0.15┆ 0.60┆FREE ┆chat    ┆T--┆API key n │
+│  ◇ imagen-4        ┆    ┆      ┆     ┆     ┆     ┆      ┆ 0.15┆ 0.60┆FREE ┆image   ┆T--┆          │
+│  id: gemini-3.5-flash                                         benched 10-07 08:00Z · discovered — │
+│  reply: Hello! How can I help you today?                                                          │
+╰ [↑↓] move [↵] pick [^f]fav [^o]ok [^l]1M+ [^x]gone [^e]free [?] keys [esc] ───────────────────────╯
+```
 
 ## Empty state
 

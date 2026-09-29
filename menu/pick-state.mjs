@@ -134,6 +134,23 @@ const settle = (list, i) => {
   return i;
 };
 
+// The session's view toggles and their defaults: ONE list, read by `initState` and by `carryAcrossRebuild`, so a new toggle
+// added here is carried across a rebuild without anyone remembering to.
+export const TOGGLE_DEFAULTS = Object.freeze({ okOnly: false, oneM: false, hideGone: false, freeOnly: false });
+// What the bench reader loaded into the state (see `reduce`'s `{ benchOf }` event): not derived from the snapshot rows.
+export const BENCH_FIELDS = Object.freeze(["benchOf", "benchOldestAt", "benchHist"]);
+
+/**
+ * A rebuilt state (`initState` after a favourite was toggled) with what the session had accumulated carried over: every
+ * view toggle and the loaded bench reader with its stamp and histograms. Everything else (cursor, filters, level) restarts
+ * as `initState` made it.
+ */
+export function carryAcrossRebuild(oldState, newState) {
+  const out = { ...newState };
+  for (const k of [...Object.keys(TOGGLE_DEFAULTS), ...BENCH_FIELDS]) out[k] = oldState[k];
+  return out;
+}
+
 export function initState(rows, { recents = [], favourites = [], termRows = 30, nowMs = Date.now(), benchOldestAt = null } = {}) {
   const known = new Set();
   // Built from SELECTABLE models only, which is where the pinned path is handled.
@@ -187,7 +204,7 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30, 
     // AND with each other and with the typed filter. They PERSIST across levels and
     // scope for the whole session (unlike the typed filter, which is per level): they are
     // a view preference, and the header chips keep them visible. Plain booleans.
-    okOnly: false, oneM: false, hideGone: false, freeOnly: false,
+    ...TOGGLE_DEFAULTS,
     // The lazily loaded bench reader (`loadBench().get`), handed in by uwpick as an event
     // `{ benchOf }` the first time a model screen is drawn, so the reducer does no I/O. `now`
     // is fixed at init so "fresh" cannot change under a session.
@@ -240,14 +257,15 @@ const slot = (s) => (s.scope === "flat" ? 2 : s.level);
 // `extra`: the lines a list screen spends OUTSIDE the rows and the six fixed ones -- the model level's
 // `reply:` line, and the rule under the pinned strip at level 0. Both renderer and reducer read the
 // page size from here, so they cannot disagree.
-// The outdated notice (a dedicated line above the footer) costs one more line on every list screen while it is showing.
+// The outdated notice (a dedicated line above the footer) costs one more line on every LIST screen while it is showing. The
+// legend and the withheld overlay are modals that do not draw it, so it costs them nothing.
 // The age histogram of one provider row: the loaded bench.json's once it is in, else the snapshot's baked one (`undefined`
 // when neither exists: no bench data, so nothing to say about its age).
 const histOfRow = (s, r) => (s.benchHist ? (s.benchHist.get(r.keyId) ?? []) : r.benchAgeHist);
 // `YYYY-MM-DD` when MORE than half of all the records are over 7 days old (the date is the OLDEST record's), else null.
 const noticeDate = (s) => outdatedNotice(s.benchOldestAt, s.rows.map((r) => histOfRow(s, r)), s.now);
 const extraLines = (s) => ((s.scope === "flat" || s.level === 1) ? 1
-  : (s.pinned?.length > 0 ? 1 : 0)) + (noticeDate(s) ? 1 : 0);
+  : (s.pinned?.length > 0 ? 1 : 0)) + (!s.legend && !s.refusals && noticeDate(s) ? 1 : 0);
 const rowsAvail = (s) => Math.max(1, (s.termRows || 30) - 8 - extraLines(s));
 
 function flatItems(s) {
@@ -369,7 +387,7 @@ function items(s) {
 
 function clamp(s) {
   const list = items(s);
-  const avail = rowsAvail(s);
+  const avail = rowsAvail({ ...s, legend: null, refusals: null });      // the LIST page: a modal open over it (which draws no notice) must not clamp it wider
   const i = slot(s);
   const cur = [...s.cur], top = [...s.top];
   cur[i] = Math.min(Math.max(0, cur[i]), Math.max(0, list.length - 1));

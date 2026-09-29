@@ -31,9 +31,9 @@ const ROWS = [
 ];
 const META = { providers: 2, models: 3, generatedAt: "2026-08-24T12:22:28.162Z" };
 // Where the badge text begins on a model row (#114 model level): frame char 1, mark and
-// glyph 4, the id, then stat 5, ttft 6, [total 6], [tok/s 6], ctx 7, $in 6, $out 6, and
+// glyph 4, the id, then stat 5, [probed 7], ttft 6, [total 6], [tok/s 6], ctx 7, $in 6, $out 6, and
 // the badge cell's own leading gap. Derived from the layout the renderer used.
-const modelBadgeCol = (L) => 1 + 4 + L.W.id + 5 + 6 + (L.showTotal ? 6 : 0) + (L.showTps ? 6 : 0) + 19 + 1;
+const modelBadgeCol = (L) => 1 + 4 + L.W.id + 5 + (L.showProbed ? 7 : 0) + 6 + (L.showTotal ? 6 : 0) + (L.showTps ? 6 : 0) + 19 + 1;
 // The longest id of ROWS[0]'s models: what the renderer sizes the id column to on V1.
 const V1_ID_W = Math.max(...ROWS[0].models.map((m) => m.id.length));
 const V0 = {

@@ -120,7 +120,7 @@ test("elision stays cheap on a 6,000-model column", () => {
 const long = "an-extremely-long-model-identifier-that-cannot-possibly-fit-in-the-column:2026-09-29-batch";
 const ROW = prow("personal.acme.free", [M(long), M("plain-one"), M("pic", { outputKind: "nontext" })]);
 const OTHER = prow("relay.zed.sub", [M("z1")]);
-const metaFor = (rows) => ({ providers: rows.length, models: rows.reduce((n, r) => n + r.models.length, 0), keyIdBucket: "", keyIdW: 30 });
+const metaFor = (rows) => ({ providers: rows.length, models: rows.reduce((n, r) => n + r.models.length, 0), keyIdW: 30 });
 const idLine = (lines) => lines.map(strip).find((l) => l.startsWith("│  id:") || l.startsWith("|  id:"));
 
 test("level 1 shows the selected row's full, unelided id on the line above the reply line and the footer", () => {
@@ -147,9 +147,9 @@ test("flat scope shows provider/model, level 0 shows the whole key id including 
   let f = reduce(initState([ROW, OTHER]), TAB).state;
   f = reduce(f, DOWN).state;
   assert.ok(idLine(frame(view(f), metaFor([ROW, OTHER]), { caps })).includes("acme/plain-one"));
-  const m0 = { ...metaFor([ROW, OTHER]), keyIdBucket: "personal." };
+  const m0 = metaFor([ROW, OTHER]);
   const l0 = reduce(initState([ROW, OTHER]), "").state;
-  assert.ok(idLine(frame(view(l0), m0, { caps })).includes("id: personal.acme.free"), "the omitted bucket is spelled out");
+  assert.ok(idLine(frame(view(l0), m0, { caps })).includes("id: personal.acme.free"), "the full key id, bucket included");
   assert.ok(idLine(frame(view(reduce(l0, DOWN).state), m0, { caps })).includes("id: relay.zed.sub"));
   const pinnedV = { level: 0, scope: "tree", filter: "", legend: false, cursor: 0, top: 0, empty: false, provider: null, more: 0,
     fullId: "acme/some-pinned-model", items: [{ kind: "pinned", mark: "*", target: "acme/some-pinned-model" }] };
@@ -259,7 +259,7 @@ test("wide, astral and combining characters cannot move a row or the rules, in i
         let st = reduce(initState(rows), { benchOf }).state;
         if (mode === "level1") st = { ...st, level: 1, provider: row };
         if (mode === "flat") st = reduce(st, TAB).state;
-        const meta = { providers: 2, models: 6, keyIdBucket: "", keyIdW: 30, flatIdW: 40, benchOf, benchAsOf: "2026-09-29T12:00:00Z" };
+        const meta = { providers: 2, models: 6, keyIdW: 30, flatIdW: 40, benchOf, benchAsOf: "2026-09-29T12:00:00Z" };
         const lines = frame(view(st), meta, { caps }).map(strip);
         for (const l of lines) {
           assert.equal(cps(l), frameWidth(caps), `${mode} cols ${cols}`);
@@ -326,7 +326,7 @@ test("escape sequences injected into any meta string never reach the output", ()
   const PWN = "\x1b]0;PWN\x07\x1b[2J\x1b[31m";
   const models = [M("m1")];
   const row = prow("personal.acme.free", models, { provider: "acme", bench: { ok: 1, empty: 0, auth: 0, pay: 0, rate: 0, gone: 0, timeout: 0, error: 0, skip: 0 } });
-  const meta = { providers: 1, models: 1, keyIdW: 30, keyIdBucket: PWN, benchAsOf: PWN, routableAsOf: PWN, discoveredAsOf: PWN,
+  const meta = { providers: 1, models: 1, keyIdW: 30, benchAsOf: PWN, routableAsOf: PWN, discoveredAsOf: PWN,
                  benchCountsAsOf: PWN, generatedAt: PWN, benchOf: () => null };
   for (const env of [UNI, ASCII]) {
     const caps = detectCaps(env, 134);

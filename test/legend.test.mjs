@@ -81,7 +81,7 @@ test("every column the pickers name in their headers is explained on the page (t
   assert.ok(cells.size >= 20, "the renderer's headers: " + [...cells].join(" | "));
   for (const c of cells) assert.ok(terms.has(c) || terms.has(c.split(" ")[0]), `the legend has no entry for the header cell "${c}"`);
   for (const w of ["alive", "down", "dead", "gutter", "reply:", "id:", "N of M"]) assert.ok(text.includes(w), w);
-  assert.match(text, /never narrower than 78/);
+  assert.match(text.replace(/\s+/g, " "), /never narrower than 78/);
   assert.equal(/14 days|14-day/.test(text), false, "the 14-day cutoff is gone from the legend");
   assert.match(text, /outdated\s+a yellow line just above the footer/);
   assert.match(text.replace(/\s+/g, " "), /more than 7 days old/);
