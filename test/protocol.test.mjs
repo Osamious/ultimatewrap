@@ -22,7 +22,7 @@ const REQUIRED = [
   "P11c-missing-snapshot-leaves-the-chat-input-empty",
   "P12-console-restored", "P13-motion", "P14-legend-and-empty-state",
   "P14a-omc-survives-uninstall", "P14b-uninstall-refuses-a-foreign-command",
-  "P15-statusline-footer",
+  "P15-statusline-footer", "P16-bench-view",
 ];
 
 test("the protocol document exists", () => {

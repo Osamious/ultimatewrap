@@ -21,11 +21,12 @@ import { loadSnapshot, SNAPSHOT_FILE } from "./snapshot.mjs";
 // 19.7 MB catalogue parse, and the picker's whole input is the pre-built
 // snapshot (Q1.1). Routability arrives on the snapshot rows (Q1.3).
 import { initState, reduce, view, tokenize } from "./pick-state.mjs";
+import { loadBench } from "./bench-data.mjs";
 import { handoffTarget, modelCommand, CONTRACT } from "./cc-contract.mjs";
 import { loadPickerState, recordRecent, toggleFavourite, recordHandoff,
          recordStartup } from "./state.mjs";
 import { frame, confirmLine, detectCaps, glyphsFor, painter, motionEnabled,
-         slideFrames, revealFrames, flashFrames, sleepSync, FRAME_MS } from "./style.mjs";
+         slideFrames, revealFrames, flashFrames, sleepSync, keyIdWidth, keyIdBucket, flatIdWidth, FRAME_MS } from "./style.mjs";
 
 const ESC = "\x1b";
 const HOME = `${ESC}[H`;
@@ -46,6 +47,7 @@ function paint(out, lines) {
 export function firstFrame({ snap, recents, favourites, caps, termRows }) {
   const rows = snap.rows;
   const state = initState(rows, { recents, favourites, termRows });
+  const bucket = keyIdBucket(rows);
   const meta = {
     providers: rows.length,
     models: rows.reduce((n, r) => n + r.models.length, 0),
@@ -61,6 +63,25 @@ export function firstFrame({ snap, recents, favourites, caps, termRows }) {
     // downstream, so adding the field to the snapshot (R15) without adding it
     // HERE would have shipped a header reading `undefined` on every row.
     discoveredAsOf: snap.discoveredAsOf ?? null,
+    // #114: when the sweep behind the provider list's status counts was taken. Named
+    // apart from `benchAsOf`, which the model screens set from bench.json itself.
+    benchCountsAsOf: snap.benchAsOf ?? null,
+    // #114: the provider list's key id column is sized to the longest key id over ALL
+    // rows, once, so it neither drifts right on wide terminals nor moves while filtering.
+    // The bucket segment (`personal.`) nearly every key id shares is not drawn; the width is
+    // measured over the ids AS DRAWN.
+    keyIdBucket: bucket,
+    keyIdW: keyIdWidth(rows, bucket),
+    // The rows themselves, so the key id column can elide with distinctness across ALL of them.
+    rows,
+    // The same idea for flat scope's id column (its longest `provider/model` target), and the
+    // header's total of ok models: the sum of the per-row counts baked into the snapshot.
+    // `null` when no row carries bench data, which the header draws as a dash.
+    flatIdW: flatIdWidth(rows),
+    // `0 ok` only when at least one provider row has a fresh record (any status count above zero);
+    // a snapshot whose counts are all zero knows nothing, and reads `- ok` like the live figures.
+    okTotal: rows.some((r) => r.bench && Object.values(r.bench).some((n) => n > 0))
+      ? rows.reduce((n, r) => n + (r.bench?.ok ?? 0), 0) : null,
   };
   return { state, meta, text: screen(view(state), meta, { caps }) };
 }
@@ -229,7 +250,7 @@ export function main() {
     // (never resolved, e.g. the gateway did not answer that build) -- only
     // the first warns; D9 forbids treating "unknown" as "dead".
     const warn = routable === false
-      ? `\n${p.dim(`not in CCR's routing table as of ${loaded.snap.routableAsOf ?? "unknown"}; it may not respond`)}`
+      ? `\n${p.dim(`not in CCR's routing table as of ${String(loaded.snap.routableAsOf ?? "unknown").replace(/[^ -~]/g, "?").slice(0, 40)}; it may not respond`)}`
       : "";
     out.write(CLEAR + SHOW + confirmLine(target, g, p) + warn + "\n");
     recordHandoff({ argv2: FILE ?? null, existed: !!FILE && fs.existsSync(FILE), wrote });
@@ -295,7 +316,20 @@ export function main() {
     }
     if (refav) {
       const next = toggleFavourite(refav);
-      state = initState(loaded.snap.rows, { ...next, termRows: out.rows || 30 });
+      // initState rebuilds everything, so what is not derived from the snapshot is
+      // carried across explicitly: the two model-level toggles and the bench reader.
+      state = { ...initState(loaded.snap.rows, { ...next, termRows: out.rows || 30, nowMs: state.now }),
+                okOnly: state.okOnly, oneM: state.oneM, benchOf: state.benchOf };
+    }
+    // #114: bench.json is read ONCE, synchronously, the first time a MODEL screen (level 1
+    // or flat scope) is about to be drawn -- never at startup and never while only the
+    // provider list is used. loadBench is total (a missing or corrupt file is an empty
+    // result), so this cannot take the picker down. The reader goes to the renderer
+    // through `meta` and to the reducer (the ok-only filter) as an event.
+    if ((state.level > 0 || state.scope === "flat") && !meta.benchOf) {
+      const b = loadBench();
+      meta = { ...meta, benchOf: b.get, benchAsOf: b.size ? b.generatedAt : null };
+      state = reduce(state, { benchOf: b.get }).state;
     }
     if (exited) {
       closeSync(CONIN);

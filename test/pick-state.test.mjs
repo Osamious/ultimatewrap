@@ -619,7 +619,7 @@ test("the overlay's arrow keys scroll its own page, and clamp at both ends witho
   const many = { keyId: "p", provider: "p", free: null, planCount: 0, health: "ok",
     models: [M("m0")],
     refused: Array.from({ length: 30 }, (_, i) => ({ id: `r${i}`, reason: "cap-exceeded", removed: 0 })) };
-  let s = reduce(initState([many], { termRows: 12 }), CTRL_R).state; // rowsAvail(12) = 5
+  let s = reduce(initState([many], { termRows: 13 }), CTRL_R).state; // rowsAvail(13) = 5
   assert.equal(view(s).refusals.top, 0);
   s = reduce(s, UP).state;
   assert.equal(view(s).refusals.top, 0, "must clamp at the top rather than go negative");
@@ -638,11 +638,11 @@ test("a resize while the overlay is open re-clamps its own scroll offset (L1)", 
   const many = { keyId: "p", provider: "p", free: null, planCount: 0, health: "ok",
     models: [M("m0")],
     refused: Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, reason: "cap-exceeded", removed: 0 })) };
-  let s = reduce(initState([many], { termRows: 30 }), CTRL_R).state;   // rowsAvail(30) = 23
+  let s = reduce(initState([many], { termRows: 30 }), CTRL_R).state;   // rowsAvail(30) = 22
   for (let i = 0; i < 40; i++) s = reduce(s, DOWN).state;               // scroll to the bottom
-  assert.equal(view(s).refusals.top, 17, "sanity: 40 - 23");
+  assert.equal(view(s).refusals.top, 18, "sanity: 40 - 22");
 
-  s = reduce(s, { resize: 60 }).state;    // rowsAvail(60) = 53, well past the 40 real entries
+  s = reduce(s, { resize: 60 }).state;    // rowsAvail(60) = 52, well past the 40 real entries
   assert.equal(view(s).refusals.top, 0,
     "growing the terminal past the full list must clamp top back to 0, not leave it scrolled");
   assert.equal(view(s).refusals.items.length, 40);

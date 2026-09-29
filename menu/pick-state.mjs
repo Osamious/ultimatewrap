@@ -11,8 +11,37 @@
 // imports nothing itself -- it takes the glyph renderers as arguments -- so this
 // cannot become a cycle back through `style.mjs`.
 import { LEGEND_LENGTH } from "./legend.mjs";
+// Light (fs + two tiny modules), already in the picker's graph via snapshot.mjs. The
+// reducer needs the ONE definition of "fresh ok" so the filter and the header agree.
+import { freshOk, isFresh } from "./bench-data.mjs";
+import { liveAlias } from "./route-hints.mjs";
 
 const asTarget = (providerName, modelId) => `${providerName}/${modelId}`;
+
+/**
+ * The 1M-context filter's rule. `ctx >= 1,000,000` alone is not enough: measured on
+ * the real snapshot, 1,062 ids carry a `[1m]` tag and one of them
+ * (`teamorouter/kimi-k3[1M]`) has a null ctx, while two ids reach 1M without the
+ * tag. The tag is how the router is asked for the long window, so either signal
+ * counts (and the tag is matched case-insensitively, as `bench-data` does).
+ */
+export const isOneM = (m) => (Number.isFinite(m?.ctx) && m.ctx >= 1_000_000) || /\[1m\]$/i.test(String(m?.id ?? ""));
+
+// `ok` per target, computed once per (reader, clock): flat scope filters ~6,000 rows on
+// every keystroke and each lookup cleans a record, so an unmemoised filter is ~100 ms a key.
+const okCache = new WeakMap();
+function okOf(s) {
+  if (typeof s.benchOf !== "function") return () => false;
+  let byNow = okCache.get(s.benchOf);
+  if (!byNow) okCache.set(s.benchOf, byNow = new Map());
+  let memo = byNow.get(s.now);
+  if (!memo) byNow.set(s.now, memo = new Map());
+  return (target) => {
+    let v = memo.get(target);
+    if (v === undefined) memo.set(target, v = freshOk(s.benchOf(target), s.now));
+    return v;
+  };
+}
 
 /**
  * Whether enter on this item can do anything.
@@ -90,7 +119,7 @@ const settle = (list, i) => {
   return i;
 };
 
-export function initState(rows, { recents = [], favourites = [], termRows = 30 } = {}) {
+export function initState(rows, { recents = [], favourites = [], termRows = 30, nowMs = Date.now() } = {}) {
   const known = new Set();
   // Built from SELECTABLE models only, which is where the pinned path is handled.
   // A pin is a persisted target STRING -- state.mjs returns nothing else -- so
@@ -139,6 +168,15 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30 }
     // a BOOLEAN `legend` for the renderer and its tests, with the offset beside
     // it as `legendTop`, so nothing downstream has to learn the new shape.
     level: 0, scope: "tree", legend: null,
+    // #114, MODEL LEVEL ONLY (level 1 and flat scope): two independent view filters that
+    // AND with each other and with the typed filter. They PERSIST across levels and
+    // scope for the whole session (unlike the typed filter, which is per level): they are
+    // a view preference, and the header chips keep them visible. Plain booleans.
+    okOnly: false, oneM: false,
+    // The lazily loaded bench reader (`loadBench().get`), handed in by uwpick as an event
+    // `{ benchOf }` the first time a model screen is drawn, so the reducer does no I/O. `now`
+    // is fixed at init so "fresh" cannot change under a session.
+    benchOf: null, now: nowMs,
     q: ["", "", ""], cur: [0, 0, 0], top: [0, 0, 0],
     provider: null, termRows,
     // #51 (§2.5(b)/(c)), R18: null when closed, otherwise
@@ -168,16 +206,22 @@ const slot = (s) => (s.scope === "flat" ? 2 : s.level);
 // or the overlay's page short of a full screen) and is exact at both worst
 // cases.
 //
-// The `Math.max(3, ...)` FLOOR is a separate, pre-existing tradeoff, restated
-// here rather than left implicit now that the divisor changed: below a
-// termRows of 10, this guarantees at least 3 visible rows -- never a
-// zero-row pane -- at the cost of the overlay's 7-line chrome (7 + 3 = 10)
-// exceeding an extremely small terminal. This is not new to this change: the
-// original `- 6` already overflowed the tree/flat chrome (6 + 3 = 9) below a
-// termRows of 9. Usable-with-a-floor beats correctly-sized-and-empty; a
-// terminal shorter than 10 rows is far outside this product's stated target
-// and is accepted, disclosed tradeoff rather than a silently broken one.
-const rowsAvail = (s) => Math.max(3, (s.termRows || 30) - 7);
+// The `Math.max(1, ...)` FLOOR is a separate tradeoff. A list screen is 6 fixed lines (title, filter,
+// blank, column header, the full-id line, footer), plus one `extra` line (the model level's `reply:`
+// line, or the rule under the pinned strip at level 0), plus the rows, plus up to two conditional
+// lines ("... N more" and "... N more recents"). With a floor of ONE row a list screen fits a
+// 10-row terminal in its worst case (6 + 1 + 1 + 2 = 10); the refusals overlay is 7 fixed lines
+// (7 + 1 = 8). Below 10 rows the frame overflows by design: never a zero-row pane beats
+// correctly-sized-and-empty, and a terminal that short is far outside this product's stated target.
+// #114: 8, not 7 -- the FULL ID line (the selected row's unelided id, one line above the footer)
+// is always present on a list screen and costs one row. The renderer reads the page size from
+// `view().legendAvail` and the reducer clamps against this same function, so they cannot disagree.
+// `extra`: the lines a list screen spends OUTSIDE the rows and the six fixed ones -- the model level's
+// `reply:` line, and the rule under the pinned strip at level 0. Both renderer and reducer read the
+// page size from here, so they cannot disagree.
+const extraLines = (s) => ((s.scope === "flat" || s.level === 1) ? 1
+  : (s.pinned?.length > 0 ? 1 : 0));
+const rowsAvail = (s) => Math.max(1, (s.termRows || 30) - 8 - extraLines(s));
 
 function flatItems(s) {
   const out = [];
@@ -189,15 +233,67 @@ function flatItems(s) {
   return out;
 }
 
+// The live `ok` counts the model-level header shows: from the SAME reader the rows, the benched
+// stamp and the ok-only filter use, so all of them agree. Memoised per (reader, clock): the flat
+// total is a pass over every row, done once.
+const okMemo = new WeakMap();
+function okBook(s) {
+  let m = okMemo.get(s.benchOf);
+  if (!m || m.now !== s.now) okMemo.set(s.benchOf, m = { now: s.now, byRow: new WeakMap(), total: undefined });
+  return m;
+}
+// `{ ok, fresh }` for one provider: MODEL ROWS whose latest fresh status is ok (exactly what the
+// ok-only filter keeps; an `x` and `x[1m]` pair are two routes and count twice), and how many rows
+// have ANY fresh record. Memoised per (reader, clock, row).
+function liveTally(s, row) {
+  const m = okBook(s);
+  let t = m.byRow.get(row);
+  if (!t) {
+    t = { ok: 0, fresh: 0 };
+    for (const m2 of row.models) {
+      const rec = s.benchOf(`${row.provider}/${m2.id}`);
+      if (isFresh(rec, s.now)) t.fresh += 1;
+      if (freshOk(rec, s.now)) t.ok += 1;
+    }
+    m.byRow.set(row, t);
+  }
+  return t;
+}
+// A reader with no records at all (bench.json missing, empty or unusable) knows nothing.
+const noReader = (s) => typeof s.benchOf !== "function" || s.benchOf.records === 0;
+/**
+ * The model-level `ok` figure, or `null` (drawn `- ok`, never `0 ok`) when nothing was benched:
+ * the reader has no records, or (at level 1) this provider has no FRESH record. `0` is reserved for
+ * "at least one fresh record and none is ok".
+ */
+function liveOk(s, row) {
+  if (noReader(s) || !row) return null;
+  const t = liveTally(s, row);
+  return t.fresh === 0 ? null : t.ok;
+}
+function liveOkTotal(s) {
+  if (noReader(s)) return null;
+  const m = okBook(s);
+  if (m.total === undefined) {
+    let ok = 0, fresh = 0;
+    for (const r of s.rows) { const t = liveTally(s, r); ok += t.ok; fresh += t.fresh; }
+    m.total = fresh === 0 ? null : ok;
+  }
+  return m.total;
+}
+
 function items(s) {
   const needle = s.q[slot(s)].toLowerCase();
   const has = (hay) => !needle || String(hay).toLowerCase().includes(needle);
+  // The model-level toggles: ok-only (latest fresh bench status is exactly `ok`) and 1M+.
+  const ok = s.okOnly ? okOf(s) : null;
+  const passes = (target, m) => (!s.oneM || isOneM(m)) && (!ok || ok(target));
 
-  if (s.scope === "flat") return flatItems(s).filter((i) => has(i.target));
+  if (s.scope === "flat") return flatItems(s).filter((i) => has(i.target) && passes(i.target, i.model));
 
   if (s.level === 1) {
     const modelItems = s.provider.models
-      .filter((m) => has(m.id))
+      .filter((m) => has(m.id) && passes(asTarget(s.provider.provider, m.id), m))
       .map((m) => ({ kind: "model", model: m, row: s.provider,
                      target: asTarget(s.provider.provider, m.id) }));
     // #51 (§2.5(b), revision 11): a second door onto the ctrl+r overlay, placed
@@ -207,7 +303,7 @@ function items(s) {
     // narrows the models below is fine; a query MATCHING it as though it were
     // a model id would be the defect §2.5(b) names).
     const withheldCount = s.provider.refused?.length ?? 0;
-    if (!needle && withheldCount > 0) {
+    if (!needle && !s.okOnly && !s.oneM && withheldCount > 0) {
       return [{ kind: "withheld-list", count: withheldCount }, ...modelItems];
     }
     return modelItems;
@@ -289,6 +385,11 @@ export function tokenize(chunk) {
 }
 
 export function reduce(state, ev) {
+  if (ev && typeof ev === "object" && Object.hasOwn(ev, "benchOf")) {
+    // The lazy bench reader arriving (see initState). The ok filter may change what the
+    // list holds, so the cursor is re-clamped like any other list change.
+    return { ...NONE, state: clamp({ ...state, benchOf: typeof ev.benchOf === "function" ? ev.benchOf : null }) };
+  }
   if (ev && typeof ev === "object" && Number.isFinite(ev.resize)) {
     let next = clamp({ ...state, termRows: ev.resize });
     // `clamp()` only re-derives the main list's `top`. Left alone, a resize
@@ -377,6 +478,17 @@ export function reduce(state, ev) {
     return { ...NONE, state: { ...state, legend: null } };
   }
   if (key === "?") return { ...NONE, state: { ...state, legend: { top: 0 } } };  // Q3.6
+
+  // ctrl+o (ok-only) and ctrl+l (1M+ context), MODEL LEVEL ONLY: no-ops at level 0
+  // (the modals above already swallowed the key). Chosen because they are free here
+  // and free in the terminal: not ctrl+c/f/r/g (handoff)/i/m/j/h/z/s/q/d, and not
+  // ctrl+b, which is now a plain no-op (the bench view it toggled is gone). Both are
+  // control bytes below 32, so the live filter below can never insert them.
+  if ((c0 === 15 || c0 === 12) && key.length === 1) {
+    if (state.scope !== "flat" && state.level === 0) return { ...NONE, state };
+    const next = c0 === 15 ? { ...state, okOnly: !state.okOnly } : { ...state, oneM: !state.oneM };
+    return { ...NONE, state: clamp(reset(next)) };
+  }
 
   if (key === "\t") {                                                          // scope toggle
     return { ...NONE, state: clamp({ ...state, scope: state.scope === "flat" ? "tree" : "flat" }) };
@@ -482,6 +594,19 @@ export function reduce(state, ev) {
   return { ...NONE, state };
 }
 
+function aliasOfSelected(item, state) {
+  if (item?.kind !== "model" || typeof state.benchOf !== "function") return null;
+  return liveAlias(item.row?.provider ?? state.provider?.provider, item.model, state.benchOf, state.now);
+}
+
+function fullIdOf(item, flat) {
+  if (!item || !isSelectable(item)) return null;
+  if (item.kind === "model") return flat ? item.target : String(item.model?.id ?? "");
+  if (item.kind === "provider") return String(item.row?.keyId ?? "");
+  if (item.kind === "pinned") return String(item.target ?? "");
+  return null;
+}
+
 export function view(state) {
   const i = slot(state);
   const all = items(state);
@@ -499,7 +624,9 @@ export function view(state) {
     const list = providerRow?.refused ?? [];
     const top = state.refusals.top;
     refusals = { provider: state.refusals.provider, top,
-                 items: list.slice(top, top + avail), total: list.length };
+                 items: list.slice(top, top + avail), total: list.length,
+                 // the longest withheld id, so the overlay can size its own id column
+                 idMax: list.reduce((n, e) => Math.max(n, [...String(e?.id ?? "")].length), 0) };
   }
   return {
     // BOOLEAN, deliberately, though the reducer now holds `null | {top}`. Every
@@ -507,6 +634,9 @@ export function view(state) {
     // object would make `if (v.legend)` keep working while `=== true` silently
     // stopped -- the worst shape of change. The offset rides beside it.
     level: state.level, scope: state.scope, filter: state.q[i], legend: !!state.legend,
+    okOnly: !!state.okOnly, oneM: !!state.oneM,
+    // The session clock the freshness rule reads (fixed at init), so the renderer never asks the wall.
+    now: state.now,
     legendTop: state.legend?.top ?? 0,
     legendTotal: LEGEND_LENGTH,
     // The page size, from the SAME `rowsAvail` the arrow-scroll clamp above
@@ -516,6 +646,19 @@ export function view(state) {
     legendAvail: avail,
     items: shown, cursor: state.cur[i], top: state.top[i],
     empty: all.length === 0, provider: state.provider,
+    // How many MODEL rows the whole filtered list holds (not this page): the header's
+    // "N of M" counts these, never the withheld-list door.
+    modelCount: all.reduce((n, it) => n + (it.kind === "model" ? 1 : 0), 0),
+    // The live ok figure for the model-level header: the open provider's, or every provider's in
+    // flat scope; `null` when no bench data is loaded (drawn as a dash, never `0 ok`).
+    okLive: state.scope === "flat" ? liveOkTotal(state) : state.level === 1 ? liveOk(state, state.provider) : undefined,
+    // The FULL id of the selected row -- what enter or ctrl+f acts on -- or null when nothing is
+    // selectable there (the withheld door, a non-chat row, an empty list).
+    fullId: fullIdOf(all[state.cur[i]] ?? null, state.scope === "flat"),
+    // The working sibling of the selected row when it is a dead alias (`= <id>` on the id line).
+    fullAlias: aliasOfSelected(all[state.cur[i]] ?? null, state),
+    // The selected provider's plan-covered model count (the provider list no longer draws it).
+    fullPlan: all[state.cur[i]]?.kind === "provider" ? (all[state.cur[i]].row?.planCount ?? 0) : 0,
     more: Math.max(0, all.length - (state.top[i] + shown.length)),
     recentsHidden: state.recentsHidden ?? 0,
     refusals,

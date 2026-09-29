@@ -12,13 +12,17 @@
 // that caused it, three frames at 30 ms, and the pause is Atomics.wait rather
 // than a spin on Date.now() (Q7.2, Q7.3).
 
-import { sanitizeDisplay } from "./sanitize.mjs";
+// `sanitizeCells`, not `sanitizeDisplay`: everything drawn here is measured in code points, so
+// wide, astral and combining characters are replaced by `?` at draw time (see sanitize.mjs).
+import { sanitizeCells as sanitizeDisplay } from "./sanitize.mjs";
+import { liveAlias } from "./route-hints.mjs";
+import { PREVIEW_CHARS, STATUSES, statusCode, statusTone, fmtMs, fmtTps, previewText, isFresh } from "./bench-data.mjs";
 // Content only. `legend.mjs` imports nothing and takes the glyph renderers as
 // arguments, so this does not become a cycle even though the legend renders
-// through `provenanceDot` and `healthDot` defined in this file.
+// through `provenanceDot` defined in this file.
 import { legendLines } from "./legend.mjs";
-// The free-tier limit vocabulary. Also import-free, for the same no-cycle reason.
-import { limitCell } from "./payload-cap.mjs";
+// The output-modality vocabulary (the `modality` column). Also import-free.
+import { modalityWord } from "./modality.mjs";
 
 // The floor, and what `FRAME_W` used to be unconditionally. Kept as the minimum
 // so no terminal renders narrower than it did before this became elastic: a
@@ -30,7 +34,7 @@ export const FRAME_MIN = 78;
 // The ceiling. Past roughly this width a row becomes physically hard to track
 // from the id on the left to the badge on the right -- the eye loses the line --
 // so surplus beyond it is left as margin rather than spent on a wider table.
-export const FRAME_MAX = 132;
+export const FRAME_MAX = 260;
 
 // The old constant, still exported and still 78. It is the BASE geometry every
 // fixed cell is measured against, and `test/style.test.mjs` uses it as the
@@ -54,47 +58,151 @@ export function frameWidth(caps) {
 }
 
 /**
- * The column table for a given frame width.
+ * The column table for a given frame width. One call resolves BOTH chromes, and the
+ * header and the rows read the same numbers, so they cannot disagree.
  *
- * SURPLUS GOES TO THE NAME COLUMNS, not spread across every cell. `id` and
- * `keyId` are the two that elide today -- R16 widened `id` 34 -> 37 for exactly
- * that reason and ran out of room -- while `ctx`, the prices and `badge` hold
- * values of known maximum width that gain nothing from being wider, and would
- * make a row harder to scan by floating its columns around as the terminal
- * changes size.
+ * LEVEL 0 (providers): see the block comment above `LEVEL0_FIXED`. The key id column takes only
+ * its CONTENT (`keyW`, capped at W.keyId); surplus width is never poured into it, so the other
+ * columns sit beside it. What the key id leaves buys the optional `free` block.
+ *
+ * MODEL LEVEL (level 1 and flat scope), ONE view showing every column when it fits:
+ *   gutter, id, status, ttft, [total], [tok/s], ctx, $in, $out, badge, modality, TVR, [output]
+ * Bracketed cells are optional. Priority, highest first: the always-drawn cells (stat,
+ * ttft, ctx, $in, $out, badge, modality, TVR); the id up to MODEL_ID_MIN (elided in the middle
+ * beyond that); then, in order, `total`, `tok/s` and the `output` preview at its minimum;
+ * and only THEN does the id grow toward its content (capped at MODEL_ID_MAX), with the
+ * preview taking ALL that is left. So every column is on screen as early as possible (the
+ * id gives way first), and on a narrowing terminal the preview goes first, then `tok/s`,
+ * then `total`; `modality` outlasts all three (it is one of the always-drawn cells).
  *
  * Returned fresh each call rather than memoised: it is a handful of integer
  * additions on a path that already rebuilds every row, and a cache keyed on
  * width is a second source of truth for the geometry.
  */
-export const LIMIT_W = 7;
+// LEVEL 0 (#114 redesign): key id | models | status | ok | free | empt | auth | pay | rate | gone | t/o | err.
+// Every cell is a dim rule plus right-aligned text. The raw status cells (all but `ok`, which is
+// folded into the `ok` element, and `skip`, which no longer occurs) are as wide as their label plus
+// the rule (`CELL_MIN` = a three-digit count). `ok` and `free` are `COUNT (PCT%)` cells.
+const CELL_MIN = 3;
+export const statusCellW = (status) => Math.max(statusCode(status).length, CELL_MIN) + 1;
+export const L0_STATUSES = Object.freeze(["empty", "auth", "pay", "rate", "gone", "timeout", "error"]);
+const L0_RAW_W = L0_STATUSES.reduce((n, st) => n + statusCellW(st), 0);          // 32
+const STATUS_TXT_W = 6, PCT_TXT_W = 10, KEYID_MIN = 6, KEYID_FLOOR = 16;
+// mark 2, models 7 (rule + 6), status 7, ok 11, then the raw cells; `free` (11) is optional.
+const LEVEL0_FIXED = 2 + 7 + (1 + STATUS_TXT_W) + (1 + PCT_TXT_W) + L0_RAW_W;
+const FREE_W = 1 + PCT_TXT_W;
 
-export function layoutFor(frameW) {
+// Model level. Every cell carries its own leading gap, so no two cells can touch.
+// Text widths: stat 4 (`empt`), ttft/total/tok-s 5, ctx 6 (`nochat`), $in/$out 5 (`180.0`),
+// badge 5 (`FREE?`), modality 8 (its header; the words are at most 5), TVR 3.
+const M_GUTTER = 4;                       // mark + space, provenance glyph + space
+const M_STATUS = 5, M_TTFT = 6, M_CTX = 7, M_PRICE = 6, M_BADGE = 6, M_MODALITY = 9, M_CAPS = 4;
+const M_TOTAL = 6, M_TPS = 6;
+const M_FIXED = M_STATUS + M_TTFT + M_CTX + 2 * M_PRICE + M_BADGE + M_MODALITY + M_CAPS;   // 49
+// The id column never WANTS more than this, however long the longest id is (73 in the real
+// snapshot; 86 as a flat target; the median is 20, the 95th percentile 36): a few outliers
+// would otherwise take every column's room and the `output` preview would never appear. Longer ids elide in the middle (padId).
+export const MODEL_ID_MAX = 40;
+// The id is guaranteed this much before any optional column is dropped (the median real id is 20).
+export const MODEL_ID_MIN = 22;
+const PREVIEW_MIN = 10;
+
+export function layoutFor(frameW, { keyW = W.keyId, idW = W.id } = {}) {
   const w = Math.max(FRAME_MIN, Math.min(FRAME_MAX, Math.floor(frameW) || FRAME_MIN));
-  let surplus = w - FRAME_MIN;
+  const inner = w - 3;
 
-  // THE LIMIT COLUMN IS RESERVED BEFORE `id` TAKES THE REST, and it is the one
-  // cell whose PRESENCE depends on width -- at BOTH levels, not just level 1.
-  //
-  // An earlier draft gave level 0 the column unconditionally, on a reading of
-  // "12 spare columns" taken from a rendered ROW. The level-0 HEADER spends more
-  // than its rows do, so the column overflowed at the 78-column floor and
-  // `clipVisible` truncated the line and appended a reset -- which surfaced as
-  // an escape sequence in a `colours: 0` render, not as a width failure. Both
-  // levels now share one rule, so the floor renders exactly what it rendered
-  // before this column existed.
-  //
-  // Dropping a column rather than shrinking every other one is deliberate: a
-  // `$out` cell that loses a digit is wrong, where an absent column is merely
-  // absent -- and the legend says where it went.
-  const showLimit = surplus >= LIMIT_W + 1;
-  if (showLimit) surplus -= LIMIT_W + 1;
+  // LEVEL 0. The key id keeps KEYID_FLOOR (or its content, if shorter), then the optional `free`
+  // column, then the key id grows toward its content; what is left is empty space at the right.
+  const avail0 = inner - LEVEL0_FIXED;
+  const want0 = Math.max(KEYID_MIN, Math.min(keyW, W.keyId));
+  let keyId = Math.min(Math.min(want0, KEYID_FLOOR), avail0);
+  let s0 = avail0 - keyId;
+  const showFree = s0 >= FREE_W;
+  if (showFree) s0 -= FREE_W;
+  keyId += Math.max(0, Math.min(want0 - keyId, s0));
 
-  // Whatever is left goes to the two name cells. Level 0's `keyId` and level 1's
-  // `id` are independent cells on different screens, so each takes the whole
-  // remainder rather than half of it.
-  return { frameW: w, inner: w - 3, showLimit,
-           W: { ...W, keyId: W.keyId + surplus, id: W.id + surplus, limit: LIMIT_W } };
+  // MODEL LEVEL. See the doc above.
+  const want = Math.min(MODEL_ID_MAX, Math.max(1, Math.floor(idW) || W.id));
+  const idMin = Math.min(want, MODEL_ID_MIN);
+  let free = inner - M_GUTTER - M_FIXED - idMin;
+  const take = (cost) => (free >= cost ? ((free -= cost), true) : false);
+  const showTotal = take(M_TOTAL);
+  const showTps = take(M_TPS);
+  const showPreview = take(1 + PREVIEW_MIN);          // the preview at its minimum, gap included
+  const grow = Math.min(want - idMin, free);          // then the id grows toward its content
+  free -= grow;
+  const id = idMin + grow;
+  // The output column takes ALL that is left (no cap): the stored reply is what limits it.
+  const preview = showPreview ? PREVIEW_MIN + free : 0;
+
+  return { frameW: w, inner, showFree, showTotal, showTps, showPreview,
+           W: { ...W, keyId, id, preview } };
+}
+
+/**
+ * The key id column's content width: the longest key id over ALL provider rows (not
+ * the visible page, so the columns do not move while filtering or scrolling), at
+ * least the header text, at most W.keyId. Code points, the measure `pad` uses.
+ */
+export function keyIdWidth(rows, bucket = "") {
+  let n = KEYID_MIN;
+  for (const r of rows ?? []) {
+    n = Math.max(n, [...sanitizeDisplay(keyIdShown(String(r?.keyId ?? ""), bucket), W.keyId + 1)].length);
+  }
+  return Math.min(n, W.keyId);
+}
+
+const keyPlanCache = new WeakMap();
+/** Head lengths for the level-0 key id column: the same distinctness-aware elision as model ids. */
+export function keyIdPlan(rows, bucket, n) {
+  if (!Array.isArray(rows)) return null;
+  let byKey = keyPlanCache.get(rows);
+  if (!byKey) keyPlanCache.set(rows, byKey = new Map());
+  const key = `${bucket}:${n}`;
+  let plan = byKey.get(key);
+  if (!plan) byKey.set(key, plan = elisionHeads(rows.map((r) => keyIdShown(r?.keyId, bucket)), n).heads);
+  return plan;
+}
+/** A key id as drawn: without the shared bucket segment (`personal.`) when there is one. */
+export const keyIdShown = (keyId, bucket = "") =>
+  (bucket && String(keyId ?? "").startsWith(bucket) ? String(keyId).slice(bucket.length) : String(keyId ?? ""));
+
+/**
+ * The leading segment (up to and including the first dot) that nearly every provider row
+ * shares, or `""`. Every key id here is `<bucket>.<provider>.<tier>`, and the bucket is the
+ * same noise on almost every row, so the provider list omits it and says so in its title.
+ * Applied only when at least 80% of the rows carry it (a few rows may live in another
+ * bucket and keep their full id, which is what tells them apart) and only if the
+ * shortened ids are all still unique, so it can never merge two rows.
+ */
+export function keyIdBucket(rows) {
+  const list = rows ?? [];
+  if (list.length < 2) return "";
+  const count = new Map();
+  for (const r of list) {
+    const m = /^[^.]+\./.exec(String(r?.keyId ?? ""));
+    if (m) count.set(m[0], (count.get(m[0]) ?? 0) + 1);
+  }
+  let best = "", n = 0;
+  for (const [k, c] of count) if (c > n) { best = k; n = c; }
+  if (!best || n / list.length < 0.8) return "";
+  const shown = new Set(list.map((r) => keyIdShown(r.keyId, best)));
+  return shown.size === list.length ? best : "";
+}
+
+/**
+ * Flat scope's id column content width: the longest `provider/model` target over the
+ * whole snapshot (with the `[pool]` label some ids carry), measured once by the caller so
+ * the column does not move while filtering. At least the header text.
+ */
+export function flatIdWidth(rows) {
+  let n = 14;
+  for (const r of rows ?? []) {
+    for (const m of r.models ?? []) {
+      n = Math.max(n, [...withPoolLabel(`${r.provider}/${m.id}`)].length);
+    }
+  }
+  return n;
 }
 
 // INNER is FRAME_W - 3, and the arithmetic is worth writing down because the
@@ -110,12 +218,9 @@ export function layoutFor(frameW) {
 // for rows), so the frame character is followed directly by body[0].
 const INNER = FRAME_W - 3;
 
-// Constraint 6 and 7 pin these. `bar` is the one addition, six cells at level 0.
-// `health` is the width of the health LABEL; the coloured dot and its space sit
-// in a two-column gutter to its left and are not part of the 8 (Constraint 6).
-// That gutter is why the label gets the full 8 rather than W.health - 2: the
-// longest label, "needs $", is 7 characters and was being clipped to "needs ".
-export const W = { keyId: 30, count: 7, bar: 6, free: 12, health: 8,
+// The base column widths (`layoutFor` resolves the real ones for a terminal). The provider
+// list's `health` column was replaced by the sweep columns (#114) and is gone.
+export const W = { keyId: 30, count: 7,
                    id: 37, ctx: 6, price: 7, badge: 6, caps: 3, prov: 1 };
 
 const ESC = "\x1b";
@@ -129,7 +234,12 @@ export function detectCaps(env = process.env, cols = process.stdout?.columns ?? 
   const known = !!(env.WT_SESSION || env.ConEmuANSI === "ON" || env.TERM_PROGRAM || env.TERM);
   const vt = known && !dumb;
   const rich = !!(env.WT_SESSION || env.COLORTERM || env.TERM_PROGRAM);
-  return { vt, unicode: vt, colours: !vt ? 0 : rich ? 256 : 16, cols };
+  // UW_PICKER_COLSEP picks the column rule for fonts that lack `┆` (Consolas is one): `ascii` draws
+  // `:`, `latin` draws `¦` (U+00A6, present in every font). Anything else, and every ASCII
+  // terminal, keeps the default. Read here, once, so the renderer stays a pure function of caps.
+  const want = String(env.UW_PICKER_COLSEP ?? "").toLowerCase();
+  const colSep = vt && want === "ascii" ? ":" : vt && want === "latin" ? "¦" : null;
+  return { vt, unicode: vt, colours: !vt ? 0 : rich ? 256 : 16, cols, colSep };
 }
 
 export function motionEnabled({ env = process.env, flags = [], caps }) {
@@ -139,39 +249,48 @@ export function motionEnabled({ env = process.env, flags = [], caps }) {
   return caps.cols >= 60;
 }
 
-// Four health glyphs, not two. Colour is an enhancement, never the only carrier
-// of a state -- `painter` returns `String(s)` unchanged whenever caps.colours is
+// Colour is an enhancement, never the only carrier of a state -- `painter` returns `String(s)` unchanged whenever caps.colours is
 // 0, and every one of these must still be distinguishable then. Each is exactly
 // one column wide in both sets, which the frame-width invariant depends on.
+// NOTE: `fav` (★) and the confirm `check` (✔) are OUTSIDE the `sanitizeCells` one-column
+// allowlist (sanitize.mjs): they are emitted by the renderer itself and must NEVER be passed through
+// `pad`, `rpad` or `padId` (which sanitise). test/round2.test.mjs fails if any OTHER glyph in this
+// table would be altered by `sanitizeCells`, and pins these two as the only deliberate exceptions.
 const UNI = {
   marker: "▶", fav: "★", recent: "↺",
-  dotOk: "●", dotWarn: "◐", dotBad: "✖", dotStale: "○",
-  on: "▰", off: "▱", check: "✔", arrow: "→", sep: "▸", caret: "▏", ell: "…", dash: "—",
+  check: "✔", arrow: "→", sep: "▸", caret: "▏", ell: "…", dash: "—",
   // The provenance ladder's five rungs, one glyph each, ordered exactly as
   // PROVENANCE_RUNGS (snapshot.mjs) names them: call-verified, config-asserted,
   // listing-verified, catalogue-only, null (blank). Each is exactly one column
-  // in both sets -- `healthDot`'s own established constraint, restated here
-  // because a five-way glyph set is exactly where a repeat of ITS bug (two
-  // states sharing one glyph under `caps.colours === 0`) would hide.
+  // in both sets, and a five-way glyph set is exactly where two states
+  // sharing one glyph under `caps.colours === 0` would hide.
   provCV: "◆", provCA: "◈", provLV: "◇", provCO: "·",
   // `padId`'s middle-match marker, distinct from the plain elision dash. The
   // first draft carried this state in colour alone (`p.bold(g.dash)`), which
   // renders as a bare `—` -- indistinguishable from an unfiltered row -- the
   // moment `caps.colours === 0` (every ASCII terminal, `painter` returning
-  // identity). Same doctrine as `healthDot`/`provenanceDot`: the glyph
+  // identity). Same doctrine as `provenanceDot`: the glyph
   // carries the state, colour is the enhancement.
   dashMatch: "‡",
+  // The dim vertical rule between table columns: a different glyph from the frame's own `v`.
+  colSep: "┆",
+  dot: "·",
   frame: { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" },
 };
 const ASCII = {
   marker: ">", fav: "*", recent: "~",
-  dotOk: "*", dotWarn: "$", dotBad: "x", dotStale: "o",
-  on: "#", off: ".", check: "OK", arrow: "->", sep: ">", caret: "_", ell: "...", dash: "-",
+  check: "OK", arrow: "->", sep: ">", caret: "_", ell: "...", dash: "-",
   provCV: "#", provCA: "=", provLV: "+", provCO: ".",
   dashMatch: "!",
+  colSep: ":",
+  dot: "|",
   frame: { tl: "+", tr: "+", bl: "+", br: "+", h: "-", v: "|" },
 };
-export function glyphsFor(caps) { return caps.unicode ? UNI : ASCII; }
+const UNI_COLSEP = { ":": { ...UNI, colSep: ":" }, "¦": { ...UNI, colSep: "¦" } };
+export function glyphsFor(caps) {
+  if (!caps.unicode) return ASCII;
+  return (caps.colSep && UNI_COLSEP[caps.colSep]) || UNI;
+}
 
 const SGR = { dim: 2, bold: 1, inv: 7, red: 31, grn: 32, yel: 33, cya: 36, mag: 35 };
 export function painter(caps) {
@@ -196,30 +315,55 @@ export function badgeColour(badge) {
        : badge === "PLAN" ? "cya" : badge === "PAID" ? "dim" : "";
 }
 
-// Deliberately not proportional below one cell: a provider with 1 free model out
-// of 324 must not render as an empty bar, because "some" and "none" is the
-// distinction the column exists to make.
-export function proportionBar(free, total, g, width = W.bar) {
-  if (free == null || !Number.isFinite(total) || total <= 0) return " ".repeat(width);
-  const filled = free <= 0 ? 0 : Math.max(1, Math.round((free / total) * width));
-  return g.on.repeat(Math.min(width, filled)) + g.off.repeat(Math.max(0, width - filled));
+/**
+ * One provider-level status cell: a count right-aligned in the status' own width
+ * (`statusCellW`: its label plus one gap), coloured by the status' tone, `-` for zero,
+ * blank when there is no bench data at all, and `Nk` from a thousand so a big provider
+ * cannot widen it.
+ */
+export function statusCount(n, unbenched, status, p, lead = " ") {
+  const room = statusCellW(status) - 1;              // the cell is `lead` (one column) + text
+  if (unbenched || !Number.isFinite(n)) return lead + " ".repeat(room);
+  if (n <= 0) return lead + p.dim(rpad("-", room));
+  // `Nk` from a thousand; past 99,999 a count no longer fits, and `big` is the truth (a
+  // truncated `1200k` read as `120`).
+  const text = rpad(n > 99999 ? "big" : n > 999 ? `${Math.floor(n / 1000)}k` : String(n), room);
+  const tone = statusTone(status);
+  return lead + (tone === "ok" ? p.grn(text) : tone === "warn" ? p.yel(text) : tone === "bad" ? p.red(text) : p.dim(text));
 }
 
-// The glyph carries the state, not only the colour. The previous draft returned
-// g.dotOk for ok, needs-$ AND broken, so in the no-colour path -- which is what
-// `painter` returns whenever `caps.colours === 0`, and what every ASCII terminal
-// gets -- a healthy provider and a dead one both rendered "*". Its own test was
-// titled "the health dot carries the state in the glyph as well as the colour"
-// and then asserted that ok and broken produce the same glyph.
-export function healthDot(health, g, p) {
-  if (health === "broken") return p.red(g.dotBad);
-  if (health === "needs $") return p.yel(g.dotWarn);
-  if (health === "ok") return p.grn(g.dotOk);
-  return p.dim(g.dotStale);
+/** `n` as a count that can never widen a cell: `Nk` from a thousand. */
+const cnt = (n) => (n > 99999 ? "big" : n > 999 ? `${Math.floor(n / 1000)}k` : String(n));
+/**
+ * `COUNT (PCT%)` of a provider's total models: the nearest whole percent, but a non-zero count never
+ * reads 0% (it is `<1%`) and a partial count never reads 100% (it is `99%`). `""` for an unknown count, `"-"` for zero.
+ */
+export const pctLabel = (n, total) => {
+  const pct = Math.round((100 * n) / total);
+  // The two ends are exact, never rounded into: a non-zero count is never 0% (`<1%`), and a PARTIAL count is
+  // never 100% (995 of 1000 reads 99%), so `(100%)` always means every one.
+  return `${n > 0 && pct < 1 ? "<1" : n < total && pct >= 100 ? 99 : Math.min(100, pct)}%`;
+};
+export function pctText(n, total) {
+  if (!Number.isFinite(n)) return "";
+  if (n <= 0) return "-";
+  if (!Number.isFinite(total) || total <= 0) return cnt(n);
+  return `${cnt(n)} (${pctLabel(n, total)})`;
+}
+/** One `COUNT (PCT%)` cell: the rule, then the text right-aligned (`tone`: green ok, cyan free), dim zero. */
+export function pctCell(n, total, tone, p, lead = " ") {
+  const t = pctText(n, total);
+  if (t === "") return lead + " ".repeat(PCT_TXT_W);
+  const txt = rpad(t, PCT_TXT_W);
+  return lead + (t === "-" ? p.dim(txt) : p[tone](txt));
+}
+/** The provider-list status cell: `alive` (green), `dead` (red), blank when there is no verdict. */
+export function aliveCell(alive, p, lead = " ") {
+  if (typeof alive !== "boolean") return lead + " ".repeat(STATUS_TXT_W);
+  return lead + (alive ? p.grn(rpad("alive", STATUS_TXT_W)) : p.red(rpad("dead", STATUS_TXT_W)));
 }
 
-// The provenance ladder's own dot, same doctrine as `healthDot`: the glyph
-// carries the state, colour is the enhancement. `call-verified` renders here
+// The provenance ladder's own dot: the glyph carries the state, colour is the enhancement. `call-verified` renders here
 // even though nothing in this branch produces it (§2.3) -- the rung is
 // defined and unfed, and the glyph test is what keeps it correct for the day
 // it is wired; dropping the branch because "no row can reach it" would delete
@@ -228,21 +372,17 @@ export function healthDot(health, g, p) {
 // this needs is the header's `discovered` stamp (Q1.3's pattern, restated for
 // this field), not a fifth mark competing with the other four for meaning.
 /**
- * The free-tier limit cell, padded and coloured, for a model row or a provider.
- *
- * COLOURED AFTER PADDING, for the reason the badge cell records at its own call
- * site: `pad` runs `sanitizeDisplay`, which strips CSI by design, so colouring
- * first deletes the colour and then pads the bare text to the wrong width.
- *
- * Red is not the only carrier of "this will not work". `100KB`, `locked` and
- * `unpaid` are three different words, distinguishable with `colours: 0`, which is
- * the same doctrine `healthDot` and `provenanceDot` follow -- and the reason this
- * renders a word rather than the glyph an earlier draft proposed.
+ * The `modality` cell: the route's primary OUTPUT modality (`menu/modality.mjs`), left-aligned like the badge.
+ * Dim for `chat` and for the two not-quite-known values (`chat?`, `?`), a calm cyan for every other known
+ * word so the rows that are NOT chat models stand out. Anything that is not a word from the closed list
+ * (an absent field, or a tampered snapshot) draws `?`: unknown reads as unknown, never as a guess, and a
+ * stored string can never reach the terminal. COLOURED AFTER PADDING (see the badge cell's note).
  */
-export function limitOut(entry, p, width = W.limit) {
-  const { text, colour } = limitCell(entry);
-  const cell = pad(text, width);
-  return colour ? p[colour](cell) : cell;
+export const MODALITY_TXT_W = 8;
+export function modalityCell(v, p) {
+  const w = modalityWord(v);
+  const cell = pad(w ?? "?", MODALITY_TXT_W);
+  return w == null || w === "chat" || w === "chat?" ? p.dim(cell) : p.cya(cell);
 }
 
 export function provenanceDot(provenance, g, p) {
@@ -295,6 +435,103 @@ const rpad = (s, n) => { const t = sanitizeDisplay(String(s ?? ""), n); return f
 // visible, already-tested row clip -- never a specific wrong digit.
 const rpadCount = (s, n) => (vis(s) <= n ? rpad(s, n) : String(s));
 
+/**
+ * DISTINCTNESS-AWARE ELISION for one column. A blind middle cut to ~22 columns makes rows
+ * that differ only in a version, a date or a suffix (`gemini-3.6-flash:batch` vs `...3.8...`)
+ * draw identical cells. Given the FULL strings of the column and its width `n`, this picks,
+ * for the strings that do not fit, how many code points to keep at the head (the rest of the
+ * budget is the tail):
+ *   1. ONE split for the whole column (so the column stays visually regular): the one leaving the
+ *      fewest strings sharing a cell, ties broken toward a tail-heavy 40% head;
+ *   2. then, for each group of strings that still share a cell, the split that separates that
+ *      group best (ties toward the column's split). Cheap: only collided groups are re-tried.
+ * Returns `{ heads, dup }`: a Map string -> head length for the strings that need eliding, and how
+ * many strings still share a cell (0 whenever the width physically allows).
+ */
+export function elisionHeads(strings, n, minHead = 0) {
+  const keep = Math.max(0, n - 1);
+  const lo = Math.max(0, Math.min(minHead, keep));      // never keep fewer head characters than this
+  const items = [];                                   // [original, code points] for those that need it
+  for (const raw of strings) {
+    const cps = [...sanitizeDisplay(String(raw ?? ""), 10_000)];
+    if (cps.length > n) items.push([raw, cps]);
+  }
+  const heads = new Map();
+  if (!items.length) return { heads, dup: 0 };
+  const cellOf = (cps, h) => cps.slice(0, h).join("") + "\u0001" + cps.slice(cps.length - (keep - h)).join("");
+  const dupOf = (list, h) => {
+    const seen = new Map();
+    for (const [, cps] of list) { const k = cellOf(cps, h); seen.set(k, (seen.get(k) ?? 0) + 1); }
+    let d = 0;
+    for (const c of seen.values()) if (c > 1) d += c;
+    return d;
+  };
+  const pref = Math.max(lo, Math.ceil(keep * 0.4));
+  const pick = (list, near) => {
+    let best = null;
+    for (let h = lo; h <= keep; h++) {
+      const d = dupOf(list, h);
+      if (best === null || d < best.d || (d === best.d && Math.abs(h - near) < Math.abs(best.h - near))) best = { h, d };
+      if (d === 0 && h >= near) break;
+    }
+    return best;
+  };
+  const h0 = pick(items, pref).h;
+  const groups = new Map();
+  for (const it of items) {
+    const k = cellOf(it[1], h0);
+    (groups.get(k) ?? groups.set(k, []).get(k)).push(it);
+  }
+  for (const list of groups.values()) {
+    const h = list.length > 1 ? pick(list, h0).h : h0;
+    for (const [raw] of list) heads.set(raw, h);
+  }
+  const finalCells = new Map();
+  let dup = 0;
+  for (const [raw, cps] of items) {
+    const k = cellOf(cps, heads.get(raw));
+    finalCells.set(k, (finalCells.get(k) ?? 0) + 1);
+  }
+  for (const c of finalCells.values()) if (c > 1) dup += c;
+  return { heads, dup };
+}
+
+// One plan per (provider row, scope, width), computed on first use and kept: the visible page
+// asks for it on every frame. Flat scope keeps the `provider/` prefix readable whenever the model
+// part alone can be made distinct in what is left of the column, and only otherwise elides the
+// whole target.
+const planCache = new WeakMap();
+export function elisionPlan(row, flat, n) {
+  if (!row || typeof row !== "object" || !Array.isArray(row.models)) return null;
+  let byKey = planCache.get(row);
+  if (!byKey) planCache.set(row, byKey = new Map());
+  const key = `${flat ? "f" : "l"}:${n}`;
+  let plan = byKey.get(key);
+  if (plan) return plan;
+  const modelOf = (m) => withPoolLabel(String(m?.id ?? ""));
+  if (!flat) {
+    plan = elisionHeads(row.models.map(modelOf), n).heads;
+  } else {
+    const prov = String(row.provider ?? "");
+    const pl = [...sanitizeDisplay(prov, 200)].length + 1;
+    const targetOf = (m) => withPoolLabel(`${prov}/${m?.id ?? ""}`);
+    if (n - pl >= 8) {
+      const parts = row.models.map(modelOf);
+      const r = elisionHeads(parts, n - pl);
+      if (r.dup === 0) {
+        plan = new Map();
+        row.models.forEach((m, i) => { const h = r.heads.get(parts[i]); if (h !== undefined) plan.set(targetOf(m), pl + h); });
+      }
+    }
+    // The model part cannot be made distinct beside the whole provider name: elide the whole
+    // target, but keep a stable head of the provider (up to 4 characters) so rows from different
+    // providers do not collapse into one look-alike cell.
+    plan ??= elisionHeads(row.models.map(targetOf), n, Math.min(4, pl - 1)).heads;
+  }
+  byKey.set(key, plan);
+  return plan;
+}
+
 // MIDDLE elision, not `pad`'s right-truncation, for the one cell whose whole
 // job is telling two rows apart. Right-truncation collides whenever two ids
 // share a long common prefix -- MEASURED against the real 4,732-model
@@ -319,13 +556,15 @@ const rpadCount = (s, n) => (vis(s) <= n ? rpad(s, n) : String(s));
 // their own real substrings, and -- when the match falls entirely inside the
 // ELIDED middle -- bolds the marker itself, so a filtered row is never blind:
 // every row that matched shows SOMETHING highlighted.
-export function padId(id, n, query, g, p) {
+export function padId(id, n, query, g, p, headHint = null) {
   const clean = sanitizeDisplay(String(id ?? ""), 10_000);
   const cps = [...clean];
   if (cps.length <= n) return highlight(clean, query, p) + fill(n - cps.length);
 
   const keep = n - 1; // one column reserved for the marker
-  const headLen = Math.ceil(keep / 2), tailLen = keep - headLen;
+  // `head` is the column's DISTINCTNESS-AWARE split (`elisionHeads`); without one, the blind middle.
+  const headLen = Number.isInteger(headHint) ? Math.max(0, Math.min(keep, headHint)) : Math.ceil(keep / 2);
+  const tailLen = keep - headLen;
   const head = cps.slice(0, headLen).join("");
   const tail = cps.slice(cps.length - tailLen).join("");
 
@@ -377,7 +616,12 @@ const ctxS = (c) => {
   }
   return `${Math.round(v)}M`;
 };
-const money = (v) => (v == null ? "" : Number(v).toFixed(2));
+// Five columns at most: two decimals up to 99.99, one up to 999.9, none beyond (the real catalogue peaks at 180).
+const money = (v) => {
+  if (v == null) return "";
+  const n = Number(v);
+  return Math.abs(n) >= 1000 ? String(Math.round(n)) : Math.abs(n) >= 100 ? n.toFixed(1) : n.toFixed(2);
+};
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 // Router-pool aliases: names that select a load-balanced GROUP of backend
@@ -472,9 +716,9 @@ const titleAt = (g, p, text, frameW) => {
 };
 
 export const HELP0 = "[↑↓] move  [↵] open  [⇥] scope  [^f] fav  [?] all keys  [esc] back";
-export const HELP1 = "[↑↓] move  [↵] select  [^f] fav  [?] all keys  [esc] back";
+export const HELP1 = "[↑↓] move  [↵] select  [^f] fav  [^o] ok  [^l] 1M+  [?] keys  [esc] back";
 const HELP0_A = "[up/dn] move [enter] open [tab] scope [^f] fav [?] all keys [esc] back";
-const HELP1_A = "[up/dn] move  [enter] select  [^f] fav  [?] all keys  [esc] back";
+const HELP1_A = "[up/dn] move [enter] select [^f] fav [^o] ok [^l] 1M+ [?] keys [esc] back";
 
 const footerAt = (g, p, text, frameW) => {
   const head = `${g.frame.bl} ${text} `;
@@ -497,7 +741,19 @@ export function frame(v, meta, { caps }) {
   // MISSED. A helper left closed over the module constant is how half a frame
   // comes out at 78 while the rest follows the terminal, which the width
   // invariant would report as a corrupt frame with no clue where it came from.
-  const layout = layoutFor(frameWidth(caps));
+  // The id column is sized to its CONTENT at the model level (#114): the longest id
+  // of the open provider (over ALL its models, not the visible page, so the columns
+  // do not move while filtering or scrolling), or in flat scope the longest target
+  // (`meta.flatIdW`, measured once from the whole snapshot; the visible page is the
+  // fallback for callers that did not supply it). Level 0 and the modals have no id
+  // content of their own and get the default.
+  const flatScope = v.scope === "flat";
+  const idW = flatScope
+    ? Math.max(14, meta.flatIdW ?? 0, ...(meta.flatIdW ? [] : v.items.map((it) => vis(withPoolLabel(it.target ?? "")))))
+    : v.level > 0 && v.provider?.models
+      ? v.provider.models.reduce((n, m) => Math.max(n, vis(withPoolLabel(m.id))), 5)
+      : undefined;
+  const layout = layoutFor(frameWidth(caps), { keyW: meta.keyIdW, idW });
   const W = layout.W;
   const INNER = layout.inner;
   const bar = (gg, body) => barAt(gg, body, INNER);
@@ -535,7 +791,11 @@ export function frame(v, meta, { caps }) {
     const gap = Math.max(1, INNER - vis(left) - vis(right));
     L.push(bar(g, left + " ".repeat(gap) + p.dim(right)));
     L.push(bar(g, ""));
-    L.push(bar(g, p.dim("  " + pad("id", W.id) + "  " + pad("reason", 24) + rpad("removed", 7))));
+    // The overlay has its OWN id width: the room the row leaves after `reason` and `removed`
+    // (2 + id + 2 + 24 + 7), capped at the longest withheld id; the model list's shrunken id
+    // column is the wrong number here.
+    const wId = Math.max(6, Math.min(v.refusals.idMax ?? W.id, INNER - 35));
+    L.push(bar(g, p.dim("  " + pad("id", wId) + "  " + pad("reason", 24) + rpad("removed", 7))));
     // MIDDLE elision (`padId`, R16) for the ID column only, not `pad`'s
     // right-truncation: MEASURED against the real snapshot, 117 of 4,732
     // model ids exceed 37 code points (max 52), and this overlay's whole job
@@ -558,7 +818,7 @@ export function frame(v, meta, { caps }) {
     // (`leading-separator` vs `leading-something-else`) -- middle elision
     // would hide the very part that tells two reasons apart.
     for (const entry of v.refusals.items) {
-      const id = padId(String(entry?.id ?? ""), W.id, "", g, p);
+      const id = padId(String(entry?.id ?? ""), wId, "", g, p);
       const reason = pad(String(entry?.reason ?? ""), 24);
       const removed = rpad(String(entry?.removed ?? 0), 7);
       L.push(bar(g, "  " + id + "  " + reason + removed));
@@ -578,7 +838,7 @@ export function frame(v, meta, { caps }) {
   const crumb = flat
     ? "UW " + g.sep + " all models"
     : v.level === 0
-      ? "UW " + g.sep + " providers"
+      ? "UW " + g.sep + " providers" + (meta.keyIdBucket ? ` ${g.sep} ids shown without ${sanitizeDisplay(meta.keyIdBucket, 30)}` : "")
       : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
   L.push(title(g, p, crumb));
 
@@ -586,9 +846,14 @@ export function frame(v, meta, { caps }) {
   // either "routable" or "nobody checked", and those are different claims; the
   // stamp is what lets the user tell which one they are looking at. `—` means the
   // refresher has never resolved routability, so nothing on screen is dimmed.
-  const routableStamp = meta.routableAsOf
-    ? `routable ${String(meta.routableAsOf).slice(5, 16).replace("T", " ")}`
-    : `routable ${g.dash}`;
+  // Every stamp is drawn text that came from a file, so it is sanitised before it is sliced.
+  // Stamps are UTC (the files write `toISOString()`), and say so with a trailing `Z`.
+  const stampOf = (iso) => {
+    const t = sanitizeDisplay(String(iso ?? ""), 40);
+    const body = t.slice(5, 16).replace("T", " ");
+    return body && t.endsWith("Z") ? body + "Z" : body;
+  };
+  const routableStamp = meta.routableAsOf ? `routable ${stampOf(meta.routableAsOf)}` : `routable ${g.dash}`;
   // Same pattern as `routableStamp`, restated for a second field the renderer
   // reads and, until this task, nobody wrote (R15/B3-OQ-4's exact failure
   // shape, one field over): `null` provenance renders blank at the row level,
@@ -603,26 +868,47 @@ export function frame(v, meta, { caps }) {
   // mangled date the moment `routableAsOf` is populated (i.e. always, once
   // the refresher has run once) -- the exact silent-disclosure failure this
   // stamp exists to prevent, one level up.
-  const discoveredStamp = meta.discoveredAsOf
-    ? `discovered ${String(meta.discoveredAsOf).slice(5, 16).replace("T", " ")}`
-    : `discovered ${g.dash}`;
-  // Flat is a MODEL-level view too -- its rows run `provenanceDot` exactly
-  // like level 1's, so the same disclosure applies: blank must be disclosed,
-  // not implied (§2.3). Missing this left flat scope showing blank gutters
-  // with nothing on screen saying why, in the one branch that renders the
-  // thing being disclosed and skips the stamp that discloses it.
-  const right = flat
-    ? `${v.items.length + v.more} of ${meta.models} models ${g.sep} ${discoveredStamp}`
-    : v.level === 0
-      ? `${meta.providers} providers ${g.sep} ${meta.models} models ${g.sep} ${routableStamp}`
-      // Counts MODEL rows only, not the WITHHELD LIST door that can sit at
-      // `v.items[0]` -- that row is not a model, and folding it into "N of M"
-      // would count it against a population (`v.provider.models.length`) it
-      // is not a member of (the exact miscount class
-      // [[counts-carry-their-denominator]] exists to catch).
-      : `${v.items.filter((it) => it.kind === "model").length} of ${v.provider.models.length} ` +
-        `${g.sep} ${discoveredStamp}`;
-  const left = `  filter: ${sanitizeDisplay(v.filter, 40)}${p.inv(g.caret)}`;
+  // The model-level stamp is how old the MEASUREMENTS are (#114); an unmeasured install is
+  // told how to get some. `discovered` (where the provenance gutter's blanks are
+  // disclosed) follows only when it also fits: the bench stamp wins a shortage.
+  // A sweep date needs records behind it: a reader with zero records (an empty file) is "no data",
+  // whatever its `generatedAt` says.
+  const hasBench = !!meta.benchAsOf && meta.benchOf?.records !== 0;
+  const benchedStamp = hasBench ? `benched ${stampOf(meta.benchAsOf)}`
+                                      : `benched ${g.dash} run bench-cli --live`;
+  const discoveredStamp = meta.discoveredAsOf ? `discovered ${stampOf(meta.discoveredAsOf)}`
+                                              : `discovered ${g.dash}`;
+  // Model-level chips, next to the typed filter: the two toggles are otherwise invisible.
+  const atProviderLevel = !flat && v.level === 0;
+  const chips = atProviderLevel ? [] : [v.okOnly ? "[ok]" : "", v.oneM ? "[1M+]" : ""].filter(Boolean);
+  const chipText = chips.map((c) => " " + c).join("");
+  // What the left side occupies with NO typed text. The stamps are chosen against this,
+  // not against the live filter, so they do not appear and vanish keystroke by keystroke:
+  // a stamp that would clip is worse than none.
+  // The stamps are chosen against the TYPED text too (a candidate that would be cut mid-token by
+  // the bar is never chosen); if even the shortest does not fit, the typed text is what gives way.
+  const typed = sanitizeDisplay(v.filter, 40);
+  const leftBare = vis(`  filter: ${g.caret}`) + vis(chipText);
+  // The right side is COUNTS ONLY (the data stamps moved to the id line): thousands separators and a
+  // middle dot between the parts. `ok` carries its share of the same population's models.
+  const okShown = v.okLive !== undefined ? v.okLive : (flat ? meta.okTotal : v.provider?.bench?.ok);
+  const N = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const okFig = (k, total) => (Number.isFinite(k) ? `${N(k)} ok${total > 0 ? ` (${pctLabel(k, total)})` : ""}` : "- ok");
+  const rightFor = (n) => (atProviderLevel
+    ? `${N(meta.providers)} providers ${g.dot} ${N(meta.models)} models ${g.dot} ${okFig(meta.okTotal, meta.models)}`
+    : flat ? `${N(n)} of ${N(meta.models)} models ${g.dot} ${okFig(okShown, meta.models)}`
+           : `${N(n)} of ${N(v.provider.models.length)} ${g.dot} ${okFig(okShown, v.provider.models.length)}`);
+  const matches = v.modelCount ?? (v.items.filter((it) => it.kind === "model").length + v.more);
+  const right = rightFor(matches);
+  // If even the counts do not fit beside the typed text, the typed text gives way (never the counts).
+  const fit = leftBare + vis(typed) + 1 + vis(rightFor(flat ? meta.models : v.provider?.models?.length ?? 0)) <= INNER ? 0 : -1;
+  let typedShown = typed;
+  if (fit === -1) {
+    const room = Math.max(0, INNER - leftBare - 1 - vis(rightFor(flat ? meta.models : v.provider?.models?.length ?? 0)));
+    const t = [...typed];
+    typedShown = t.length <= room ? typed : room > vis(g.ell) ? g.ell + t.slice(t.length - (room - vis(g.ell))).join("") : "";
+  }
+  const left = `  filter: ${typedShown}${p.inv(g.caret)}` + p.yel(chipText);
   const gap = Math.max(1, INNER - vis(left) - vis(right));
   L.push(bar(g, left + " ".repeat(gap) + p.dim(right)));
   L.push(bar(g, ""));
@@ -638,7 +924,7 @@ export function frame(v, meta, { caps }) {
     // The offset comes from the reducer (`v.legendTop`), clamped there against
     // this same `avail` arithmetic, so the two can never disagree about how many
     // lines a page holds -- the discipline the refusals overlay already follows.
-    const all = legendLines(g, p, { provenanceDot, healthDot });
+    const all = legendLines(g, p, { provenanceDot });
     const avail = Math.max(1, v.legendAvail ?? all.length);
     const top = Math.min(Math.max(0, v.legendTop ?? 0), Math.max(0, all.length - avail));
     for (const line of all.slice(top, top + avail)) L.push(bar(g, "  " + line));
@@ -655,40 +941,13 @@ export function frame(v, meta, { caps }) {
     return L;
   }
 
-  // Header columns must line up with the row columns beneath them, which the
-  // previous draft's did not: it reserved W.bar + W.free = 18 for "free" while
-  // the row emitted a 5-wide bar + " " + an 11-wide value = 17, so everything
-  // from "free" rightward was off by one; and it emitted a bare "caps" (4) over a
-  // 3-wide T/V/R cell. Both are now derived from the same W constants as the row,
-  // and the derived-offset test below asserts they agree rather than trusting it.
-  // The two-space gap before "health" is the dot gutter (see W).
-  // The provenance gutter is a two-column blank in the header, matching the
-  // health dot's own gutter convention (see W): the glyph needs no text
-  // label of its own, since "distinct glyph per state" is the whole
+  // Header columns must line up with the row columns beneath them: both are derived from the same
+  // widths, and the derived-offset test asserts they agree rather than trusting it.
+  // The provenance gutter is a two-column blank in the header (a glyph and a space): the
+  // glyph needs no text label of its own, since "distinct glyph per state" is the whole
   // observable, and a label would compete with the `discovered` stamp
   // already carrying that disclosure at the header line above.
-  L.push(bar(g, p.dim(!flat && v.level === 0
-    ? "  " + pad("key id", W.keyId) + rpad("models", W.count) + "   " +
-      pad("free", W.bar + W.free) + "  " + pad("health", W.health) + (layout.showLimit ? pad("limit", W.limit) : "")
-    : "  " + "  " + pad(flat ? "provider/model" : "model", W.id) + rpad("ctx", W.ctx) + " " +
-      rpad("$in", W.price) + rpad("$out", W.price) + "  " +
-      pad("badge", W.badge) + pad("TVR", W.caps) +
-      (layout.showLimit ? " " + pad("limit", W.limit) : ""))));
-
-  if (v.empty) {
-    // The instruction comes FIRST, and the query is clipped to 20.
-    //
-    // This line is `2 + 14 + filter + 1 + 1 + 1 + 33` columns, so at a filter of 24
-    // it exceeds INNER = 75 while sanitizeDisplay permitted 30. `bar` then clips
-    // from the right -- and what is on the right is "backspace to widen, esc to
-    // clear". The user loses the stated way out at the exact moment they are most
-    // stuck, and the frozen mock uses a three-character filter so it never showed.
-    // Ordering the instruction ahead of the echoed query makes the clip fall on
-    // the query, which is the part the user already knows.
-    L.push(bar(g, `  backspace to widen, esc to clear ${g.dash} no match for ` +
-                  `"${sanitizeDisplay(v.filter, 20)}"`));
-  }
-
+  const S = g.colSep;
   // #60: the display cap on pinned recents (`pick-state.mjs`'s
   // `MAX_RECENTS_SHOWN`) is a hiding action and must disclose itself, the same
   // way a withheld model does. Reuses the picker's existing "... N more"
@@ -714,8 +973,9 @@ export function frame(v, meta, { caps }) {
     L.push(bar(g, p.dim(`  ${g.ell} ${v.recentsHidden} more recents`)));
   };
 
-  v.items.forEach((it, i) => {
-    if (i === pinnedCount) maybeDiscloseRecents();
+
+  // One table row (or pinned row, or the withheld door) as a finished line.
+  const rowLine = (it, i) => {
     const selected = v.top + i === v.cursor;
     const mark = selected ? g.marker : " ";
     let body;
@@ -731,24 +991,21 @@ export function frame(v, meta, { caps }) {
     } else if (it.kind === "provider") {
       const r = it.row;
       const total = r.models.length;
-      const freeTxt = r.free == null ? g.dash
-        : r.planCount ? `${r.free} +${r.planCount} plan` : String(r.free);
-      body = `${mark} ` + highlight(pad(r.keyId, W.keyId), v.filter, p) +
-             // #51 (§2.5(a)): bare count when nothing is withheld, `#/#`
-             // when something is -- never a new column, the same W.count
-             // cell renamed to a wider role (revision 11).
-             rpadCount(countCell(total, r.refused?.length ?? 0), W.count) + "   " +
-             proportionBar(r.free, total, g) + " " + pad(freeTxt, W.free - 1) +
-             healthDot(r.health, g, p) + " " + pad(r.health, W.health) +
-             // The free-tier limit, aggregated over this provider's free rows.
-             // `r.limit` is absent on a snapshot written before schema 4, and
-             // `limitCell(undefined)` renders `?` -- "not probed", which is
-             // exactly what an older snapshot means, and distinct from the `n/a`
-             // a provider with no free rows earns.
-             (layout.showLimit ? limitOut(r.limit, p, W.limit) : "");
+      const sepd = p.dim(S);
+      const keyText = keyIdShown(r.keyId, meta.keyIdBucket);
+      const keyHead = keyIdPlan(meta.rows, meta.keyIdBucket ?? "", W.keyId)?.get(keyText) ?? null;
+      // key id | models | status | ok | [free] | the raw status cells, every one a rule plus
+      // right-aligned text. `ok` and `free` are COUNT (PCT%) of the provider's models; the plan
+      // count is reachable on the `id:` line of the selected provider.
+      body = `${mark} ` + padId(keyText, W.keyId, v.filter, g, p, keyHead) +
+             sepd + rpadCount(countCell(total, r.refused?.length ?? 0, W.count - 1), W.count - 1) +
+             aliveCell(r.benchFlags?.alive, p, sepd) +
+             pctCell(r.bench == null ? NaN : r.bench.ok, total, "grn", p, sepd) +
+             (layout.showFree ? pctCell(r.free == null ? NaN : r.free, total, "cya", p, sepd) : "") +
+             L0_STATUSES.map((st) => statusCount(r.bench?.[st], r.bench == null, st, p, sepd)).join("");
     } else if (it.kind === "pinned") {
       body = `${mark} ` + (it.mark === "*" ? p.yel(g.fav) : p.dim(g.recent)) + " " +
-             highlight(pad(withPoolLabel(it.target), W.keyId + W.count), v.filter, p);
+             highlight(pad(withPoolLabel(it.target), INNER - 4), v.filter, p);
     } else {
       const m = it.model;
       // Three states, three glyphs. capsOf now distinguishes "the catalogue says
@@ -765,7 +1022,7 @@ export function frame(v, meta, { caps }) {
       // to W.badge + 9, leaving nine stray spaces. The +9 was wrong on its own
       // terms too: it assumed a 9-character SGR wrapper, but p.dim (used for
       // PAID) is 8 and p.ramp's 256-colour form is 11 or more per character.
-      const badgeCell = pad(m.badge, W.badge);
+      const badgeCell = pad(m.badge, 5);
       const badgeOut = badgeColour(m.badge) ? p[badgeColour(m.badge)](badgeCell) : badgeCell;
       // In flat scope the id must be the TARGET. A bare `qwen3-max` in a list
       // drawn from every provider at once names no row the user can act on --
@@ -781,27 +1038,47 @@ export function frame(v, meta, { caps }) {
       // The branch is here at the call site, not inside ctxS(), which stays a
       // number formatter. `nochat` is six columns exactly, so W.ctx is untouched.
       //
-      // NOT the modality name. The design intent was AUDIO / VIDEO / IMAGE, and
-      // the cell is wide enough -- but `outputKind` is a three-valued label and
-      // the specific modality is not carried on the row or in the snapshot.
-      // Naming it would need a fourth per-model field and a second schema bump,
-      // so the cell says the consequence it can prove instead of the cause it
-      // cannot. Recorded rather than quietly narrowed.
+      // This cell says the consequence (`nochat`); the CAUSE -- what the route does output -- is the
+      // separate `modality` column beside the badge (`m.outModality`, schema 7).
       const ctxCell = m.outputKind === "nontext" ? "nochat" : ctxS(m.ctx);
-      // The provenance gutter, same 2-column convention as health's dot: one
+      // The provenance gutter, a 2-column convention: one
       // glyph, one space, no text label. `m.provenance` arrives straight off
       // the snapshot row (schema 3, R15) -- `null` for a synthetic/unknown
       // row (relay is `config-asserted`, never null; see catalog.mjs).
-      body = `${mark} ` + provenanceDot(m.provenance, g, p) + " " +
-             padId(withPoolLabel(flat ? it.target : m.id), W.id, v.filter, g, p) +
-             rpad(ctxCell, W.ctx) + " " +
-             rpad(money(m.pin), W.price) + rpad(money(m.pout), W.price) + "  " +
-             badgeOut +
-             cap(m.tools, "T", "cya") + cap(m.vision, "V", "mag") + cap(m.reason, "R", "yel") +
-             // Only when the frame is wide enough to have reserved it. At the
-             // 78-column floor level 1 has three spare columns and the column is
-             // not drawn at all -- see `layoutFor`.
-             (layout.showLimit ? " " + limitOut(m.limit, p, W.limit) : "");
+      const idText = withPoolLabel(flat ? it.target : m.id);
+      const plan = flat ? elisionPlan(it.row, true, W.id) : elisionPlan(v.provider, false, W.id);
+      const idCell = padId(idText, W.id, v.filter, g, p, plan?.get(idText) ?? null);
+      // A row nobody measured draws BLANKS, not zeros: 0 ms would be a claim. `meta.benchOf`
+      // is loaded lazily by uwpick the first time a model screen is drawn.
+      // Only a FRESH record is drawn (the same rule the counts and the filter use): a 30-day-old
+      // measurement is not shown as a current fact.
+      const got = meta.benchOf ? meta.benchOf(it.target) : null;
+      const rec = isFresh(got, v.now ?? Date.now()) ? got : null;
+      const tone = rec ? statusTone(rec.s) : "dim";
+      const stat = pad(rec ? statusCode(rec.s) : "", 4);
+      const statOut = tone === "ok" ? p.grn(stat) : tone === "warn" ? p.yel(stat)
+        : tone === "bad" ? p.red(stat) : p.dim(stat);
+      const timed = rec?.s === "ok";
+      // A record whose stream was CUT (`x`: the probe stopped a model that ignored max_tokens) has no honest
+      // `total` -- it is the time to the cut, not the model's own -- so that cell is blank, and its tok/s is an
+      // estimate over the part seen, drawn with a leading `~`. `reply:` says why (see below).
+      const cut = timed && rec.x === 1;
+      const sepd = p.dim(S);
+      // A `gone` route with an `ok` sibling says WHERE the working route is, in the preview cell
+      // (no new column); the baked `aliasOf` is honoured only while both records are still fresh.
+      // Surface, never substitute: enter still selects THIS row.
+      const alias = liveAlias(flat ? it.row?.provider : v.provider?.provider, m, meta.benchOf, v.now ?? Date.now());
+      body = `${mark} ` + provenanceDot(m.provenance, g, p) + " " + idCell + sepd + statOut +
+             sepd + rpad(timed || (rec?.s === "timeout" && Number.isFinite(rec.t)) ? fmtMs(rec.t) : "", 5) +
+             (layout.showTotal ? sepd + rpad(!cut && (timed || rec?.s === "timeout") ? fmtMs(rec.d) : "", 5) : "") +
+             (layout.showTps ? sepd + rpad(timed ? (cut ? (Number.isFinite(rec.r) ? "~" + fmtTps(rec.r) : "-") : fmtTps(rec.r)) : "", 5) : "") +
+             sepd + rpad(ctxCell, 6) + sepd + rpad(money(m.pin), 5) + sepd + rpad(money(m.pout), 5) +
+             sepd + badgeOut + sepd + modalityCell(m.outModality, p) +
+             sepd + cap(m.tools, "T", "cya") + cap(m.vision, "V", "mag") + cap(m.reason, "R", "yel") +
+             // The optional cells exist only when `layoutFor` reserved them (see its priority list).
+             (layout.showPreview
+               ? sepd + (alias ? p.dim(pad(`= ${alias} (works)`, W.preview)) : pad(previewText(rec, W.preview), W.preview))
+               : "");
       // Q1.3: `routable` is a value on the row, baked in by the refresher. `false`
       // dims; `null` -- nobody checked -- does not, because dimming everything the
       // one time the gateway was unreachable says "nothing works" when the truth
@@ -825,11 +1102,126 @@ export function frame(v, meta, { caps }) {
       // says whether routability was resolved at all.
       if (m.routable === false || m.outputKind === "nontext") body = p.dim(strip(body));
     }
-    L.push(bar(g, selected ? p.inv(strip(body)) : body));
+    return bar(g, selected ? p.inv(strip(body)) : body);
+  };
+
+  // PINNED STRIP (favourites `★`, recents `↺`): drawn ABOVE the column header, separated from the
+  // table by a dim rule, so the header sits directly on top of the provider rows and the columns
+  // stay aligned. Same items, same order, same cursor as when they were table rows. No pins on
+  // this page: no strip and no rule.
+  const pinStrip = !flat && v.level === 0 && pinnedCount > 0;
+  if (pinStrip) {
+    for (let i = 0; i < pinnedCount; i++) L.push(rowLine(v.items[i], i));
+    maybeDiscloseRecents();
+    L.push(bar(g, p.dim("  " + g.frame.h.repeat(Math.max(0, INNER - 4)))));
+  }
+
+  // MODEL LEVEL, one view (#114): gutter, id, then status / ttft / [total] / [tok/s], then
+  // ctx / $in / $out / badge / modality / TVR, then the [output] preview LAST, since it is
+  // the flexible column. Every cell carries its own leading space, so none can touch
+  // another; `layoutFor` decides which optional cells exist, and the rows read the same
+  // flags, so header and rows cannot disagree.
+  // COLUMNS ARE SEPARATED BY A DIM VERTICAL RULE (`g.colSep`, a different glyph from the
+  // frame's own `v`). Each separator REPLACES the one-column gap the cell already had
+  // in front of it, so it costs no width, and the header and the rows put it in the
+  // same columns because both are built from the same widths below: a cell is
+  // `sep + text`, where text is `width - 1` wide.
+  L.push(bar(g, p.dim(!flat && v.level === 0
+    ? "  " + pad("key id", W.keyId) + S + rpad("models", W.count - 1) + S + rpad("status", STATUS_TXT_W) +
+      S + rpad("ok", PCT_TXT_W) + (layout.showFree ? S + rpad("free", PCT_TXT_W) : "") +
+      L0_STATUSES.map((st) => S + rpad(statusCode(st), statusCellW(st) - 1)).join("")
+    : "  " + "  " + pad(flat ? "provider/model" : "model", W.id) + S + pad("stat", 4) +
+      S + rpad("ttft", 5) + (layout.showTotal ? S + rpad("total", 5) : "") +
+      (layout.showTps ? S + rpad("tok/s", 5) : "") +
+      S + rpad("ctx", 6) + S + rpad("$in", 5) + S + rpad("$out", 5) +
+      S + pad("badge", 5) + S + pad("modality", MODALITY_TXT_W) + S + pad("TVR", 3) +
+      (layout.showPreview ? S + pad("output", W.preview) : ""))));
+
+  if (v.empty) {
+    // The instruction comes FIRST, and the query is clipped to 20.
+    //
+    // This line is `2 + 14 + filter + 1 + 1 + 1 + 33` columns, so at a filter of 24
+    // it exceeds INNER = 75 while sanitizeDisplay permitted 30. `bar` then clips
+    // from the right -- and what is on the right is "backspace to widen, esc to
+    // clear". The user loses the stated way out at the exact moment they are most
+    // stuck, and the frozen mock uses a three-character filter so it never showed.
+    // Ordering the instruction ahead of the echoed query makes the clip fall on
+    // the query, which is the part the user already knows.
+    // With nothing typed there is no query to echo: only the toggles (below) explain the list.
+    if (v.filter) {
+      L.push(bar(g, `  backspace to widen, esc to clear ${g.dash} no match for ` +
+                    `"${sanitizeDisplay(v.filter, 20)}"`));
+    } else if (!chips.length) {
+      L.push(bar(g, "  nothing to list here"));
+    }
+    // Which toggles are on is the reason a list can be empty with nothing typed, so it gets a
+    // line of its own (the line above is already at the frame's width).
+    if (chips.length) {
+      const names = [v.okOnly ? "ok-only" : "", v.oneM ? "1M+ context only" : ""].filter(Boolean).join(" + ");
+      const nodata = v.okOnly && !(meta.benchAsOf && meta.benchOf?.records !== 0) ? ` ${g.dash} no benchmark data yet` : "";
+      L.push(bar(g, `  filtered by ${names}${nodata}`));
+      L.push(bar(g, p.dim("  turn a toggle off: ctrl+o (ok-only), ctrl+l (1M+)")));
+    }
+  }
+
+  // The rows of the table. At level 0 the PINNED rows were already drawn above the column header.
+  v.items.forEach((it, i) => {
+    if (pinStrip && i < pinnedCount) return;
+    L.push(rowLine(it, i));
   });
   maybeDiscloseRecents();               // all-pinned, no-providers edge: the loop above never hit i === pinnedCount
 
   if (v.more > 0) L.push(bar(g, p.dim(`  ${g.ell} ${v.more} more`)));
+  // THE FULL ID of the selected row, one line above the footer: exactly what enter or ctrl+f
+  // will act on, however the id column elided it (level 1: the model id; flat: provider/model;
+  // level 0: the whole key id, bucket included). Blank when nothing is selectable, so the frame
+  // keeps its height. Clipped from the LEFT with a visible ellipsis when longer than the frame.
+  // The data stamps live at the RIGHT END of this line (they used to crowd the header): what the
+  // selected id leaves free, fullest candidate that fits first, dropped whole (never clipped) otherwise.
+  {
+    const label = "  id: ";
+    let fid = "";
+    if (v.fullId) {
+      const room = INNER - vis(label);
+      const cps = [...sanitizeDisplay(v.fullId, 10_000)];
+      fid = p.dim(label) + (cps.length <= room ? cps.join("")
+        : g.ell + cps.slice(cps.length - (room - vis(g.ell))).join(""));
+      // `  = <sibling>` when the row is a dead alias of a working route, or `  N plan` for a
+      // provider with plan-covered models (the count the provider list no longer draws), when the
+      // whole line still fits.
+      const tail = v.fullAlias ? `  = ${sanitizeDisplay(v.fullAlias, 200)}`
+        : Number.isFinite(v.fullPlan) && v.fullPlan > 0 ? `  ${Math.trunc(v.fullPlan)} plan` : "";   // a number only: a tampered planCount draws nothing
+      if (tail && cps.length + [...tail].length <= room) fid += p.dim(tail);
+    }
+    const both = (a, b) => [a, b].filter(Boolean).join(` ${g.dot} `);
+    const benchDate = meta.benchCountsAsOf ? `bench ${stampOf(meta.benchCountsAsOf)}` : "";
+    const cands = atProviderLevel
+      ? [both(routableStamp, benchDate), benchDate, routableStamp]
+      : [both(benchedStamp, discoveredStamp), benchedStamp];
+    const spare = INNER - vis(fid) - 2;
+    const stamp = cands.find((c) => c && vis(c) <= spare) ?? "";
+    L.push(bar(g, fid + (stamp ? " ".repeat(INNER - vis(fid) - vis(stamp)) + p.dim(stamp) : "")));
+  }
+  // MODEL LEVEL: `reply:` -- the selected row's FULL stored reply (or skip reason), sanitised, with the
+  // `~` thinking marker kept; clipped with an ellipsis only when longer than the frame. Blank
+  // when there is none. One row, accounted for in pick-state's `rowsAvail`.
+  if (flat || v.level > 0) {
+    const sel = v.items[v.cursor - v.top];
+    let reply = "";
+    if (sel?.kind === "model") {
+      const got = meta.benchOf ? meta.benchOf(sel.target) : null;
+      const rec = isFresh(got, v.now ?? Date.now()) ? got : null;
+      // A cut stream and an ok record that hit a stream error after its first token say so up front.
+      const note = rec?.s === "ok" && rec.x === 1 ? "[cut] " : rec?.s === "ok" && typeof rec.m === "string" && rec.m ? "[stream error] " : "";
+      // The note already says "stream error", so the stored message loses its own `stream error after first token:` lead.
+      const tail = note === "[stream error] " ? sanitizeDisplay("  (" + rec.m.replace(/^stream error( after first token)?:?\s*/i, "") + ")", 400) : "";
+      const text = rec ? [...(note + previewText(rec, 10_000) + tail)] : [];
+      const room = INNER - vis("  reply: ");
+      if (text.length) reply = p.dim("  reply: ") + (text.length <= room ? text.join("")
+        : text.slice(0, Math.max(0, room - vis(g.ell))).join("") + g.ell);
+    }
+    L.push(bar(g, reply));
+  }
   const atProviders = !flat && v.level === 0;
   L.push(footer(g, p, caps.unicode ? (atProviders ? HELP0 : HELP1)
                                    : (atProviders ? HELP0_A : HELP1_A)));

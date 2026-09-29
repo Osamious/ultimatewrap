@@ -132,7 +132,7 @@ test("abort empties the buffer and exits 0, so the sentinel does not survive", (
   let code = 0;
   try {
     execFileSync(process.execPath, ["C:/Users/osami/.uw/menu/uwpick.mjs", buf],
-      { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1" }, stdio: "pipe" });
+      { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1", USERPROFILE: dir, HOME: dir }, stdio: "pipe" });
   } catch (e) { code = e.status ?? -1; }
   assert.equal(fs.readFileSync(buf, "utf8"), "", "the buffer must be emptied");
   assert.equal(code, 0, "exit 0 is what makes CC ACCEPT the emptied file");
@@ -148,7 +148,7 @@ test("abort keeps the discarding exit when it could not empty the buffer", () =>
   let code = 0;
   try {
     execFileSync(process.execPath, ["C:/Users/osami/.uw/menu/uwpick.mjs", notAFile],
-      { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1" }, stdio: "pipe" });
+      { env: { ...process.env, UW_PICKER_QUIT_IMMEDIATELY: "1", USERPROFILE: dir, HOME: dir }, stdio: "pipe" });
   } catch (e) { code = e.status ?? -1; }
   assert.notEqual(code, 0, "an un-emptied buffer must still be discarded");
 });

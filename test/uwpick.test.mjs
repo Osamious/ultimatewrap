@@ -28,23 +28,39 @@ const plain = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const show = (v, caps = CAPS) => plain(screen(v, META, { caps }));
 
 test("the provider header names the required columns", () => {
-  assert.match(show(view(initState(ROWS))), /key id\s+models\s+free\s+health/);
+  // key id | models | status | ok | [free] | empt auth pay rate gone t/o err (#114 redesign). Every column is
+  // introduced by a dim rule (`:` in these ASCII caps), so the labels never touch. The removed columns
+  // (health, dead, needs $, skip, limit) are gone.
+  assert.match(show(view(initState(ROWS))),
+    /key id\s+:models:status:\s*ok:empt:auth:pay:rate:gone:t\/o:err/);
+  assert.doesNotMatch(show(view(initState(ROWS))), /health|needs \$|:dead|skip|limit/);
 });
 
-test("a nullable free column renders a dash, not a zero", () => {
-  const line = show(view(initState(ROWS))).split("\n").find((l) => l.includes("personal.blank.paid"));
-  assert.match(line, /-/);
-  assert.doesNotMatch(line, /\s0\s/);
+// `free` is not guaranteed at the 78-column floor: it needs a terminal of 91 columns
+// (and the `limit` column no longer exists), so the free-column cases read a wide one.
+const WIDE = detectCaps({ TERM: "dumb" }, 134);
+
+test("a nullable free column renders blank when unknown, and a dash for a known zero, never a 0", () => {
+  const rows = [...ROWS, { keyId: "personal.zero.free", provider: "zero", free: 0, planCount: 0, health: "ok", models: [M("z1")] }];
+  const lines = show(view(initState(rows)), WIDE).split("\n");
+  const blank = lines.find((l) => l.includes("personal.blank.paid"));
+  const zero = lines.find((l) => l.includes("personal.zero.free"));
+  const cell = (l) => l.split(":")[4];   // key id : models : status : ok : free
+  assert.equal(cell(blank).trim(), "", "free unknown: blank, not a claim");
+  assert.equal(cell(zero).trim(), "-", "free known to be zero: a dash");
+  assert.doesNotMatch(blank + zero, /\s0\s|\(0%\)/);
 });
 
-test("a provider with plan-covered models renders the +N plan form", () => {
-  const line = show(view(initState(ROWS))).split("\n").find((l) => l.includes("personal.acme.free"));
-  assert.match(line, /12 \+4 plan/);
+test("a provider with plan-covered models shows its plan count on the id line, and free as COUNT (PCT%)", () => {
+  const lines = show(view(initState(ROWS)), WIDE).split("\n");
+  assert.match(lines.find((l) => l.includes("personal.acme.free") && l.includes(":")), /12 \(100%\)/);
+  assert.match(lines.find((l) => l.startsWith("|  id:")), /id: personal\.acme\.free\s+4 plan/);
 });
 
-test("the model header names the six required columns", () => {
+test("the model header names every column, the catalogue ones and the measured ones", () => {
   const s = reduce(initState(ROWS), "\r").state;
-  assert.match(show(view(s)), /model\s+ctx\s+\$in\s+\$out\s+badge\s+TVR/);
+  assert.match(show(view(s)), /model\s*:stat:\s*ttft(:total)?(:tok\/s)?:\s*ctx:\s*\$in:\s*\$out:badge:modality:TVR/);
+  assert.doesNotMatch(show(view(s)), /limit/, "the limit column is gone from the model header");
 });
 
 test("model rows render ctx, prices, badge and caps", () => {
@@ -177,7 +193,9 @@ test("the first frame is produced synchronously, with no routability at all", ()
   const snap = { schemaVersion: 1, generatedAt: META.generatedAt, builtAt: "x", rows: ROWS };
   const f = firstFrame({ snap, recents: [], favourites: [], caps: CAPS, termRows: 30 });
   assert.equal(typeof f.text, "string");
-  assert.equal(f.text.includes("personal.acme.free"), true);
+  // 12 columns of key id at 80 (#114), and every row here shares `personal.`, which is not drawn.
+  assert.equal(f.text.includes("acme.free") && f.meta.keyIdBucket === "personal.", true);
+  assert.equal(f.meta.keyIdW, 10, "the key id column is sized to the longest id AS DRAWN (blank.paid, 10), once");
   assert.equal(f.meta.providers, 2);
   assert.equal(f.meta.models, 3);
   // Nothing here may be a promise: the whole point is that it runs before the RPC.
@@ -354,7 +372,8 @@ test("the legend scrolls, clamps at both ends, and shows every line across the s
     t = reduce(t, DOWN).state;
   }
   for (const probe of ["call-verified", "catalogue-only", "FREE?", "PAID",
-                       "needs $", "broken", "not a chat model", "not listed now",
+                       "PROVIDER LIST", "no benchmark data at all", "snapshot.mjs --build",
+                       "not a chat model", "not listed now",
                        "ctrl+r", "backspace"]) {
     assert.ok([...seen].some((l) => l.includes(probe)),
       `scrolling the legend never revealed "${probe}"`);
@@ -451,7 +470,7 @@ test("a pool alias is labeled in flat scope too, keyed on the tail of provider/m
                     { kind: "model", target: "openrouter/free", model: M("free") },
                     { kind: "model", target: "openrouter/qwen3.8-flash", model: M("qwen3.8-flash") },
                   ] };
-  const lines = show(flatV).split("\n");
+  const lines = show(flatV, WIDE).split("\n");
   const poolLine = lines.find((l) => l.includes("openrouter/free"));
   const ordinaryLine = lines.find((l) => l.includes("openrouter/qwen3.8-flash"));
   assert.match(poolLine, /\[pool\]/);
