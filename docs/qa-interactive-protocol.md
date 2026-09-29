@@ -61,33 +61,40 @@ instead, you pressed ctrl+g on an empty prompt; the sentinel goes in first.
 
 **Do:** read the header row and the rows beneath it.
 
-**Expected:** `key id`, `models`, `status`, `ok`, then (from a 91-column terminal) `free`,
-then seven raw status columns `empt` `auth` `pay` `rate` `gone` `t/o` `err` in that
-order. There is no `health`, `dead`, `needs $`, `skip` or `limit` column. At about 80
-columns there is no `free` column and long key ids are clipped (16 characters); on a wide
-terminal the key id column is only as wide as the longest id (30 at most), the other
+**Expected:** `key id`, `status`, then (once the full key ids fit and there is room) `oldest probe`, then `models`, `ok` and a `%` column, then (once `oldest probe` is drawn and there is room) `free` and its `%`, then seven raw status columns `empt` `auth` `pay` `rate` `gone` `t/o` `err` in
+that order. There is no `health`, `dead`, `needs $`, `skip` or `limit` column. At about 80
+columns there is no `oldest probe` or `free` block and long key ids are elided with a visible marker (`~` in ASCII, an em dash in Unicode; 16 characters
+show); from about 94 columns every key id is shown WHOLE (the column is sized to the longest full id,
+up to 64 characters), `oldest probe` appears after it (about 107 columns for the current ids) and `free` after that (about 117), the other
 columns sit right beside it (not pushed to the far edge), and spare width is empty space
 at the right. Every column is introduced by a dim vertical rule (`┆` on a Unicode terminal,
-`:` on an ASCII one), in the header and in every row, in the same screen columns. The title says
-`ids shown without personal.` and rows read `google.free` (not `personal.google.free`);
-a row in another bucket keeps its full id, and typing `personal` still matches the rows.
+`:` on an ASCII one), in the header and in every row, in the same screen columns. There is no
+"ids shown without" note in the title, and every row shows its FULL key id including the bucket
+(`personal.google.free`, `relay.anthropic.subscription`); typing `personal` matches the rows. The `models`
+cell is at most 7 wide (`N` or `N/M`) and never moves a column; `ok` `%` is ok / models while
+`[no gone]` is off and ok / (models minus gone) while it is on (`ctrl+x`).
 
-`status` says `alive` (green) when anything on the provider responded (an `ok`, an
-empty reply, a refusal for payment or rate, an auth or not-found answer, a provider-side
-error), `dead` (red) only when every fresh probe got no response at all (a timeout with nothing
-back, or a connection failure), and is blank when nothing was benched. `ok` and `free` read
-`COUNT (PCT%)` (for example `236 (50%)`; `<1%` for a small non-zero count; `(100%)` whole);
-`-` is a known zero; blank is unknown. The other cells are counts, `-` for zero, or blank
-when the provider has no benchmark data (a snapshot built without a sweep is all blank,
-including `status`). Favourites and recents sit **above** the column header, closed by a
-thin rule; with none, there is no strip and no rule. The header's right end reads
-`P providers | M models | K ok (P%)` (`- ok` when nothing was benched) and nothing else;
-the line above the footer reads `id: <full key id>`, then `N plan` when that provider has
-plan-covered models, with `routable ...` / `bench ...` dates at its right end.
+`status` says `alive` (green) when at least one model on the provider answered `ok`; `down`
+(yellow) when there are fresh probes, none `ok`, and at least one answered (a refusal for key,
+payment or model, an empty reply, a rate limit, a provider error, or a timeout that returned a
+first token); `dead` (red) only when every fresh probe got no response at all (a timeout with
+nothing back, or a connection failure); and blank when nothing was benched. The word carries
+the state on a colourless terminal. `ok` and `free` are a count then a percent with no
+parentheses (`236` `50%`; `<1%` for a small non-zero count; `100%` only when every one; `99%`
+never `100%` for a partial count); the `ok` count is green and the `free` count blue, and the
+percent is green from 70%, yellow from 30% to 69%, red below 30%, dim for `-` (no glyph follows it). `-` is a known zero; blank is unknown.
+The other cells are counts, `-` for zero, or blank when the provider has no benchmark data
+(a snapshot built without a sweep is all blank, including `status`). Favourites and recents sit
+**above** the column header, closed by a thin rule; with none, there is no strip and no rule.
+The header's right end reads `P providers | M models | K ok (P%)` (`- ok` when nothing was
+benched) and nothing else; the line above the footer reads `id: <full key id>`, then `N plan`
+when that provider has plan-covered models, with `routable ...` / `bench ...` dates at its
+right end.
 
 **Fail means:** a `0` where `-` or blank belongs is the failure that matters most: it is
 the design lying (a blank means "not determined"; a `0` is a claim). A `dead` on a provider
-that answered anything, an `alive` or `dead` on a provider nobody benched, a status label
+that answered anything, an `alive` on a provider with no `ok` model, a `down` on one with an `ok` model, a
+status on a provider nobody benched, a percent with parentheses, a block glyph after a percent, an id elided while the terminal has the width, a status label
 touching its neighbour or a cell wider than its label plus a gap, a huge gap between
 `key id` and `models`, a pinned row below the column header, a stamp cut in half, or a
 ragged frame.
@@ -342,8 +349,11 @@ test harness to sample that is not our own mock.
 
 **Do:** press `?`, read the legend, press any key to close it; then type `zzzz`.
 
-**Expected:** the legend replaces the rows and lists the keys including ctrl+f and
-esc; the key that closes it does nothing else, so pressing esc to close does not
+**Expected:** the legend replaces the rows and is laid out as four sections, each opened by a
+heading rule (KEYS, PROVIDER LIST, MODEL LIST, PROBES) with an aligned `term  meaning` list under it;
+the terms are drawn in the colours they have in the picker (alive/down/dead, the modality words,
+the probe statuses, the % bands). It lists the keys including ctrl+f and
+esc, scrolls with up/down (the footer says "N-M of T"), and every line fits the frame; the key that closes it does nothing else, so pressing esc to close does not
 exit the picker; the filter still reads what it read before. With `zzzz` typed,
 one line reads, in this order:
 
@@ -425,7 +435,7 @@ suspecting `hud-shim.mjs`.
 **Do:** open any provider (or press tab for flat scope). Look at the header and
 rows, then resize the terminal to about 80, about 100 and about 130 columns. Press
 `ctrl+b` (nothing should happen). Press `ctrl+o`, then `ctrl+l`, then each again.
-Press `?` and read the MODALITY, HEADER, ID LINE AND REPLY LINE, and BENCH COLUMNS sections.
+Press `?` and read the MODEL LIST and PROBES sections.
 
 **Expected:** there is no toggle: one view shows the catalogue columns (`ctx`,
 `$in`, `$out`, `badge`, `modality`, `TVR`) **and** the measured ones (`stat`, `ttft`,
@@ -437,8 +447,8 @@ everything up to `TVR` except `total`, `tok/s` and `output` (ids elided in the m
 22 characters); wider terminals add `total`, `tok/s` and finally `output`, in that
 order, and from about 103 columns every column shows. `modality` is present at every width. It
 reads one of `chat`, `chat?`, `image`, `audio`, `video`, `embed`, `rank`, `mod`, `stt`,
-`ocr`, `live`, `other` or `?` (unknown), dim for `chat`, `chat?` and `?` and cyan for the
-rest, left-aligned under the header `modality`, and a route that no evidence describes reads `?`,
+`ocr`, `live`, `other` or `?` (unknown), each known word in its OWN colour (twelve distinct
+colours; `?` dim), left-aligned under the header `modality`, and a route that no evidence describes reads `?`,
 never `chat`; a route the picker already dims as not-chat is never labelled `chat`. The frame is never
 wider than the terminal, down to an 80-column terminal: the frame has a **78-column floor**, so on a terminal
 narrower than 80 columns it is wider than the terminal and wraps (80 columns is the supported minimum). The header's right end reads `N of M | K ok (P%)`
@@ -462,25 +472,103 @@ every row at the same columns; pinned rows, the `... N more` line, the withheld 
 and the empty state carry none, and a selected row is inverted across the whole row.
 
 The `id:` line (above the `reply:` line at a model list) reads `id: <full id>` for the selected row (level 1 the
-model id, flat `provider/model`, the provider list the full key id with the omitted
-`personal.`), is blank on a row that cannot be selected, and is clipped from the left
+model id, flat `provider/model`, the provider list the full key id), is blank on a row that cannot be selected, and is clipped from the left
 with an ellipsis only when longer than the frame. Long ids in the list elide keeping the
 part that differs (versions and suffixes stay visible) and CJK or emoji in an id or
 preview show as `?` without moving any column. `ctrl+r` on a provider with withheld
 models shows the whole withheld id where the terminal allows.
 
-Header stamps end in `Z` (UTC). A model row whose newest bench record is older than 14
-days draws blank measured cells. On a terminal whose font lacks `┆`, `UW_PICKER_COLSEP=ascii`
+Header stamps end in `Z` (UTC). A model row whose bench record is old still draws its
+measured cells (there is no age cutoff; the yellow outdated line says when to re-sweep). On a terminal whose font lacks `┆`, `UW_PICKER_COLSEP=ascii`
 (or `latin`) swaps the rule without moving any column.
 
 A row whose stream was cut for ignoring `max_tokens` draws a blank `total`, a `~`-prefixed `tok/s`
 and a `reply:` line starting `[cut]`; an ok row with a stream error after the first token has a
 `reply:` line starting `[stream error]`.
 
-**Fail means:** a stale (30-day) status drawn on a row, a cut row showing a `total`, two rows drawing the same id cell
+**Fail means:** a 30-day-old status missing from a row, a cut row showing a `total`, an `ok` `%` whose denominator disagrees with the `[no gone]` chip (over all models when off, minus gone when on), two rows drawing the same id cell
 when the width allows better, a
 row wider than the frame after a non-Latin id, a header `K ok` that disagrees with the
 `ctrl+o` list length, a ragged or wrapped frame at any width, columns touching, a big gap
 between the id and the next column, zeros on unbenched rows, a `modality` that says `chat` for an image, audio or embedding model or a guessed value where `?` belongs, a `limit` column, a chip missing while a
 filter is on, an `ok` figure showing `0 ok` for no data, a `reply:` line that changes the frame height or shows escape characters, a preview that shows escape
 characters or garbles the frame, or a control key appearing in the filter text.
+
+### P17-hide-gone
+
+**Do:** at the provider list note the `ok` `%` of a provider whose `gone` count is above zero and the header
+`K ok (P%)`. Press `ctrl+x`. Then open that provider (enter), press `ctrl+o`, `ctrl+x` again, go back with esc,
+and press tab for flat scope and `ctrl+x` once more. Move the cursor down several rows before each press.
+
+**Expected:** by default nothing is hidden and the `ok` `%` is ok / models. At the provider list `ctrl+x`
+adds a `[no gone]` chip beside the typed filter, changes that provider's `%` and the header figure to
+ok / (models minus gone), hides NO provider row, leaves the cursor where it was, and does not change the `ok`
+count, `models`, the `gone` column or the `free` `%`. Opening a provider keeps the chip on; on the model list the
+same key removes every row whose fresh probe status is `gone` (rows with no fresh record stay), changes
+`N of M` to the filtered count, shows the header `K ok (P%)` over models minus gone, and puts the cursor on
+the first visible row; the footer reads `[^x]gone`. With `ctrl+o` on as well the header shows `[ok] [no gone]`
+and the list is the intersection. Pressing `ctrl+x` again shows every row, restores the original `%` and
+removes the chip, at whichever level you are on. If every row is gone the list says `filtered by gone routes
+hidden` and how to turn it off. The frame keeps its width at every terminal width.
+
+**Fail means:** a gone row still listed while the chip is on, a row with no record hidden, a provider row
+disappearing at the provider list, the `%` not following the chip, the cursor on a row that is not visible or
+a blank list with rows behind it, a ragged or wider frame with the chip, or a control byte appearing in the
+filter text.
+
+### P18-free-only
+
+**Do:** open a provider that has `FREE`, `FREE?` and `PAID` models, or press tab for flat scope. Press `ctrl+e`,
+then `ctrl+o`, then `ctrl+x`, then `ctrl+e` again. Press `ctrl+e` at the provider list. Turn all four toggles
+on at once and read the top line at about 80 columns.
+
+**Expected:** `ctrl+e` adds a `[free]` chip and keeps only models whose badge column reads `FREE` or `FREE?`
+(a row with a blank badge, including a `FREE?` whose probe said payment is required, is out); `N of M`
+follows; the cursor returns to the top; the footer reads `[^e]free`. It combines with the other chips as an
+intersection. Pressing it again restores the list. At the provider list it does nothing. With all four chips on
+at 80 columns the top line stays inside the frame, the chips shorten (`[1M]`, `[-gone]`) rather than the counts
+being clipped, and an empty result says `filtered by FREE / FREE? only` and names `ctrl+e` as the way out.
+
+**Fail means:** a `PAID` or blank-badge row listed while the chip is on, the counts clipped by the chips, a
+ragged frame, the key doing anything at the provider list, or a control byte appearing in the filter text.
+
+### P19-outdated-notice
+
+**Do:** with a `bench.json` in which MORE THAN HALF of the records are more than 7 days old (or edit a
+copy: set most `a` back 8 days), open the picker. Look above the footer at the provider list, open
+a provider, press tab for flat scope, then resize to about 80, 100 and 134 columns. Repeat with every record
+newer than 7 days, with exactly half the records older (no line) and one more than half (the line), and with no
+`bench.json` at all. With `ctrl+x` on, read the top-right header total.
+
+**Expected:** at every level a yellow line reads `Model Status might be outdated! Last time the list was fully
+updated was YYYY-MM-DD, run node refresh/bench-cli.mjs --live to update your list fully` right-aligned on the
+last content line above the footer, YYYY-MM-DD being the date of the OLDEST record (UTC); on narrower frames it
+shortens to `Status may be outdated (full update YYYY-MM-DD): node refresh/bench-cli.mjs --live` and then to
+`Outdated since YYYY-MM-DD: node refresh/bench-cli.mjs --live`, always with the command whole and never wider
+than the frame. Old rows keep their cells and counts (nothing is hidden for being old). With half or fewer of the records
+older than 7 days, and with no bench data, the line is absent (the no-data case still shows `benched -`).
+The list is one row shorter while the line shows and no frame is taller than the terminal. While `[no gone]` is
+on, the provider-list header reads `P providers · M models · K ok (P%)` with M = all models minus gone and P =
+K / that M; the provider rows' `models` and `gone` columns do not change.
+
+**Fail means:** a notice on fresh data or with no data, the notice quoting the newest record's date, the command
+clipped, colour codes leaking on a colourless terminal, a frame taller than the terminal, an old record drawn
+blank, or the header total ignoring the `[no gone]` chip.
+
+### P20-oldest-probe
+
+**Do:** at about 134 columns read the provider list's `oldest probe` column; give it a snapshot whose providers
+have records of different ages (a re-probe of one provider's models, or edit the `benchAgeHist` of a copy), then
+open a provider and go back (the file's histograms replace the snapshot's). Resize down to about 106, 100 and 80
+columns and up again; run once with `NO_COLOR` or colour off.
+
+**Expected:** between `status` and `models` a 12-wide column headed `oldest probe` (lowercase, whole) shows the
+age of each provider's OLDEST probe record, right-aligned: `45m`, `5h`, `3d`, `12d`, `40d`; `-` for a provider
+with no records, blank when there is no bench data. A provider that has one 30-day-old record and many fresh ones
+reads `30d`, not the fresh age. Colours: under 2 days green, under 4 yellow, under 7 orange, 7 days or more red;
+with colour off the text alone. It is absent below about 107 columns (for the current ids) and `free` goes first
+as the terminal narrows: no `free` below about 117 columns, no `oldest probe` below about 107, the key id whole
+before either. Header and rows line up at every width and the ages do not change while the picker stays open.
+
+**Fail means:** a header other than `oldest probe`, an age of the newest record instead of the oldest, a wrong colour at 2d, 4d or 7d,
+a ragged frame, or `free` shown without `oldest probe`.

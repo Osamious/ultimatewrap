@@ -15,45 +15,84 @@ invariant test asserts for every frame in both glyph sets.
 ## Level 0 — providers
 
 ```text
-╭─ UW ▸ providers ▸ ids shown without personal. ─────────────────────────────╮
-│  filter: ▏                      44 providers · 1,584 models · 610 ok (39%) │
+╭─ UW ▸ providers ───────────────────────────────────────────────────────────╮
+│  filter: ▏                                   1 providers · 1 models · - ok │
 │                                                                            │
-│▶ ★ google/gemini-3.5-flash-lite                                            │
-│  ───────────────────────────────────────────────────────────────────────   │
-│  key id          ┆models┆status┆        ok┆empt┆auth┆pay┆rate┆gone┆t/o┆err │
-│  google.free     ┆     3┆ alive┆   2 (67%)┆   -┆   -┆  -┆   -┆   1┆  -┆  - │
-│  openrouter.free ┆    12┆ alive┆   5 (42%)┆   1┆   1┆  3┆   -┆   2┆  -┆  - │
-│  acme.paid       ┆     1┆ alive┆         -┆   -┆   -┆  1┆   -┆   -┆  -┆  - │
-│  dead.free       ┆     1┆  dead┆         -┆   -┆   -┆  -┆   -┆   -┆  1┆  - │
-│  id: google/gemini-3.5-flash-lite                       bench 09-29 19:26Z │
-╰ [↑↓] move  [↵] open  [⇥] scope  [^f] fav  [?] all keys  [esc] back ────────╯
+│  ── KEYS ──────────────────────────────────────────────────────────────    │
+│    up/down    move the cursor (wraps at either end)                        │
+│    a-z 0-9    type to filter; the filter is per level                      │
+│    backspace  delete one character from the filter                         │
+│    enter      open a provider, or select a model                           │
+│    tab        toggle flat provider/model search                            │
+│    ctrl+f     add or remove a favourite                                    │
+│    ctrl+o     ok-only filter on model lists (last benchmark ok)            │
+│    ctrl+l     1M+ filter on model lists (ctx >= 1M or a [1m] tag)          │
+│    ctrl+x     toggle [no gone]: on model lists it hides routes marked      │
+│               gone; on either level it makes the % = ok / (models - gone)  │
+│               instead of ok / models (off by default)                      │
+│    ctrl+e     toggle [free]: on model lists show only models badged FREE   │
+│               or FREE?                                                     │
+│    ctrl+r     show withheld models for this provider                       │
+│    esc        clear the filter, then go back, then quit                    │
+│    ctrl+c     quit without changing the chat input                         │
+│    ?          this screen; up/down scrolls it                              │
+│                                                                            │
+│  ── PROVIDER LIST ─────────────────────────────────────────────────────    │
+│    Read from the last benchmark sweep, baked into the snapshot (the date   │
+│    is on the id: line). Refresh it with: node menu/snapshot.mjs --build    │
+│    key id     the key's FULL id, bucket included (e.g.                     │
+│               personal.openrouter.free), sized to the longest id. Only on  │
+│               a narrow terminal is it elided, with a marker (—), keeping   │
+│               the part that differs.                                       │
+│                                                                            │
+│  1-26 of 186   [↑↓] scroll  [any key] returns                              │
+╰ [↑↓] move [↵] open [⇥] scope [^f] fav [^x] gone [?] all keys [esc] back ───╯
 ```
 
-Columns, left to right: `key id`, `models`, `status` (`alive` green, `dead` red, blank when nothing was
-benched), `ok` and `free` as `COUNT (PCT%)` (`free` only from a 91-column terminal), then the seven raw status
-counts `empt auth pay rate gone t/o err` (`-` is a known zero, blank is unknown). Every column is introduced by
-a dim rule (`┆`, `:` in ASCII). Favourites and recents sit above the column header, closed by a thin rule.
-The header's right side is counts only; the dates (`routable`, `bench`) sit at the right end of the `id:` line,
-which shows the selected row in full. A blank `status`/`ok` means "not measured", never "zero".
+## Level 0, wide: the `oldest probe` column
 
-## Level 1 — a provider's models
+From 107 columns (for a 30-character longest key id) the provider list draws `oldest probe` right after `status`;
+`free` follows from 117. Ages: `5h` and `3d` green then yellow (under 4d), `5d` orange, `9d` red (the frame below is
+the real renderer at 134 columns with colour off; the age text carries the meaning). `-` is a provider with no probe
+record, blank one with no bench data:
 
 ```text
-╭─ UW ▸ personal.google.free ▸ models ───────────────────────────────────────╮
-│  filter: ▏                                             3 of 3 · 2 ok (67%) │
-│                                                                            │
-│    model                ┆stat┆ ttft┆   ctx┆  $in┆ $out┆badge┆modality┆TVR  │
-│▶ ◇ gemini-3.5-flash-lite┆ok  ┆842ms┆    1M┆ 0.00┆ 0.00┆FREE ┆chat    ┆TVR  │
-│  ◇ gemini-3.5-flash     ┆ok  ┆910ms┆    1M┆ 0.30┆ 2.50┆PAID ┆chat    ┆TVR  │
-│  ◇ veo-3.1              ┆gone┆     ┆    1M┆ 0.00┆ 0.00┆     ┆video   ┆TVR  │
-│  id: gemini-3.5-flash-lite             benched 09-29 19:26Z · discovered — │
-│  reply: Hello there!                                                       │
-╰ [↑↓] move  [↵] select  [^f] fav  [^o] ok  [^l] 1M+  [?] keys  [esc] back ──╯
+╭─ UW ▸ providers ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  filter: ▏                                                                               5 providers · 619 models · 311 ok (50%) │
+│                                                                                                                                  │
+│  key id                  ┆status┆oldest probe┆ models┆  ok┆   %┆free┆   %┆empt┆auth┆pay┆rate┆gone┆t/o┆err                        │
+│▶ personal.google.free    ┆ alive┆          5h┆    194┆ 120┆ 62%┆  60┆ 31%┆   -┆   -┆  4┆   -┆  30┆  -┆  -                        │
+│  personal.openrouter.free┆ alive┆          3d┆    320┆ 150┆ 47%┆  90┆ 28%┆   -┆   2┆  -┆   -┆  86┆  -┆  -                        │
+│  personal.nvidia.free    ┆ alive┆          5d┆     88┆  41┆ 47%┆  88┆100%┆   -┆   -┆  -┆   -┆   -┆  -┆  3                        │
+│  personal.cerebras.free  ┆  down┆          9d┆     12┆   -┆   -┆  12┆100%┆   -┆  12┆  -┆   -┆   -┆  -┆  -                        │
+│  relay.newprovider.free  ┆      ┆           -┆      5┆   -┆   -┆    ┆    ┆   -┆   -┆  -┆   -┆   -┆  -┆  -                        │
+│  id: personal.google.free                                                             routable 10-07 08:00Z · bench 09-29 21:00Z │
+╰ [↑↓] move [↵] open [⇥] scope [^f] fav [^x] gone [?] all keys [esc] back ─────────────────────────────────────────────────────────╯
 ```
 
-The `modality` column says what the route outputs (`chat` dim, everything else cyan, `?` unknown). Under the
-`id:` line, `reply:` shows the selected row's stored reply in full. `total`, `tok/s` and `output` join from
-wider terminals (every column shows from 103 columns).
+## The outdated line
+
+When more than half of the bench records are more than 7 days old, a yellow line is drawn right-aligned
+on the last content line, just above the footer, on every list screen (here at 134 columns, so the middle wording;
+from 154 columns the full sentence, below 88 columns and down to the 78-column floor the shortest form; the command
+is always whole). The date is the oldest record's:
+
+```text
+╭─ UW ▸ providers ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  filter: ▏                                                                               5 providers · 619 models · 311 ok (50%) │
+│                                                                                                                                  │
+│  key id                  ┆status┆oldest probe┆ models┆  ok┆   %┆free┆   %┆empt┆auth┆pay┆rate┆gone┆t/o┆err                        │
+│▶ personal.google.free    ┆ alive┆          9d┆    194┆ 120┆ 62%┆  60┆ 31%┆   -┆   -┆  4┆   -┆  30┆  -┆  -                        │
+│  personal.openrouter.free┆ alive┆          9d┆    320┆ 150┆ 47%┆  90┆ 28%┆   -┆   2┆  -┆   -┆  86┆  -┆  -                        │
+│  personal.nvidia.free    ┆ alive┆          9d┆     88┆  41┆ 47%┆  88┆100%┆   -┆   -┆  -┆   -┆   -┆  -┆  3                        │
+│  … 2 more                                                                                                                        │
+│  id: personal.google.free                                                             routable 10-07 08:00Z · bench 09-29 21:00Z │
+│                                              Status may be outdated (full update 2026-09-28): node refresh/bench-cli.mjs --live  │
+╰ [↑↓] move [↵] open [⇥] scope [^f] fav [^x] gone [?] all keys [esc] back ─────────────────────────────────────────────────────────╯
+```
+
+Old records stay visible and are never hidden or dimmed; this line and the `oldest probe` column show how old the
+data is. It costs one list row while it shows.
 
 ## Empty state
 
@@ -86,6 +125,7 @@ both sets, which the frame-width invariant depends on.
 | favourite | `★` | `*` |
 | recent | `↺` | `~` |
 | column rule | `┆` | `:` |
+| id elision marker | `—` | `~` |
 | counts separator | `·` | `|` |
 | confirm | `✔` | `OK` |
 | arrow | `→` | `->` |
@@ -108,11 +148,29 @@ both sets, which the frame-width invariant depends on.
 | vision `V` | magenta |
 | reasoning `R` | yellow |
 | absent capability `-` | dim |
-| status `alive` / `dead` | green / red |
-| `ok` count / `free` count | green / cyan |
-| modality `chat` | dim |
-| modality, any other known word | cyan |
+| status `alive` / `down` / `dead` | green / yellow / red |
+| `ok` count / `free` count | green / blue |
+| `%` cells | green from 70%, yellow 30-69%, red under 30%, dim for zero |
+| modality words | one colour each, see below; `?` dim |
 | title | 256-colour ramp, degrading to cyan at 16 colours |
+
+Modality colours (one table, `MODALITY_COLOURS` in `menu/modality.mjs`; the word carries the meaning, the colour is decoration):
+
+| word | 256-colour | hue | 16-colour (SGR) |
+|---|---|---|---|
+| `chat` | 40 | green | 32 green |
+| `chat?` | 79 | aquamarine | 36 cyan |
+| `image` | 201 | magenta | 35 magenta |
+| `embed` | 208 | orange | 33 yellow |
+| `video` | 196 | red | 91 bright red |
+| `audio` | 226 | yellow | 93 bright yellow |
+| `stt` | 33 | azure blue | 94 bright blue |
+| `live` | 51 | bright cyan | 96 bright cyan |
+| `rank` | 141 | lavender | 95 bright magenta |
+| `ocr` | 213 | pink | 31 red |
+| `mod` | 190 | yellow-green | 92 bright green |
+| `other` | 250 | light grey | 97 bright white |
+| `?` (unknown) | dim | not a type | dim |
 
 An unroutable row (`routable === false`) is dimmed whole. `routable === null`
 is **not** dimmed: dimming everything the one time the gateway was unreachable

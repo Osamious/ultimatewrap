@@ -174,8 +174,8 @@ that's why it's never the default and never scheduled.
 
 ### 6c. Health — probe results feeding the snapshot's `health` field
 
-> The picker no longer draws a health column: the provider list shows a `status`
-> (alive / dead) and benchmark counts (6d). The `health` string is still resolved and
+> The picker no longer draws a health column: the provider list shows a three-state `status`
+> (alive / down / dead) and benchmark counts (6d). The `health` string is still resolved and
 > stored on every snapshot row for other readers, and everything below still applies to it.
 
 The snapshot's `health` field (`ok` / `needs $` / `broken` / `stale`) is
@@ -438,6 +438,52 @@ What a live run does, so its cost is predictable:
   `--max-row-cost` to 0.65 to include them).
   Neither is part of the catalogue snapshot, so a snapshot rebuild never discards a
   sweep. (A rebuild *reads* `bench.json` to count, below; it never writes it.)
+- **History backups.** `bench.json` keeps one record per model and every run overwrites
+  it, so a route that was `ok` and later returns `gone` would lose its evidence. Every run
+  that writes `bench.json` or its log (`--live`, `--compact`, `--redact`, a real
+  `--reclassify-notices`; never a dry run) first copies the current `bench.json` to
+  `~/.uw/state/bench-history/bench-<UTC yyyymmddThhmmssZ>.json` and prints
+  `bench: history saved -> ...`. **The copy is always redacted** (every record goes
+  through the same provider-text redaction as compaction, so a `bench.json` written
+  before redaction existed cannot leak a key fragment into history; measurements and
+  statuses are untouched; the copy is content-identical, re-serialised as compact JSON,
+  so identical for files the tool wrote). It
+  saves `bench.json` only, not an unfolded `bench.jsonl` log: the sweep's end-of-run
+  compaction folds the log into `bench.json` later, and the next run's copy has it. A
+  copy identical to the newest one is not repeated (`history unchanged`). At most 30
+  copies are kept (about 1 MB each), the one just written always among them;
+  `--keep-history N` changes that (at least 1: there is deliberately no way to turn
+  history off). Older copies are pruned by name, and only files named
+  `bench-<stamp>.json` (plus the `.tmp-*` debris of an interrupted write of one) are ever
+  touched. No `bench.json` yet is a quiet `history skipped`; a real failure prints one
+  warning and never stops the run. `state/` is gitignored, so none of this is
+  committed. It is a safety net you read by opening a file, not a queryable history (an
+  ever-`ok` ledger is a separate, later item).
+- **The sweep ends by rebuilding the snapshot.** After the end-of-run compaction, and
+  before it releases the sweep lock, a `--live` run that changed `bench.json`'s records
+  (finished, or stopped by Ctrl-C or the time limit; a run whose only results were
+  transient ones that older real records outrank changes nothing and does not rebuild)
+  runs `node menu/snapshot.mjs --build` itself as a background child process (5 minute
+  limit) and prints one line,
+  `bench: snapshot rebuilt (<N providers, M models, catalogue ...; routability: ...>)`.
+  When the gateway is up and the vault registry, providers and catalogue files exist,
+  `node refresh/bench-cli.mjs --live` alone therefore brings both picker levels up to
+  date: the rebuild recomputes the bench counts and flags from `bench.json`, and also
+  re-stamps routability and re-fetches the relay catalogue, exactly as the manual
+  command does. **A rebuild during a gateway outage would degrade routability, so it is
+  skipped**: when the sweep gave up on a dead gateway, or `/health` does not answer right
+  before the build, the run prints `bench: snapshot not rebuilt (gateway not answering);
+  run: node menu/snapshot.mjs --build when it is back`; and a build whose output says
+  routability was unknown is reported as a warning
+  (`snapshot rebuilt WITHOUT routability`), not as success. A run that recorded nothing,
+  a dry run and every read-only path do not rebuild. A failed rebuild never fails the
+  sweep or changes its exit code: it prints one
+  `bench: warning: snapshot not rebuilt (<reason>); run: node menu/snapshot.mjs --build`
+  line on stderr. Ctrl-C during the rebuild kills the child (the exit code stays as
+  decided); a second Ctrl-C exits at once. The manual rebuild is needed only after the
+  other bench writers (`--reclassify-notices`, `--redact`, `--compact`, which do NOT
+  rebuild), after a catalogue change, or after a skipped or failed rebuild. There is no
+  flag to turn the rebuild off.
 
 **How to read it.** TTFT is request-sent → first streamed token; total is
 request-sent → stream closed; tok/s is provider-reported output tokens divided by
@@ -486,10 +532,30 @@ never used: it says the request failed, not what the model is. A mixed output li
 (`audio` + `text`) is not treated as primary evidence. A route the picker already treats as not-chat
 (`outputKind` `nontext`, which dims it and shows `nochat` in `ctx`) is never labelled `chat`: a rung that
 would say so is skipped, and the next rung, or `other`, decides. The column is 8 wide (the size of its header; the words are at most 5), left-aligned like
-the badge, dim for `chat`, `chat?` and `?`, cyan for every other word so non-chat rows stand
-out. The snapshot stores it as `outModality` (always present, `null` when unknown) and the
+the badge. Every known word has its OWN colour (table below, one source of truth in
+`menu/modality.mjs`; decoration only, the word carries the meaning) and `?` (unknown) is dim.
+On a 16-colour terminal the ANSI 8+8 colours are used (some words share a hue with a bright variant),
+and with no colour the word alone is drawn. The words:
+
+| word | 256-colour | hue | 16-colour (SGR) |
+|---|---|---|---|
+| `chat` | 40 | green | 32 green |
+| `chat?` | 79 | aquamarine | 36 cyan |
+| `image` | 201 | magenta | 35 magenta |
+| `embed` | 208 | orange | 33 yellow |
+| `video` | 196 | red | 91 bright red |
+| `audio` | 226 | yellow | 93 bright yellow |
+| `stt` | 33 | azure blue | 94 bright blue |
+| `live` | 51 | bright cyan | 96 bright cyan |
+| `rank` | 141 | lavender | 95 bright magenta |
+| `ocr` | 213 | pink | 31 red |
+| `mod` | 190 | yellow-green | 92 bright green |
+| `other` | 250 | light grey | 97 bright white |
+| `?` (unknown) | dim | not a type | dim |
+ The snapshot stores it as `outModality` (always present, `null` when unknown) and the
 deciding source as `outModalitySrc` (present only when known); both arrived with snapshot
-schema 7 (a schema-6 file is rejected and rebuilt rather than drawn with blank `status` and `?`). The existing `modality` field is unchanged: it
+schema 7 (a schema-6 file is rejected and rebuilt rather than drawn with blank `status` and `?`); the
+provider `status` became three-state in schema 8. The existing `modality` field is unchanged: it
 is still the listing's raw capability token. On the real 2026-09-29 data (6,032 routes) this
 gives: `chat` 3,672 (`mode` 2,097, `output` 1,346, `listing` 229), `chat?` 628 (`bench-ok`),
 `image` 106, `embed` 87, `video` 44, `audio` 33, `stt` 31, `live` 20, `rank` 11, `ocr` 9,
@@ -504,11 +570,10 @@ part alone can be made distinct. Measured on the real snapshot (terminal 80 / 90
 22 / 27 / 27 / 13 / 1 providers to 0 / 1 / 1 / 0 / 0 in a provider's list, and in flat
 scope from 644 / 1116 / 1116 / 227 / 26 targets to 84 / 188 / 188 / 5 / 0. The line
 above the footer, `id: ...`, always shows the selected row's **full** id (level 1 the
-model id, flat `provider/model`, provider list the whole key id including the omitted
-bucket) and is blank when the row cannot be selected; it costs one list row. On a model
+model id, flat `provider/model`, provider list the whole key id) and is blank when the row cannot be selected; it costs one list row. On a model
 list (and in flat scope) a second line, `reply: ...`, sits under it: the selected row's
 full stored reply (or `skipped: <reason>`), sanitised, clipped with an ellipsis only at
-the frame edge, blank for an unbenched or stale row; it costs one more list row (the
+the frame edge, blank for an unbenched row; it costs one more list row (the
 reducer and renderer share `rowsAvail`, so no screen exceeds the terminal height). The
 withheld-models overlay (`ctrl+r`) sizes its own id column (up to the longest
 withheld id). Wide (CJK), emoji and combining characters are drawn as `?` in every
@@ -518,23 +583,48 @@ matches the `benched` stamp and the `ctrl+o` list; the provider list keeps the
 snapshot's counts. The output column takes all the width that is left (the frame
 follows the terminal up to 260 columns): the stored reply, not the layout, limits it.
 
-Two filters apply to model lists only (`ctrl+o` and `ctrl+l`).
-Both are toggles, they combine with each other and with typed text (logical AND),
-they stay on when you go back a level, open another provider or switch to flat
-scope, and the header shows a chip for each (`[ok]`, `[1M+]`):
+Four toggles: `ctrl+o`, `ctrl+l` and `ctrl+e` apply to model lists only (they do nothing at the
+provider list); `ctrl+x` works at BOTH levels. All are toggles, default off, one shared flag each
+(so they survive going back a level, opening another provider or switching to flat scope), they
+combine with each other and with typed text (logical AND), and the header shows a chip for each
+(`[ok]`, `[1M+]`, `[no gone]`, `[free]`):
 
-- `ctrl+o` **ok-only**: only models whose latest *fresh* (last 14 days) bench status
-  is exactly `ok`. Unbenched, `empt`, `pay` and stale-`ok` models are out. With no
+- `ctrl+o` **ok-only**: only models whose latest bench status (a record of any age)
+  is exactly `ok`. Unbenched, `empt` and `pay` models are out. With no
   bench data at all the list is empty and says so.
 - `ctrl+l` **1M+**: `ctx >= 1,000,000` **or** an id ending in `[1m]` (any case).
   Both are needed: in the real catalogue 1,062 ids carry the tag, one of them
   (`teamorouter/kimi-k3[1M]`) with a null ctx, and two reach 1M without the tag.
+- `ctrl+x` **no gone**: on model lists and in flat scope it hides every model whose latest *fresh*
+  bench record is `gone` (the route is not found upstream); a route with no fresh record is shown
+  and a `gone` record hides whatever its age. **On either level it also changes the percent figures**:
+  the provider list's `ok` `%` and both headers' `K ok (P%)` are ok / models while the toggle is
+  off, and ok / (models minus gone) while it is on (a zero denominator reads `-`). At the provider
+  list it hides no provider row and leaves the cursor where it is; on a model list turning it on or
+  off returns the cursor to the top. The `free` `%` is always over ALL models (a catalogue price
+  fact) and the `ok` count, `models` and the raw `gone` column never change. Pure reducer toggle over
+  the same lazily loaded bench data as `ctrl+o`. The chip `[no gone]` shows at both levels, `N of M`
+  counts the filtered list, and the footer carries `[^x]gone`. (`ctrl+g` is not used: it is the key
+  that opens the picker.)
+- `ctrl+e` **free only**: keeps only models whose badge AS DRAWN is `FREE` or `FREE?`. A `FREE?`
+  whose fresh probe said payment is required is already drawn with a blank badge (the snapshot
+  blanks it), so it does not match. The provider list's `free` count is different: it counts the
+  `FREE` / `FREE?` badges the catalogue gave at snapshot time, before that blanking, so the two can
+  differ by exactly those rows. The chip is `[free]`. With all four chips on, the chip row shortens in
+  two steps (packed, then `[1M]` and `[-gone]`) so the counts on the right are never clipped: at 78
+  columns the left part (`filter:` plus the four chips) is 32 columns wide.
 
 The header's right side is **counts only**: `N of M | K ok (P%)` on a provider
 (N = models matching the filters, M = the provider's models, K = that provider's
 models whose latest fresh bench result is `ok`, whatever the filters say, P = K as a
-share of M), `N of M models | K ok (P%)` in flat scope, and `P providers | M models |
-K ok (P%)` on the provider list; thousands take a separator from 1,000. `- ok` (a dash)
+share of M while [no gone] is off, of M minus the fresh `gone` routes while it is on, counted
+live from `bench.json`), `N of M models | K ok (P%)` in flat scope, and
+`P providers | M models | K ok (P%)` on the provider list (the same two denominators, from the
+snapshot's baked counts; while `[no gone]` is on the header total M is also all models minus
+gone, and the % is over that shown total, e.g. 6,000 models and 1,146 gone read `4,854 models`;
+the provider rows' own `models` and `gone` columns never change, so the header total can be
+less than the sum of the visible `models` cells; on a model list `N of M` keeps the provider's
+full M, so rows hidden by the toggle show as N < M); thousands take a separator from 1,000. `- ok` (a dash)
 means nothing was benched, never `0 ok`: it is shown when the bench reader has no
 records at all, and at level 1 also for a provider with no fresh record; `0 ok` appears
 only when the provider has at least one fresh record and none is `ok`. The **data
@@ -552,30 +642,60 @@ are LIVE: their rows, `benched` stamp, `K ok` and the ok-only filter all read
 example `1396 ok` on the provider list and `1404 ok` in flat scope) until the snapshot
 is rebuilt.
 
-**The provider list's sweep columns.** Level 0 is, left to right: `key id`, `models`,
-`status`, `ok`, `free` (only from a 91-column terminal), then seven raw counts in this
-order: `empt`, `auth`, `pay`, `rate`, `gone`, `t/o`, `err`. The `dead`, `needs $`,
-`skip` and `limit` columns and the health label are gone.
+**The provider list's sweep columns.** Level 0 is, left to right: `key id`, `status`,
+`oldest probe` (only when the terminal has room after the full key id), `models`, `ok` and its `%`,
+`free` and its `%` (only when it has room after `oldest probe`), then seven raw
+counts in this order: `empt`, `auth`, `pay`, `rate`, `gone`, `t/o`, `err`. The `dead`
+and `needs $` *yes/no* columns, `skip`, `limit` and the health label are gone.
 
-- `status` is **alive** when anything on the provider responded and **dead** when
-  nothing did. It is by *response*, not by result: an `ok`, an `empt`, an `auth` or `gone`
-  (an HTTP answer refusing the key or the model), a `pay`, a `rate`, and a provider-side
-  error body all count as a response. Only a `timeout` that got no first token back and a
-  transport-level `err` (`fetch failed`, `Failed to reach upstream provider`, `terminated`, a socket reset: the
-  `NO_RESPONSE` pattern in `menu/route-hints.mjs`) are no-response, and a provider is dead
-  only when it has at least one fresh probe result and *every* one is a no-response
-  failure. `skip` records are not probe results and are ignored. It is blank when the
-  provider has no fresh record (a provider nobody benched has no verdict). It is baked as
-  `benchFlags.alive` at snapshot build (snapshot schema 7).
-  On the real 2026-09-29 data every one of the 57 providers is alive; the previous `dead`
-  rule (no `ok`/`empt` and every record a refusal or failure) flagged 8.
-- `ok` and `free` are `COUNT (PCT%)` of the provider's models: the nearest whole
-  percent, but a non-zero count never reads 0% (it is `<1%`) and 100% reads `(100%)`.
-  `-` is a known zero; blank is unknown (no bench data, or a provider with no free-tier
-  data). The plan-covered count moved to the `id:` line (`N plan`).
+- `status` has three states over the provider's probe records (of any age; `skip` records
+  are not probe results and are ignored):
+  - **alive** (green): at least one fresh `ok` model.
+  - **down** (yellow): at least one fresh record, none `ok`, and at least one answered: an
+    `auth`, `pay`, `gone`, `empt` or `rate` result, a provider-side error body, or a timeout
+    that returned a first token. The provider is reachable, nothing on it works right now.
+  - **dead** (red): at least one fresh record and *every* one is a no-response: a
+    `timeout` with no first token, or a transport-level `err` (`fetch failed`,
+    `Failed to reach upstream provider`, `terminated`, a socket reset: the `NO_RESPONSE`
+    pattern in `menu/route-hints.mjs`).
+  - **blank**: no fresh record (a provider nobody benched has no verdict).
+  It is a label only: routing never prunes a provider for reading `down` or `dead`. It is
+  baked as `benchFlags.status` at snapshot build (schema 8); the older two-state
+  `benchFlags.alive` (answered in any shape) stays in the file for other readers. On the real
+  2026-09-29 data (57 providers): 42 alive, 15 down, 0 dead. The 15 down are the providers
+  with no `ok` model at all (`pollinations`, `maestro`-`deepseek`, `gmicloudai`, `chutes`, `routllm`,
+  `seekai`, `cerebras`, `sambanova`, `xai`, `tabiai`, `gorouter`, `indeedwebid`, `kiosapi`,
+  `kktoken`, `justdowork`). The two-state version read all 57 as alive.
+- `oldest probe` is the age of the provider's OLDEST probe record (the worst case, not the latest one: one
+  stale model makes the provider read old), right-aligned in 12 under its lowercase header: `45m`, `5h`, `3d`,
+  `12d`, `40d`. Whole minutes under an hour (`<1m` under a minute), whole hours under a day, whole days from a
+  day; every unit rounds down (`59m`, then `1h`; `23h`, then `1d`; `47h` reads `1d`; `6d23h` reads `6d`). `-`
+  means the provider has no probe record, blank means there is no bench data. It is coloured as a hint by how
+  close the age is to the outdated threshold T = `BENCH_OUTDATED_DAYS` (7 days): **green** under 2/7 T (2d),
+  **yellow** under 4/7 T (4d), **orange** under T (7d), **red** from T (7d) on; the bands are computed from the
+  constant, never repeated. Orange is 256-colour 208, and bright red (91) on a 16-colour terminal (beside yellow 33
+  and red 31); with colour off only the age text shows, which carries the whole meaning. The age is computed
+  against the picker's own clock (fixed when it opens, so it does not tick while open) from an **age histogram**
+  baked on each snapshot row (`benchAgeHist`, schema 9: `[[epochHour, count], ...]`, every status, the record's
+  stamp floored to the hour), so it reads no `bench.json` at level 0. Because records are filed under the start of
+  their hour, an age can read up to an hour older than the exact one (a record from 11:50 seen at 12:00 reads
+  `1h`); once `bench.json` has been loaded (first model screen) its own histograms replace the snapshot's. The
+  header is the full `oldest probe` (12 characters) and is never abbreviated: on a terminal too narrow for the
+  column the whole column is off.
+- `ok` and `free` are each two sub-columns, with no parentheses: the count (right-aligned in 4,
+  `-` for zero, `2k` from a thousand; the `ok` count is drawn green, the `free` count blue) and the
+  percent (right-aligned in 4: `50%`, `<1%`, `100%`, `-`; the header just says `%` over it). **The `ok`
+  `%` is ok / models normally, and ok / (models minus gone) while `[no gone]` is on (`ctrl+x`, at
+  either level; it hides no provider)**; a route never probed stays in the denominator and a zero
+  denominator reads `-`. The `free` `%` is always over ALL the provider's models (a catalogue price
+  fact), whatever the toggle says. The percent is nearest whole, but a non-zero count never reads 0% (`<1%`) and a
+  partial count never reads 100% (it is `99%`). The percent is coloured by band as a hint: 70% and
+  up green, 30-69 yellow, under 30 red, zero dim. The numbers carry the meaning without any colour.
+  Blank is unknown (no bench data, or a provider with no free-tier data). The plan-covered count
+  moved to the `id:` line (`N plan`).
 - Each raw count is how many of that provider's models had that status on their latest
-  probe, with no grouping. Only probes from the last 14 days count everywhere above, so
-  a model that was never benched (or not recently) is in **no** column and the counts can
+  probe, with no grouping. Every record counts whatever its age (there is no cutoff), so
+  a model that was never benched is in **no** column and the counts can
   add up to less than `models`. A count cell reads `-` for zero and `2k` from a thousand up.
 - **Pinned rows** (favourites `*` and recents) are drawn *above* the column header, closed
   by a dim rule, so the cursor starts on them and the table below stays aligned. With no
@@ -587,28 +707,51 @@ wraps. Columns are separated by dim vertical rules (`┆` on Unicode terminals, 
 list and on model lists; each rule replaces the one-column gap the cell already had,
 so it costs no width and the header labels can never touch.
 
-Key ids are drawn **without the bucket segment** (`personal.`) when at least 80% of
-the rows share it and the shortened ids stay unique; the title says so (`ids shown
-without personal.`). A row in another bucket (`relay.`, `personal_maestro.`, ...)
-keeps its full id. Selection and filtering use the full id, so typing `personal`
-still matches every row (there is just nothing to highlight). Example (the 2026-09-29
-snapshot, 57 providers): this freed 9 characters on 53 of the 57 rows and the drawn
-ids were all unique.
+Key ids are drawn **in full**, bucket included (`personal.openrouter.free`): nothing is
+omitted from the id and the title carries no "ids shown without ..." note. Selection and
+filtering use the same full id.
 
-Width: the key id column is only as wide as the longest id **as drawn** (30 in that
-snapshot, set by the four rows in other buckets) and is **not** stretched on wide
-terminals, so the other columns sit next to it. At the 78-column floor the other level-0
-columns leave the key id 16 columns; `free` is drawn from a 91-column terminal and the
-key id reaches its full 30 from 105. An id that does not fit is **elided with a visible
-marker** using the same distinctness-aware split as model ids (so `openrouter-x-1` and
-`openrouter-x-2` stay different), never hard-cut.
+Width: the key id column is sized to the **longest full key id** (30 in the 2026-09-30 snapshot:
+`personal.experientiallabs.free` and `personal_maestro.deepseek.paid`, measured over ALL provider rows,
+never the visible page) and is drawn **whole** whenever the terminal has the room: it takes its full
+width BEFORE the optional `oldest probe` column and the optional `free` block, and before anything else optional. Only when even the mandatory
+columns plus the full id do not fit is it elided, **with a visible marker** (an em dash in Unicode,
+`~` in ASCII, never a plain hyphen), using the same distinctness-aware split as model ids (so
+`openrouter-x-1` and `openrouter-x-2` stay different), never hard-cut. Measured on the real snapshot (57
+providers, longest full id 30): every id is whole from a **94-column** terminal, `oldest probe` appears from
+**107** columns, `free` from **117** (it needs `oldest probe` too, so a narrowing terminal loses `free` first, then
+`oldest probe`), and at the 80-column floor the id gets 16 columns (56 of the 57 ids are elided there;
+2 still at 93 columns, none from 94). A 45-character id would be whole from 109 columns, `oldest probe` from
+122 and `free` from 132. The id column is capped at 64 so a hostile id cannot starve the other columns; spare width beyond the
+full id, `oldest probe` and `free` is left empty at the right, never padded into a gap. The `models` cell is 7 wide (`N`
+or `N/M` with M withheld; the worst real pair `469/100` fits, a wider one abbreviates and finally reads
+`big/big`), so it never shifts a column.
 
 **Rules that keep the numbers honest.**
-- *Freshness:* a bench record is used only if it is at most 14 days old and not dated in
-  the future (judged against the later of the picker's start time and the real clock, plus 5 minutes of
-  skew, so a record a sweep wrote after the picker opened still counts, while a genuinely future one does not). That one rule is applied to the counts, the verdicts, the `K ok` figures,
-  the `ctrl+o` filter **and the cells drawn on a model row**, so a 30-day-old
-  measurement draws blank instead of a stale status.
+- *No age cutoff, an outdated notice instead:* every reader (the counts, the verdicts, the
+  `K ok` figures, the filters, the hide-gone toggle, the provider status and **the cells drawn on a
+  model row**) uses a bench record whatever its age. Only a record with no timestamp, or one
+  dated more than 5 minutes beyond the later of the picker's start time and the real clock
+  (a hand edit, a clock that ran ahead), is refused. An old list is announced, never hidden:
+  when **more than half** of the bench records are more than 7 days old (`BENCH_OUTDATED_DAYS`, the
+  sweep's own default `--ttl`, a test keeps the two equal; `BENCH_OUTDATED_SHARE` = 0.5: exactly half does not
+  trigger it) a yellow
+  line is drawn right-aligned just above the footer, on the provider list and on model
+  lists and flat scope: `Model Status might be outdated! Last time the list was fully updated
+  was 2026-09-29, run node refresh/bench-cli.mjs --live to update your list fully`. The date is
+  the OLDEST record's (every listed route was probed at least then: the last time the list was fully
+  updated), UTC `YYYY-MM-DD`. The full sentence needs about 154 columns; on a
+  narrower frame the words shorten from the front and the command stays whole (from 88 columns: `Status may be
+  outdated (full update 2026-09-29): node refresh/bench-cli.mjs --live`, then `Outdated since
+  2026-09-29: node refresh/bench-cli.mjs --live` (the last fits the 78-column floor)); old records are never hidden or dimmed: the notice and the `oldest probe` column are what show how old the data is. With no bench
+  data at all there is no such line (the `benched - run bench-cli --live` stamp is the
+  disclosure). The line costs one row on every list screen while it shows (`rowsAvail`, shared by
+  the reducer and the renderer, so no frame exceeds the terminal height). The provider list uses
+  the stamp and the per-provider age histograms baked into the snapshot (`benchOldestAt` and each row's
+  `benchAgeHist`, schema 9; about 3.8 KB more on the real 57-provider file); once `bench.json` has been
+  loaded (first model screen) its own oldest stamp and histograms replace them (an empty or missing file leaves
+  the snapshot's). The sweep engine keeps its own
+  7-day `--ttl` and retention window; none of that changed.
 - *One dedupe rule, routes:* an `x` and an `x[1m]` are two selectable routes that share
   one probe record. Both count, everywhere (counts, verdicts, the model-level and
   provider-list figures, the ok-only list), so a count always equals the list it
@@ -623,9 +766,8 @@ marker** using the same distinctness-aware split as model ids (so `openrouter-x-
   bench data, provider columns will be blank`. If `bench.json` is missing, corrupt or the
   wrong schema and the **previous** snapshot had counts, the build keeps the previous
   counts and their stamp and says `bench: no usable bench data; kept the previous counts
-  as of <stamp>` instead of silently blanking them. Carried counts are re-aged against the
-  same 14-day window: if the previous stamp is older than that they are dropped, and the
-  notice says so.
+  as of <stamp>` instead of silently blanking them. Carried counts have no age limit (the
+  outdated notice says when the list needs a sweep); only a missing or future stamp stops the carry.
 - *Font fallback:* the column rule is `┆`, which some fonts (Consolas, for one) lack. Set
   `UW_PICKER_COLSEP=ascii` for `:` or `UW_PICKER_COLSEP=latin` for `¦` (U+00A6, in every
   font). Anything else, and any ASCII terminal, keeps the default.
@@ -645,9 +787,9 @@ to rebuild); a rebuild with no `bench.json` shows blank cells.
 ### 6e. Route hints baked at snapshot build: blank `FREE?` badges and alias labels
 
 Two hints are computed by `node menu/snapshot.mjs --build` from the bench data it already
-loads (`menu/route-hints.mjs`; the same 14-day freshness rule as everything else, so a stale
-or future-dated record changes nothing). Both are **additive optional fields** on a model row
-(an older snapshot simply has none and renders as before; the schema is 7 since `alive` and `outModality` joined the file).
+loads (`menu/route-hints.mjs`; the same usability rule as everything else: a record of any age
+counts, a future-dated one changes nothing). Both are **additive optional fields** on a model row
+(an older snapshot simply has none and renders as before; the schema is 9: `alive` and `outModality` joined the file in 7, the three-state `status` in 8, `benchOldestAt` and the per-row `benchAgeHist` in 9).
 
 - **A `FREE?` badge whose fresh probe says `pay` is blanked.** `FREE?` means "zero price, or a
   provider-published `:free` name"; a provider that answers "this request requires more
