@@ -1655,3 +1655,44 @@ test("buildTargets: an `only` list that was given but is empty selects NOTHING (
   assert.deepEqual([...buildTargets(snap, { only: ["b/z"] }).keys()], ["b"]);
   assert.equal(buildTargets(snap, { only: ["nope"] }).size, 0);
 });
+
+// ------------------------------------------------- every probe carries the client tag
+
+test("probeOne: every request carries x-ccr-client: uw-probe, on success, refusal and a thrown error alike", async () => {
+  const seen = [];
+  const record = (inner) => async (url, init) => { seen.push({ url, headers: init.headers }); return inner(url, init); };
+  const ok = streamFetch([{ at: 5, chunk: textDelta("Hello there friend") + stop() }]);
+  await probeOne({ fetchImpl: record(ok.fetchImpl), now: ok.now, url: "http://gw/v1/messages", key: "k", model: "p/m" });
+  const refused = streamFetch([{ at: 5, chunk: JSON.stringify({ error: { message: "nope" } }) }], { status: 401 });
+  await probeOne({ fetchImpl: record(refused.fetchImpl), now: refused.now, url: "http://gw/v1/messages", key: "k", model: "p/m" });
+  await probeOne({ fetchImpl: record(async () => { throw new Error("ECONNRESET"); }), url: "http://gw/v1/messages", key: "k", model: "p/m" });
+  assert.equal(seen.length, 3);
+  for (const s of seen) {
+    assert.equal(s.headers["x-ccr-client"], "uw-probe", "exact header name and value");
+    assert.equal(s.headers["x-api-key"], "k", "the existing headers are unchanged");
+    assert.equal(s.headers["anthropic-version"], "2023-06-01");
+    assert.equal(s.headers["content-type"], "application/json");
+  }
+});
+
+test("probeOne: the tag comes from the CCR contract, not a literal in the engine", () => {
+  const src = fs.readFileSync(new URL("../refresh/bench.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /x-ccr-client|uw-probe/, "bench.mjs must name neither string; ccr-client.mjs owns both");
+});
+
+test("runSweep: a retried row is tagged on every attempt", async () => {
+  const seen = [];
+  let n = 0;
+  const fetchImpl = async (_url, init) => {
+    seen.push(init.headers["x-ccr-client"]);
+    n += 1;
+    return { ok: false, status: n === 1 ? 429 : 200, headers: { get: () => null }, text: async () => "{}", body: null };
+  };
+  await runSweep({
+    groups: new Map([["p", [{ key: "p/m", provider: "p", id: "m", free: true, cost: 0, worst: 0 }]]]),
+    onResult: () => {}, backoffBaseMs: 1, backoffMaxMs: 2, maxRetries: { rate: 1, other: 0 },
+    probe: (t) => probeOne({ fetchImpl, url: "u", key: "k", model: t.key }),
+  });
+  assert.ok(seen.length >= 2, `the row was attempted more than once (${seen.length})`);
+  assert.deepEqual([...new Set(seen)], ["uw-probe"]);
+});

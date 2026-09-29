@@ -242,3 +242,55 @@ test("the boundary allowlist is keyed per file and per needle, not per file alon
     assert.notEqual(re.source, ".", `${f} must not be exempted wholesale`);
   }
 });
+
+// C1 (live status): the client tag and the router's data folder live in the CCR contract module.
+// The override CHAIN itself is tested in test/ccr-client-paths.test.mjs.
+import { spawnSync } from "node:child_process";
+
+test("the CCR contract names the probe tag and the usage databases", () => {
+  assert.equal(CCR.CONTRACT.clientHeader, "x-ccr-client");
+  assert.equal(CCR.CONTRACT.probeClient, "uw-probe");
+  assert.equal(path.basename(CCR.CONTRACT.usageDb), "usage.sqlite");
+  assert.equal(path.basename(CCR.CONTRACT.requestLogsDb), "request-logs.sqlite");
+  assert.equal(path.dirname(CCR.CONTRACT.usageDb), CCR.CONTRACT.dataDir);
+  assert.equal(path.dirname(CCR.CONTRACT.requestLogsDb), CCR.CONTRACT.dataDir);
+});
+
+test("UW_CCR_DATA_DIR redirects CONTRACT.usageDb and requestLogsDb in a fresh process too", () => {
+  const dir = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw", "harness", "scratch", "ccr-data-override");
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e",
+    `const { CONTRACT: C } = await import(${JSON.stringify(new URL("../menu/ccr-client.mjs", import.meta.url).href)});
+     console.log(JSON.stringify([C.dataDir, C.usageDb, C.requestLogsDb]));`],
+    { env: { ...process.env, UW_CCR_DATA_DIR: dir }, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), [dir, path.join(dir, "usage.sqlite"), path.join(dir, "request-logs.sqlite")]);
+});
+
+// The tag and the data-folder names are owned by the CCR contract module. menu/ and refresh/ may not repeat them;
+// keysync/, harness/ and the top level of spike/ (scripts that talk to the gateway) may not either. Two named
+// allowances: refresh/spike-client-tag.mjs SAYS "uw-probe" in comments (it reads the value from the contract), and
+// spike/route-probe.mjs uses "uw-probe" as a router RULE id, which is unrelated to the client tag.
+const TAG_NEEDLES = [/x-ccr-client/, /uw-probe/, /UW_CCR_DATA_DIR/, /usage\.sqlite/, /request-logs\.sqlite/];
+const TAG_ALLOW = new Map([
+  ["refresh/spike-client-tag.mjs", /uw-probe/],
+  ["spike/route-probe.mjs", /uw-probe/],
+]);
+
+test("the tag literals and the data-folder names appear only in the CCR contract module", () => {
+  const root = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw");
+  const offenders = [];
+  for (const dir of ["menu", "refresh", "keysync", "harness", "spike"]) {
+    const d = path.join(root, dir);
+    if (!fs.existsSync(d)) continue;
+    for (const f of fs.readdirSync(d)) {
+      if (!/\.(mjs|cjs)$/.test(f) || (dir === "menu" && f === "ccr-client.mjs")) continue;
+      const rel = `${dir}/${f}`;
+      const body = fs.readFileSync(path.join(d, f), "utf8");
+      for (const n of TAG_NEEDLES) {
+        if (TAG_ALLOW.get(rel)?.source === n.source) continue;
+        if (n.test(body)) offenders.push(`${rel} matches ${n}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, []);
+});

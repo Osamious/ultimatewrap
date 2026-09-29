@@ -15,8 +15,6 @@ import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import { CONTRACT as CC } from "./cc-contract.mjs";
 
-const APPDATA = process.env.APPDATA ?? "";
-
 // The fingerprint names a VERSION, not only a shape. "service.json + /api/ccr/rpc
 // + x-ccr-web-auth" describes an interface that a CCR upgrade can keep while
 // changing what the calls mean, and a fingerprint that cannot move is a check
@@ -43,15 +41,53 @@ export function ccrVersion() {
   } catch { return null; }
 }
 
+
+// WHERE THE ROUTER KEEPS ITS FILES, as CCR 3.0.22's own bundle resolves them (dist/main/cli.js, identifiers
+// `$i`, `uq`, `Tpe`, `hw`, `Nx`; Windows branch -- this project is Windows-only). An env value counts only when
+// it is non-blank after trimming. Precedence, first hit wins:
+//
+//   config folder  (holds service.json)           = <app-data base>\claude-code-router
+//     app-data base = CCR_INTERNAL_APP_DATA_DIR, else APPDATA, else LOCALAPPDATA, else USERPROFILE\AppData\Roaming
+//   data folder    (usage.sqlite, request-logs.sqlite) =
+//     UW_CCR_DATA_DIR (ours: tests and QA)  >  CCR_INTERNAL_USER_DATA_DIR (the router's own)  >  the config folder
+//
+// So a run from inside a CCR sandbox (which sets the CCR_INTERNAL_* names) reads the SANDBOX's data, never
+// production's. Two deliberate differences from the router: with no usable base at all it returns null (callers
+// say "router data not found") where the router falls back to os.homedir(); and UW_CCR_DATA_DIR moves the
+// data folder only, never service.json. Not getAppInfo().dataDir: that RPC costs ~7 s on this machine.
+const envVal = (env, name) => String(env[name] ?? "").trim() || null;
+
+/** The router's config folder (service.json lives here), or null when no app-data base can be found. */
+export function configDir(env = process.env) {
+  const base = envVal(env, "CCR_INTERNAL_APP_DATA_DIR") ?? envVal(env, "APPDATA") ?? envVal(env, "LOCALAPPDATA")
+    ?? (envVal(env, "USERPROFILE") ? path.join(envVal(env, "USERPROFILE"), "AppData", "Roaming") : null);
+  return base ? path.join(base, "claude-code-router") : null;
+}
+
+/** The router's data folder (the databases live here), normalised, or null when none can be found. Read from `env` on every call. */
+export function dataDir(env = process.env) {
+  const own = envVal(env, "UW_CCR_DATA_DIR") ?? envVal(env, "CCR_INTERNAL_USER_DATA_DIR");
+  return own ? path.resolve(own) : configDir(env);
+}
+export const usageDb = (env = process.env) => { const d = dataDir(env); return d ? path.join(d, "usage.sqlite") : null; };
+export const requestLogsDb = (env = process.env) => { const d = dataDir(env); return d ? path.join(d, "request-logs.sqlite") : null; };
+
 export const CONTRACT = Object.freeze({
   product: "claude-code-router",
   // shape + version. Task A15 reports drift on either half.
   fingerprint: "3.0.22 / service.json + /api/ccr/rpc + x-ccr-web-auth",
   verifiedVersion: "3.0.22",
-  servicePath: path.join(APPDATA, "claude-code-router", "service.json"),
+  servicePath: configDir() ? path.join(configDir(), "service.json") : "",
   rpcPath: "/api/ccr/rpc",
   authHeader: "x-ccr-web-auth",
   tokenParam: "ccr_web_token",
+  // Getters, so they read the environment when asked (the functions above take an `env`). null = not found.
+  // CCR 3.0.22 fills usage_events.client from the request header named next.
+  get dataDir() { return dataDir(); },
+  get usageDb() { return usageDb(); },
+  get requestLogsDb() { return requestLogsDb(); },
+  clientHeader: "x-ccr-client",
+  probeClient: "uw-probe",
   installDir: INSTALL_DIR,
   bundledCatalogue: path.join(INSTALL_DIR, "dist", "models.json"),
   // The bundle carrying the locally-patched gateway handshake timeout. Named here

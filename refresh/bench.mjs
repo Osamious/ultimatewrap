@@ -17,6 +17,7 @@ import {
 } from "../menu/bench-data.mjs";
 import { sanitizeDisplay } from "../menu/sanitize.mjs";
 import { redactClip } from "../menu/redact.mjs";
+import { CONTRACT as CCR } from "../menu/ccr-client.mjs";
 
 // ------------------------------------------------------------------ SSE
 
@@ -346,7 +347,9 @@ export async function probeOne({
   try {
     const res = await fetchImpl(url, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+      // The client tag lets the gateway's usage log tell UW's own probes from real use.
+      headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01",
+                 [CCR.clientHeader]: CCR.probeClient },
       body: JSON.stringify({ model, max_tokens: maxTokens, stream: true,
                              messages: [{ role: "user", content: prompt }] }),
       signal: ac.signal,
