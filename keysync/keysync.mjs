@@ -14,11 +14,40 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { admitRemoteModels } from "../menu/denylist.mjs";
+import { readJsonOr } from "../menu/atomic.mjs";
+// The offer-matching rule and the has-a-price-at-all predicate, from the module
+// that owns them. NOT from `menu/catalog.mjs`: that file statically imports THIS
+// one (`menu/catalog.mjs:25`, deliberately, with a comment saying why it is not
+// dynamic), so importing back from it closes a circular import and drags
+// `ccr-client.mjs`/`atomic.mjs` into keysync's transitive graph. Both lanes
+// import from `keysync/catalog-join.mjs`, which imports neither.
+import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry,
+         trustedContextTokens } from "./catalog-join.mjs";
+import { resolveCatalogPath } from "../refresh/catalog-store.mjs";
 
 // ---------------------------------------------------------------- vault load
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
 const readJson = (f) => JSON.parse(fs.readFileSync(f, "utf8").replace(/^\uFEFF/, ""));
 
+/**
+ * The vault, verbatim. Profiles are passed through WHOLE rather than projected
+ * onto a known field list, which is what lets optional per-provider settings be
+ * added in `providers.json` alone. Two are read outside this file today:
+ *
+ *   `listing`             (R9, `refresh/discover.mjs:listingProfileFor`) -- how
+ *                         to ask this host what models a key can call.
+ *   `vouchedBareClaude`   (R13c, `run.mjs:vouchedBareClaudeProviders`) -- the
+ *                         operator accepts this provider sole-owning a bare
+ *                         Claude-shaped id, so `checkBareCollisions` reports the
+ *                         finding instead of stopping the run. Absent or false
+ *                         on every entry as shipped; setting it is a deliberate
+ *                         config decision about a specific reseller's business,
+ *                         never a source-level default, and its reader requires
+ *                         `=== true` so a stray string cannot disarm the guard.
+ *
+ * Listed here because a field that exists only at its distant reader is a field
+ * the next person edits `providers.json` without knowing about.
+ */
 export function loadVault() {
   const registry = readJson(path.join(LLMKEYS, "registry.json"));
   const providers = readJson(path.join(LLMKEYS, "providers.json"));
@@ -38,17 +67,27 @@ export function filterRegistry(registry, providers) {
 
 // --------------------------------------------------------------- tie-breaks
 // The plan requires multi-key providers resolve to a DELIBERATELY CHOSEN key by
-// name, never by an unexamined timestamp. Only two providers survive the filter
-// with multiple keys. Both choices are recorded here with their reason.
-export const KEY_CHOICES = {
-  // 19-second timestamp gap would otherwise silently route the user's personal
-  // traffic through an institutional (university) key. Prefer the personal one.
-  groq: "personal.groq.free",
-  // Both are personal buckets; pick the primary one explicitly.
-  deepseek: "personal_maestro.deepseek.paid"
-};
+// name, never by an unexamined timestamp. #21: this choice used to be a
+// hardcoded object here (`KEY_CHOICES`), which meant adding a second key for
+// any new provider was a source edit and redeploy. It now lives in
+// ~/.llmkeys/key-choices.json -- identical shape, read at runtime -- so
+// `keysync/key.mjs add` can write a choice without touching this file. The
+// object's uniqueness property (one value per provider key) is preserved
+// exactly: a JS object cannot express two choices for one key any more than
+// the old literal could, which is why this stays a map and not a per-entry
+// flag on the registry rows.
+//
+// Absent or missing file both mean "no choices recorded yet" -- not an error.
+// A provider with no recorded choice still resolves fine as long as it has at
+// most one key after filterRegistry; the throw below only fires on genuine
+// ambiguity, exactly as it always did.
+export const KEY_CHOICES_FILE = path.join(LLMKEYS, "key-choices.json");
 
-export function chooseKeys(filtered) {
+export function loadKeyChoices(file = KEY_CHOICES_FILE) {
+  return readJsonOr(file, {});
+}
+
+export function chooseKeys(filtered, choices = loadKeyChoices()) {
   const byProvider = new Map();
   for (const r of filtered) {
     if (!byProvider.has(r.provider)) byProvider.set(r.provider, []);
@@ -58,40 +97,220 @@ export function chooseKeys(filtered) {
   const ambiguous = [];
   for (const [provider, entries] of byProvider) {
     if (entries.length === 1) { chosen.push(entries[0]); continue; }
-    const want = KEY_CHOICES[provider];
+    const want = choices[provider];
     const pick = entries.find((e) => e.id === want);
     if (!pick) { ambiguous.push({ provider, ids: entries.map((e) => e.id) }); continue; }
     chosen.push(pick);
   }
   if (ambiguous.length) {
-    throw new Error(`multi-key provider(s) with no deliberate choice in KEY_CHOICES: ` +
+    throw new Error(`multi-key provider(s) with no deliberate choice in ${KEY_CHOICES_FILE}: ` +
       `${JSON.stringify(ambiguous)} — decide by name, do not let a timestamp decide.`);
   }
   return chosen;
 }
 
 // ------------------------------------------------------------------ catalog
-const CATALOG_FILE = "C:\\nvm4w\\nodejs\\node_modules\\@musistudio\\claude-code-router\\dist\\models.json";
-
+// B4: the path is resolved through `refresh/catalog-store.mjs` rather than
+// hardcoded here -- a local flat copy if one exists, else the node_modules
+// bundle with a logged warning. A global `npm i -g` has already silently
+// wiped a local patch once; a bare, fallback-less hardcode had no way to
+// notice that happening short of an ENOENT crash.
+//
+// Returns the two groupings the FILE declares about itself. `byProvider` is the
+// grouping every caller already had; `byAlias` is the bundle's own `aliases[]`
+// field, which this function used to discard (report 12 §1) -- 10,184 strings
+// naming the same 4,298 models as other hosts spell them, and the single
+// largest contributor to the D3 join. The ladder's DERIVED structures (global
+// ids, tails, case-folded variants) are not built here: they are policy, and
+// they belong to `keysync/catalog-join.mjs`.
+//
+// MEASURED 2026-09-06: no alias is claimed by two entries, so a flat Map loses
+// nothing. A collision would still be first-wins, which is the same rule
+// `byProvider` push order already follows.
 export function loadCatalog() {
-  const doc = readJson(CATALOG_FILE);
+  const doc = readJson(resolveCatalogPath());
   const byProvider = new Map();
+  const byAlias = new Map();
   for (const m of doc.models ?? []) {
     if (!m.provider || !m.model) continue;
     if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
     byProvider.get(m.provider).push(m);
+    for (const a of m.aliases ?? []) {
+      if (typeof a === "string" && a && !byAlias.has(a)) byAlias.set(a, m);
+    }
   }
-  return { generatedAt: doc.generatedAt, byProvider };
+  return { generatedAt: doc.generatedAt, byProvider, byAlias };
 }
 
-/** free / paid / unknown — a guess is worse than no label, so default to unknown. */
-export function inferTier(entry) {
-  const p = entry.pricing ?? {};
-  const nums = [p.inputPerMillion, p.outputPerMillion, p.input, p.output]
-    .map((v) => (typeof v === "number" ? v : Number(v)))
-    .filter((v) => Number.isFinite(v));
-  if (!nums.length) return "unknown";
-  return nums.every((v) => v === 0) ? "free" : "paid";
+/**
+ * free / paid / unknown — a guess is worse than no label, so default to unknown.
+ *
+ * READS THE LIVE PRICING PATH (#10). This used to read
+ * `pricing.{inputPerMillion,outputPerMillion,input,output}`. None of those four
+ * fields exists in this schema, which stores prices at
+ * `pricing.offers[].per1MTokens` — so the function returned `"unknown"` for
+ * 4,298 of 4,298 catalogue entries, the free-first term in `buildProviders`'s
+ * sort evaluated `1 - 1 = 0` for every pair, and selection collapsed to
+ * shortest-id-first.
+ *
+ * PROVIDER-MATCHED, WHICH IS WHY THIS TAKES A SECOND ARGUMENT. `offers[]` is a
+ * merged array holding up to 16 elements, most of them pricing the model at a
+ * DIFFERENT host. Folding them answers "is this free anywhere"; taking
+ * `offers[0]` answers "is the first element of an arbitrarily ordered array
+ * free". The question a routing decision needs is "is it free on MY key", so the
+ * offer is matched to the provider the key belongs to and a non-matching offer
+ * yields `null` — blank — rather than falling back to offer 0. That whole rule
+ * lives in `priceOf` and is called here rather than restated: one owner.
+ *
+ * ALL-ZERO OFFERS ARE `"unknown"`, NOT `"free"` (#55). The bundle encodes "not
+ * priced per token" as `{input: 0, output: 0}` under a token `sourceUnit` —
+ * shape-identical to a genuine free tier. The only discriminator the record
+ * carries is CONTRAST: another offer on the same entry naming a real price
+ * proves the bundle does hold pricing for this model, which makes the zero a
+ * fact about the model rather than a hole in the data.
+ * `openai/gpt-5-5` (kenari 0/0 alongside frogbot 2.5/15) is a real free tier;
+ * `google/lyria-3-pro-preview`, every offer 0/0, is a missing price.
+ * `hasPricedOffer` is that contrast test, shared with `menu/catalog.mjs`'s
+ * `badgeOf` so #55 is implemented once — and it reads the WHOLE offers array,
+ * not the matched offer, which is load-bearing: on
+ * `mistral/labs-devstral-small-2512` the matched offer IS 0/0 while a second
+ * mistral offer prices it at 0.1/0.3.
+ *
+ * Under-classifying is the safe direction, and it is the only direction
+ * available: a `false` from `hasPricedOffer` is evidence of absence and not
+ * proof of it (a provider's `auto` mode may be genuinely free of charge), so it
+ * may withhold the `"free"` claim and must never make the opposite one. An
+ * unknown-tier row sorts after genuine free rows and ahead of nothing.
+ *
+ * @param {object} entry                     a bundled-catalogue entry
+ * @param {string|null} providerName         the provider whose key will pay
+ */
+export function inferTier(entry, providerName = null) {
+  const price = priceOf(entry, providerName);
+  if (!price) return "unknown";
+  if (price.in !== 0 || price.out !== 0) return "paid";
+  return hasPricedOffer(entry) ? "free" : "unknown";
+}
+
+/**
+ * text / nontext / null, from the catalogue's own `modalities.output`.
+ *
+ * Sits beside `inferTier` for locality -- the other entry-to-label function over
+ * the catalogue -- but the rule it follows is `makeRoutableOf`'s
+ * (`menu/catalog.mjs:143`), not `inferTier`'s. It is also, now, a SORT TERM
+ * AHEAD OF `inferTier`'s on the routing path (see `buildProviders`).
+ *
+ * WHAT THAT ORDER IS AND IS NOT DEFENDING AGAINST. This paragraph used to say
+ * that repairing #10 turned free-first on and that "rerankers and music
+ * generators are disproportionately free, so free-first alone promotes non-chat
+ * rows over paid chat models". #55 shipped alongside #10, so that is false as
+ * shipped: an all-zero-offer row is `"unknown"`, not `"free"`, and MEASURED
+ * over the live bundle exactly ONE of 4,298 entries is free. `hasPricedOffer`
+ * is what holds the media generators back; this term demotes only rows that
+ * DECLARE themselves non-text. The full correction, with the google
+ * measurement, is at the sort in `buildProviders`.
+ *
+ * *(Until 2026-09-07 this paragraph also recorded the opposite of #10:
+ * `inferTier` read `pricing.inputPerMillion` while this schema stores
+ * `pricing.offers[].per1MTokens`, so it yielded a usable value for 0 of 4,298
+ * entries and the free-first sort was a no-op. That is #10, fixed above.)*
+ *
+ * POSITIVE SIGNALS ONLY. Absence of `modalities.output` is `null` -- unknown,
+ * which renders selectable -- never `"nontext"`. Wrongly hiding a real chat
+ * model is worse than letting an ambiguous one through, and the catalogue is
+ * measurably wrong in that direction: `nvidia/bge-m3` is an embedding model
+ * declaring `output: ["text"]`, so it reads as `"text"` here and stays
+ * selectable. That miss is accepted, not worked around.
+ *
+ * The embedding/score clause runs BEFORE the text clause because 18 catalogue
+ * entries declare both -- an embedding model that also emits text is still not a
+ * chat model. The other 117 non-text entries never reach it.
+ *
+ * Same value as the keysync picker row's `kind` (T7), under different local
+ * pressure: `pick-state.mjs` already spends `item.kind` on
+ * "model" | "provider" | "pinned", so the menu pipeline cannot reuse the bare
+ * name without putting two vocabularies in one expression.
+ */
+/**
+ * The capability vocabulary, GROUNDED IN R10's SWEEP rather than invented.
+ *
+ * MEASURED over the 44 cached records (3,745 projected models, 349 carrying a
+ * capability at all), the whole observed vocabulary is:
+ *   tool_calling 132, text 115, base 46, chat 38, reasoning 7, video 6,
+ *   image 3, web_search 2.
+ *
+ * Only two of those eight are modality claims. `tool_calling`, `reasoning` and
+ * `web_search` are capability FLAGS -- a model that reasons still answers in
+ * text -- and `base` is a vendor tier word, not a modality: mistral labels its
+ * OCR, moderation, embedding and TTS models `base` alongside its chat models,
+ * so reading `base` as text would promote a TTS row. Those four are NO SIGNAL
+ * and fall through to the bundle, which is the same positive-signals-only
+ * doctrine the modality branch below already follows.
+ *
+ * The lists carry a few spellings beyond the eight (`audio`, `embedding`,
+ * `image_gen`, `speech`, `rerank`, `moderation`, `completion`) because
+ * `capabilityField` reads four different provider field names and the observed
+ * set is one sweep's worth, not the vocabulary's bound. Each added token is an
+ * unambiguous modality word in the same sense as the two measured ones; nothing
+ * ambiguous is added, and an unrecognised token stays no-signal.
+ */
+const CAPABILITY_NONTEXT = new Set([
+  "audio", "audio_gen", "embed", "embedding", "embeddings", "image", "image_gen",
+  "moderation", "rerank", "reranker", "speech", "stt", "transcription", "tts",
+  "video", "video_gen", "vision_gen",
+]);
+const CAPABILITY_TEXT = new Set(["chat", "completion", "completions", "text"]);
+
+/**
+ * A provider's own capability token -> "text" | "nontext" | null.
+ *
+ * `null` for anything outside both lists, which is most of what providers send.
+ * Separated from `outputKind` so the vocabulary is assertable on its own and so
+ * the precedence in `outputKind` reads as one line rather than as a branch.
+ */
+export function capabilityKind(capability) {
+  if (typeof capability !== "string" || !capability) return null;
+  const t = capability.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (CAPABILITY_NONTEXT.has(t)) return "nontext";
+  if (CAPABILITY_TEXT.has(t)) return "text";
+  return null;
+}
+
+/**
+ * `capability` OUTRANKS `modalities.output` (R11), and only where it speaks.
+ *
+ * The bundle is a periodic snapshot merged across hosts; a provider's own
+ * listing is what that provider says about the row it is serving today. Where
+ * the two disagree the listing wins -- which is what lets a live `image` or
+ * `video` demote a row whose bundle entry claims `["audio", "text"]` and
+ * therefore reads as text here.
+ *
+ * SAME PRECEDENCE ON BOTH PATHS. This value reaches the selection sort (which
+ * orders routing AND the picker) and `normalizeModel`'s `kind`, so the two
+ * cannot disagree about whether a row is a chat model.
+ *
+ * `bucketFor` DOES NOT READ `capability`, and that boundary is unchanged: it
+ * reads `kind`, which is this function's answer, and `reason`, which is the
+ * bundle's `capabilities.reasoning` and nothing else. A provider's `reasoning`
+ * capability token is deliberately NOT mapped onto `reason` -- it is
+ * no-signal above -- because `bucketFor`'s capable bucket is a claim about a
+ * client-side prompt profile, not about a marketing flag.
+ */
+export function outputKind(entry, capability = null) {
+  const declared = capabilityKind(capability);
+  if (declared) return declared;
+  const out = entry?.modalities?.output;
+  // An EMPTY array is absence of signal, exactly like a missing field, and the
+  // doc above binds this function to answer `null` for absence. Falling through
+  // returned "nontext" -- a positive claim built from no evidence -- which made
+  // the row unselectable AND silently deleted its pin from recents and
+  // favourites at initState (menu/pick-state.mjs's `known` set). A user-visible
+  // deletion triggered by an empty upstream field. menu/catalog.mjs's isTextOut
+  // already treats the same shape as text; this is the two agreeing.
+  // MEASURED 2026-09-06: 0 of 4,298 catalogue entries, so latent, not live.
+  if (!Array.isArray(out) || out.length === 0) return null;
+  if (out.includes("embedding") || out.includes("score")) return "nontext";
+  return out.includes("text") ? "text" : "nontext";
 }
 
 // ------------------------------------------------------------ protocol rule
@@ -108,16 +327,398 @@ export function resolveProtocol(vaultProvider) {
   if (base.includes("anthropic")) {
     return { type: "anthropic_messages", baseUrl: vaultProvider.baseUrl };
   }
+  // DIRECT OpenAI GETS THE RESPONSES TRANSPORT, and only direct OpenAI (#108).
+  //
+  // `gpt-5.x` and the o-series refuse function tools on /v1/chat/completions
+  // outright -- "Function tools with reasoning_effort are not supported for
+  // gpt-5.6 in /v1/chat/completions. To use function tools, use the Responses
+  // API." MEASURED 2026-09-09 down to a SINGLE tool, so it is not the 128-tool
+  // cap and not the one tool whose schema OpenAI rejects; those bite later.
+  // Claude Code always sends tools, so chat-completions can never serve these
+  // rows -- 153 of 340 `openai/` rows.
+  //
+  // THE HOST-REGISTRY NOTE ABOVE NO LONGER HOLDS, and that is why this is
+  // possible. It records, measured 2026-09-01, that CCR derives the protocol
+  // from the base-URL host and overrides an explicit `type`. Re-MEASURED
+  // 2026-09-09 against v3.0.22 with an additive probe provider: `type:
+  // openai_responses` on `api.openai.com` is honoured, and gpt-5.6 answers WITH
+  // tools through it. The older note is left in place because it is still true
+  // of the other two branches, which is why they pair host and type.
+  //
+  // VERIFIED NOT TO REGRESS THE ROWS THAT ALREADY WORK: `gpt-4o-mini` answers
+  // on the Responses transport as well as on chat-completions, so the 187
+  // GPT-4-era rows are not being traded for the 153.
+  //
+  // MATCHED ON THE HOST, never on the provider name, so a vault entry that
+  // points at OpenAI under any label gets the same treatment, and a router
+  // merely RESELLING OpenAI models keeps chat-completions -- which is correct,
+  // since those speak it natively.
+  // `openAiHost` parses and compares the HOST, never `includes()`, so a router
+  // whose path or query mentions api.openai.com -- or a lookalike domain that
+  // merely ends with it -- keeps chat-completions.
+  if (openAiHost(vaultProvider.baseUrl)) {
+    return { type: "openai_responses", baseUrl: vaultProvider.baseUrl };
+  }
   return { type: "openai_chat_completions", baseUrl: vaultProvider.baseUrl };
 }
 
-// --------------------------------------------------------------- build plan
-const MAX_MODELS_PER_PROVIDER = Number(process.env.UW_MAX_MODELS ?? 3);
+const openAiHost = (u) => {
+  try { return new URL(u).hostname.toLowerCase() === "api.openai.com"; } catch { return false; }
+};
 
-// A model Claude Code knows, whose client-side handling every keysync row
-// borrows. Mid-tier on purpose: it must not imply capabilities (or a context
-// window) that a small third-party model cannot honour.
-const BEHAVES_AS = process.env.UW_BEHAVES_AS ?? "claude-sonnet-4-6";
+// --------------------------------------------------------------- build plan
+//
+// THE CAP IS THE PICKER'S ALONE (R11). It used to size BOTH `providers[].models`
+// -- what CCR routes on -- and `picker` -- the flat `/model` menu -- from one
+// array, so bounding a menu that is unusable at 44 providers x full catalogues
+// also bounded REACH: ~1,501 catalogue rows resolved to `undefined` and did not
+// route. The two have different constraints and now have different sizes. The
+// name says which one it governs; the old `MAX_MODELS_PER_PROVIDER` did not, and
+// that ambiguity is what let one number stand in for two decisions.
+//
+// This is the DEFAULT. `pickerCapFrom` resolves `UW_MAX_MODELS` against it, so
+// an operator can still re-impose a finite cap without a source edit.
+//
+// UNBOUNDED, 2026-09-08 (R13b reopened after #91). R13b first landed 10, chosen
+// as the largest candidate inside a "parse time <= 2x today's" ceiling. That
+// ceiling was growth discipline, never a measured stall threshold -- R13b's own
+// report said the absolute cost was sub-millisecond at EVERY candidate including
+// `inf`. Two binary-level facts then removed the reason to spend anything on it:
+//
+//   1. CLAUDE CODE ENFORCES NO SIZE LIMIT ON `modelPicker.options[]`. `Ato`, its
+//      options builder, iterates the array with no slice and no length check.
+//      The only enforced ceiling is 10 VISIBLE rows with 1-row scroll, and the
+//      picker's search/filter is dead code -- `"Search models"` / `"Type to
+//      filter"` sit behind `canEnter:!1`. That ceiling was already blown at 391
+//      rows, so widening makes native browsing no worse than it already was.
+//      uwpick, not the native `/model` menu, is the surface meant to go wide.
+//   2. NO ALTERNATE DECLARATION CHANNEL EXISTS. `availableModels` is an
+//      allowlist with no capability field; `modelOverrides` is structurally
+//      capped by its own key-uniqueness (one provider id per KNOWN Anthropic
+//      model) and cannot fan many third-party ids onto a shared profile;
+//      `ANTHROPIC_CUSTOM_MODEL_OPTION` takes one entry; CCR's own config carries
+//      protocol detection and no capability surface back to the client. So
+//      `options[]` is the ONLY channel that can carry `behavesAs`, and every row
+//      the cap withheld was a lost capability declaration, not a menu slot.
+//
+// MEASURED against the real vault, 2026-09-08, both configurations built from
+// the same run (45 providers, 5,026 third-party routing ids). `settings.json` is
+// the WHOLE file as `atomicWriteJson` writes it -- `JSON.stringify(_, null, 2)`,
+// pretty-printed, which is the only basis that matches disk. Parse is the median
+// of 7 trials x 1,500 `JSON.parse` of that exact blob:
+//
+//   cap   picker rows   picker block   settings.json   parse ms   x cap-10   undeclared of 5,026
+//    10           391         74,913          80,379     0.2113      1.00x                 4,646
+//   inf         5,037      1,063,622       1,069,088     2.5063     11.86x                     0
+//
+// (Non-picker settings content is 5,466 B in both. 5,037 = 5,026 third-party
+// rows + the relay's 11.)
+//
+// THE COST IS 1.07 MB AND 2.5 ms PER LAUNCH, AND THAT IS NOT SMALL -- state it
+// plainly rather than inherit "negligible" from a smaller estimate. The resolver
+// plan's reopen amendment tabled 57,415 B / 0.1708 ms for this configuration;
+// that figure is NOT reproducible here and is internally inconsistent with its
+// own row count (391 rows cannot fit in the 17,608 B it calls "today" at ~192 B
+// per pretty-printed row). It also blows the 100 KB budget R13b originally wrote
+// above this line, and the plan's own "past 200 KB" named failure, by 5x.
+//
+// IT IS SPENT ANYWAY, DELIBERATELY, and the reason is fact 2 rather than the
+// size: `options[]` is the only channel that can carry `behavesAs`, so every row
+// the cap withheld cost a capability declaration -- 4,646 of 5,026 ids resolving
+// through `lH()` to the maximal assumption set. 2.5 ms of startup parse against
+// 4,646 recovered declarations is the trade, made with the number known. A future
+// task that wants the bytes back should reduce ROW SIZE (211 B/row in-blob) or
+// prune stale ids, not restore the cap -- the cap is the one lever here that
+// pays for bytes in declarations.
+//
+// ROW SHAPE STAYS FULL -- `{model, label, description, behavesAs}` -- and that is
+// a REVERSAL of a minimal-shape (`model`+`behavesAs`) draft that would have cut
+// 57,415 bytes to 30,360. The saving was chosen on the byte metric alone, before
+// "no hard limit exists" was established; once it was, there was no threshold the
+// minimal shape rescued anything from. `description` carries the ANSWERING
+// HOSTNAME (run.mjs), the disambiguator for one provider serving visually
+// identical ids across several keys or endpoints, and Claude Code's auto-fill
+// ("Custom model (id)") cannot reproduce it. `label` likewise carries the
+// formatted `provider > model` string. Both are free at this size.
+//
+// THIS RE-MERGES ROUTING AND PICKER IN OUTPUT SIZE, and that is stated rather
+// than left to be discovered. R11 decoupled them so the picker could stay small
+// while routing grew; uncapped, the picker tracks routing 1:1 in practice. They
+// remain two constants and two slice points in code -- staleness filtering still
+// applies to each independently, and the divergence stays available for whenever
+// a real reason to use it returns.
+export const MAX_PICKER_MODELS_PER_PROVIDER = Infinity;
+
+/**
+ * `UW_MAX_MODELS` -> a usable positive integer, or the default.
+ *
+ * A VALIDATED PARSE, NEVER A BARE `Number()`, AND THAT IS THE WHOLE FUNCTION.
+ * The previous form was `Number(process.env.UW_MAX_MODELS ?? 3)` compared with
+ * `models.length >= MAX_MODELS_PER_PROVIDER`. `Number("x")` is `NaN`, and every
+ * comparison against `NaN` is false -- so `UW_MAX_MODELS=x` did not fall back to
+ * 3, it removed the cap entirely and silently. Renaming the constant while
+ * keeping the coercion reproduces that exactly: the rename passes every other
+ * check in this file and the picker goes unbounded on one typo'd env value,
+ * which is why this has its own test rather than riding on the rename's.
+ *
+ * WHAT THE VALIDATION IS STILL FOR NOW THAT THE DEFAULT IS UNBOUNDED. The
+ * failure above was "a typo silently uncaps the picker", and uncapped is now
+ * where the default already sits -- so on the DEFAULT path a loose parse is no
+ * longer observable. The direction that still matters is the operator's: someone
+ * who types `UW_MAX_MODELS=5` is deliberately re-imposing a cap, and a loose
+ * parse of a typo'd value near it (`"5.0"`, `"0x5"`) would silently give them a
+ * DIFFERENT cap than the one they typed, or none. `Number.isSafeInteger` is the
+ * weakest of these now: its only failure mode was unbounding, which the default
+ * already does, so it is retained as belt-and-braces rather than as a guard
+ * carrying weight. This is stated so the next reader does not infer more from
+ * the test below it than the test can now prove.
+ *
+ * `/^\d+$/` on the TRIMMED string, not `Number.isInteger(Number(s))`: the latter
+ * accepts `"3.0"`, `"0x3"`, `" 3 "`, `"3e0"` and `""` (which is 0). A cap is an
+ * operator-typed count, so the only spelling that means one is a run of digits.
+ * Zero falls back too -- a cap of zero is an empty menu, which is never what a
+ * count was typed to express, and rule 1 forbids reaching it by accident.
+ */
+export function pickerCapFrom(raw, fallback = MAX_PICKER_MODELS_PER_PROVIDER) {
+  if (typeof raw !== "string" && typeof raw !== "number") return fallback;
+  const s = String(raw).trim();
+  if (!/^\d+$/.test(s)) return fallback;
+  const n = Number.parseInt(s, 10);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+// ------------------------------------------------------- provenance (R13b)
+//
+// HOW STRONG THE EVIDENCE IS THAT AN ID IS REAL, as the FIRST term of the
+// selection sort. Before this, the sort carried no provenance term at all, so a
+// row the provider's own listing named and a row only the bundled snapshot
+// mentions were separated by nothing but insertion order (see `extras` below).
+//
+// THE RUNG ORDER, AND WHY `config-asserted` SITS SECOND RATHER THAN THIRD OR
+// FIRST. Two real populations are asserted by local config with nothing ever
+// probing them: the vault's `testModel` (one per provider) and the relay's
+// literal model list. Ranking them BELOW `listing-verified` sorts the relay's
+// models and every `testModel` under third-party listing rows, which is exactly
+// the regression #59 fixed once already. Ranking them at the TOP conflates "a
+// human wrote this id in a config file" with "a completion came back 200 on a
+// dated run", which is the only rung carrying real evidence. So: second.
+//
+// A DATED REAL CALL OUTRANKS A LIVE LISTING OUTRANKS A SNAPSHOT. `call-verified`
+// is verify-prune.mjs's probe -- an actual completion, the strongest signal any
+// of these carry. `listing-verified` is what the provider says it serves TODAY,
+// which is real-time evidence that a config literal is not. `catalogue-only` is
+// the bundled `models.json`: a periodic snapshot merged across hosts, and the
+// weakest positive claim. Absence of all four is `null`, which sorts LAST and
+// leaves such rows exactly where they are relative to each other.
+export const PROVENANCE_ORDER = Object.freeze([
+  "call-verified", "config-asserted", "listing-verified", "catalogue-only",
+]);
+
+// Unranked sorts after every named rung. Derived from the array rather than
+// written as a literal so adding a rung cannot leave this stale.
+export const PROVENANCE_UNRANKED = PROVENANCE_ORDER.length;
+
+/**
+ * A provenance label -> its sort position. `null`/unknown -> last.
+ *
+ * Separated from `provenanceOf` for the same reason `capabilityKind` is
+ * separated from `outputKind`: the vocabulary is assertable on its own, and the
+ * sort reads one number rather than a chain of string comparisons.
+ */
+export function provenanceRank(label) {
+  const i = PROVENANCE_ORDER.indexOf(label);
+  return i === -1 ? PROVENANCE_UNRANKED : i;
+}
+
+/**
+ * The STRONGEST rung an id qualifies for, or `null` for none.
+ *
+ * Membership sets, not booleans, because every caller already holds sets and
+ * because "strongest wins" has to be decided in one place -- an id is routinely
+ * in several at once (a `testModel` that also appears in the catalogue and was
+ * also probed). Checking them in rung order and returning the first hit is what
+ * makes that precedence a property of this function rather than of each call
+ * site's `if` order.
+ *
+ * Every set is optional and a missing one contributes nothing rather than
+ * throwing: this is enrichment over inputs that may legitimately be absent, and
+ * an absent input must degrade to a lower rung, never stop a build.
+ *
+ * CORRECTED AT R13c. This used to read "run.mjs passes neither a discovery cache
+ * nor probe results today" and treat the whole function as latent. HALF OF THAT
+ * IS NOW FALSE: run.mjs calls `loadDiscoveryCache` and passes the result to
+ * `buildProviders`, so `listed` is populated on the production build and
+ * discovered ids resolve to `listing-verified` rather than falling through to
+ * `catalogue-only`. `verified` is still unpassed -- probe results reach
+ * `applyVerifiedOnly`, not this -- so `call-verified` remains the one rung
+ * nothing in the pipeline reaches.
+ *
+ * @param {string} id                     the model id as the provider spells it
+ * @param {object} [sets]
+ * @param {Set<string>} [sets.verified]   ids a real completion returned 200 for
+ * @param {Set<string>} [sets.asserted]   ids local config names (testModel, relay)
+ * @param {Set<string>} [sets.listed]     ids the provider's live listing named
+ * @param {Set<string>} [sets.catalogued] ids the bundled catalogue names
+ * @returns {"call-verified"|"config-asserted"|"listing-verified"|"catalogue-only"|null}
+ */
+export function provenanceOf(id, { verified, asserted, listed, catalogued } = {}) {
+  if (verified?.has(id)) return "call-verified";
+  if (asserted?.has(id)) return "config-asserted";
+  if (listed?.has(id)) return "listing-verified";
+  if (catalogued?.has(id)) return "catalogue-only";
+  return null;
+}
+
+/**
+ * verify-prune.mjs's output -> `provider -> Set<id>` of call-verified ids.
+ *
+ * Accepts the file as it is on disk (`{working: [...], results: [...]}`), the
+ * `working` array on its own, or an already-grouped Map/object -- the same
+ * shape-tolerance `discoveryIndex` has, for the same reason: a malformed or
+ * absent input must cost a rung, never a build.
+ *
+ * READS `working`, OR `results` FILTERED BY `ok`, AND NEVER `results` WHOLE.
+ * `results` records failures too (4 of 22 on the live file), and a row that
+ * returned 401 or timed out is the opposite of call-verified. verify-prune.mjs
+ * derives `working` as exactly `results.filter(r => r.ok)`, so the two paths
+ * agree by construction; the filter exists for a caller holding only `results`.
+ *
+ * SPLIT ON THE FIRST SLASH ONLY. Ids contain slashes -- `cloudflare/@cf/openai/
+ * gpt-oss-120b` and `nscale/Qwen/Qwen3-4B-Instruct-2507` are both real rows --
+ * so splitting on every slash would key them under a provider that does not
+ * exist and silently drop the strongest rung for the rows most likely to have
+ * earned it. verify-prune.mjs's own `m.split("/")[0]` reads the provider the
+ * same way.
+ */
+export function verifiedIndex(verified) {
+  const out = new Map();
+  if (!verified) return out;
+  let flat = null;
+  if (Array.isArray(verified)) flat = verified;
+  else if (Array.isArray(verified?.working)) flat = verified.working;
+  else if (Array.isArray(verified?.results)) {
+    flat = verified.results.filter((r) => r?.ok === true).map((r) => r?.model);
+  }
+  if (flat) {
+    for (const full of flat) {
+      if (typeof full !== "string") continue;
+      const cut = full.indexOf("/");
+      if (cut <= 0 || cut === full.length - 1) continue;
+      const provider = full.slice(0, cut);
+      if (!out.has(provider)) out.set(provider, new Set());
+      out.get(provider).add(full.slice(cut + 1));
+    }
+    return out;
+  }
+  const pairs = verified instanceof Map ? verified.entries()
+    : (typeof verified === "object" ? Object.entries(verified) : []);
+  for (const [provider, ids] of pairs) {
+    if (!Array.isArray(ids)) continue;
+    out.set(provider, new Set(ids.filter((i) => typeof i === "string" && i !== "")));
+  }
+  return out;
+}
+
+// --------------------------------------------------- capability buckets (D4)
+//
+// `behavesAs` names a model Claude Code already knows, whose client-side
+// handling (prompt profile, effort tiers, thinking policy, believed context
+// window) every third-party row borrows. One constant for all 83 rows was an
+// OVER-declaration: it told Claude Code that a 4,096-token non-reasoning model
+// handles what a frontier reasoning model handles. Under-declare instead --
+// report 18 §10.6 measured that of the eight gated predicates, five are free to
+// under-declare and four are dangerous to over-declare.
+//
+// A TABLE, VALIDATED BY AN ALLOWLIST, NOT A DENYLIST. A denylist passes a typo
+// (`claude-sonnet-4-51`) silently, and silently is the failure mode this exists
+// to prevent. V1/V2/V6 in validate() check the table itself, so a wrong entry
+// stops the run rather than shipping 83 wrong declarations.
+//
+// FOUR CLASSIFICATIONS, TWO TARGETS. The extras are not decoration: keeping
+// "we measured it small" and "we know nothing" separately countable is what
+// makes the no-signal population (38 of 83) auditable, and it is the only
+// reason bucketFor's `> 0` guard is observable at all -- with `unknown` folded
+// into `weak`, both branches return the same string and the guard is untestable.
+export const BUCKET_TARGETS = Object.freeze({
+  // Unchanged from the single constant this replaces, deliberately: 27 of 83
+  // rows stay byte-identical, which is the control group proving the classifier
+  // RAN rather than replaced everything it touched.
+  capable: "claude-sonnet-4-6",
+  weak:    "claude-sonnet-4-5",
+  unknown: "claude-sonnet-4-5",   // D3 — same target, distinct classification
+  nonchat: "claude-sonnet-4-5"    // D6 — inert, but never absent
+});
+
+// The weak target is `claude-sonnet-4-5`, NOT the capability-identical
+// `claude-haiku-4-5`. Report 18 §10.2 fn 1: haiku's `interleaved_thinking` flips
+// false on bedrock / vertex / gateway / any custom base URL -- which is exactly
+// every provider shape UW routes through. `haiku-4-5` is absent from the
+// allowlist below for the same reason, so a later edit cannot reach for it.
+export const ALLOWED_BEHAVES_AS = Object.freeze([
+  "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-opus-4-6", "claude-opus-4-1"
+]);
+
+// Models whose client-side handling carries a MODEL-SPECIFIC prompt bundle,
+// which a third-party model must never inherit: `opus_5_prompt_bundle`,
+// `fable_5_mitigations`, `refusal_fallback`, `thinking_disabled_effort_cap` and
+// `rejects_disabled_thinking` (report 18 §10.3) -- plus these models omit
+// `temperature` entirely (§10.2), so a borrowed profile silently drops a
+// parameter the third-party provider expects.
+export const PROMPT_BUNDLE_MODELS = /^claude-(opus-5|fable-5|mythos-5)/;
+
+// INCLUSIVE, and the catalogue has a natural gap that makes `>=` vs `>` a
+// visible one-character mutation rather than a taste call. Measured over the 83
+// rows: mistral/mistral 8192, ollama/llama2 4096, ollama/llama3 8192,
+// cohere/command 4096 | cerebras/llama3.1-8b EXACTLY 128000,
+// cloudflare/granite-4.0-h-micro 131000, sambanova/gemma-4-31b-it 131072.
+// Nothing sits between 8,192 and 128,000, and a real row sits on the boundary.
+export const CTX_CAPABLE_MIN = 128000;
+
+/**
+ * The normalized keysync model -> its capability classification.
+ *
+ * ORDER IS LOAD-BEARING AND `kind` GOES FIRST. `contextTokens` is not
+ * trustworthy for a non-text row: google/veo-2 carries 480 (video SECONDS) and
+ * google/lyria carries 0. Both are numbers, so a proxy that ran first would read
+ * them as tiny models. Both also carry `reasoning: false`, so moving `reason`
+ * above `kind` sends them to weak instead of nonchat -- and every count in the
+ * audit still sums to 83, which is why the test for this asserts on a row that
+ * is `kind: "nontext"` and `reason: true` at once.
+ *
+ * `contextTokens > 0`, not `!= null`: google/lyria really reports 0, and a zero
+ * is the absence of a window rather than a very small one.
+ *
+ * Reads `contextTokens`. See normalizeModel for why that name is asserted.
+ *
+ * @param {{kind: ?string, reason: ?boolean, contextTokens: ?number}} model
+ * @returns {"nonchat"|"capable"|"weak"|"unknown"}
+ */
+export function bucketFor(model) {
+  if (model?.kind === "nontext") return "nonchat";
+  if (model?.reason === true) return "capable";
+  if (model?.reason === false) return "weak";
+  const ctx = model?.contextTokens;
+  if (typeof ctx !== "number" || !(ctx > 0)) return "unknown";
+  return ctx >= CTX_CAPABLE_MIN ? "capable" : "weak";
+}
+
+/**
+ * The declaration a row carries. NEVER null, "" or undefined.
+ *
+ * Omitting `behavesAs` is not the honest option, it is the MAXIMAL one: an id
+ * with no declaration resolves through the binary's `lH()` to every effort tier,
+ * adaptive thinking on and thinking un-disableable, plus an unknown-model launch
+ * warning. Report 18 §3 measures that as strictly worse than any bucket target,
+ * which is why even the four non-chat rows declare the weak target (D6) -- the
+ * declaration is inert on a model that cannot answer a chat request, and inert
+ * beats maximal.
+ *
+ * The lookup goes through BUCKET_TARGETS so the table cannot be bypassed by a
+ * caller that "knows" the answer.
+ */
+export function behavesAsFor(model) {
+  return BUCKET_TARGETS[bucketFor(model)];
+}
 
 /**
  * Anthropic via the local OAuth relay, added as a first-class provider.
@@ -159,10 +760,29 @@ const BEHAVES_AS = process.env.UW_BEHAVES_AS ?? "claude-sonnet-4-6";
 // degrade to a blank suffix, never throw during config generation.
 const hostOf = (u) => { try { return new URL(u).host; } catch { return ""; } };
 
-const ANTHROPIC_FULL = Object.freeze([
+// CURATED, REVIEWED, STATIC. This is NOT "the rows the picker shows" -- the
+// picker shows every id the live catalog returns. It has two narrower jobs, and
+// both are about what happens when live data is absent or untrustworthy:
+//
+//   1. FALLBACK. When the live fetch fails entirely (relay down, no cache) or
+//      the cache is past the routing staleness ceiling, these four ids are the
+//      routing set AND the picker set, because they are known-good by review.
+//   2. VOUCHING, for the collision guard. `checkBareCollisions` treats the
+//      relay's ownership of an id as evidence of SAFETY only for ids in here.
+//      Routing auto-adds every live id, and without this distinction that
+//      auto-add would make the guard's FATAL path structurally unreachable --
+//      a reseller sole-listing a live-but-unreviewed id would be laundered into
+//      an accepted ambiguity by our own routing config. See run.mjs.
+//
+// Adding an id here therefore stays a deliberate one-line human edit: it is an
+// assertion that a human looked at that id, not merely that Anthropic serves it.
+export const ANTHROPIC_FULL = Object.freeze([
   "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-fable-5-1"
 ]);
-const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
+// EXPORTED because checkBareCollisions must exempt these four from its realIds
+// narrowing, and a second copy of the list there would be free to drift from this
+// one -- which is the drift that produced the hole eeea057 opened.
+export const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
 
 // `[1m]`, on the PICKER list only -- never on `models`/`routing`.
 //
@@ -187,9 +807,168 @@ const ANTHROPIC_ALIASES = Object.freeze(["opus", "sonnet", "haiku", "fable"]);
 // anthropic-oauth-relay.mjs's `resolveModelId`), which is what makes it safe
 // for `validate()` to require the picker's suffixed id to also appear
 // verbatim in `models[]` -- see the picker-row construction below.
-const ANTHROPIC_PICKER = Object.freeze([
+//
+// THIS ARRAY IS NOW THE FALLBACK, NOT THE LIVE TRUTH. The tags below are what
+// ships when the live catalog cannot be reached at all (relay down AND no
+// cache): a hand-checked snapshot of the same facts, never deleted, so a
+// network failure degrades to today's exact behaviour rather than to untagged
+// rows. When live data IS available, `buildAnthropicPickerRows` recomputes each
+// tag from the model's real `max_input_tokens` and this array is not consulted
+// for that id -- so Anthropic changing a context window, or shipping a 1M
+// variant of Haiku, no longer needs a code edit.
+const ANTHROPIC_PICKER_FALLBACK = Object.freeze([
   "claude-opus-5[1m]", "claude-sonnet-5[1m]", "claude-haiku-4-5-20251001", "claude-fable-5-1[1m]"
 ]);
+
+// DERIVED from the array above, never re-typed. Two hand-maintained lists of one
+// fact are how they drift; this one cannot, because the map is generated from
+// the array at load time and a change to either is a change to both.
+export const ANTHROPIC_FALLBACK_TAGS = Object.freeze(Object.fromEntries(
+  ANTHROPIC_PICKER_FALLBACK.map((tagged) => [tagged.replace(/\[1m\]$/i, ""), tagged])
+));
+
+// Claude Code's client-side context-window lever, in full: `Gc(e) =
+// /\[1m\]/i.test(e) -> 1e6`. A string suffix and nothing else -- the
+// `modelPicker.options[]` schema has exactly four fields (model, label,
+// description, behavesAs) and no numeric context field -- so this constant is
+// the whole of the threshold, and `>=` is the whole of the comparison.
+export const ONE_M_TOKENS = 1_000_000;
+
+/**
+ * Tag each id with `[1m]` iff its LIVE context window says so.
+ *
+ * Pure: no fetch, no cache, no clock. `contextById` is whatever
+ * `fetchAnthropicCatalog` resolved (possibly from a stale cache, possibly
+ * empty); the fallback map covers ids it has no entry for.
+ *
+ * THREE INPUTS, IN PRECEDENCE ORDER, and the third is the one that matters:
+ *   1. live window stated  -> tag iff >= 1M. Authoritative.
+ *   2. no live window, but a hand-tagged default exists (the curated four)
+ *                          -> use that default. "Not stated" is NOT "small":
+ *      treating it as small would silently drop a real 1M row back to a
+ *      believed 200k window, the exact defect the `[1m]` work was done to fix.
+ *   3. no live window AND no default (any id beyond the curated four)
+ *                          -> BARE. Nothing has confirmed a 1M window for this
+ *      id, and the two errors are not symmetric: under-claiming costs display
+ *      accuracy, while over-claiming lets a session send a prompt larger than
+ *      the model can actually hold. Guess downward or not at all.
+ *
+ * @param {readonly string[]} ids              bare ids to build rows for
+ * @param {Map<string, number>|object} contextById  live max_input_tokens by id
+ * @param {object} [fallbackTags]              bare id -> hand-tagged default
+ * @returns {string[]} one entry per input id, in the same order
+ */
+export function buildAnthropicPickerRows(ids, contextById, fallbackTags = ANTHROPIC_FALLBACK_TAGS) {
+  const ctx = contextById instanceof Map ? contextById : new Map(Object.entries(contextById ?? {}));
+  return (ids ?? []).map((raw) => {
+    // Strip first, always. The curated list is bare today, but an id that ever
+    // arrived already tagged would otherwise be looked up under a key that is
+    // not in `contextById` and then emitted as `claude-opus-5[1m][1m]` -- a
+    // model string nothing resolves, in the one place a wrong string is silent.
+    const id = String(raw).replace(/\[1m\]$/i, "");
+    const live = ctx.get(id);
+    if (Number.isFinite(live)) return live >= ONE_M_TOKENS ? `${id}[1m]` : id;
+    return fallbackTags?.[id] ?? id;
+  });
+}
+
+// ------------------------------------------------- `[1m]` on RESELLER rows
+//
+// The relay can tag freely because it strips `[1m]` at its own last hop. CCR
+// does NOT -- MEASURED: an upstream 404 echoes the suffix back verbatim
+// (`Model "groq/llama-3.3-70b-versatile[1m]" is not configured`). So on a
+// reseller the suffix reaches the provider's own id parser, and whether that
+// parser tolerates it is a PER-PROVIDER FACT rather than a property of the
+// model. Tagging a row whose provider rejects it turns a working row into a
+// dead one, which is strictly worse than the 200k window it was trying to fix.
+//
+// WHY THE SUFFIX IS THE LEVER AT ALL. A third-party row borrows its believed
+// context window from the model named in `behavesAs`, and all four entries in
+// ALLOWED_BEHAVES_AS declare `window: 200000` WITH `supports_1m_suffix: true`.
+// The 200000 is why a 1M reseller model runs at 200k; the flag is what the
+// suffix acts on. MEASURED end to end: a probe row
+// `tokenrouter/anthropic/claude-sonnet-5[1m]` (behavesAs `claude-sonnet-4-6`)
+// was accepted by Claude Code and its RAW statusline payload -- captured
+// before hud-shim, so it is Claude Code's own belief and not a HUD correction
+// -- reported `context_window_size: 1000000`, against 200000 unsuffixed.
+export const ONEM_PROBE_FILE = path.join(os.homedir(), ".uw", "state", "onem-suffix-probe.json");
+
+/**
+ * The measured per-provider verdicts, as `provider -> "accepts"|"rejects"|"unknown"`.
+ *
+ * Written by `keysync/probe-1m-suffix.mjs`. A missing or malformed file yields
+ * an EMPTY map, never null: the tagging rule below reads an absent provider the
+ * same way it reads `unknown`, so "never probed" and "probed but blocked on
+ * billing" take one path rather than two.
+ */
+export function loadOneMVerdicts(file = ONEM_PROBE_FILE) {
+  const out = new Map();
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
+    for (const [provider, v] of Object.entries(raw?.verdicts ?? {})) {
+      if (typeof v?.verdict === "string") out.set(provider, v.verdict);
+    }
+  } catch { /* no probe yet: every provider reads as unknown */ }
+  return out;
+}
+
+// The last segment of a router-pool id. `openrouter/auto`, `kilo/auto`,
+// `orcarouter/auto` and `openrouter/router` are the four #75 pins, and each
+// carries its POOL's window (2,000,000 on two of them) rather than a model's.
+const POOL_IDS = /(^|\/)(auto|router|default)$/i;
+
+/**
+ * The id a row is DISPLAYED and SELECTED under.
+ *
+ * NOT SCOPED TO CLAUDE NAMES, and that is the mechanism rather than an
+ * ambition. The suffix acts through `behavesAs`, which EVERY third-party row
+ * carries and which always names a Claude model -- and all four entries in
+ * ALLOWED_BEHAVES_AS declare `supports_1m_suffix: true`. The lever reads the
+ * suffix off the selector and the flag off the borrowed profile; neither
+ * consults the model's own name. So a 1M qwen row and a 1M Claude row take the
+ * same window from the same flag, and restricting this to `/claude/i` would
+ * leave the qwen row believing 200k for no reason either half of the mechanism
+ * can state.
+ *
+ * Tags iff both hold: the row's own context window is at least 1M, and the
+ * provider has not been measured to REJECT the suffix. An unmeasured provider
+ * is tagged -- the one place this file guesses upward, and a deliberate posture:
+ * every provider that could answer the probe accepted, none rejected, and the
+ * few that could not answer are failing every request on billing or auth
+ * anyway, so their rows do not work today regardless. Re-running
+ * `probe-1m-suffix.mjs` demotes a provider that turns out to reject, which is
+ * what makes the guess reversible rather than permanent.
+ *
+ * `rejects` is honoured absolutely: a measured no is never overridden.
+ *
+ * IDEMPOTENT. An id that already carries the suffix is returned unchanged --
+ * both writers call this, `claude-opus-5[1m][1m]` resolves to nothing in the
+ * one place a wrong string is silent, and teamorouter really does serve a model
+ * whose own name ends in `[1M]`.
+ *
+ * @param {string} provider
+ * @param {string} id           the provider's own bare spelling
+ * @param {?number} ctx         the row's context window, or null if unknown
+ * @param {Map<string,string>} [verdicts]
+ * @returns {string}
+ */
+export function tagOneM(provider, id, ctx, verdicts) {
+  const s = String(id ?? "");
+  if (/\[1m\]$/i.test(s)) return s;
+  // #75, AND THE SAME SENTENCE IT ALREADY WRITES ABOUT `bucketFor`. A router
+  // pool's window belongs to the pool, so `kilo/auto`'s 2,000,000 is "evidence
+  // about no model at all" -- it must not buy a 1M claim any more than it may
+  // buy a capable classification. The row's own `mode` flag is the proper
+  // signal and is measured false for all four of these live, so the flag alone
+  // does not reach them; these are the ids #75's own corpus test pins.
+  if (POOL_IDS.test(s)) return s;
+  // "Not stated" is not "small", but it is not 1M either. An unknown window has
+  // confirmed nothing, and over-claiming lets a session send a prompt larger
+  // than the model can hold -- the asymmetry buildAnthropicPickerRows names.
+  if (!(Number.isFinite(ctx) && ctx >= ONE_M_TOKENS)) return s;
+  if (verdicts?.get(provider) === "rejects") return s;
+  return `${s}[1m]`;
+}
 
 export const ANTHROPIC_RELAY = {
   name: "anthropic",
@@ -199,9 +978,13 @@ export const ANTHROPIC_RELAY = {
   api_key: "relay-ignores-this",
   autoFetchModels: false,
   enabled: true,
-  // Verified live through CCR 2026-09-02.
+  // Verified live through CCR 2026-09-02. `models` and `routing` stay the
+  // curated set: they are the STATIC SAFETY NET for the same total-failure case
+  // `picker` covers, and run.mjs unions the live ids on top of them rather than
+  // replacing them, so a live response that anomalously omits one of the four
+  // cannot remove it from routing.
   models: ANTHROPIC_FULL,
-  picker: ANTHROPIC_PICKER,
+  picker: ANTHROPIC_PICKER_FALLBACK,
   routing: Object.freeze([...ANTHROPIC_FULL, ...ANTHROPIC_ALIASES])
 };
 
@@ -228,10 +1011,160 @@ export const ANCHOR_PREFERENCE = [
   "bigmodel/"
 ];
 
-export function buildProviders(chosen, providers, catalog, keyReader) {
+/**
+ * One catalogue entry -> the normalized model object the row builder consumes.
+ *
+ * ONE FUNCTION, TWO CALL SITES, AND THAT IS THE POINT. The two push sites below
+ * (the vault's testModel, and the catalogue-ranked extras) built this literal
+ * separately, which is the single recorded downside of reading capability
+ * signals from the entry already in hand: two places to keep in sync. Widening
+ * both by hand is how they drift. It is exported for the same reason
+ * `checkBareCollisions` and `deriveAnthropicSets` are: the pipeline cannot be
+ * driven from a test without a vault, so a shape left inline is a shape nothing
+ * can assert on -- and the ONE thing worth asserting here is the field NAME.
+ *
+ * `contextTokens`, NOT `ctx`. `ctx` is the menu pipeline's name for the same
+ * number (`menu/catalog.mjs:176`); this side has always called it
+ * `contextTokens`. A classifier reading `ctx` here gets `undefined` for every
+ * row, silently sends all 7 context-proxy rows to the weak bucket (27/56 becomes
+ * 24/59) and stays green under any test that feeds it an object literal. Hence
+ * the paired test that drives the classifier with an object THIS function built.
+ *
+ * `?? null`, NEVER `||`. `false || null === null`, so `||` would turn a
+ * MEASURED-false capability back into "unknown" -- the same conflation as
+ * `!!undefined === false`, wearing a different operator. `reasoning` is `false`
+ * on 12 of the 45 matched rows, and each of those is a real signal.
+ *
+ * `entry` is undefined for 38 of the 83 rows (a vault testModel with no
+ * catalogue entry at all). Every derived field is then `null` or `"unknown"`:
+ * no signal is not a small model.
+ *
+ * `providerName` IS PASSED THROUGH, NOT DERIVED. `inferTier` matches the price
+ * offer to the provider whose key will pay, and this function is its only call
+ * site -- so a provider-matched `inferTier` cannot be fed unless the name
+ * arrives here. Deriving it from `entry.provider` instead would be wrong at the
+ * one call site that matters: `buildProviders` normalizes the vault's
+ * `testModel` against a catalogue entry looked up under the LIVE provider, and
+ * the price that governs is the live provider's, not the entry's bundle
+ * grouping. Absent (the 38 no-entry rows, and any caller with no key in hand) it
+ * falls through to `priceOf`'s no-provider rule, which answers only when exactly
+ * one usable offer exists.
+ *
+ * @param {string} id                     the model id as the provider spells it
+ * @param {object|null|undefined} entry   its bundled-catalogue entry, if any
+ * @param {string|null} providerName      the provider whose key will pay
+ */
+export function normalizeModel(id, entry, providerName = null, capability = null) {
+  return {
+    id,
+    tier: entry ? inferTier(entry, providerName) : "unknown",
+    // Withheld, never the raw bundle number, when this is an OpenRouter row
+    // and the number is only OpenRouter's own best-of-several-backends claim
+    // (#20) -- see `trustedContextTokens`.
+    contextTokens: trustedContextTokens(providerName, entry),
+    reason: entry?.capabilities?.reasoning ?? null,
+    kind: outputKind(entry, capability)
+  };
+}
+
+/**
+ * A discovery input -> `provider -> [{id, capabilityRaw, ...}]`.
+ *
+ * Accepts what R10's cache actually holds and what a caller is likely to have in
+ * hand: a Map or plain object of provider -> record, where a record is either
+ * the cache record (`{outcome, models: [...]}`) or the bare projected array.
+ * Anything else contributes nothing rather than throwing -- this is optional
+ * enrichment, and a malformed cache must degrade to the pre-R11 candidate set,
+ * never stop a build.
+ *
+ * `lastGood` IS NOT CONSULTED. A record carrying it says the provider failed
+ * TODAY, and the same failure that produced it is the reason its listing may be
+ * retired. Routing on it would advertise ids nothing has confirmed this run; the
+ * `testModel` half of the union is what keeps such a provider present.
+ */
+// A listing that returns API RESOURCE NAMES rather than model ids (#107).
+//
+// Google's `GET /v1beta/models` answers `models/gemini-3.8-flash`, because that
+// is the resource's own name. Routed back as a model id it is rejected outright:
+// `generateContent` already carries `models/` in its URL path, so the prefix
+// arrives doubled -- MEASURED 2026-09-09, `google/models/gemini-3.8-flash`
+// returns `400 * GenerateContentRequest.model: unexpected model name format`
+// while the bare `google/gemini-3.5-flash-lite` answers normally.
+//
+// STRIPPED HERE, at the one normalisation both lanes already share, rather than
+// in `admitRemoteModels`: that function's subject is security -- hostile strings
+// and terminal escapes -- and its docstring pins that guarantee. A vendor's
+// naming convention is not a threat, and mixing the two would make the security
+// contract harder to read for a reason unrelated to security.
+//
+// PROVIDER-SCOPED, deliberately. Only google does this today (55 of 4,298
+// catalogue-plus-listing ids, all google, measured), and a blanket strip would
+// silently rewrite any future provider that legitimately serves a model whose
+// name begins `models/`. When a second such provider appears this becomes a set.
+const RESOURCE_PREFIX = new Map([["google", /^models\//]]);
+
+export function discoveryIndex(discovery) {
+  const out = new Map();
+  if (!discovery) return out;
+  const pairs = discovery instanceof Map
+    ? discovery.entries()
+    : (typeof discovery === "object" ? Object.entries(discovery) : []);
+  for (const [provider, record] of pairs) {
+    const models = Array.isArray(record) ? record
+      : (Array.isArray(record?.models) ? record.models : null);
+    if (!models) continue;
+    const strip = RESOURCE_PREFIX.get(provider);
+    const usable = models.filter((m) => typeof m?.id === "string" && m.id !== "");
+    if (!strip) { out.set(provider, usable); continue; }
+    // DEDUPED AFTER STRIPPING. 46 of google's 55 prefixed ids collapse onto a
+    // bare row the catalogue already carries, so without this the picker would
+    // show the same model twice under one name. First writer wins, which keeps
+    // the catalogue's own spelling when both exist.
+    const seen = new Set();
+    const kept = [];
+    for (const m of usable) {
+      const id = m.id.replace(strip, "");
+      if (id === "" || seen.has(id)) continue;
+      seen.add(id);
+      kept.push(id === m.id ? m : { ...m, id });
+    }
+    out.set(provider, kept);
+  }
+  return out;
+}
+
+/**
+ * @param {object[]} chosen        the vault registry entries, one per provider
+ * @param {Map} providers          provider name -> vault profile
+ * @param {object} catalog         from `loadCatalog`
+ * @param {(id: string) => string} keyReader
+ * @param {Map|object|null} [discovery]  R10's cache, provider -> record. Absent
+ *   or malformed leaves the candidate set at `testModel u catalogue`, which is
+ *   the pre-R11 set MINUS nothing -- discovery only ever ADDS ids, so a caller
+ *   with no cache loses no reach it had before.
+ * @param {object|string[]|Map|null} [verified]  verify-prune.mjs's probe output.
+ *   RANKING ONLY -- unlike `discovery` it contributes no candidates, so it can
+ *   reorder the picker's prefix but can never change which ids route. Absent
+ *   drops every row to a lower provenance rung together, which is a no-op on the
+ *   sort rather than a reordering.
+ */
+export function buildProviders(chosen, providers, catalog, keyReader, discovery = null,
+                               verified = null, oneMVerdicts = loadOneMVerdicts()) {
   const out = [];
   const picker = [];
   const notes = [];
+  const discoveredBy = discoveryIndex(discovery);
+  const verifiedBy = verifiedIndex(verified);
+  // READ PER CALL, NOT AT MODULE LOAD, so a test can set the variable and
+  // observe the bound it produces. Reading it once at import made the only
+  // assertable thing about the parse its return value, which is exactly the
+  // check the `NaN` bug slipped past.
+  const pickerCap = pickerCapFrom(process.env.UW_MAX_MODELS);
+  // LAZY, and built at most once per call. It is a full pass over the bundle
+  // (4,298 entries), which a run with no discovery has no use for -- and every
+  // such run is the one that must stay exactly as cheap as it was.
+  let joinIdx = null;
+  const joinIndex = () => (joinIdx ??= buildJoinIndex(catalog));
 
   for (const reg of chosen) {
     const vp = providers.get(reg.provider);
@@ -260,39 +1193,261 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       ? (admitRemoteModels(reg.provider, [vp.testModel]).kept[0] ?? null)
       : null;
 
+    // DISCOVERY (R10's cache), the third source and the newest one. It is the
+    // provider's OWN listing -- what this key can call today -- where the bundle
+    // is a periodic snapshot merged across hosts. Admitted through the same gate
+    // as the other two, in ONE call, because a second per-provider
+    // `admitRemoteModels` would print a second SECURITY line for the same
+    // provider and split one finding across two messages.
+    const discovered = discoveredBy.get(reg.provider) ?? [];
+    const discoveredKept = discovered.length
+      ? new Set(admitRemoteModels(reg.provider, discovered.map((m) => m.id)).kept)
+      : new Set();
+    // Keyed by id so a CATALOGUE-sourced candidate picks up the live capability
+    // for the same id. Without this the precedence would apply only to rows
+    // discovery contributed on its own, which is the half where the bundle has
+    // nothing to be outranked.
+    const capabilityById = new Map();
+    for (const m of discovered) {
+      if (discoveredKept.has(m.id) && m.capabilityRaw) capabilityById.set(m.id, m.capabilityRaw);
+    }
+
     // MEASURED 2026-09-01: preferring catalog ids over the vault's testModel
     // dropped the live pass rate to 4/44 — the bundled catalog lists models a
     // given key/tier often cannot actually call (mostly upstream 404s). The
     // vault's testModel is the probe-verified known-good id for this key, so it
     // leads; catalog entries are appended as extras.
+    //
+    // `models` IS NOW THE UNION AND IS UNCAPPED (R11): testModel u discovery u
+    // catalogue, deduplicated, in that order of precedence. The picker takes a
+    // prefix of it; routing takes all of it.
+    //
+    // THE UNION IS WHAT KEEPS A RESPONDING PROVIDER IN THE CONFIG, and that is
+    // not a refinement of "the discovered set" -- it is the difference between
+    // this being safe and it deleting providers. The `!models.length` skip below
+    // PRECEDES the `out.push`, so a provider whose candidate set is empty is
+    // dropped from `Providers[]` entirely. MEASURED in R10's sweep: `tabiai` and
+    // `gorouter` both answered HTTP 200 with `data: []` (outcome `empty`) and
+    // both carry a real `testModel` -- so a discovered-set-only rule deletes two
+    // providers that ANSWERED, which rule 1 forbids. `testModel` leading the
+    // union is what makes that structurally impossible rather than merely
+    // unlikely.
     const models = [];
     const seen = new Set();
     if (safeTestModel) {
+      // `cat` is undefined for 38 of the 83 rows — this is the no-signal case.
       const cat = safeEntries.find((m) => m.model === safeTestModel);
-      models.push({
-        id: safeTestModel,
-        tier: cat ? inferTier(cat) : "unknown",
-        contextTokens: cat?.limits?.contextTokens
-      });
+      models.push(normalizeModel(safeTestModel, cat, reg.provider,
+        capabilityById.get(safeTestModel) ?? null));
       seen.add(safeTestModel);
     }
-    if (safeEntries.length) {
-      // Curate rather than dump: the picker is a flat list and 44 providers x
-      // full catalogs is unusable. Prefer free-tier, then shortest id.
-      const ranked = safeEntries
-        .map((m) => ({ m, tier: inferTier(m) }))
-        .sort((a, b) => (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
-          a.m.model.length - b.m.model.length);
-      for (const { m, tier } of ranked) {
-        if (models.length >= MAX_MODELS_PER_PROVIDER || seen.has(m.model)) continue;
-        models.push({ id: m.model, tier, contextTokens: m.limits?.contextTokens });
-        seen.add(m.model);
+    // The two extra sources, gathered before the sort so ONE ordering governs
+    // both outputs. Catalogue first, then discovery-only ids: the sort is stable
+    // and carries NO provenance term, so insertion order is the only thing
+    // separating two otherwise-equal rows. Adding a provenance term is R13b's,
+    // deliberately not this task's -- ranking a live listing above the bundle is
+    // a decision with its own evidence, not a side effect of unioning them.
+    const extras = [];
+    const queued = new Set(seen);
+    for (const m of safeEntries) {
+      if (queued.has(m.model)) continue;
+      queued.add(m.model);
+      extras.push({ id: m.model, entry: m, capability: capabilityById.get(m.model) ?? null });
+    }
+    for (const d of discovered) {
+      if (!discoveredKept.has(d.id) || queued.has(d.id)) continue;
+      queued.add(d.id);
+      // The join is what turns a live id into capability signals: `reasoning`
+      // and `contextTokens` exist ONLY in the bundle, so an unjoined live id is
+      // an honest `unknown` rather than a guess. `null` is a real answer here.
+      extras.push({ id: d.id, entry: joinCatalogEntry(joinIndex(), reg.provider, d.id),
+                    capability: d.capabilityRaw ?? null });
+    }
+    if (extras.length) {
+      // ONE ORDERING, TWO CONSUMERS (R11). This sort used to decide membership:
+      // the loop below stopped at the cap, so a row past position 3 was not
+      // merely lower in the menu, it did not ROUTE. It now decides ORDER only --
+      // every extra joins `models`, and the picker takes a prefix. "Curate
+      // rather than dump" stays exactly true of the flat 44-provider menu and
+      // stops being true of the routing table, which has no display cost and
+      // whose bound was costing ~1,501 catalogue rows their ability to resolve.
+      //
+      // Prefer chat, then free-tier, then shortest id.
+      //
+      // `kind` IS THE FIRST TERM, AHEAD OF FREE-FIRST. The ORDER is free; what
+      // this comment used to claim about the free-first term was not.
+      //
+      // CORRECTED 2026-09-07. It read: "repairing #10 turns the term on for the
+      // first time... measured on cohere, where the repair alone replaces
+      // `command | command-a | command-r` with two rerankers", and, below, that
+      // free-first promotes Lyria back into google's top-3. BOTH ARE FALSE AS
+      // SHIPPED, and the reason is mechanical: #55 landed with #10. `inferTier`
+      // classifies an all-zero-offer row as `"unknown"`, not `"free"`, so
+      // MEASURED over the live bundle there is EXACTLY ONE free row in all
+      // 4,298 entries (`mistral/labs-devstral-small-2512`). A free-first term
+      // with one free row catalogue-wide evaluates `1 - 1 = 0` for essentially
+      // every pair and cannot promote a CLASS of anything.
+      //
+      // SO NAME THE GUARD THAT IS ACTUALLY DOING THE WORK: `hasPricedOffer`
+      // (#55), inside `inferTier`, not the `kind` term here. MEASURED on
+      // google's 185 entries: with #55, the top-3 is
+      // `gemma-3 | gemma-2-9b | gemma-4-31b`; with #55 removed and the `kind`
+      // term left exactly as it is, it becomes
+      // `lyria-3-pro-preview | lyria-3-clip-preview | gemma-3` -- two music
+      // generators. The `kind` term does not stop them, because they declare
+      // `["audio", "text"]` and `outputKind` therefore reads them as text.
+      //
+      // That matters to whoever edits this next: removing #55 as "R5b's
+      // labelling fix" while keeping the `kind` term reinstates two music
+      // generators into a provider's routing set. The previous wording told
+      // them the opposite.
+      //
+      // The `kind` term stays, on its own merit: it is the only term that
+      // demotes a DECLARED non-chat row, and the data costs nothing to obtain
+      // -- `outputKind(entry, capability)` is called a few lines below in
+      // `normalizeModel`, on the same entry and the same capability.
+      //
+      // `=== "nontext"`, NOT `!== "text"`. `outputKind` answers `null` for
+      // absence of signal (`menu/catalog.mjs`'s `isTextOut` agrees), and a
+      // no-signal row must rank WITH the text rows, not with the generators:
+      // demoting on absent evidence is the confident-wrong this codebase
+      // refuses everywhere else.
+      //
+      // THE GUARD IS NO LONGER BUNDLE-ONLY (R11), AND IT IS ALSO NOT RETIRED.
+      // `kind` is now `outputKind(entry, capability)`, so a provider's own
+      // capability token OUTRANKS the bundle's `modalities.output` -- which is
+      // what lets a live `image`/`video` demote a row the bundle calls text.
+      //
+      // WHAT THAT DOES NOT FIX, MEASURED AGAINST R10's ACTUAL CACHE. R11's brief
+      // said this retires the provisional guard for google's Lyria previews,
+      // "where those rows are `image_gen`/`audio`". They are not, in the cache
+      // that exists: all 55 of google's projected models carry
+      // `capabilityRaw: null`, Lyria included, because Google's listing states
+      // `supportedGenerationMethods` and none of `discover.mjs`'s four
+      // `capabilityField` candidates matches it. So Lyria is still read as text
+      // here and is still held out by `hasPricedOffer` alone. The precedence is
+      // real and fires -- MEASURED, llm7 supplies 9 `image`/`video` tokens via
+      // `model_type` -- but the named example is not one of them, and widening
+      // `capabilityField` to reach Google is a discovery-side change, not this
+      // one.
+      //
+      // THE STATED GATE DOES NOT PASS, and saying it does was the second false
+      // claim in this block. The boolean "no provider's top-3 acquires a row
+      // whose `modalities.output` contains a modality other than text" is
+      // FALSE against the real `buildProviders`: MEASURED, 4 of 44 built
+      // providers and 5 of 83 picker rows carry such a row --
+      // `openrouter/auto` and `kilo/auto` (`["image","text"]`),
+      // `openai/gpt-5-nano` (`["image","text"]`), and `nscale/flux.1-schnell`
+      // and `nscale/stable-diffusion-xl-base-1.0` (`["image"]`).
+      //
+      // It is the OBSERVABLE that is mis-specified, not the code, and it must
+      // not be "fixed" by making the gate pass: nscale's entire catalogue is
+      // image models, so its top-3 is non-text by construction, and rule 1
+      // (never prune a responding provider) keeps those rows. Correcting the
+      // observable belongs to the plan, not here; what this comment owes the
+      // next reader is the number with its denominator rather than a pass.
+      // NO `localeCompare`. The third term is a length comparison and stays one:
+      // `localeCompare` is locale-dependent and ICU-build-dependent, so it would
+      // make the SAME vault and the SAME bundle produce a different top-3 on a
+      // different machine -- an ordering that cannot be reproduced from the
+      // inputs is not an ordering this config may be built on.
+      //
+      // PROVENANCE IS THE SECOND TERM (R13b), BELOW `kind` AND ABOVE FREE-FIRST.
+      // See PROVENANCE_ORDER for the rung order and why `config-asserted` is
+      // second within it. The four sets are all already in hand: nothing here is
+      // fetched or re-derived, so the term costs one Map lookup per row.
+      //
+      // R13b's brief specified this term ABOVE `kind`. THAT ORDER IS WRONG, and
+      // it is wrong in a way this fixture proves rather than argues: the live
+      // `capability` token is BOTH the thing that demotes a row through `kind`
+      // and the thing that promotes it to `listing-verified`, because a row
+      // carries a capability only when a listing named it. Ranked above `kind`,
+      // the promotion wins and supplying discovery data makes a declared
+      // `image_gen` row sort HIGHER than it did with no discovery at all -- the
+      // exact inverse of what the precedence exists to do. MEASURED: it inverts
+      // "a capability demotes a row in the SELECTION SORT, not only in `kind`"
+      // (test/routing-split.test.mjs), which is a shipped R11 invariant.
+      //
+      // The general form, which is why this is a correction and not a local
+      // patch: `kind === "nontext"` is a DISQUALIFIER -- "is this a chat model
+      // at all" -- and provenance is a QUALITY ranking over rows that already
+      // passed it. Strong evidence that an image generator exists is still
+      // strong evidence about an image generator. Every other term here
+      // (free-first, id length) is a preference among comparable rows, so
+      // provenance sits directly beneath the one disqualifier and above them.
+      //
+      // `asserted` IS THE testModel AND THE testModel IS NOT IN `extras`. It is
+      // pushed into `models` above, ahead of this sort, so today the set is
+      // always disjoint from what is being sorted and the rung is unreachable
+      // from here. It is passed anyway, because `provenanceOf`'s precedence is
+      // only correct if every caller hands it every set it has -- and the day
+      // `testModel` stops being special-cased upstream, this sort must already
+      // rank it second rather than dropping it to `catalogue-only`.
+      //
+      // THIS TERM IS LIVE ON THE PRODUCTION BUILD AS OF R13c, and the note it
+      // replaces said the opposite. That note read "run.mjs passes NEITHER
+      // `discovery` NOR `verified`, so every extra resolves to `catalogue-only`,
+      // the term evaluates 3 - 3 = 0 for every pair, and the ordering is exactly
+      // what it was" -- true when written, false the moment run.mjs began
+      // calling `loadDiscoveryCache`. `discoveredKept` now feeds `listed` above,
+      // so a discovered extra ranks 2 against an undiscovered one's 3 and SORTS
+      // AHEAD OF IT. R13b's provenance term is doing real work here, and a reader
+      // reasoning about ordering from the old note would have reasoned about a
+      // build that no longer exists.
+      //
+      // `verified` IS still unpassed -- probe results reach `applyVerifiedOnly`,
+      // not this sort -- so `call-verified` stays the one rung the pipeline
+      // cannot reach. It is passed anyway, for the same reason `asserted` is.
+      const provSets = {
+        verified: verifiedBy.get(reg.provider),
+        asserted: safeTestModel ? new Set([safeTestModel]) : undefined,
+        listed: discoveredKept,
+        catalogued: keptIds,
+      };
+      const ranked = extras
+        .map((e) => ({ e, kind: outputKind(e.entry, e.capability),
+                       tier: e.entry ? inferTier(e.entry, reg.provider) : "unknown",
+                       prov: provenanceRank(provenanceOf(e.id, provSets)) }))
+        .sort((a, b) => (a.kind === "nontext" ? 1 : 0) - (b.kind === "nontext" ? 1 : 0) ||
+          a.prov - b.prov ||
+          (a.tier === "free" ? 0 : 1) - (b.tier === "free" ? 0 : 1) ||
+          a.e.id.length - b.e.id.length);
+      // The entry is in hand by construction, so the capability signals need no
+      // lookup — which is what makes cross-provider name matching structurally
+      // impossible here rather than merely discouraged. `ranked`'s `tier` is
+      // dropped in favour of normalizeModel recomputing it: same value from the
+      // same entry AND the same provider name, and one owner of the shape beats
+      // a second literal. That second clause is now load-bearing rather than
+      // incidental -- `inferTier` is provider-matched, so recomputing it from a
+      // different name would silently disagree with the sort that just ran.
+      //
+      // NO CAP HERE ANY MORE. The `models.length >= MAX_MODELS_PER_PROVIDER`
+      // that stood in this condition is the whole of what R11 moved: it now
+      // bounds the picker slice below and nothing else. `seen` still guards the
+      // testModel, which `extras` already excludes -- kept because it is the
+      // dedup invariant this loop has always maintained, not because a duplicate
+      // can currently reach it.
+      for (const { e } of ranked) {
+        if (seen.has(e.id)) continue;
+        models.push(normalizeModel(e.id, e.entry, reg.provider, e.capability));
+        seen.add(e.id);
       }
     }
     if (!models.length) {
       notes.push(`${reg.provider}: no testModel and no catalog entry — skipped`);
       continue;
     }
+    // THE SPLIT. `models` routes in full; `pickerModels` is the prefix the flat
+    // `/model` menu carries. Taking a PREFIX of one ordered list rather than
+    // re-ranking is what keeps the two from disagreeing about which rows a
+    // provider's best ones are.
+    //
+    // `pickerCap` DEFAULTS TO `Infinity`, so this is a full copy unless an
+    // operator set `UW_MAX_MODELS`. It stays a slice, and a COPY rather than the
+    // same array: the two lists are still separately filterable downstream
+    // (`--verified-only` prunes the picker and returns routing by identity), and
+    // aliasing them here would make that asymmetry impossible to express.
+    const pickerModels = models.slice(0, pickerCap);
 
     const name = reg.provider;
     out.push({
@@ -306,10 +1461,35 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       enabled: true
     });
 
-    for (const m of models) {
+    for (const m of pickerModels) {
+      // `Providers[].models` above stays BARE and must: CCR matches a request
+      // against it tolerantly (it already accepts a suffixed id there) but
+      // FORWARDS the id verbatim, so the suffix belongs on the selector the user
+      // picks, never on the routing list. Same split the relay already uses.
+      //
+      // THE JOIN IS CONSULTED FOR THE TAG, and it has to be. `menu/catalog.mjs`
+      // resolves a row's window through `joinCatalogEntry` and this loop reads
+      // `m.contextTokens`, which is absent for a handful of discovery-sourced
+      // ids the join does resolve -- measured: 5 rows, among them
+      // `nvidia/deepseek-ai/deepseek-v4-flash-0731` at 1,310,720. Two writers
+      // with different windows produce two different SPELLINGS of one row, and
+      // uwpick emits the snapshot's, so the picker would lack the very target
+      // the user just selected. That is #111 again, one data path over.
+      //
+      // Read for the tag ONLY, never written back to `row.contextTokens`:
+      // that field feeds `bucketFor` and would move `behavesAs` classifications
+      // on rows this change has no evidence about.
+      // `m.contextTokens` already went through `trustedContextTokens` inside
+      // `normalizeModel`; the join fallback below must go through the same
+      // gate (#20) or it would re-admit an OpenRouter aggregate claim this
+      // very check exists to withhold.
+      const ctxForTag = m.contextTokens
+        ?? trustedContextTokens(name, joinCatalogEntry(joinIndex(), name, m.id))
+        ?? null;
+      const shown = tagOneM(name, m.id, ctxForTag, oneMVerdicts);
       const row = {
-        model: `${name}/${m.id}`,
-        label: `${name} > ${m.id}`
+        model: `${name}/${shown}`,
+        label: `${name} > ${shown}`
       };
       // The answering HOSTNAME, appended to the description.
       //
@@ -335,7 +1515,19 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
       // provider-format id, warns on every launch, and assumes a 200k context
       // window regardless of the model's real one. behavesAs names a model it
       // DOES know whose client-side handling (prompt profile) to reuse.
-      row.behavesAs = BEHAVES_AS;
+      //
+      // Per row now, not one constant for all 83: see BUCKET_TARGETS. Never
+      // absent -- behavesAsFor always returns a table value, because an absent
+      // declaration resolves to the MAXIMAL assumption set, not to none.
+      row.behavesAs = behavesAsFor(m);
+      // UW-SIDE FIELDS, BOTH STRIPPED BEFORE THE WRITE (run.mjs). Claude Code's
+      // own zod schema for a row is exactly {model, label?, description?,
+      // behavesAs?}, so either of these reaching settings.json is a fifth key in
+      // a four-key schema. `kind` is carried unconditionally, including its null,
+      // so validate() sees the same field on every row -- V5 asks whether a row
+      // is non-chat, and a key that exists only on some rows makes "absent" and
+      // "text" indistinguishable there.
+      row.kind = m.kind;
       if (m.contextTokens) row.contextTokens = m.contextTokens;
       picker.push(row);
     }
@@ -344,7 +1536,72 @@ export function buildProviders(chosen, providers, catalog, keyReader) {
 }
 
 // ------------------------------------------------------------- validations
-export function validate({ providers, picker }, expectedCount) {
+
+/**
+ * V1, V2 and V6: the rules whose subject is the BUCKET TABLE itself.
+ *
+ * Split out of `validate()` for one reason, and it is a testing reason rather
+ * than a structural one. The table is a frozen module constant, so a test could
+ * not make it wrong -- which left these three rules with no test that could
+ * FAIL. What stood in for one re-implemented all three in the test body against
+ * the same constants and never called `validate()` at all, so deleting the rules
+ * outright left the suite green. Parameterising the table is what makes the
+ * failure branch reachable, and T8's acceptance criterion (one test per rule,
+ * asserting the message names its reason) satisfiable.
+ *
+ * Defaults are the live constants, so the production call site is unchanged and
+ * the real table is still validated on every run.
+ *
+ * @param {Record<string,string>} [targets]  the bucket -> behavesAs table
+ * @param {readonly string[]} [allowed]      the vetted behavesAs allowlist
+ * @param {RegExp} [bundle]                  ids carrying a model-specific prompt bundle
+ * @returns {string[]} problems, empty when the table is sound
+ */
+export function validateBucketTable(targets = BUCKET_TARGETS,
+                                    allowed = ALLOWED_BEHAVES_AS,
+                                    bundle = PROMPT_BUNDLE_MODELS) {
+  const problems = [];
+
+  // V1 -- the table holds vetted targets, not typos. An allowlist rather than a
+  // denylist because a denylist passes `claude-sonnet-4-51` in silence, and
+  // silence is the failure mode this exists to prevent.
+  // V2 -- and no target may carry a model-specific prompt bundle.
+  for (const [bucket, target] of Object.entries(targets)) {
+    if (!allowed.includes(target)) {
+      problems.push(`bucket "${bucket}" target "${target}" is not in ALLOWED_BEHAVES_AS ` +
+        `— a vetted target, not a typo`);
+    }
+    if (bundle.test(target)) {
+      problems.push(`bucket target "${target}" carries a model-specific prompt bundle ` +
+        `(report 18 §10.3) and must never be inherited by a third-party model`);
+    }
+  }
+
+  // V6 -- THE WHOLE TABLE SHAPE, over all four keys, not one inequality.
+  // This is the canary for the failure that looks like success. `capable !== weak`
+  // guards one of the three ways the table can break: pointing `unknown` or
+  // `nonchat` at the capable target flips 38 or 4 rows back into over-declaration
+  // with that inequality still true and every other rule green.
+  if (targets.capable === targets.weak) {
+    problems.push(`BUCKET_TARGETS.capable and .weak name the same target ` +
+      `("${targets.weak}"); the table would classify without declaring anything`);
+  }
+  for (const bucket of ["unknown", "nonchat"]) {
+    if (targets[bucket] !== targets.weak) {
+      problems.push(`BUCKET_TARGETS.${bucket} points at the capable target; only "capable" may`);
+    }
+  }
+
+  return problems;
+}
+
+// `table` exists so the tier-1 rules can be OBSERVED firing, not merely asserted
+// to be present. It defaults to the live constants, so every production call is
+// unchanged. Without it the only available check was a source-string match on
+// validate.toString(), which passes when the call appears in a COMMENT and never
+// shows the returned problems reaching `problems` -- a test for a vacuity that
+// was shaped like one.
+export function validate({ providers, picker }, expectedCount, table = {}) {
   const problems = [];
 
   if (providers.length !== expectedCount) {
@@ -390,6 +1647,154 @@ export function validate({ providers, picker }, expectedCount) {
     if (!p.api_key || typeof p.api_key !== "string") problems.push(`provider "${p.name}" has no api_key`);
   }
 
+  // ---- tier 1: the capability declarations ---------------------------------
+  // Subject = the BUILT set. Everything asserted here has its subject in scope
+  // at this point in the run; the two rules whose subject is the WRITTEN artifact
+  // live in run.mjs's assertOptionsComplete instead, because `options[]` does not
+  // exist until 350 lines below this function is called. Asserting an invariant
+  // where its subject does not yet exist is how a rule passes vacuously.
+  const targets = new Set(Object.values(BUCKET_TARGETS));
+
+  // V1, V2 and V6, whose subject is the TABLE rather than this build.
+  problems.push(...validateBucketTable(table.targets, table.allowed, table.bundle));
+
+  // V3 -- every non-relay row declares, and declares a table value.
+  // The relay rows are exempt BY CONSTRUCTION, not by oversight: they carry no
+  // `behavesAs` because Claude Code already knows those ids, so a declaration
+  // there would be borrowed from the model itself.
+  // V5 -- a non-chat row declares the WEAK target specifically. Inverted from an
+  // earlier draft that had it declare nothing: absence resolves through lH() to
+  // the maximal assumption set, which is the state this branch exists to remove.
+  const relayPrefix = `${ANTHROPIC_RELAY.name}/`;
+  for (const row of picker) {
+    if (row.model.startsWith(relayPrefix)) continue;
+    if (!row.behavesAs || !targets.has(row.behavesAs)) {
+      problems.push(`picker row "${row.model}" has behavesAs ` +
+        `${row.behavesAs ? `"${row.behavesAs}"` : "(none)"}, which is not a bucket target`);
+    } else if (row.kind === "nontext" && row.behavesAs !== BUCKET_TARGETS.weak) {
+      problems.push(`non-chat row "${row.model}" declares "${row.behavesAs}"; a non-chat row ` +
+        `must declare the weak target — omitting it resolves to the maximal assumption ` +
+        `set (report 18 §3)`);
+    }
+  }
+
+  // V4 -- `options[]` is a registry keyed by `model`, so a duplicate makes array
+  // order decide which declaration wins for that id. Report 19 §6.3.
+  const seenRows = new Set();
+  for (const row of picker) {
+    if (seenRows.has(row.model)) problems.push(`duplicate picker row "${row.model}"`);
+    seenRows.add(row.model);
+  }
+
+  // V9 -- `autoFetchModels` must be exactly `false` on every entry, the relay
+  // included. Report 12 §10, #44.
+  //
+  // THIS IS NOT A REACH LIMITATION, and reading it as one is how it gets
+  // flipped. It is the ENFORCEMENT POINT FOR BOTH MODEL GATES. `admitRemoteModels`
+  // and `checkBareCollisions` run here, at keysync time, over keysync's inputs.
+  // CCR's own discovery runs at gateway start and every 600s after, hits each
+  // provider's /v1/models itself, and APPENDS what it finds to
+  // `Providers[].models` -- after both gates have already run, and without
+  // re-entering either. So a hostile aggregator publishing a bare Claude-shaped
+  // id has it fetched and made routable while the guard never sees it, because
+  // the guard only ever inspects what keysync wrote. The picker sanitiser is
+  // bypassed on the same path unconditionally, so ids carrying ANSI escapes or
+  // U+202E reach the menu and are rendered. The rule is not "fewer models"; it
+  // is "every model passes our gate first".
+  //
+  // STRICT `!== false`, NOT `=== true`, and that distinction is the finding
+  // itself. The value is a literal at two construction sites -- ANTHROPIC_RELAY
+  // and buildProviders -- and #44 is precisely that nothing stops either from
+  // dropping it. A rule that only rejected an explicit `true` would still be
+  // relying on the construction sites to always set the field, which is the
+  // reliance this rule exists to replace.
+  //
+  // AND ABSENCE IS NOT NEUTRAL -- IT OPENS AN ALIAS CHAIN. Do not "simplify"
+  // this to `=== true`. CCR parses the field from FOUR spellings, coalescing on
+  // nullish (VERIFIED byte-exact in the shipped bundle,
+  // @musistudio/claude-code-router/dist/main/cli.js):
+  //
+  //   autoFetchModels:oM(r.autoFetchModels ?? r.auto_fetch_models
+  //                      ?? r.autoRefreshModels ?? r.auto_refresh_models)
+  //   function oM(e){return typeof e=="boolean"?e:void 0}
+  //
+  // `??` falls through only on null/undefined, so a PRESENT `autoFetchModels`
+  // short-circuits the whole chain and the three aliases become unreachable.
+  // An ABSENT one falls through to all three, and any of them set `true` is
+  // honoured. So `=== true` would permit the key to be absent -- which is
+  // exactly the state in which a snake_case alias silently wins. Requiring the
+  // field present AND false is what makes the alias chain unreachable by
+  // construction, which is the real reason this rule is strict.
+  for (const p of providers) {
+    if (p.autoFetchModels !== false) {
+      problems.push(`provider "${p.name}" has autoFetchModels ` +
+        `${JSON.stringify(p.autoFetchModels)}, which must be exactly false: CCR's own ` +
+        `discovery appends provider-declared ids to Providers[].models at gateway start, ` +
+        `after admitRemoteModels and checkBareCollisions have already run over keysync's ` +
+        `inputs — so every id it adds becomes a routing target that passed neither gate ` +
+        `nor the picker sanitiser`);
+    }
+  }
+
+  // V10 -- the relay's provider name is reserved, asserted HERE and not only
+  // inside run.mjs's relay branch. #23 + #25.
+  //
+  // `assertRelayNameUnclaimed` is the primary guard and still runs, but it runs
+  // AT THE INJECTION, inside `if (anthropicOn)`. So in the one configuration
+  // where an impostor is most useful -- the relay down, or `--no-anthropic` --
+  // nothing checks the name at all. `checkBareCollisions` keys owners by
+  // provider NAME, so an entry called `anthropic` collapses into the relay's
+  // identity and the guard reports no collision while the impostor sole-owns a
+  // Claude id. Nothing else here catches it either: the alias-collision rule
+  // above compares `aliases.get(k) !== p.name`, and two entries SHARING a name
+  // make that comparison equal, so duplicate names are exactly the case it
+  // cannot see (#25).
+  //
+  // IDENTITY IS PROVEN BY THE BASE URL MATCHING THE RELAY'S, NOT BY ONE BEING
+  // DECLARED. That is the same distinction buildProviders already draws when it
+  // puts the answering hostname in a picker row's description: a vault nickname
+  // is user-chosen and can be made to read as official, a hostname cannot.
+  //
+  // SO THE TEST IS `!==`, NOT `declared && !==`, AND AN ABSENT URL FAILS IT.
+  // Until 2026-09-07 the guard read `claimants[0].api_base_url && ... !== ...`,
+  // defended by a comment claiming "buildProviders sets one on every vault entry
+  // it emits, so a built impostor always takes the declared branch". That is
+  // FALSE: `resolveProtocol` returns `baseUrl: vaultProvider.baseUrl` unguarded,
+  // so a vault entry with `protocol: "openai"` and no `baseUrl` reaches
+  // `api_base_url: undefined` and the `&&` short-circuited the whole rule away.
+  // MEASURED: an impostor named `anthropic` with no base url produced 0 problems
+  // from V10 and 0 findings from checkBareCollisions — in exactly the relay-down
+  // configuration V10 exists for.
+  //
+  // "An entry with no base url answers nothing" was the other half of the same
+  // mistake. It does not need to answer: the harm is the NAME, and the four
+  // privileges below are granted on the name alone, before any request is made.
+  const relayName = ANTHROPIC_RELAY.name.toLowerCase();
+  const claimants = providers.filter((p) =>
+    String(p?.name ?? "").toLowerCase() === relayName);
+  // Named in full because "reserved name" alone tells an operator nothing about
+  // why renaming their provider is not optional -- the three dependents
+  // assertRelayNameUnclaimed names, plus the admission exemption it omits.
+  const reservedWhy = `checkBareCollisions keys owners by provider name and would collapse ` +
+    `it into the relay's identity (reporting no collisions while it sole-owns a Claude id), ` +
+    `orderNativePickerOptions would hoist its rows to the head of the /model menu, ` +
+    `validate()'s V3 exemption would excuse those rows from declaring behavesAs — which ` +
+    `lH() resolves to the maximal assumption set — and admitRemoteModels treats the name ` +
+    `as its \`trusted\` relay, exempting every id it advertises from the UW_ALIAS check, ` +
+    `so it alone could squat uw/ routing slots. Rename it in providers.json.`;
+  if (claimants.length > 1) {
+    problems.push(`${claimants.length} providers are named "${ANTHROPIC_RELAY.name}", ` +
+      `a name reserved for the relay: ${reservedWhy}`);
+  } else if (claimants.length === 1 &&
+             claimants[0].api_base_url !== ANTHROPIC_RELAY.api_base_url) {
+    const answersAt = claimants[0].api_base_url
+      ? `"${claimants[0].api_base_url}"` : `no declared base url`;
+    problems.push(`the provider named "${ANTHROPIC_RELAY.name}" answers at ` +
+      `${answersAt}, not at the relay's ` +
+      `"${ANTHROPIC_RELAY.api_base_url}", and that name is reserved for the relay: ` +
+      `${reservedWhy}`);
+  }
+
   return problems;
 }
 
@@ -418,6 +1823,36 @@ export function stripOneMSuffix(settings) {
     stripped += 1;
   }
   return stripped;
+}
+
+/**
+ * Claude Code's gateway model discovery: with this env var set it fetches
+ * `GET /v1/models` at every startup and writes the result to
+ * `cache/gateway-models.json`. UW routes thousands of models, so that cache
+ * reached 688 KB (~4,990 entries) and Claude Code's own startup processing of it
+ * took ~100 s of CPU against ~16 s without it. MEASURED 2026-09-09 via Claude
+ * Code's `[event-loop-stall]` diagnostic; re-confirmed 2026-09-29 (cache 868 KB,
+ * clean launch 10.4 s once the variable was gone).
+ *
+ * The feature is a pure cost here: `modelPicker.replaceBuiltInOptions: true`
+ * erases every discovered row, and UW carries its rows in `modelPicker.options[]`.
+ *
+ * WHY THIS IS A GUARD AND NOT A ONE-OFF EDIT: CCR owns the variable. Its claude-code
+ * profile defaults `env` to `{CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1"}`
+ * (`K0` in cli.js) and writes that into settings.json on every profile apply --
+ * i.e. on every `--target live` run. Hand-removing it (2026-09-09) held only until
+ * the next apply. Configuration cannot turn it off: Claude Code gates on raw
+ * truthiness (`if(!a.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY)`, so "0" is
+ * still ON) and CCR's env sanitizer drops empty values, then re-defaults "1".
+ * Removal after CCR's write is the only lever this repo owns.
+ *
+ * @returns {boolean} whether the variable was present and removed
+ */
+export const GATEWAY_DISCOVERY_ENV = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
+export function stripGatewayDiscovery(settings) {
+  if (!settings?.env || !(GATEWAY_DISCOVERY_ENV in settings.env)) return false;
+  delete settings.env[GATEWAY_DISCOVERY_ENV];
+  return true;
 }
 
 /**

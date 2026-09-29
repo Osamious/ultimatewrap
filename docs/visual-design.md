@@ -129,9 +129,29 @@ coloured instead, which carries the same information inside the width the
 columns already promise.
 
 **The favourite key is ctrl+f, not bare `f`.** The filter is live and owns every
-printable character: a user searching for `flash` types `f` first. `?` survives
-as a bare key precisely because `MODEL_ID_OK` excludes it, so a filter
-containing `?` could never match anything and the key costs the search nothing.
+printable character: a user searching for `flash` types `f` first. That much
+still holds.
+
+**The `?` binding's justification does not** *(revision 11, corrected against
+shipped source)*. This paragraph used to read: *"`?` survives as a bare key
+precisely because `MODEL_ID_OK` excludes it, so a filter containing `?` could
+never match anything and the key costs the search nothing."* Every clause of
+that is now false. D2 inverted admission from an allowlist to a denylist and
+`MODEL_ID_OK` no longer exists; `?` is not among the denied characters, so
+`admitId("gpt?4")` returns `"gpt?4"` *(measured)*. A `?`-bearing id can
+therefore exist, while `menu/pick-state.mjs` consumes `?` for the legend
+**before** the live filter ever sees it — so such a row is now **unfilterable**.
+
+The binding is not being changed here, and the fix is not designed here. What is
+recorded is that it now rests on nothing: either the binding moves to a control
+key (the `ctrl+f` reasoning above applies unchanged) or the filter gains a way
+to reach a `?`. **R18 should own it** — it is the task that opens
+`menu/pick-state.mjs`, `menu/style.mjs` and `test/pick-state.test.mjs` together,
+and it already reasons about `?`, the legend branch and modal dispatch order.
+
+**The same false claim is still live in source**, as the comment above the
+`? opens the legend overlay` test in `test/pick-state.test.mjs`. No
+documentation edit reaches it; R18 must correct it in the same pass.
 
 **Level 0 gains a sixth column** of six cells for the proportion bar. The five
 columns constraint 6 pins keep their widths and their order.

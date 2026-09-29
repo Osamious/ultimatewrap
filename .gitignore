@@ -47,3 +47,29 @@ supervise/supervise-state.json
 # object code, .pdb and .rlib. Discovered at Task A1 execution: `git add -A`
 # staged them because no rule here covered them.
 prior-art/uw-rust-tui/target/
+
+# OMC's own runtime state (project memory, mode state, wiki). Per-machine and
+# churns on its own schedule. It ships an inner .gitignore, but that does not
+# stop the parent tree from offering the directory to `git add -A`.
+.omc/
+
+# Full clone of deepseek-ai/deepseek-harness, read at source for report 19's
+# counterfactual. 102 MB / 9,080 files of someone else's repository; the report
+# cites it by file:line and the clone is one `git clone` away if needed again.
+spike/dsh-src/
+
+# Raw research dumps behind reports 16 and 18: models.dev and litellm catalogue
+# snapshots plus scraped env-var/error references, 8 MB total. Re-fetchable, and
+# the conclusions drawn from them live in research/phase6/.
+spike/research/
+
+# Console-input experiment scripts for report 17 §4.2 (AttachConsole +
+# WriteConsoleInput). That path was investigated and deliberately NOT adopted —
+# it would cross UW's own never-auto-submit boundary. The design is recorded in
+# the report; the scripts stay local so the repo does not ship keystroke-delivery
+# tooling for an approach nobody chose.
+spike/acw/
+
+# Stdout/stderr capture from statusline shim runs.
+spike/shim.out
+spike/shim.err

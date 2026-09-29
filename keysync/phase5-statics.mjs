@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { listSettingsBackups } from "./safety.mjs";
 
 const LIVE_SETTINGS = path.join(os.homedir(), ".claude", "settings.json");
 
@@ -77,18 +78,26 @@ const rows = settings.modelPicker?.options ?? [];
 
 // ---- T1.4 a restore point exists and is actually usable --------------------
 {
-  const dir = path.dirname(LIVE_SETTINGS);
-  const base = `${path.basename(LIVE_SETTINGS)}.uw-backup-`;
-  const backups = fs.readdirSync(dir).filter((f) => f.startsWith(base)).sort().reverse();
+  // Ordered by parsed timestamp through the SAME helper retention uses. This
+  // used to be a verbatim copy of retention's `.sort().reverse()`, which selects
+  // the wrong file across the two stamp formats — so it would report a stale
+  // backup as the usable restore point while the run had just deleted the real
+  // one. A checker that confirms a rollback path which does not exist is worse
+  // than no checker.
+  const { dated, undatable } = listSettingsBackups(LIVE_SETTINGS);
   let usable = false, detail = "no backup found";
-  if (backups.length) {
+  if (dated.length) {
+    const newest = dated[0];
     try {
-      const b = JSON.parse(fs.readFileSync(path.join(dir, backups[0]), "utf8").replace(/^﻿/, ""));
+      const b = JSON.parse(fs.readFileSync(newest.path, "utf8").replace(/^﻿/, ""));
       // A backup that parses but has no picker is not a restore point.
       usable = (b.modelPicker?.options?.length ?? 0) > 0;
-      detail = `${backups[0]} parses, ${b.modelPicker?.options?.length ?? 0} rows`;
-    } catch (e) { detail = `${backups[0]} does NOT parse: ${e.message.slice(0, 60)}`; }
+      detail = `${newest.name} parses, ${b.modelPicker?.options?.length ?? 0} rows`;
+    } catch (e) { detail = `${newest.name} does NOT parse: ${e.message.slice(0, 60)}`; }
   }
+  // Undatable backups are excluded from the ordering, so say so rather than
+  // letting the operator assume every file present was considered.
+  if (undatable.length) detail += ` (${undatable.length} backup(s) with an unrecognised stamp ignored)`;
   record("T1.4", "a newest settings backup exists and is restorable", usable, detail, true);
 }
 

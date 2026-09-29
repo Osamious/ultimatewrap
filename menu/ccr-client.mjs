@@ -175,10 +175,25 @@ export async function rpc(method, args = [], opts = {}) {
   } catch { return undefined; }      // no answer at all
 }
 
+// Both levels are shape-checked, and the two failures are not the same failure.
+// `rpc` never throws -- it returns undefined on no answer -- so what reaches here
+// is a well-formed HTTP response carrying a malformed body, which is the case
+// nothing upstream is looking for.
+//
+//   {Providers: 5}  threw `TypeError: number 5 is not iterable`, which escapes
+//                   into the picker's startup path as a crash, not a blank stamp.
+//   {models: "ab"}  was WORSE because it was silent: a STRING IS ITERABLE, so
+//                   for..of walked it per character and produced the routing
+//                   targets `x/a` and `x/b`. Every real target then reads as
+//                   unroutable and the whole menu dims. Array.isArray is what
+//                   separates a list of ids from a string that looks like one.
 export function routableFromConfig(cfg) {
   const set = new Set();
-  for (const p of cfg?.Providers ?? []) {
-    for (const m of p?.models ?? []) set.add(`${p.name}/${m}`);
+  const providers = cfg?.Providers;
+  if (!Array.isArray(providers)) return set;
+  for (const p of providers) {
+    if (!Array.isArray(p?.models)) continue;
+    for (const m of p.models) set.add(`${p.name}/${m}`);
   }
   return set;
 }

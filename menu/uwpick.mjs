@@ -54,6 +54,13 @@ export function firstFrame({ snap, recents, favourites, caps, termRows }) {
     // picker asks nobody anything; it prints the stamp so the user can see how
     // old the dim state is rather than assuming it is live.
     routableAsOf: snap.routableAsOf ?? null,
+    // R15/R16: same reasoning, same failure shape (B3/OQ-4) this file's own
+    // comment already names for `routableAsOf` -- a field the renderer reads
+    // and nobody writes renders a permanent, indistinguishable-from-broken
+    // dash. `meta` is a fixed literal built here, not derived from `snap`
+    // downstream, so adding the field to the snapshot (R15) without adding it
+    // HERE would have shipped a header reading `undefined` on every row.
+    discoveredAsOf: snap.discoveredAsOf ?? null,
   };
   return { state, meta, text: screen(view(state), meta, { caps }) };
 }
@@ -65,6 +72,12 @@ export function failMessage(res) {
   return `uwpick: snapshot unreadable (${res.detail}) — ${fix}`;
 }
 
+// NO keysync state file is read here, and that is the design rather than an
+// omission. An earlier revision of the Anthropic-catalog work added a banner fed
+// by `~/.uw/state/new-anthropic-models.json`; the native picker now shows every
+// live Anthropic id, so "new id detected, not added" no longer describes
+// anything, and the coupling was removed with it. uwpick's whole input remains
+// the pre-built catalogue snapshot.
 export function framesFor(kind, lines, opts) {
   if (!opts.motion) return [lines];
   if (kind === "enter") return slideFrames(lines, 6, 3);
@@ -159,6 +172,17 @@ export function main() {
     }
   };
   const draw = () => {
+    // COLUMNS AS WELL AS ROWS. `caps.cols` was read once at startup and never
+    // again, which was harmless while the frame was a fixed 78 and is not now:
+    // widening the terminal would leave the frame at its launch width until the
+    // picker was restarted. Same cadence as the row re-read beside it -- there is
+    // no event loop here to hang a `resize` listener on, so both are refreshed on
+    // the keystroke that triggers the redraw.
+    //
+    // Mutated rather than rebuilt: `glyphsFor`/`painter`/`motionEnabled` were
+    // resolved from this object at startup and a fresh `detectCaps` would leave
+    // them pointing at the old one.
+    caps.cols = out.columns ?? caps.cols;
     state = reduce(state, { resize: out.rows || 30 }).state;
     paint(out, lines());
   };
@@ -183,7 +207,7 @@ export function main() {
 
   // Selection only. Every non-selection path goes through abort(), which
   // truncates the buffer and exits non-zero (Q2.1, Q2.3a).
-  const finish = (target) => {
+  const finish = (target, routable) => {
     let wrote = false;
     try {
       fs.writeFileSync(FILE, modelCommand(...target.split(/\/(.*)/s)));
@@ -197,7 +221,17 @@ export function main() {
     }
     // Q3.3: the frame collapses to one line, which is what the user is left
     // looking at for the instant before Claude Code repaints.
-    out.write(CLEAR + SHOW + confirmLine(target, g, p) + "\n");
+    //
+    // #48, "surface, do not block": the selection above already went through
+    // unconditionally -- this only adds a second line when the picker itself
+    // knew, at build time, that CCR had no route for this id. `routable` is
+    // `false` (known dead), `true` (known live) or `null`/`undefined`
+    // (never resolved, e.g. the gateway did not answer that build) -- only
+    // the first warns; D9 forbids treating "unknown" as "dead".
+    const warn = routable === false
+      ? `\n${p.dim(`not in CCR's routing table as of ${loaded.snap.routableAsOf ?? "unknown"}; it may not respond`)}`
+      : "";
+    out.write(CLEAR + SHOW + confirmLine(target, g, p) + warn + "\n");
     recordHandoff({ argv2: FILE ?? null, existed: !!FILE && fs.existsSync(FILE), wrote });
     process.exit(CONTRACT.handoff.acceptExit);      // 0: CC accepts the content
   };
@@ -268,7 +302,7 @@ export function main() {
       if (exited.target) {
         recordRecent(exited.target);
         run("select", view(state).cursor - view(state).top + 4);
-        finish(exited.target);
+        finish(exited.target, exited.routable);
       }
       quit("esc-or-ctrl-c");
     }

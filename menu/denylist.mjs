@@ -37,7 +37,13 @@
 // WHERE IT IS CALLED:
 //   1. keysync.mjs:buildProviders  -- routing. Sanitisation and `uw/`.
 //   2. menu/catalog.mjs:buildFrom  -- display. Same two rules.
-//   3. refresh/tiers.mjs           -- ingest (Task B6). Same two rules.
+// A third entry named a module in a planned `refresh/` tree that was never
+// built (Task B6, plans/phase6-menu-and-catalogue.md:289), stated in the present
+// tense as if it already called this. Removed 2026-09-06 for the same reason the
+// sibling claim in catalog.mjs was: a list of callers that names one nobody wrote
+// is read as evidence a wire exists, and that is precisely how the routability
+// wire stayed missing through two design reviews. When the ingest path is built
+// it can add its own line.
 //
 // A large share of the 44 providers are small aggregator hosts with no
 // meaningful security assurance -- routllm.pro, seekai.cc, tabitoken.com,
@@ -46,7 +52,7 @@
 // sanitise every id and to show the answering hostname on every row -- not a
 // reason to refuse the models they sell.
 
-import { admitId } from "./sanitize.mjs";
+import { admitId, classifyRefusal, sanitizeDisplay } from "./sanitize.mjs";
 
 // Anchored. The trailing group means "opus" and "opus-4-8" match while
 // "opusculum" and "hakuna" do not -- the boundary must be a separator, a digit,
@@ -100,6 +106,20 @@ export const UW_ALIAS = /^uw\//i;
 // resolver both read it, which is why it is exported.
 export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.test(String(id ?? ""));
 
+// THE ONLY CONSTRUCTOR OF A REJECTION, so the sanitised form is the only form
+// that exists past this point (#52). There is deliberately no second field
+// holding the raw string "for debugging": that is not a smaller version of the
+// egress, it IS the egress, relocated.
+//
+// `Math.max(0, ...)` is not defensive padding. NFC can LENGTHEN a string in the
+// composition-exclusion cases (U+0958 and its family decompose to two code
+// points and do not recompose), so the delta is genuinely signed, and a negative
+// "removed" count in a security list would read as nonsense.
+const refusal = (raw, reason) => {
+  const id = sanitizeDisplay(raw);
+  return { id, reason, removed: Math.max(0, [...String(raw ?? "")].length - [...id].length) };
+};
+
 /**
  * @param {string}   providerName
  * @param {string[]} ids
@@ -116,24 +136,90 @@ export const isReserved = (id) => RESERVED.test(String(id ?? "")) || UW_ALIAS.te
  *                  rejections across all 4,298 bundled ids today, so this is
  *                  latent -- but it goes live with Task B6, where discovery
  *                  returns raw provider strings instead of a curated bundle.
- * @returns {{kept: string[], rejected: string[]}}
+ * @returns {{kept: string[], rejected: {id: string, reason: string, removed: number}[]}}
+ *                  `rejected` holds the DISPLAY-SAFE form of each refused name,
+ *                  never the raw one, plus the reason code (#51) and `removed`.
+ *
+ *                  `removed` is the NET code-point delta between the raw name and
+ *                  its display form -- stripping, NFC normalisation and the
+ *                  80-code-point cap measured together, not a count of stripped
+ *                  characters. All three are ways what was advertised differs
+ *                  from what would be shown, which is what a future reader of a
+ *                  withheld list would need told; but because NFC can LENGTHEN a
+ *                  string (U+0958 and its composition-exclusion family), the
+ *                  three can offset each other. MEASURED: raw `"\x07क़"`
+ *                  reports `removed: 0` with the BEL genuinely stripped, the
+ *                  clamp having absorbed a -1/+1 cancellation. So `removed > 0`
+ *                  means the forms differ in length; `removed === 0` does NOT
+ *                  mean nothing was stripped, and no caller may read it that way.
+ *                  The reason code, not this number, is what says why a name was
+ *                  refused.
+ *
+ * THE BOUNDARY OF THIS GUARANTEE, stated because the claim is what makes it
+ * dangerous (#24). One safe representation means this path cannot acquire a new
+ * hole when someone adds the next consumer -- and that is true of THIS path
+ * only. `keysync/anthropic-catalog.mjs` feeds relay ids into `deriveAnthropicSets`
+ * -> `Providers[].models` without calling `admitId` or `admitRemoteModels` at
+ * all. That is #24, it is not covered here, and the risk this note exists to
+ * defuse is that a completeness framing makes the second path harder to notice
+ * afterwards than it is today.
  */
 export function admitRemoteModels(providerName, ids, { trusted = "anthropic", warn = true } = {}) {
   const kept = [], rejected = [];
   const exempt = providerName === trusted;
   for (const raw of ids ?? []) {
     const id = admitId(raw);
-    if (!id) { rejected.push(String(raw)); continue; }
+    // SANITISED AT THE PRODUCER, NOT AT THE CONSUMER (#52). The obvious place
+    // for this is the console.warn below, and it is the wrong place: it leaves
+    // the raw string sitting in `rejected` for any future reader to print, and
+    // the whole finding is that a refused name reaches a terminal.
+    //
+    // WHY THIS CHANNEL IS NOW HOSTILE-ONLY. Before the denylist inversion, a
+    // rejection was dominated by benign real ids the allowlist happened to
+    // refuse -- 16 of them, measured, mostly leading-`~` aliases. After the
+    // inversion an id can only be refused by one of the named rules in
+    // `admitId`, and three of those -- ESC_SEQ, CTRL, INVISIBLE -- ARE the
+    // terminal-attack classes. So "this string was rejected" went from weak
+    // evidence of hostility to strong evidence of it, and it is printed
+    // verbatim on ordinary stderr by the routing path in `keysync.mjs`.
+    //
+    // MEASURED: `admitRemoteModels("tabiai", ["evil\x1b[2J\x1b]52;c;aGk=\x07"])`
+    // put 2 ESC and 1 BEL into the warn line, and `\x1b]52;c;<base64>\x07` is
+    // OSC 52 -- a clipboard write. A provider listing could put content into
+    // the operator's clipboard THROUGH the warning that refused it.
+    //
+    // Both branches go through `refusal`, so the invariant is a property of the
+    // array rather than of the caller's discipline. `sanitizeDisplay`'s
+    // 80-code-point cap is accepted here: a rejected name is by definition not a
+    // routing selector, so its exact length is not load-bearing, and an
+    // unbounded provider string in a security line is itself a way to flood a
+    // terminal. What the cap costs is now stated rather than swallowed -- it is
+    // part of `removed`.
+    if (!id) { rejected.push(refusal(raw, classifyRefusal(raw))); continue; }
     // RULE 2. This line was `if (!exempt && isReserved(id))`. `isReserved` is
     // still exported and still true for Claude names -- it is now consumed by
     // the collision guard, which can see the ownership this loop cannot. Do not
     // reinstate it here: doing so drops every model tabiai and gorouter sell.
-    if (!exempt && UW_ALIAS.test(id)) { rejected.push(id); continue; }
+    // `uw-namespace` is the one reason `classifyRefusal` cannot produce: this id
+    // PASSED `admitId`, and whether it is refused depends on `providerName`,
+    // which sanitize.mjs never sees. Named here, at the branch that owns it.
+    if (!exempt && UW_ALIAS.test(id)) { rejected.push(refusal(id, "uw-namespace")); continue; }
     kept.push(id);
   }
   if (warn && rejected.length) {
-    console.warn(`SECURITY: provider "${providerName}" advertised ${rejected.length} ` +
-      `rejected model name(s): ${rejected.slice(0, 10).join(", ")}`);
+    // THE PROVIDER NAME IS PROVIDER-CONTROLLED TOO (#52). Every `r.id` on this
+    // line is display-safe because `refusal` is the only constructor of a
+    // rejection -- but the name interpolated beside them arrived from the same
+    // untrusted config and had, until this line existed, no such guarantee.
+    // MEASURED: a providerName carrying `\x1b[2J\x1b]52;c;<b64>\x07‮` put a
+    // real screen-clear and an OSC-52 clipboard write onto stderr THROUGH the
+    // warning that refused its models. Same class as the ids, same line, same
+    // fix. Sanitised HERE, at the point of display, and deliberately not at the
+    // top of the function: `exempt` above compares the RAW name against
+    // `trusted`, and normalising before that comparison would let a name that
+    // merely sanitises to "anthropic" inherit the relay's `uw/` exemption.
+    console.warn(`SECURITY: provider "${sanitizeDisplay(providerName)}" advertised ${rejected.length} ` +
+      `rejected model name(s): ${rejected.slice(0, 10).map((r) => r.id).join(", ")}`);
   }
   return { kept, rejected };
 }

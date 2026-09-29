@@ -5,6 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 // One fixed location, deliberately NOT the keysync directory and NOT %TEMP%
@@ -97,53 +98,195 @@ export function deleteStaleWifToken(configDir, profileId) {
   return file;
 }
 
+// Date.UTC ROLLS OVER out-of-range components (month 13 becomes next January)
+// instead of failing, so a garbage stamp would otherwise parse to a plausible
+// wrong date — and a stamp misdated into the future is exactly the file that
+// would then be protected as "newest" while the real backup was pruned.
+// Round-trip every component and reject anything that did not survive intact.
+const utcExact = (y, mo, d, h, mi, s, ms = 0) => {
+  const t = Date.UTC(y, mo - 1, d, h, mi, s, ms);
+  const dt = new Date(t);
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d
+    && dt.getUTCHours() === h && dt.getUTCMinutes() === mi && dt.getUTCSeconds() === s
+    && dt.getUTCMilliseconds() === ms ? t : null;
+};
+
+// The two stamp formats that coexist on disk. BOTH must stay parseable: the only
+// settings backup on a live machine can be the legacy compact one, and a fix that
+// stopped recognising it would orphan the user's sole rollback point — worse than
+// the bug. run.mjs writes only the hyphenated form, so there is nothing to unify
+// at the write site; this is a read-side compatibility shim for what already exists.
+const STAMP_FORMATS = [
+  // `new Date().toISOString().replace(/[:.]/g, "-")` — run.mjs:1269.
+  [/^(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
+    (m) => utcExact(+m[1], +m[2], +m[3], +m[4], +m[5], +m[6], +m[7])],
+  // ISO basic form, no separators, second precision (e.g. 20260905T090726).
+  // Read as UTC: it carries no zone, and consistency matters more than the
+  // absolute value since it is only ever compared against other stamps.
+  [/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/,
+    (m) => utcExact(+m[1], +m[2], +m[3], +m[4], +m[5], +m[6])]
+];
+
+/** Epoch ms for a backup stamp, or null if it is not a stamp we recognise. */
+export function parseBackupStamp(stamp) {
+  for (const [re, toMs] of STAMP_FORMATS) {
+    const m = re.exec(String(stamp));
+    if (m) return toMs(m);
+  }
+  return null;
+}
+
+/**
+ * Every settings backup, ordered by PARSED timestamp — the single ordering used
+ * by both retention and the phase 5 "a restore point exists" check. A lexical
+ * sort is NOT chronological across the two stamp formats: at offset 4 it compares
+ * "-" (0x2D) against a digit (0x30+), so every hyphenated stamp sorts below every
+ * compact one regardless of date. `.sort().reverse()` therefore kept a Sep 5
+ * backup and deleted the one the current run had just written.
+ *
+ * Stamps we cannot date are returned SEPARATELY, and are deliberately treated as
+ * neither newest nor oldest: they are never pruned (deleting a file we cannot
+ * date is the destructive direction of the error) and never offered as the newest
+ * restore point (presenting a file we cannot date as current is the misleading
+ * one). They only arise from hand-made copies, so they do not accumulate on their
+ * own; the caller may surface the count.
+ *
+ * `capFailedSnapshots` shares this PARSER and deliberately inverts this POLICY —
+ * a config snapshot full of provider keys is a file you want gone, not kept. Read
+ * the comment there before unifying the two.
+ */
+export function listSettingsBackups(settingsFile) {
+  const dir = path.dirname(settingsFile);
+  const base = `${path.basename(settingsFile)}.uw-backup-`;
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return { dated: [], undatable: [] }; }
+
+  const dated = [], undatable = [];
+  for (const name of names) {
+    if (!name.startsWith(base)) continue;
+    const entry = { name, path: path.join(dir, name) };
+    const at = parseBackupStamp(name.slice(base.length));
+    if (at === null) undatable.push(entry);
+    else dated.push({ ...entry, at });
+  }
+  dated.sort((a, b) => b.at - a.at); // newest first
+  return { dated, undatable };
+}
+
 /**
  * Retention. The config snapshot carries every provider key, so it goes as soon
  * as the write is verified. The settings backup carries no provider keys (only
  * an apiKeyHelper path and env vars), and it is the user's rollback path, so the
- * most recent one is kept and older ones pruned.
+ * most recent few are kept and older ones pruned.
+ *
+ * keepSettings is 5, not 1 (report 08 F4). With one backup, two bad runs destroy
+ * the last good copy: the second run's backup replaces the first, so if the first
+ * apply broke something and the second ran before anyone noticed, there is
+ * nothing left to roll back to. Keysync is a REPEATED writer now rather than an
+ * operator-run command, which makes that sequence scheduled rather than
+ * hypothetical. The cost is a handful of small JSON files carrying no provider
+ * keys — asymmetric in the obvious direction.
  */
-export function retainOnSuccess({ snapshot, settingsFile, keepSettings = 1 }) {
+export function retainOnSuccess({ snapshot, settingsFile, keepSettings = 5 }) {
   const removed = [];
   if (snapshot && fs.existsSync(snapshot)) { fs.rmSync(snapshot, { force: true }); removed.push(snapshot); }
 
-  const dir = path.dirname(settingsFile);
-  const base = `${path.basename(settingsFile)}.uw-backup-`;
-  const backups = fs.readdirSync(dir).filter((f) => f.startsWith(base)).sort().reverse();
-  for (const stale of backups.slice(keepSettings)) {
-    fs.rmSync(path.join(dir, stale), { force: true });
-    removed.push(path.join(dir, stale));
+  // Ordered by parsed timestamp, never by string sort — see listSettingsBackups.
+  // The newest backup is never the one deleted.
+  const { dated } = listSettingsBackups(settingsFile);
+  for (const stale of dated.slice(keepSettings)) {
+    fs.rmSync(stale.path, { force: true });
+    removed.push(stale.path);
   }
   return removed;
 }
 
-/** Cap what survives a FAILED run, so a rotated-out key cannot linger forever. */
-export function capFailedSnapshots(max = 2) {
-  if (!fs.existsSync(BACKUP_DIR)) return [];
-  const files = fs.readdirSync(BACKUP_DIR)
-    .filter((f) => f.startsWith("config-"))
-    .sort().reverse();
+/**
+ * Cap what survives a FAILED run, so a rotated-out key cannot linger forever.
+ *
+ * Orders by the SAME parser as the settings backups, and deliberately by the
+ * OPPOSITE undatable policy. The asymmetry is the point, and it follows from
+ * what each kind of file contains:
+ *
+ *   settings backup   a rollback point, no provider keys. Keeping one too long
+ *                     is harmless; deleting one is the destructive error — so an
+ *                     undatable stamp is NEVER pruned (see listSettingsBackups).
+ *   config snapshot   every provider API key, in one file. Deleting one is
+ *                     harmless (the run already failed and the live DB is
+ *                     untouched); keeping one too long is the risk — so an
+ *                     undatable stamp is pruned FIRST, being precisely the file
+ *                     whose age cannot be established.
+ *
+ * Do NOT unify these two policies. Sharing the parsing is correct; sharing the
+ * policy either strands key material on disk indefinitely or deletes the user's
+ * only rollback point.
+ *
+ * `dir` is injectable so tests never touch the real backup directory.
+ */
+export function capFailedSnapshots(max = 2, dir = BACKUP_DIR) {
+  if (!fs.existsSync(dir)) return [];
+  const dated = [], undatable = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.startsWith("config-")) continue;
+    // config-<stamp>.sqlite, or .sqlite.dpapi once DPAPI-encrypted.
+    const at = parseBackupStamp(name.slice("config-".length).replace(/\.sqlite(\.dpapi)?$/, ""));
+    if (at === null) undatable.push(name); else dated.push({ name, at });
+  }
+  dated.sort((a, b) => b.at - a.at); // newest first
+  // Undatable rank LAST, so they are the first candidates for pruning. Total kept
+  // is still `max` — ranking them low never keeps more files than before.
+  const ranked = [...dated.map((d) => d.name), ...undatable];
+
   const removed = [];
-  for (const stale of files.slice(max)) {
-    fs.rmSync(path.join(BACKUP_DIR, stale), { force: true });
+  for (const stale of ranked.slice(max)) {
+    fs.rmSync(path.join(dir, stale), { force: true });
     removed.push(stale);
   }
   return removed;
 }
 
+/**
+ * Restore settings.json from a backup.
+ *
+ * TWO DISTINCT FAILURE MODES, reported separately, because they call for
+ * opposite operator responses: "no-backup" means nothing was attempted and no
+ * rollback point exists, while "restore-failed" means the backup is intact and
+ * still worth copying by hand. The old bare `false` collapsed them, and the
+ * caller's single message named the backup path in both — sending an operator to
+ * a file that is not there.
+ *
+ * Returns { ok: true, path } | { ok: false, reason, detail }. A `path` is present
+ * ONLY on success, so a caller cannot name a path that was never written.
+ */
 export function restoreSettings(backup, settingsFile) {
-  if (!backup || !fs.existsSync(backup)) return false;
+  if (!backup || !fs.existsSync(backup)) {
+    return {
+      ok: false, reason: "no-backup",
+      detail: backup
+        ? "the backup file does not exist (never written this run, or removed since)"
+        : "no backup path was recorded for this run"
+    };
+  }
   // Restore via temp + rename for the same reason the forward write does: this
   // path runs precisely when something has already failed, and a crash midway
   // through a truncate-and-overwrite leaves a file worse than either version.
   const tmp = `${settingsFile}.uw-restore-${process.pid}`;
+  const short = (m) => String(m).slice(0, 100);
   try {
     fs.copyFileSync(backup, tmp);
     fs.renameSync(tmp, settingsFile);
-    return true;
+    return { ok: true, path: settingsFile };
   } catch (e) {
     fs.rmSync(tmp, { force: true });
-    try { fs.copyFileSync(backup, settingsFile); return true; } catch { return false; }
+    try {
+      fs.copyFileSync(backup, settingsFile);
+      return { ok: true, path: settingsFile };
+    } catch (e2) {
+      return {
+        ok: false, reason: "restore-failed",
+        detail: `atomic restore failed (${short(e.message)}); direct copy also failed (${short(e2.message)})`
+      };
+    }
   }
 }
 
@@ -222,6 +365,60 @@ const stable = (v) => {
   }
   return v;
 };
+
+// ---- settings.json integrity across the rewrite (#7 / report 08 F4) --------
+
+/**
+ * The keys whose silent loss has NO visible symptom. Losing `autoMode.environment`
+ * while `permissions.defaultMode` stays "auto" removes the policy governing
+ * auto-approval and nothing anywhere reports it. List is report 08 F4's, verbatim.
+ */
+export const SECURITY_CRITICAL_KEYS = [
+  "permissions", "hooks", "enabledPlugins", "extraKnownMarketplaces",
+  "statusLine", "apiKeyHelper", "autoMode", "skillOverrides",
+  "skipDangerousModePermissionPrompt", "skipAutoPermissionPrompt"
+];
+
+/** The ONLY top-level keys keysync may add, change or remove. */
+export const KEYSYNC_OWNED_KEYS = ["modelPicker", "model"];
+
+// stable() sorts object keys but preserves array order, so a benign re-ordering
+// of an object is not reported as a modification while a reordered `hooks` array
+// — which changes execution order — still is.
+const digest = (v) =>
+  crypto.createHash("sha256").update(JSON.stringify(stable(v) ?? null)).digest("hex").slice(0, 16);
+
+/**
+ * Assert that a settings.json rewrite changed only what keysync owns.
+ *
+ * The pre-existing post-write check is presence-only on three fields while
+ * settings.json carries twenty, so nineteen keys could vanish silently. This
+ * REJECTS rather than warns: moving from an operator-run command to a schedule
+ * removes the human who would have noticed the warning.
+ *
+ * Throws on any drift. The caller's catch restores settings.json from the backup.
+ */
+export function assertSettingsInvariants(before, after, { owned = KEYSYNC_OWNED_KEYS } = {}) {
+  const ownedSet = new Set(owned);
+  const problems = [];
+
+  for (const k of Object.keys(before)) {
+    if (!(k in after) && !ownedSet.has(k)) problems.push(`key "${k}" LOST`);
+  }
+  for (const k of SECURITY_CRITICAL_KEYS) {
+    // A dropped key is already reported as LOST; this is the subtler case where
+    // the key survives and its contents were rewritten.
+    if (!(k in before) || !(k in after)) continue;
+    if (digest(before[k]) !== digest(after[k])) problems.push(`security-critical key "${k}" MODIFIED`);
+  }
+  for (const k of Object.keys(after)) {
+    if (!(k in before) && !ownedSet.has(k)) problems.push(`unexpected new key "${k}"`);
+  }
+
+  if (problems.length) {
+    throw new Error(`post-write settings integrity check failed: ${problems.join("; ")}`);
+  }
+}
 
 // Only the provider fields keysync sets. MEASURED: CCR normalizes and enriches
 // persisted providers with additional fields, so comparing a freshly built
@@ -352,6 +549,12 @@ export function otherClaudeSessions() {
  */
 export function atomicWriteJson(file, obj) {
   const tmp = `${file}.uw-tmp-${process.pid}`;
+  // The temp file is written NEXT TO the target, so a missing parent directory
+  // fails the write rather than the rename -- and the caller sees ENOENT for a
+  // path it just constructed. settings.json's directory always exists; a state
+  // file under ~/.uw/state/ on a fresh machine does not, and assuming otherwise
+  // is the kind of thing that only breaks for a first-time user.
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }); } catch { /* the write below reports it */ }
   let acl = null;
   if (fs.existsSync(file)) {
     try { acl = ps(`(Get-Acl -LiteralPath '${psQuote(file)}').Sddl`).trim(); } catch { /* best effort */ }

@@ -18,6 +18,12 @@
     { "provider": "acme", "model": "acme-legacy-1",
       "capabilities": {},
       "pricing": { "inputPerMillion": 0, "outputPerMillion": 0 } },
+
+    { "provider": "acme", "model": "acme-free-1",
+      "modalities": { "input": ["text"], "output": ["text"] },
+      "capabilities": {},
+      "pricing": { "offers": [ { "provider": "acme", "per1MTokens": { "input": 0, "output": 0 } },
+                               { "provider": "acme", "per1MTokens": { "input": 0.1, "output": 0.3 } } ] } },
     { "provider": "blank", "model": "blank-a", "capabilities": {} },
     { "provider": "blank", "model": "blank-b", "capabilities": {} },
 

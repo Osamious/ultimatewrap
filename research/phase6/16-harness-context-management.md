@@ -437,6 +437,64 @@ advertised a context length, Claude Code would ignore it.
 
 ---
 
+## Addendum (2026-09-05): Anthropic rows are no longer static, new mechanism confirmed
+
+Written after shipping dynamic `[1m]` tagging for UW's Anthropic subscription rows
+(`claude-sub-models` branch) and a follow-up capability investigation. Updates sections 9
+and 10; does not change sections 1-8 or 11's recommendations, which stand unchanged.
+
+- **The "4 Anthropic relay rows, hardcoded null" in section 9 is stale.** Shipped this
+  session: `[1m]` tags are computed live from Anthropic's real `/v1/models`
+  `max_input_tokens` field (the relay is a confirmed pure passthrough), refreshed on every
+  `keysync run`. Row count is whatever Anthropic currently serves — 11 at last
+  measurement, not a static 4, and no longer hand-tagged. `hud-shim`'s exclusion of these
+  rows is now correct for a stronger reason than before: Claude Code computes their window
+  correctly natively via the `[1m]` marker, so there is nothing left for the shim to fix.
+
+- **New mechanism: Claude Code's catalog matcher canonicalizes by substring, not exact or
+  prefix match.** `Xh(e)` lowercases the id and checks `e.includes("claude-opus-5")`, etc.,
+  falling back to stripping a trailing `-\d{8}` date suffix. A provider-prefixed,
+  `[1m]`-suffixed id such as `anthropic/claude-opus-5[1m]` therefore resolves to the
+  correct baked-catalog entry WITHOUT `behavesAs` — confirmed empirically, not just from
+  source: a row with no `behavesAs` is still selectable in `/model`, and CC filters any
+  `"unknown"`-status row out of that list entirely, so visibility itself is proof of
+  correct resolution. `[1m]`/`[2m]` decoration is also stripped before this match, and
+  dated ids (`claude-opus-4-5-20251101`) canonicalize to their family via the same rule.
+
+- **`behavesAs` is a strict fallback, only consulted when a row is otherwise unrecognized**
+  (`isKnown(id)` false) — not a general override, and not reachable at all for a row `Xh`
+  already resolves. For the 83 non-Anthropic rows it is load-bearing precisely because
+  their ids never match `Xh`'s Claude-shaped substring rules; there is no way to phrase a
+  non-Anthropic id so Claude Code recognizes it without either `behavesAs` or the launch
+  warning it exists to suppress.
+
+- **Capability fields split cleanly from context, same ceiling for the gated ones.**
+  Confirmed separately this session: Claude Code never reads Anthropic's API-reported
+  `capabilities` object at all — the fetch path that would parse it is dead code in the
+  build read, and its own schema strips `capabilities` even when live. Of the API's nine
+  fields, six (`pdf_input`, `image_input`, `batch`, `citations`, `code_execution`,
+  `structured_outputs`) have no client-side gate whatsoever — already fully dynamic
+  through any pure-passthrough relay, no engineering needed. The remaining three
+  (`effort`, `thinking`, `context_management`) are gated through the SAME baked catalog as
+  the context window, so they carry the identical ceiling this section documents: correct
+  and auto-updating for the dynamically-tagged Anthropic rows, frozen at whatever
+  `claude-sonnet-4-6` was baked as for the 83 `behavesAs` rows, for the same reason context
+  is.
+
+- **`run.mjs:869` still strips `contextTokens` before writing `modelPicker.options`,
+  confirmed present as of 2026-09-05** (current line number; untouched by this session's
+  Anthropic-specific work, which runs through a different code path). Section 11's
+  recommendation to stop doing this is unaffected and still open.
+
+- **An investigation was in flight as this addendum was written**, chasing whether this
+  section's "unreachable inside Claude Code" conclusion has a genuine loophole —
+  specifically whether the window-resolver is re-evaluated fresh per model on every check
+  (which would mean the `[1m]`/catalog branches already track a live switch, and only the
+  env-var branch is frozen), whether the env-var read is a live `process.env` reference or
+  a startup snapshot, and whether `behavesAs` could bucket the 83 rows across the baked
+  catalog's several distinct real windows (some 1M, some 200k) instead of one blanket
+  value. Results were not yet in when this addendum was written; expect a further update.
+
 ## 11. What transfers to UW regardless
 
 Even with the Claude Code ceiling in place, most of this survey applies to UW's own picker,

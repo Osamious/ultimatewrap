@@ -131,6 +131,30 @@ Gate on **two** conditions: a coverage floor, and **zero `unsupported-shape`**.
 A shape we cannot parse is a defect and must fail the run; it must not be
 absorbed into the denominator as though it were a provider's own limitation.
 
+> **SUPERSEDED, 2026-09-07 — the run-wide `unsupported-shape === 0` gate was
+> deliberately not implemented, and this paragraph is kept for the reasoning
+> rather than the rule.**
+>
+> The plan supersedes it: a shape we cannot parse must not discard the records of
+> the 43 providers that answered correctly. R8 ships the distinction the paragraph
+> above is really asking for — `empty` and `unsupported-shape` stay separate
+> outcomes, `unsupported-shape` records the top-level keys it actually saw, and
+> `coverageOf` excludes `no-endpoint` from the denominator — **without** letting one
+> provider's unrecognised envelope fail a run of 44 authenticated requests. The
+> per-record write path in `refresh/cli.mjs` makes "a partial run retains its cache"
+> true, which a run-wide gate would undo.
+>
+> The sentiment survives as a *report*, not a gate: the CLI prints how many
+> providers returned a shape the parser does not read, and says to re-run only
+> those after adding an envelope candidate.
+>
+> **Measured on R10's first acceptance sweep:** 40 `ok`, 2 `auth` (`xai` 403,
+> `indeedwebid` 401 — see #89), 2 `empty` (`tabiai`, `gorouter`, both HTTP 200 with
+> an empty list, exactly as predicted), **0 `unsupported-shape`**, 3,745 models kept
+> of 3,745 listed, 0 refused by the sanitiser, 44 of 44 records cached. The gate
+> would have passed. It was still right not to build it, because passing on one run
+> is not the property being argued about.
+
 ---
 
 ## 2. Where discovery plugs into the pipeline
