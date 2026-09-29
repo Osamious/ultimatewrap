@@ -2,12 +2,13 @@
 // at snapshot build from the best evidence and drawn from a closed vocabulary. Unknown stays unknown.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { outputModalityOf, modalityWord, MODALITY_WORDS, MODALITY_SRCS } from "../menu/modality.mjs";
+import { outputModalityOf, modalityWord, MODALITY_WORDS, MODALITY_SRCS, MODALITY_COLOURS } from "../menu/modality.mjs";
 import { buildFrom } from "../menu/catalog.mjs";
 import { buildSnapshot } from "../menu/snapshot.mjs";
-import { detectCaps, painter, frame, frameWidth, layoutFor, modalityCell, MODALITY_TXT_W, FRAME_MIN, FRAME_MAX } from "../menu/style.mjs";
+import { detectCaps, painter, frame, frameWidth, layoutFor, modalityCell, modalityHue, MODALITY_TXT_W, FRAME_MIN, FRAME_MAX } from "../menu/style.mjs";
 import { initState, view } from "../menu/pick-state.mjs";
 import { legendLines } from "../menu/legend.mjs";
+import { glyphsFor } from "../menu/style.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const cps = (s) => [...s].length;
@@ -130,19 +131,20 @@ test("buildSnapshot keeps the catalogue's value and source", () => {
   assert.deepEqual([a.outModality, a.outModalitySrc], ["image", "output"]);
   assert.equal(b.outModality, null);
   assert.equal(Object.hasOwn(b, "outModalitySrc"), false, "the source is absent when the value is null");
-  assert.equal(s.schemaVersion, 7, "the new fields ride schema 7");
+  assert.equal(s.schemaVersion, 9, "the current schema");
 });
 
-test("a fresh ok probe with no other evidence is `chat?` from `bench-ok`; failures, stale records and other evidence are not used", () => {
+test("a fresh ok probe with no other evidence is `chat?` from `bench-ok`; failures, future-dated records and other evidence are not used", () => {
   const b = benchOf({
-    "p/ok-only": okRec(), "p/stale": okRec(30 * 86400), "p/failed": { ...okRec(), s: "error", p: "not a chat model" },
+    "p/ok-only": okRec(), "p/stale": okRec(30 * 86400), "p/future": okRec(-3 * 86400), "p/failed": { ...okRec(), s: "error", p: "not a chat model" },
     "p/gone": { ...okRec(), s: "gone" }, "p/empt": { ...okRec(), s: "empty" }, "p/img": okRec(),
   });
-  const s = buildSnapshot(built([{ id: "ok-only" }, { id: "stale" }, { id: "failed" }, { id: "gone" }, { id: "empt" }, { id: "never" },
+  const s = buildSnapshot(built([{ id: "ok-only" }, { id: "stale" }, { id: "future" }, { id: "failed" }, { id: "gone" }, { id: "empt" }, { id: "never" },
                                  { id: "img", outModality: "image", outModalitySrc: "listing" }]), { bench: b, nowMs: NOW });
   const by = Object.fromEntries(s.rows[0].models.map((m) => [m.id, m]));
   assert.deepEqual([by["ok-only"].outModality, by["ok-only"].outModalitySrc], ["chat?", "bench-ok"]);
-  for (const id of ["stale", "failed", "gone", "empt", "never"]) assert.equal(by[id].outModality, null, `${id}: no positive evidence`);
+  assert.deepEqual([by.stale.outModality, by.stale.outModalitySrc], ["chat?", "bench-ok"], "an old ok probe still counts");
+  for (const id of ["future", "failed", "gone", "empt", "never"]) assert.equal(by[id].outModality, null, `${id}: no positive evidence`);
   assert.deepEqual([by.img.outModality, by.img.outModalitySrc], ["image", "listing"], "a catalogued modality is never overwritten by the probe");
 });
 
@@ -162,21 +164,39 @@ const modelView = (models) => {
 };
 const NAMES = ["chat", "chat?", "image", "audio", "video", "embed", "rank", "mod", "stt", "ocr", "live", "other"];
 
-test("the modality cell: eight columns, left-aligned, dim for chat and unknown, cyan for every other known word, `?` for anything else", () => {
-  const p = painter({ ...detectCaps(UNI, 100), colours: 256 });
+test("the modality cell: eight columns, left-aligned, its own colour per known word, dim `?` for anything else", () => {
+  const p256 = painter({ ...detectCaps(UNI, 100), colours: 256 });
+  const p16 = painter({ ...detectCaps(UNI, 100), colours: 16 });
+  const p0 = painter({ ...detectCaps(ASCII, 100), colours: 0 });
   assert.equal(MODALITY_TXT_W, 8);
   for (const w of NAMES) {
-    const c = modalityCell(w, p);
-    assert.equal(cps(strip(c)), 8, w);
-    assert.equal(strip(c), w.padEnd(8), "left-aligned like the badge");
-    const dim = w === "chat" || w === "chat?";
-    assert.equal(c.includes("\x1b[2m"), dim, `${w}: dim only for chat and chat?`);
-    assert.equal(/\x1b\[36m/.test(c), !dim, `${w}: cyan for the non-chat words`);
+    for (const p of [p256, p16, p0]) {
+      const c = modalityCell(w, p);
+      assert.equal(cps(strip(c)), 8, w);
+      assert.equal(strip(c), w.padEnd(8), "left-aligned like the badge");
+    }
+    const c = MODALITY_COLOURS[w];
+    assert.equal(modalityCell(w, p256), `\x1b[38;5;${c.c256}m${w.padEnd(8)}\x1b[0m`, `${w}: its own 256-colour code`);
+    assert.equal(modalityCell(w, p16), `\x1b[${c.c16}m${w.padEnd(8)}\x1b[0m`, `${w}: its 16-colour code`);
+    assert.equal(modalityCell(w, p0), w.padEnd(8), `${w}: no colour codes at all with colour off`);
+    assert.equal(modalityHue(w, p256), `38;5;${c.c256}`);
   }
   for (const bad of [undefined, null, "", "\x1b[2J", "poem", 7, "chat\n"]) {
-    assert.equal(strip(modalityCell(bad, p)), "?       ", JSON.stringify(bad));
-    assert.ok(modalityCell(bad, p).includes("\x1b[2m"), "unknown is dim");
+    assert.equal(strip(modalityCell(bad, p256)), "?       ", JSON.stringify(bad));
+    assert.equal(modalityCell(bad, p256), "\x1b[2m?       \x1b[0m", "unknown is dim, not a type colour");
+    assert.equal(modalityCell(bad, p0), "?       ");
   }
+});
+
+test("the modality colour table: twelve known words, twelve DISTINCT 256-colour codes and twelve distinct 16-colour codes", () => {
+  assert.deepEqual(Object.keys(MODALITY_COLOURS).sort(), [...NAMES].sort(), "exactly the known words, nothing for `?`");
+  const c256 = NAMES.map((w) => MODALITY_COLOURS[w].c256), c16 = NAMES.map((w) => MODALITY_COLOURS[w].c16);
+  assert.equal(new Set(c256).size, 12);
+  assert.equal(new Set(c16).size, 12);
+  assert.notEqual(MODALITY_COLOURS.chat.c256, MODALITY_COLOURS["chat?"].c256, "chat and chat? differ");
+  for (const n of c256) assert.ok(Number.isInteger(n) && n >= 16 && n <= 255, "a colour-cube or grey-ramp code, never a system colour");
+  for (const n of c16) assert.ok([31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97].includes(n));
+  assert.equal(Object.isFrozen(MODALITY_COLOURS), true);
 });
 
 test("header and rows: `modality` sits between badge and TVR, on the same rule columns, at every width, in both glyph sets", () => {
@@ -219,20 +239,28 @@ test("modality is always drawn and outlasts total and tok/s: the drop order is p
   assert.ok(at78.some((l) => l.includes("image")));
 });
 
-test("non-chat rows are cyan in the modality cell and a chat row is not", () => {
-  const { v } = modelView([M("c", "chat"), M("i", "image")]);
-  const raw = frame(v, { providers: 1, models: 2 }, { caps: { ...detectCaps(UNI, 134), colours: 256 } });
+test("in a model row each modality word carries its own colour, and unknown is dim", () => {
+  const { v } = modelView([M("c", "chat"), M("i", "image"), M("u", null)]);
+  const raw = frame(v, { providers: 1, models: 3 }, { caps: { ...detectCaps(UNI, 134), colours: 256 } });
   const rowOf = (name) => raw.find((l) => strip(l).includes(` ${name} `) && !strip(l).includes("id:"));
-  assert.match(rowOf("i"), /\x1b\[36mimage/);
-  assert.doesNotMatch(rowOf("c"), /\x1b\[36mchat/);
+  assert.match(rowOf("i"), new RegExp(`\\x1b\\[38;5;${MODALITY_COLOURS.image.c256}mimage`));
+  assert.match(rowOf("c"), new RegExp(`\\x1b\\[38;5;${MODALITY_COLOURS.chat.c256}mchat`));
+  assert.match(rowOf("u"), /\x1b\[2m\?/);
+  const bare = frame(v, { providers: 1, models: 3 }, { caps: { ...detectCaps(ASCII, 134), colours: 0 } });
+  assert.equal(bare.join("").includes("\x1b"), false, "no colour codes with colour off");
+  for (const l of raw) assert.equal(cps(strip(l)), frameWidth(detectCaps(UNI, 134)));
 });
 
-test("the legend defines every word and the limit column is gone from it", () => {
+test("the legend defines every modality word, in its own colour, and the limit column is gone from it", () => {
   const stub = new Proxy({}, { get: () => (x) => x });
   const text = legendLines({ dashMatch: "!" }, stub, { provenanceDot: () => "#" }).join("\n");
-  for (const w of NAMES) assert.ok(text.includes(`    ${w}`), `legend defines ${w}`);
+  for (const w of NAMES) assert.ok(new RegExp(`^ {13}${w.replace("?", "\\?")} `, "m").test(text), `legend defines ${w}`);
   assert.ok(/chat\?/.test(text) && /never guessed|unknown/i.test(text));
   assert.equal(/FREE-TIER LIMIT|'limit' column/.test(text), false);
+  // and draws each word through the same colour table the rows use
+  const p = painter({ ...detectCaps(UNI, 100), colours: 256 });
+  const coloured = legendLines(glyphsFor(detectCaps(UNI, 100)), p, { provenanceDot: () => "#", modality: (w) => (modalityWord(w) ? p.raw(modalityHue(w, p), w) : w) }).join("\n");
+  for (const w of NAMES) assert.ok(coloured.includes(`\x1b[38;5;${MODALITY_COLOURS[w].c256}m${w}\x1b[0m`), `legend shows ${w} in its colour`);
 });
 
 test("an old snapshot row with no outModality field draws `?` and nothing throws", () => {

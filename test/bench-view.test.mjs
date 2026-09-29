@@ -393,7 +393,7 @@ test("the legend documents the columns, the filters and the keys; the footer nam
   const stub = new Proxy({}, { get: () => (x) => x });
   const lines = legendLines({ dashMatch: "!" }, stub, { provenanceDot: () => "#" });
   const text = lines.join("\n");
-  for (const needle of ["ctrl+o", "ctrl+l", "1M", "BENCH COLUMNS", "ttft", "tok/s", "NO tools", "bench-cli", "K ok"]) {
+  for (const needle of ["ctrl+o", "ctrl+l", "1M", "MODEL LIST", "ttft", "tok/s", "NO tools", "bench-cli", "K ok"]) {
     assert.ok(text.includes(needle), needle);
   }
   assert.equal(text.includes("ctrl+b"), false, "the toggle is gone from the legend");
@@ -401,14 +401,14 @@ test("the legend documents the columns, the filters and the keys; the footer nam
   assert.equal(lines.length, LEGEND_LENGTH);
   const caps = { ...VT, cols: 134, colours: 0 };
   const foot = frame(V1(), META, { caps }).map(strip).at(-1);
-  assert.ok(foot.includes("[^o] ok") && foot.includes("[^l] 1M+"));
+  assert.ok(foot.includes("[^o]ok") && foot.includes("[^l]1M+") && foot.includes("[^x]gone") && foot.includes("[^e]free"));
   assert.equal(foot.includes("[^b]"), false);
 });
 
 // ------------------------------------------------------------------ lazy load
 
 test("the bench file is not read at startup and level 0 never asks for a record", () => {
-  const snap = { schemaVersion: 7, generatedAt: "x", builtAt: "x", rows: snapRows(3, 4) };
+  const snap = { schemaVersion: 9, generatedAt: "x", builtAt: "x", rows: snapRows(3, 4) };
   let calls = 0;
   const f = firstFrame({ snap, recents: [], favourites: [], caps: PLAIN, termRows: 30 });
   assert.equal(f.meta.benchOf, undefined, "firstFrame does not load bench.json");

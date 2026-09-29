@@ -21,12 +21,12 @@ import { loadSnapshot, SNAPSHOT_FILE } from "./snapshot.mjs";
 // 19.7 MB catalogue parse, and the picker's whole input is the pre-built
 // snapshot (Q1.1). Routability arrives on the snapshot rows (Q1.3).
 import { initState, reduce, view, tokenize } from "./pick-state.mjs";
-import { loadBench } from "./bench-data.mjs";
+import { loadBench, oldestStampOf, ageHistOf } from "./bench-data.mjs";
 import { handoffTarget, modelCommand, CONTRACT } from "./cc-contract.mjs";
 import { loadPickerState, recordRecent, toggleFavourite, recordHandoff,
          recordStartup } from "./state.mjs";
 import { frame, confirmLine, detectCaps, glyphsFor, painter, motionEnabled,
-         slideFrames, revealFrames, flashFrames, sleepSync, keyIdWidth, keyIdBucket, flatIdWidth, FRAME_MS } from "./style.mjs";
+         slideFrames, revealFrames, flashFrames, sleepSync, keyIdWidth, flatIdWidth, FRAME_MS } from "./style.mjs";
 
 const ESC = "\x1b";
 const HOME = `${ESC}[H`;
@@ -46,8 +46,8 @@ function paint(out, lines) {
 
 export function firstFrame({ snap, recents, favourites, caps, termRows }) {
   const rows = snap.rows;
-  const state = initState(rows, { recents, favourites, termRows });
-  const bucket = keyIdBucket(rows);
+  // The provider list's outdated notice comes from the snapshot's baked stamp until bench.json is loaded.
+  const state = initState(rows, { recents, favourites, termRows, benchOldestAt: snap.benchOldestAt ?? null });
   const meta = {
     providers: rows.length,
     models: rows.reduce((n, r) => n + r.models.length, 0),
@@ -68,10 +68,8 @@ export function firstFrame({ snap, recents, favourites, caps, termRows }) {
     benchCountsAsOf: snap.benchAsOf ?? null,
     // #114: the provider list's key id column is sized to the longest key id over ALL
     // rows, once, so it neither drifts right on wide terminals nor moves while filtering.
-    // The bucket segment (`personal.`) nearly every key id shares is not drawn; the width is
-    // measured over the ids AS DRAWN.
-    keyIdBucket: bucket,
-    keyIdW: keyIdWidth(rows, bucket),
+    // The FULL key id is drawn (bucket included), so the width is the longest full id.
+    keyIdW: keyIdWidth(rows),
     // The rows themselves, so the key id column can elide with distinctness across ALL of them.
     rows,
     // The same idea for flat scope's id column (its longest `provider/model` target), and the
@@ -82,6 +80,8 @@ export function firstFrame({ snap, recents, favourites, caps, termRows }) {
     // a snapshot whose counts are all zero knows nothing, and reads `- ok` like the live figures.
     okTotal: rows.some((r) => r.bench && Object.values(r.bench).some((n) => n > 0))
       ? rows.reduce((n, r) => n + (r.bench?.ok ?? 0), 0) : null,
+    // The header percent leaves `gone` routes out of its denominator (models minus gone), from the same baked counts.
+    goneTotal: rows.reduce((n, r) => n + (Number.isFinite(r.bench?.gone) ? r.bench.gone : 0), 0),
   };
   return { state, meta, text: screen(view(state), meta, { caps }) };
 }
@@ -319,7 +319,8 @@ export function main() {
       // initState rebuilds everything, so what is not derived from the snapshot is
       // carried across explicitly: the two model-level toggles and the bench reader.
       state = { ...initState(loaded.snap.rows, { ...next, termRows: out.rows || 30, nowMs: state.now }),
-                okOnly: state.okOnly, oneM: state.oneM, benchOf: state.benchOf };
+                okOnly: state.okOnly, oneM: state.oneM, hideGone: state.hideGone, freeOnly: state.freeOnly,
+                benchOf: state.benchOf, benchOldestAt: state.benchOldestAt, benchHist: state.benchHist };
     }
     // #114: bench.json is read ONCE, synchronously, the first time a MODEL screen (level 1
     // or flat scope) is about to be drawn -- never at startup and never while only the
@@ -329,7 +330,11 @@ export function main() {
     if ((state.level > 0 || state.scope === "flat") && !meta.benchOf) {
       const b = loadBench();
       meta = { ...meta, benchOf: b.get, benchAsOf: b.size ? b.generatedAt : null };
-      state = reduce(state, { benchOf: b.get }).state;
+      // bench.json wins over the snapshot's baked stamp and histograms once it is loaded: the oldest record among the listed
+      // routes, and each provider's age histogram. An empty or missing file has nothing to say: the snapshot's stay.
+      const fromFile = b.size ? { benchOldestAt: oldestStampOf(loaded.snap.rows, b.get, state.now),
+        benchHist: new Map(loaded.snap.rows.map((r) => [r.keyId, ageHistOf(r.provider, r.models, b.get, state.now)])) } : {};
+      state = reduce(state, { benchOf: b.get, ...fromFile }).state;
     }
     if (exited) {
       closeSync(CONIN);

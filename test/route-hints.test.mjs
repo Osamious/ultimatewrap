@@ -51,11 +51,11 @@ test("all 12 real FREE?-but-pay shapes lose the misleading badge and say why", (
   assert.deepEqual(by, { kilo: 2, tokenrouter: 1, xkiro: 4, commandcode: 2, teamorouter: 3 });
 });
 
-test("only a FRESH pay on a FREE? badge changes anything", () => {
+test("only a pay on a FREE? badge changes anything (any age, but never a future-dated one)", () => {
   const cases = [
-    ["stale pay (30 days)", "FREE?", "pay", 30 * DAY, "FREE?", false],
+    ["an old pay (30 days) still blanks: there is no age limit", "FREE?", "pay", 30 * DAY, "", true],
     ["future-dated pay", "FREE?", "pay", -3 * DAY, "FREE?", false],
-    ["the 14-day edge is still fresh", "FREE?", "pay", 14 * DAY, "", true],
+    ["a 100-day-old pay still blanks", "FREE?", "pay", 100 * DAY, "", true],
     ["gone", "FREE?", "gone", 1000, "FREE?", false],
     ["error", "FREE?", "error", 1000, "FREE?", false],
     ["rate", "FREE?", "rate", 1000, "FREE?", false],
@@ -98,7 +98,7 @@ test("additive fields: absent on ordinary rows, and an old snapshot without them
   const m = JSON.parse(JSON.stringify(snap)).rows[0].models[0];
   assert.equal(Object.hasOwn(m, "badgeNote"), false);
   assert.equal(Object.hasOwn(m, "aliasOf"), false);
-  assert.equal(snap.schemaVersion, 7, "the current schema");
+  assert.equal(snap.schemaVersion, 9, "the current schema");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-rh-"));
   const file = path.join(dir, "s.json");
   writeSnapshotFile(snap, file);
@@ -131,7 +131,7 @@ test("alias rules: org prefix, bare id, punctuation/case, and the :free :thinkin
   }
 });
 
-test("what is NOT an alias: :batch rows, non-gone rows, stale or non-ok siblings, [1m] twins, unrelated ids", () => {
+test("what is NOT an alias: :batch rows, non-gone rows, non-ok siblings, future-dated siblings, [1m] twins, unrelated ids", () => {
   const at = (statuses, agoOf = () => 1000) => {
     const ids = Object.keys(statuses);
     const map = Object.fromEntries(ids.map((id) => [`p/${id.replace(/\[1m\]$/i, "")}`, rec(statuses[id], agoOf(id))]));
@@ -141,8 +141,8 @@ test("what is NOT an alias: :batch rows, non-gone rows, stale or non-ok siblings
   assert.equal(at({ "x:free": "error", x: "ok" }).size, 0, "the row itself must be gone");
   assert.equal(at({ "x:free": "gone", x: "gone" }).size, 0, "the sibling must be ok");
   assert.equal(at({ "x:free": "gone", x: "empty" }).size, 0);
-  assert.equal(at({ "x:free": "gone", x: "ok" }, (id) => (id === "x" ? 30 * DAY : 1000)).size, 0, "a stale sibling");
-  assert.equal(at({ "x:free": "gone", x: "ok" }, (id) => (id === "x:free" ? 30 * DAY : 1000)).size, 0, "a stale own record");
+  assert.equal(at({ "x:free": "gone", x: "ok" }, (id) => (id === "x" ? 30 * DAY : 1000)).size, 1, "an old sibling record still counts");
+  assert.equal(at({ "x:free": "gone", x: "ok" }, (id) => (id === "x:free" ? 30 * DAY : 1000)).size, 1, "and so does an old own record");
   assert.equal(at({ "x:free": "gone", x: "ok" }, (id) => (id === "x" ? -DAY : 1000)).size, 0, "a future-dated sibling");
   assert.equal(at({ "x[1m]": "gone", x: "ok" }).size, 0, "x and x[1m] are one model, not an alias");
   assert.equal(at({ alpha: "gone", beta: "ok" }).size, 0);
@@ -150,13 +150,14 @@ test("what is NOT an alias: :batch rows, non-gone rows, stale or non-ok siblings
   assert.equal(at({ "x:free": "gone", x: "ok" }).get("x:free"), "x", "and the plain case still works");
 });
 
-test("liveAlias honours the baked pointer only while both records are still fresh", () => {
+test("liveAlias honours the baked pointer while both records say so, whatever their age", () => {
   const model = M("x:free", "PAID", { aliasOf: "x" });
   const get = (own, sib, ownAgo = 1000, sibAgo = 1000) => (t) => (t === "p/x:free" ? rec(own, ownAgo) : t === "p/x" ? rec(sib, sibAgo) : null);
   assert.equal(liveAlias("p", model, get("gone", "ok"), NOW), "x");
   assert.equal(liveAlias("p", model, get("ok", "ok"), NOW), null, "it has come back to life");
   assert.equal(liveAlias("p", model, get("gone", "gone"), NOW), null, "the sibling died");
-  assert.equal(liveAlias("p", model, get("gone", "ok", 1000, 30 * DAY), NOW), null);
+  assert.equal(liveAlias("p", model, get("gone", "ok", 1000, 30 * DAY), NOW), "x", "an old sibling record still answers");
+  assert.equal(liveAlias("p", model, get("gone", "ok", 1000, -3 * DAY), NOW), null, "a future-dated one does not");
   assert.equal(liveAlias("p", { ...model, aliasOf: undefined }, get("gone", "ok"), NOW), null);
   assert.equal(liveAlias("p", model, null, NOW), null);
 });
@@ -298,8 +299,7 @@ test("enter on an alias row selects THAT row, never the sibling (surface, do not
 test("the legend explains the blank FREE? badge and the `= id (works)` label", () => {
   const stub = new Proxy({}, { get: () => (x) => x });
   const text = legendLines({ dashMatch: "!" }, stub, { provenanceDot: () => "#" }).join("\n");
-  assert.match(text, /FREE\? route whose last probe/);
-  assert.match(text, /payment\s+required/);
+  assert.match(text, /FREE\?\s+whose\s+fresh\s+probe\s+said\s+payment\s+is\s+required/);
   assert.match(text, /= id \(works\)/);
-  assert.match(text, /enter still selects the row you are on/);
+  assert.match(text, /enter\s+still\s+selects\s+THIS\s+row/);
 });

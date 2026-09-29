@@ -67,10 +67,10 @@ test("uniqueness is reported honestly when the width physically cannot separate 
 test("padId with a head hint keeps exactly that many head characters, and the default is unchanged", () => {
   const g = glyphsFor(detectCaps(ASCII, 80)), p = painter(detectCaps(ASCII, 80));
   const id = "abcdefghijklmnopqrstuvwxyz0123456789";
-  assert.equal(padId(id, 12, "", g, p), "abcdef-56789".slice(0, 6) + g.dash + id.slice(-5), "blind: ceil(11/2) = 6 head");
-  assert.equal(padId(id, 12, "", g, p, 3), "abc" + g.dash + id.slice(-8));
-  assert.equal(padId(id, 12, "", g, p, 0), g.dash + id.slice(-11));
-  assert.equal(padId(id, 12, "", g, p, 99), id.slice(0, 11) + g.dash, "clamped to the budget");
+  assert.equal(padId(id, 12, "", g, p), "abcdef-56789".slice(0, 6) + g.elide + id.slice(-5), "blind: ceil(11/2) = 6 head");
+  assert.equal(padId(id, 12, "", g, p, 3), "abc" + g.elide + id.slice(-8));
+  assert.equal(padId(id, 12, "", g, p, 0), g.elide + id.slice(-11));
+  assert.equal(padId(id, 12, "", g, p, 99), id.slice(0, 11) + g.elide, "clamped to the budget");
   assert.equal(cps(padId(id, 12, "", g, p, 3)), 12);
   // The marker still bolds when the match hides in the elided middle (the padId contract).
   const pv = painter(detectCaps(UNI, 80)), gv = glyphsFor(detectCaps(UNI, 80));

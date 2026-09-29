@@ -40,7 +40,7 @@ test("buildSnapshot stamps the schema and keeps every display field", () => {
   assert.equal(typeof s.builtAt, "string");
   assert.equal(s.rows.length, 2);
   assert.deepEqual(Object.keys(s.rows[0]).sort(),
-                   ["bench", "benchFlags", "free", "health", "keyId", "limit", "models", "planCount", "provider", "refused"]);
+                   ["bench", "benchAgeHist", "benchFlags", "free", "health", "keyId", "limit", "models", "planCount", "provider", "refused"]);
   // `routable` joined this list on 2026-09-06. The previous eight-key version of
   // this assertion was green while buildSnapshot dropped the field on every
   // build -- it stated the key set the code emitted and therefore certified the
@@ -266,12 +266,12 @@ test("a truncated snapshot is unreadable rather than empty", () => {
 });
 
 test("a future schema is refused with the observed version quoted", () => {
-  const f = scratch("v9.json");
-  fs.writeFileSync(f, JSON.stringify({ ...buildSnapshot(BUILT), schemaVersion: 9 }));
+  const f = scratch("v10.json");
+  fs.writeFileSync(f, JSON.stringify({ ...buildSnapshot(BUILT), schemaVersion: 10 }));
   const r = loadSnapshot(f);
   assert.equal(r.ok, false);
   assert.equal(r.reason, "schema");
-  assert.match(r.detail, /9/);
+  assert.match(r.detail, /10/);
 });
 
 test("contextIndex maps provider/model to context tokens and skips unknowns", () => {
@@ -732,18 +732,20 @@ test("#113: a router pool never buys a 1M claim from its pool's window", () => {
     "and it is anchored, so a real model whose name merely starts with 'auto' still tags");
 });
 
-test("schema 7: a schema-6 snapshot is rejected (it has no `alive` and no `outModality`), and a current one loads", async () => {
+test("schema 9: a schema-6, 7 or 8 snapshot is rejected (no three-state status, no oldest-record stamp), and a current one loads", async () => {
   const fs2 = await import("node:fs"), os2 = await import("node:os"), path2 = await import("node:path");
-  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), "uw-schema7-"));
+  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), "uw-schema8-"));
   const file = path2.join(dir, "snapshot.json");
   try {
-    fs2.writeFileSync(file, JSON.stringify({ schemaVersion: 6, generatedAt: "x", builtAt: "x", rows: [] }));
-    const old = loadSnapshot(file);
-    assert.equal(old.ok, false);
-    assert.equal(old.reason, "schema");
-    assert.match(old.detail, /expected schemaVersion 7, found 6/);
+    for (const old of [6, 7, 8]) {
+      fs2.writeFileSync(file, JSON.stringify({ schemaVersion: old, generatedAt: "x", builtAt: "x", rows: [] }));
+      const r = loadSnapshot(file);
+      assert.equal(r.ok, false);
+      assert.equal(r.reason, "schema");
+      assert.match(r.detail, new RegExp(`expected schemaVersion 9, found ${old}`));
+    }
     fs2.writeFileSync(file, JSON.stringify({ schemaVersion: SNAPSHOT_SCHEMA, generatedAt: "x", builtAt: "x", rows: [] }));
     assert.equal(loadSnapshot(file).ok, true);
-    assert.equal(SNAPSHOT_SCHEMA, 7);
+    assert.equal(SNAPSHOT_SCHEMA, 9);
   } finally { fs2.rmSync(dir, { recursive: true, force: true }); }
 });

@@ -7,30 +7,54 @@
 // passed IN as arguments and this module imports nothing at all. No cycle can
 // form, in either direction.
 //
-// THE GLYPH ROWS RENDER THROUGH THE SAME FUNCTIONS THE ROWS DO. `provenanceDot`
-// is handed in rather than reimplemented here, so a legend
-// entry cannot drift from what the picker actually paints. A legend that
-// transcribed `◆` as a literal would be wrong on every ASCII terminal (where the
-// rung is `#`) and would go stale the day a glyph changes -- which is exactly
-// the failure a reference screen exists to prevent.
+// THE GLYPH ROWS RENDER THROUGH THE SAME FUNCTIONS THE ROWS DO. `provenanceDot`,
+// `modality` and `stat` are handed in rather than reimplemented here, so a legend
+// entry cannot drift from what the picker actually paints (a `◆` transcribed as a
+// literal would be wrong on every ASCII terminal, and a colour copied here would go
+// stale the day the table changes).
+//
+// LAYOUT. Four sections, one blank line between them, each opened by a heading rule
+// drawn from the glyph table: KEYS, PROVIDER LIST, MODEL LIST, STAMPS, PROBES. Inside a
+// section every entry is `term  meaning` in two aligned columns; the term is drawn in
+// the colour it has in the picker, and a meaning that needs more than one line wraps
+// under itself (a hanging indent). Every line is at most LINE_MAX columns, which fits
+// the narrowest frame (78, minus the frame's own two-column indent).
 
-// The key binds. Unchanged in content from the pre-glossary legend: this is the
-// ONLY complete list of keys, which is why the footer reads "all keys" and
-// points here rather than trying to carry them itself.
+/** The widest a legend line may be: 78 columns of frame, minus the 3 the frame draws and the 2 of indent. */
+export const LINE_MAX = 72;
+const TERM_W = 11;                      // the term column: `discovered` is the longest term, plus a gap
+const TEXT_W = LINE_MAX - 2 - TERM_W;   // the meaning column, after the 2-space indent
+
+// The key binds. This is the ONLY complete list of keys, which is why the footer
+// reads "all keys" and points here rather than trying to carry them itself.
 const KEYS = [
-  "up / down      move the cursor (wraps at either end)",
-  "a-z 0-9 etc    type to filter; the filter is per level",
-  "backspace      delete one character from the filter",
-  "enter          open a provider, or select a model",
-  "tab            toggle flat provider/model search",
-  "ctrl+f         add or remove a favourite",
-  "ctrl+o         ok-only filter on model lists (last benchmark ok)",
-  "ctrl+l         1M+ filter on model lists (ctx >= 1M or a [1m] tag)",
-  "ctrl+r         show withheld models for this provider",
-  "esc            clear the filter, then go back, then quit",
-  "ctrl+c         quit without changing the chat input",
-  "?              this screen; up/down scrolls it",
+  ["up/down", "move the cursor (wraps at either end)"],
+  ["a-z 0-9", "type to filter; the filter is per level"],
+  ["backspace", "delete one character from the filter"],
+  ["enter", "open a provider, or select a model"],
+  ["tab", "toggle flat provider/model search"],
+  ["ctrl+f", "add or remove a favourite"],
+  ["ctrl+o", "ok-only filter on model lists (last benchmark ok)"],
+  ["ctrl+l", "1M+ filter on model lists (ctx >= 1M or a [1m] tag)"],
+  ["ctrl+x", "toggle [no gone]: on model lists it hides routes marked gone; on either level it makes the % = ok / (models - gone) instead of ok / models (off by default)"],
+  ["ctrl+e", "toggle [free]: on model lists show only models badged FREE or FREE?"],
+  ["ctrl+r", "show withheld models for this provider"],
+  ["esc", "clear the filter, then go back, then quit"],
+  ["ctrl+c", "quit without changing the chat input"],
+  ["?", "this screen; up/down scrolls it"],
 ];
+
+// Greedy word wrap at `width` code points (the text here is plain ASCII).
+function wrap(text, width) {
+  const out = [];
+  let line = "";
+  for (const word of String(text).split(" ")) {
+    if (line && line.length + 1 + word.length > width) { out.push(line); line = word; }
+    else line = line ? `${line} ${word}` : word;
+  }
+  if (line) out.push(line);
+  return out;
+}
 
 /**
  * Every line of the `?` screen, in order, already coloured.
@@ -39,179 +63,139 @@ const KEYS = [
  * @param {object} p     the active painter, from `painter(caps)`
  * @param {object} r     renderers borrowed from style.mjs
  * @param {Function} r.provenanceDot  (rung, g, p) -> one column
+ * @param {Function} [r.modality]     (word) -> the modality word in its colour (unpadded)
+ * @param {Function} [r.stat]         (code) -> a probe-status code in its tone colour (unpadded)
+ * @param {Function} [r.age]          (tone, text) -> an `oldest probe` age band in its colour; tone is grn, yel, ora or red
  * @returns {string[]}
  */
-export function legendLines(g, p, { provenanceDot }) {
+export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (c) => c, age = (tone, text) => text }) {
   const rung = (name) => provenanceDot(name, g, p);
+  const h = g.frame?.h ?? "-";
   const L = [];
 
-  L.push(p.bold("KEYS"));
-  for (const k of KEYS) L.push("  " + k);
+  const heading = (name) => {
+    L.push(p.bold(`${h}${h} ${name} `) + p.dim(h.repeat(Math.max(2, LINE_MAX - 2 - 4 - name.length))));
+  };
+  // One entry: the term (already coloured, `plain` is its visible text for padding), then the meaning wrapped
+  // in the second column with a hanging indent.
+  const entry = (plain, shown, text, tw = TERM_W) => {
+    const lines = wrap(text, LINE_MAX - 2 - tw);
+    // A term wider than the term column stands on its own line, and its meaning hangs beneath it.
+    if (plain.length >= tw) { L.push("  " + shown); lines.forEach((ln) => L.push("  " + " ".repeat(tw) + ln)); return; }
+    const lead = shown + " ".repeat(tw - plain.length);
+    lines.forEach((ln, i) => L.push("  " + (i === 0 ? lead : " ".repeat(tw)) + ln));
+  };
+  const plainEntry = (term, text) => entry(term, term, text);
+  const note = (text) => wrap(text, LINE_MAX - 2).forEach((ln) => L.push("  " + p.dim(ln)));
+  const gap = () => L.push("");
 
-  L.push("");
-  L.push(p.bold("READING A MODEL ROW"));
+  // ------------------------------------------------------------------ 1. KEYS
+  heading("KEYS");
+  for (const [k, text] of KEYS) plainEntry(k, text);
 
-  L.push(p.dim("  gutter -- where this row's facts came from"));
-  // Ordered top rung first, exactly as PROVENANCE_RUNGS names them, so the
-  // column reads as the confidence ladder it is rather than four unrelated marks.
-  L.push(`    ${rung("call-verified")}  call-verified     the model answered a real request`);
-  L.push(`    ${rung("config-asserted")}  config-asserted   named in your own config, never probed`);
-  L.push(`    ${rung("listing-verified")}  listing-verified  the provider's own listing named it`);
-  L.push(`    ${rung("catalogue-only")}  catalogue-only    only the offline catalogue names it`);
-  // `null` renders a blank column by design, so the entry has to say so in
-  // words: an empty gutter with an empty explanation beside it teaches nothing.
-  L.push(`    ${rung(null)}  (blank)           nobody looked; no provenance recorded`);
+  // ------------------------------------------------------------ 2. PROVIDER LIST
+  gap();
+  heading("PROVIDER LIST");
+  note("Read from the last benchmark sweep, baked into the snapshot (the date is on the id: line). A --live sweep rebuilds it itself. After --reclassify-notices, --redact, --compact or a skipped rebuild, run: node menu/snapshot.mjs --build");
+  entry("key id", "key id", "the key's FULL id, bucket included (e.g. personal.openrouter.free), sized to the longest id. Only on a narrow terminal is it elided, with a marker (" + (g.elide ?? "~") + "), keeping the part that differs.");
+  entry("status", "status", "over each model's latest probe (however old):");
+  // The three states get their own aligned sub-list.
+  const state = (word, painted, text) => {
+    const lines = wrap(text, LINE_MAX - 2 - TERM_W - 7);
+    lines.forEach((ln, i) => L.push("  " + " ".repeat(TERM_W) + (i === 0 ? painted + " ".repeat(7 - word.length) : " ".repeat(7)) + ln));
+  };
+  state("alive", p.grn("alive"), "at least one model answered ok");
+  state("down", p.yel("down"), "answered, but nothing works: only refusals (key, payment, model, rate), empty replies, provider errors, or a timeout that got a first token");
+  state("dead", p.red("dead"), "NO response at all: timeouts with nothing back, or connection failures");
+  state("blank", "blank", "nothing benched recently, so no verdict");
+  entry("oldest probe", "oldest probe", "age of the provider's oldest probe result; green under 2d, yellow under 4d, orange under 7d, red 7d or older");
+  L.push("  " + " ".repeat(TERM_W) + age("grn", "45m 5h") + "  " + age("yel", "2d 3d") + "  " + age("ora", "4d 6d") + "  " + age("red", "7d 12d 40d"));
+  note("It is the OLDEST probe, not the latest: one stale model makes the provider read old, and a fresh one hides nothing. '-' the provider has no probe result, blank no bench data. Shown only on a wide terminal, after the whole key id.");
+  entry("models", "models", "how many models the provider lists; N/M means N listed and M withheld (ctrl+r shows them)");
+  entry("header", "header", "'P providers, M models, K ok (P%)': while [no gone] is on the header M excludes gone routes and the % is ok / M; the models column always counts all, so M can be less than the sum of the visible cells");
+  entry("ok", p.grn("ok"), "models that answered ok on their latest probe");
+  entry("free", p.blu("free"), "models badged FREE or FREE? when the catalogue was read, and their share of ALL models (never changed by [no gone]); blank when the provider has no price data. Shown only when the terminal is wide enough (after oldest probe). The [free] filter uses the badge as drawn, so a FREE? row whose fresh probe said payment is required does not match");
+  entry("%", "%", "the share beside ok and free. Beside ok: % = ok / models normally; % = ok / (models - gone) while [no gone] is on (ctrl+x, works here too; it hides no provider). Beside free: always of all models. '<1%' for a small non-zero count; '100%' only when every one. Coloured by band, as a hint:");
+  L.push("  " + " ".repeat(TERM_W) + p.grn("70% and up") + "   " + p.yel("30% to 69%") + "   " + p.red("under 30%") + "   " + p.dim("- none"));
+  L.push("  " + "counts".padEnd(TERM_W) + stat("empt") + " " + stat("auth") + " " + stat("pay") + " " + stat("rate") + " " + stat("gone") + " " + stat("t/o") + " " + stat("err"));
+  L.push("  " + " ".repeat(TERM_W) + "one per probe result (defined under PROBES)");
+  note("Each raw count is how many models had that result on their latest probe. '-' none, '2k' thousands, blank no bench data. Models never benched are in no count, so counts can add up to less than 'models'.");
+  note("Favourites (*) and recents sit above the column header, closed by a thin rule.");
 
-  L.push("");
-  L.push(p.dim("  badge -- what the model costs"));
-  L.push("    FREE     zero token price and a recurring grant");
-  L.push("    FREE?    zero price, or a provider-published ':free' name");
-  L.push("    PLAN     covered by a subscription you already pay for");
-  L.push("    PAID     a non-zero token price");
-  L.push("    (blank)  no price evidence we are willing to stand behind; also a");
-  L.push("             FREE? route whose last probe (under 14 days old) said");
-  L.push("             payment is required (the snapshot notes 'probe: payment");
-  L.push("             required'); refreshed when the snapshot is rebuilt");
+  // -------------------------------------------------------------- 3. MODEL LIST
+  gap();
+  heading("MODEL LIST");
+  note("Read live from bench.json, so it can differ from the provider list after a new sweep.");
+  plainEntry("gutter", "where the row's facts came from (first column):");
+  const gut = (name, label, text) => L.push("  " + " ".repeat(TERM_W) + rung(name) + " " + label + " ".repeat(Math.max(1, 17 - label.length)) + text);
+  gut("call-verified", "call-verified", "answered a real request");
+  gut("config-asserted", "config-asserted", "named in your own config");
+  gut("listing-verified", "listing-verified", "the provider's listing named it");
+  gut("catalogue-only", "catalogue-only", "only the offline catalogue");
+  gut(null, "(blank)", "nobody looked");
+  entry("model", "model", "the model id, sized to the longest id; a longer one is elided in the middle, keeping the part that differs");
+  entry("provider/model", "provider/model", "in flat search (tab) the first column reads provider/model: the full target, what enter selects");
+  entry("stat", "stat", "what the last probe got back (see PROBES); blank = not benched");
+  entry("ttft", "ttft", "request sent to first streamed token");
+  entry("total", "total", "request sent to stream closed; blank for a cut stream");
+  entry("tok/s", "tok/s", "output tokens per second as the provider reports; '-' when too short to measure; '~56' is an estimate for a cut stream");
+  entry("ctx", "ctx", "context window; 'nochat' means the route emits no text");
+  entry("$in $out", "$in $out", "price per million tokens, in and out");
+  entry("badge", "badge", "FREE zero price and a recurring grant; FREE? zero price or a ':free' name; PLAN covered by a subscription; PAID a non-zero price; blank no price evidence (also a FREE? whose fresh probe said payment is required)");
+  entry("modality", "modality", "what the route outputs, decided when the snapshot was built from the best evidence. Unknown stays '?', never guessed:");
+  const mod = (w, text) => L.push("  " + " ".repeat(TERM_W) + modality(w) + " ".repeat(Math.max(1, 6 - w.length)) + text);
+  mod("chat", "text out: a language model");
+  mod("chat?", "answered a chat test with text; nothing else known");
+  mod("image", "makes images");
+  mod("audio", "speech or music out");
+  mod("video", "makes video");
+  mod("embed", "vectors, not text");
+  mod("rank", "scores documents");
+  mod("mod", "moderation verdicts");
+  mod("stt", "speech to text");
+  mod("ocr", "reads documents");
+  mod("live", "realtime voice model (a streaming API)");
+  mod("other", "known NOT to be a chat model, kind not known");
+  L.push("  " + " ".repeat(TERM_W) + "?     no evidence: nothing says what it outputs");
+  note("Each word is drawn in its own colour; a failed test ('not a chat model') and the id are never used to name a modality.");
+  entry("TVR", "TVR", "tools, vision, reasoning: a letter is yes, '-' no, '?' unknown");
+  entry("output", "output", "first words of the reply; '~' marks reasoning shown because no answer text arrived; '= id (works)' on a 'gone' route names a sibling that answered ok (enter still selects THIS row)");
+  entry("N of M", "N of M", "models matching the filters, of the provider's models (M stays the full count, so rows hidden by [no gone] show as N < M); then 'K ok (P%)': how many answered ok, with P = ok / models normally and ok / (models - gone) while [no gone] is on ('- ok' when nothing was benched, never '0 ok'). The provider list header uses the same rule");
+  entry("[ok]", "[ok]", "the ctrl+o filter is on: only models whose last probe was ok");
+  entry("[1M+]", "[1M+]", "the ctrl+l filter is on: only ctx >= 1M or a [1m] tag");
+  entry("[no gone]", "[no gone]", "ctrl+x is on (off by default): gone routes are hidden on model lists and the % figures leave them out; the chip shows on both levels");
+  entry("[free]", "[free]", "the ctrl+e filter is on: only models badged FREE or FREE? as drawn");
+  entry("id:", "id:", "the FULL id of the selected row (what enter or ctrl+f acts on), then the data dates: routable, benched, discovered");
+  entry("reply:", "reply:", "the whole stored reply of the selected row; '[cut]' the probe stopped a stream that ignored its token limit; '[stream error]' it failed after the first token");
+  note("A dimmed row is one of two things: 'not a chat model' (cannot be selected) or 'not listed now' (the gateway did not list it at snapshot time; it may still work).");
+  note("Columns drop as the terminal narrows: output first, then tok/s, then total. All show from 103 columns. The frame is never narrower than 78 (an 80-column terminal is the minimum).");
+  note("A long id is elided keeping the part that differs; wide and emoji characters draw as '?'. A filter that matched inside the elided middle shows " + g.dashMatch + ".");
 
-  L.push("");
-  L.push(p.dim("  other cells"));
-  L.push("    TVR      tools / vision / reasoning");
-  L.push("             a letter means yes, '-' means no, '?' means unknown");
-  L.push("    ctx      context window; 'nochat' means it emits no text");
-  L.push(`    ${g.dashMatch}        your filter matched inside the elided middle of an id`);
+  // ----------------------------------------------------------------- 4. STAMPS
+  const dash = g.dash ?? "-";
+  gap();
+  heading("STAMPS");
+  note("Dates at the right end of the selected row's id: line, dim, UTC (MM-DD HH:MMZ), each whole or dropped when there is no room. A dash after the word means never.");
+  entry("routable", "routable", "provider list: when the snapshot last asked the gateway which routes it can serve. Rows it says it cannot serve are dimmed; 'routable " + dash + "' means never resolved, so nothing is dimmed (undimmed = routable OR nobody checked).");
+  entry("bench", "bench", "provider list: when the probes behind the status, ok, % and empt..err counts were taken (baked in at snapshot build).");
+  entry("benched", "benched", "model list: when the probe records behind the row cells (stat, ttft, total, tok/s, reply:) were written, read live from bench.json. 'benched " + dash + " run bench-cli --live' means no probe data yet; an old record is still drawn (see outdated below).");
+  entry("discovered", "discovered", "model list: when the providers' own model listings were last fetched; 'discovered " + dash + "' (never) explains a blank provenance gutter.");
 
-  L.push("");
-  L.push(p.dim("  a dimmed row means one of two different things"));
-  // The user's own question, and the distinction is worth the two lines: one
-  // dim is a hard block, the other is a soft staleness warning, and the row
-  // gives no other clue which it is.
-  L.push("    not a chat model  it emits image/audio/video; cannot be selected");
-  L.push("    not listed now    the gateway did not list it when this snapshot");
-  L.push("                      was built; it may still work -- try it");
+  entry("outdated", p.yel("outdated"), "a yellow line just above the footer, on both lists: 'Model Status might be outdated! Last time the list was fully updated was DATE, run node refresh/bench-cli.mjs --live to update your list fully' (a --live sweep also rebuilds the snapshot, so both lists update). It shows when MORE than half of the probe records are more than 7 days old (the sweep's own re-probe age); DATE is the OLDEST record, i.e. when the list was last fully updated. Old records stay visible and are never hidden or dimmed: this line and the oldest probe column show how old the data is. On a narrow terminal the words shorten but the command stays whole. With no probe data at all there is no such line (see benched).");
 
-  L.push("");
-  L.push(p.bold("MODALITY  (what the model outputs)"));
-  L.push(p.dim("  the primary OUTPUT of the route, decided when the snapshot was built"));
-  L.push(p.dim("  from the best evidence; unknown stays '?', it is never guessed"));
-  L.push("    chat     text out: a language model (dim)");
-  L.push("    chat?    answered a chat test with text, nothing else known;");
-  L.push("             could also do more (dim)");
-  L.push("    image    makes images         audio    speech or music out");
-  L.push("    video    makes video          embed    vectors, not text");
-  L.push("    rank     scores documents     mod      moderation verdicts");
-  L.push("    stt      speech to text       ocr      reads documents");
-  L.push("    live     realtime voice model (a streaming API)");
-  L.push("    other    known NOT to be a chat model, kind not known");
-  L.push("    ?        no evidence: nothing says what it outputs");
-  L.push(p.dim("  every word but chat, chat? and ? is drawn in colour, so the rows"));
-  L.push(p.dim("  that are not chat models stand out. A failed test (\"not a chat"));
-  L.push(p.dim("  model\") is never used to name a modality; nothing comes from the id"));
-  L.push("");
-  L.push(p.bold("PROVIDER LIST  (the sweep columns)"));
-  L.push(p.dim("  read from the last benchmark sweep, when the snapshot was built"));
-  L.push("    models   how many models the provider lists");
-  L.push("    status   alive: at least one model answered at all (an ok, an");
-  L.push("             empty reply, a refusal for payment, key or model, or a");
-  L.push("             provider error all count: something answered). dead: every");
-  L.push("             probe in the last 14 days got NO response at all: a");
-  L.push("             timeout with nothing back, or a connection failure.");
-  L.push("             (blank): nothing benched recently, so no verdict");
-  L.push("    ok       COUNT (PCT%): models that answered ok, and their share");
-  L.push("             of the provider's models (<1% for a small non-zero");
-  L.push("             count; '-' for none; blank when there is no bench data)");
-  L.push("    free     COUNT (PCT%): models with a zero price and a recurring");
-  L.push("             grant; shown only from a 91-column terminal");
-  L.push(p.dim("  then one count per benchmark status: how many of a provider's"));
-  L.push(p.dim("  models had that result on their latest probe, within 14 days"));
-  L.push("    empt     no text came back   auth   key refused");
-  L.push("    pay      needs balance       rate   rate limited");
-  L.push("    gone     not found upstream  t/o    too slow");
-  L.push("    err      provider or network error");
-  L.push("    -        none of this provider's models had that status");
-  L.push("    (blank)  this provider has no benchmark data at all");
-  L.push("    2k       thousands, so a cell never widens");
-  L.push("    a model that was never benched, or not within 14 days, is in NO");
-  L.push("    column, so the counts can add up to less than 'models'");
-  L.push(p.bold("  PINNED ROWS"));
-  L.push("    favourites (*) and recent picks sit ABOVE the column header,");
-  L.push("    closed by a thin rule; the cursor starts on the first of them");
-  L.push(p.dim("  columns (here and on model lists) are separated by dim vertical"));
-  L.push(p.dim("  rules; they are ':' on ASCII terminals"));
-  L.push(p.dim("  key ids are drawn without the bucket segment nearly every row"));
-  L.push(p.dim("  shares (the title names it, e.g. personal.); a row in another"));
-  L.push(p.dim("  bucket keeps its full id, and filtering still matches all of it"));
-  L.push(p.dim("  the key id column is as wide as the longest id as drawn (up to"));
-  L.push(p.dim("  30), and clipped on narrow terminals (16 characters at 80"));
-  L.push(p.dim("  columns); the frame follows the terminal up to 260 columns"));
-  L.push(p.dim("  every figure and row on this LIST is BAKED into the snapshot (the"));
-  L.push(p.dim("  'bench MM-DD' on the id: line is its date); model lists read"));
-  L.push(p.dim("  bench.json LIVE, so the two can differ after a new sweep. To"));
-  L.push(p.dim("  refresh this list: node menu/snapshot.mjs --build"));
-
-  L.push("");
-  L.push(p.bold("HEADER, ID LINE AND REPLY LINE"));
-  L.push("    header   counts only, right-aligned: 'N of M | K ok (P%)' on a");
-  L.push("             model list, 'N of M models | K ok (P%)' in flat scope,");
-  L.push("             'P providers | M models | K ok (P%)' on the provider list");
-  L.push("    N of M   models matching the filters, of the provider's models");
-  L.push("    K ok     models whose last benchmark (within 14 days) was ok:");
-  L.push("             all of them, whatever the filters say; '- ok' when");
-  L.push("             nothing was benched (no bench file, or none fresh for");
-  L.push("             this provider), never '0 ok'. Model lists count it LIVE;");
-  L.push("             on the provider list it is BAKED at snapshot build");
-  L.push("    [ok]     ctrl+o is on: only models whose last benchmark was ok");
-  L.push("    [1M+]    ctrl+l is on: only models with ctx >= 1M or a [1m] tag");
-  L.push("    id:      the FULL id of the selected row (what enter or ctrl+f");
-  L.push("             acts on), never elided; on the provider list it includes");
-  L.push("             the omitted bucket, then 'N plan' when the provider has");
-  L.push("             plan-covered models. Blank when the row cannot be");
-  L.push("             selected. The data dates sit at its right end: 'routable'");
-  L.push("             / 'benched' / 'discovered', whole or dropped, never cut");
-  L.push("    reply:   model lists: the FULL stored reply of the selected row");
-  L.push("             (or why it was skipped), clipped only at the frame edge;");
-  L.push("             '~' marks reasoning text. Blank for an unbenched row");
-  L.push("    = id (works)  in the output cell of a 'gone' route: a sibling of");
-  L.push("             the same provider (another spelling, ':free', ':thinking',");
-  L.push("             '@eu'/'@us', an org prefix) that answered ok. It only says");
-  L.push("             where; enter still selects the row you are on. The id:");
-  L.push("             line shows '  = id' too when it fits");
-  L.push(p.dim("  a long id is elided keeping the part that differs between rows"));
-  L.push(p.dim("  (versions, suffixes); wide, emoji and combining characters draw"));
-  L.push(p.dim("  as '?', in every column"));
-  L.push(p.dim("  header times are UTC (a trailing Z); a row's measured cells draw"));
-  L.push(p.dim("  only if its record is under 14 days old"));
-  L.push(p.dim("  the two filters combine with each other and with typed text,"));
-  L.push(p.dim("  apply to model lists only, and stay on when you go back or"));
-  L.push(p.dim("  open another provider"));
-
-  L.push(p.bold("BENCH COLUMNS  (model lists, next to the catalogue columns)"));
-  L.push(p.dim("  one real request per model, sent through the gateway"));
-  L.push("    stat     what the probe got back (below)");
-  L.push("    ttft     request sent -> first streamed token");
-  L.push("    total    request sent -> stream closed");
-  L.push("    tok/s    output tokens per second of generation, as reported");
-  L.push("             by the provider; '-' when too short to measure");
-  L.push("             '~56' is an estimate: the probe CUT the stream of a model");
-  L.push("             that ignored its token limit, so total is left blank and");
-  L.push("             the reply: line starts '[cut]'. '[stream error]' there");
-  L.push("             means the stream failed after the first token");
-  L.push("    output   first words of the reply; '~' marks reasoning text");
-  L.push("             shown because no answer text arrived");
-  L.push("    (blank)  this model has not been benched -- blank, not zero");
-  L.push(p.dim("  every column shows when the terminal is wide enough; on a narrower"));
-  L.push(p.dim("  one they drop in this order: output, tok/s, total"));
-  L.push(p.dim("  status"));
-  L.push("    ok       answered     empt   no text came back (often: the");
-  L.push("                                 96-token budget went on thinking)");
-  L.push("    auth     key refused  pay    needs balance or credits");
-  L.push("    rate     rate limited gone   model not found upstream");
-  L.push("    t/o      too slow     err    provider or network error");
-  L.push("    skip     not probed; the output column says why");
-  L.push(p.dim("  the probe is a bare chat message with NO tools and 96 output"));
-  L.push(p.dim("  tokens. A model can pass it and still fail a real Claude Code"));
-  L.push(p.dim("  session (tool schemas, large prompts). One sample, taken under"));
-  L.push(p.dim("  sweep load: read it as a ranking, not a benchmark."));
-  L.push(p.dim("  refresh with: node refresh/bench-cli.mjs --live"));
+  // ------------------------------------------------------------------ 5. PROBES
+  gap();
+  heading("PROBES");
+  note("One real request per model through the gateway; refresh with: node refresh/bench-cli.mjs --live. Results are never hidden for being old; the oldest probe column and the yellow outdated line show how old they are.");
+  entry("ok", stat("ok"), "answered");
+  entry("empt", stat("empt"), "no text came back (often the 96-token budget went on thinking)");
+  entry("auth", stat("auth"), "key refused");
+  entry("pay", stat("pay"), "needs balance or credits");
+  entry("rate", stat("rate"), "rate limited");
+  entry("gone", stat("gone"), "model not found upstream");
+  entry("t/o", stat("t/o"), "too slow (timed out)");
+  entry("err", stat("err"), "provider or network error");
+  note("The probe is a bare chat message with NO tools and 96 output tokens. A model can pass it and still fail a real Claude Code session (tool schemas, large prompts). It is one sample, taken under sweep load: read it as a ranking, not a benchmark.");
 
   return L;
 }

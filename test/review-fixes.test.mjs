@@ -5,9 +5,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { detectCaps, glyphsFor, frame, frameWidth, statusCount, painter, elisionHeads, keyIdPlan, keyIdShown } from "../menu/style.mjs";
+import { detectCaps, glyphsFor, frame, frameWidth, statusCount, painter, elisionHeads, keyIdPlan } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
-import { isFresh, freshOk, BENCH_FRESH_MS, FUTURE_SKEW_MS, countStatuses, providerFlags } from "../menu/bench-data.mjs";
+import { isUsable, isOk, BENCH_FRESH_MS, FUTURE_SKEW_MS, countStatuses, providerFlags } from "../menu/bench-data.mjs";
 import { buildSnapshot, main, loadSnapshot } from "../menu/snapshot.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
@@ -23,31 +23,31 @@ const prow = (keyId, models, o = {}) => ({ keyId, provider: keyId.split(".")[1] 
 
 // ------------------------------------------------------------ 6. freshness
 
-test("isFresh: a timestamp, not in the future, at most 14 days old", () => {
-  assert.equal(isFresh(rec(1000), NOW), true);
-  assert.equal(isFresh(rec(BENCH_FRESH_MS), NOW), true, "the 14-day edge is inclusive");
-  assert.equal(isFresh(rec(BENCH_FRESH_MS + 2000), NOW), false);
-  assert.equal(isFresh(rec(-DAY), NOW), false, "a record dated in the FUTURE is not evidence");
-  assert.equal(isFresh(rec(-1000), NOW), true, "a second of clock skew is tolerated");
-  assert.equal(isFresh(rec(-4 * 60 * 1000), NOW), true, "and so are a few minutes (a record written just after the picker started)");
-  assert.equal(isFresh(rec(-10 * 60 * 1000), NOW), false, "ten minutes ahead of every clock is not evidence");
-  assert.equal(isFresh({ s: "ok" }, NOW), false, "no timestamp");
-  assert.equal(isFresh({ s: "ok", a: NaN }, NOW), false);
-  assert.equal(isFresh(null, NOW), false);
-  assert.equal(freshOk(rec(-DAY), NOW), false, "and ok-ness needs freshness too");
-  assert.equal(freshOk(rec(1000, { s: "gone" }), NOW), false);
-  assert.equal(freshOk(rec(1000), NOW), true);
+test("isUsable: a timestamp and not in the future; there is NO age limit", () => {
+  assert.equal(isUsable(rec(1000), NOW), true);
+  for (const days of [14, 15, 30, 100, 400]) assert.equal(isUsable(rec(days * DAY), NOW), true, `${days} days old still counts`);
+  assert.equal(isUsable(rec(-DAY), NOW), false, "a record dated in the FUTURE is not evidence");
+  assert.equal(isUsable(rec(-1000), NOW), true, "a second of clock skew is tolerated");
+  assert.equal(isUsable(rec(-4 * 60 * 1000), NOW), true, "and so are a few minutes (a record written just after the picker started)");
+  assert.equal(isUsable(rec(-10 * 60 * 1000), NOW), false, "ten minutes ahead of every clock is not evidence");
+  assert.equal(isUsable({ s: "ok" }, NOW), false, "no timestamp");
+  assert.equal(isUsable({ s: "ok", a: NaN }, NOW), false);
+  assert.equal(isUsable(null, NOW), false);
+  assert.equal(isOk(rec(-DAY), NOW), false, "and ok-ness needs a usable record too");
+  assert.equal(isOk(rec(100 * DAY), NOW), true, "an old ok is still ok");
+  assert.equal(isOk(rec(1000, { s: "gone" }), NOW), false);
+  assert.equal(isOk(rec(1000), NOW), true);
 });
 
-test("counts and verdicts exclude a future-dated record, like an old one", () => {
+test("counts and verdicts exclude a future-dated record but keep an old one", () => {
   const get = (t) => ({ "p/a": rec(-DAY), "p/b": rec(30 * DAY), "p/c": rec(1000) })[t] ?? null;
-  assert.deepEqual(countStatuses("p", [{ id: "a" }, { id: "b" }, { id: "c" }], get, NOW).ok, 1);
-  assert.equal(providerFlags("p", [{ id: "a" }, { id: "b" }], get, NOW), null, "nothing fresh: no verdict");
+  assert.deepEqual(countStatuses("p", [{ id: "a" }, { id: "b" }, { id: "c" }], get, NOW).ok, 2, "the 30-day-old ok counts, the future-dated one does not");
+  assert.equal(providerFlags("p", [{ id: "a" }], get, NOW), null, "only a future-dated record: no verdict");
 });
 
-test("a 30-day-old or future-dated record draws BLANK on the model list; a fresh one draws", () => {
+test("a 30- or 100-day-old record STILL DRAWS its cells on the model list; a future-dated one draws blank", () => {
   const models = [M("fresh"), M("old"), M("future"), M("edge")];
-  const bench = { "p/fresh": rec(DAY), "p/old": rec(30 * DAY), "p/future": rec(-3 * DAY), "p/edge": rec(13 * DAY) };
+  const bench = { "p/fresh": rec(DAY), "p/old": rec(30 * DAY), "p/future": rec(-3 * DAY), "p/edge": rec(100 * DAY) };
   const row = prow("personal.p.free", models, { provider: "p" });
   const benchOf = (t) => bench[t] ?? null;
   for (const env of [UNI, ASCII]) {
@@ -58,7 +58,7 @@ test("a 30-day-old or future-dated record draws BLANK on the model list; a fresh
     const cellsOf = (id) => lines.find((l) => l.includes(id));
     assert.match(cellsOf("fresh"), /ok\s+.*842ms/);
     assert.match(cellsOf("edge"), /842ms/);
-    assert.doesNotMatch(cellsOf("old"), /842ms|hello there/, "a stale measurement is not drawn as a current fact");
+    assert.match(cellsOf("old"), /842ms/, "an old measurement is still drawn (the outdated notice says so instead)");
     assert.doesNotMatch(cellsOf("future"), /842ms|hello there/, "nor is a future-dated one");
   }
 });
@@ -68,29 +68,29 @@ test("a 30-day-old or future-dated record draws BLANK on the model list; a fresh
 test("level-0 key ids elide with a visible marker and stay distinct where a hard cut collided", () => {
   const names = ["openrouter-x-1", "openrouter-x-2", "openrouter-x-3", "openrouter-x-4", "openrouter-x-5"];
   const rows = names.map((n) => prow(`personal.${n}.free`, [M("m")], { provider: n }));
-  assert.equal(new Set(rows.map((r) => keyIdShown(r.keyId, "personal.").slice(0, 12))).size, 1, "precondition: a 12-column hard cut gives one identical cell");
-  const heads = keyIdPlan(rows, "personal.", 12);
-  const { dup } = elisionHeads(rows.map((r) => keyIdShown(r.keyId, "personal.")), 12);
+  assert.equal(new Set(rows.map((r) => r.keyId.slice(0, 16))).size, 1, "precondition: a 16-column hard cut (the 80-column key id) gives one identical cell");
+  const heads = keyIdPlan(rows, 16);
+  const { dup } = elisionHeads(rows.map((r) => r.keyId), 16);
   assert.equal(dup, 0);
   for (const env of [UNI, ASCII]) {
     const caps = detectCaps(env, 80);
     const g = glyphsFor(caps);
-    const meta = { providers: 5, models: 5, keyIdBucket: "personal.", keyIdW: 30, rows };
+    const meta = { providers: 5, models: 5, keyIdW: 30, rows };
     const lines = frame(view(initState(rows)), meta, { caps }).map(strip);
-    const cells = lines.slice(4, 9).map((l) => l.slice(3, 15));
+    const cells = lines.slice(4, 9).map((l) => l.slice(3, 19));
     assert.equal(new Set(cells).size, 5, cells.join(" | "));
-    for (const c of cells) { assert.equal(cps(c), 12); assert.ok(c.includes(g.dash), `${c}: a visible marker, not a silent cut`); }
+    for (const c of cells) { assert.equal(cps(c), 16); assert.ok(c.includes(g.elide), `${c}: a visible marker, not a silent cut`); }
     for (const l of lines) assert.equal(cps(l), frameWidth(caps));
   }
   assert.ok(heads instanceof Map);
-  assert.equal(keyIdPlan(rows, "personal.", 12), heads, "cached per (rows, bucket, width)");
-  assert.equal(keyIdPlan(undefined, "", 12), null);
+  assert.equal(keyIdPlan(rows, 16), heads, "cached per (rows, width)");
+  assert.equal(keyIdPlan(undefined, 16), null);
 });
 
 test("wide enough for every key id, nothing is elided at level 0", () => {
   const rows = ["personal.google.free", "personal.openrouter.free"].map((k) => prow(k, [M("m")]));
   const caps = detectCaps(ASCII, 134);
-  const lines = frame(view(initState(rows)), { providers: 2, models: 2, keyIdBucket: "", keyIdW: 30, rows }, { caps }).map(strip);
+  const lines = frame(view(initState(rows)), { providers: 2, models: 2, keyIdW: 30, rows }, { caps }).map(strip);
   assert.ok(lines.some((l) => l.includes("personal.openrouter.free ")));
 });
 
@@ -245,15 +245,15 @@ test("UW_PICKER_COLSEP picks the column rule; the default and ASCII terminals ar
   }
 });
 
-test("a record written after the picker started is fresh; a genuinely future or corrupt one is still refused", () => {
+test("a record written after the picker started is usable; a genuinely future or corrupt one is still refused", () => {
   const real = Date.now();
   const pickerStart = real - 2 * 60 * 60 * 1000;           // the picker has been open for two hours: state.now is frozen there
   const at = (ms) => ({ s: "ok", a: Math.floor(ms / 1000) });
-  assert.equal(isFresh(at(real - 30 * 1000), pickerStart), true, "a sweep in another window wrote it 30 s ago: newer than state.now, still fresh");
-  assert.equal(isFresh(at(pickerStart + 60 * 1000), pickerStart), true);
-  assert.equal(isFresh(at(real + FUTURE_SKEW_MS + 60 * 1000), pickerStart), false, "beyond the real clock plus the skew: refused");
-  assert.equal(isFresh(at(real + DAY), pickerStart), false, "a day ahead: a hand edit or a clock that ran ahead");
-  assert.equal(isFresh(at(real + DAY), real), false);
-  assert.equal(isFresh(at(pickerStart - BENCH_FRESH_MS - 5000), pickerStart), false, "the 14-day window is still measured from now");
-  assert.equal(freshOk({ s: "ok", a: Math.floor((real - 1000) / 1000) }, pickerStart), true, "so the ok-only list and the header count it");
+  assert.equal(isUsable(at(real - 30 * 1000), pickerStart), true, "a sweep in another window wrote it 30 s ago: newer than state.now, still fresh");
+  assert.equal(isUsable(at(pickerStart + 60 * 1000), pickerStart), true);
+  assert.equal(isUsable(at(real + FUTURE_SKEW_MS + 60 * 1000), pickerStart), false, "beyond the real clock plus the skew: refused");
+  assert.equal(isUsable(at(real + DAY), pickerStart), false, "a day ahead: a hand edit or a clock that ran ahead");
+  assert.equal(isUsable(at(real + DAY), real), false);
+  assert.equal(isUsable(at(pickerStart - BENCH_FRESH_MS - 5000), pickerStart), true, "there is no age window any more");
+  assert.equal(isOk({ s: "ok", a: Math.floor((real - 1000) / 1000) }, pickerStart), true, "so the ok-only list and the header count it");
 });

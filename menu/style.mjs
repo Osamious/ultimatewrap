@@ -16,13 +16,13 @@
 // wide, astral and combining characters are replaced by `?` at draw time (see sanitize.mjs).
 import { sanitizeCells as sanitizeDisplay } from "./sanitize.mjs";
 import { liveAlias } from "./route-hints.mjs";
-import { PREVIEW_CHARS, STATUSES, statusCode, statusTone, fmtMs, fmtTps, previewText, isFresh } from "./bench-data.mjs";
+import { PREVIEW_CHARS, STATUSES, statusCode, statusTone, fmtMs, fmtTps, previewText, isUsable, probeAgeTone } from "./bench-data.mjs";
 // Content only. `legend.mjs` imports nothing and takes the glyph renderers as
 // arguments, so this does not become a cycle even though the legend renders
 // through `provenanceDot` defined in this file.
 import { legendLines } from "./legend.mjs";
 // The output-modality vocabulary (the `modality` column). Also import-free.
-import { modalityWord } from "./modality.mjs";
+import { modalityWord, MODALITY_COLOURS } from "./modality.mjs";
 
 // The floor, and what `FRAME_W` used to be unconditionally. Kept as the minimum
 // so no terminal renders narrower than it did before this became elastic: a
@@ -61,9 +61,10 @@ export function frameWidth(caps) {
  * The column table for a given frame width. One call resolves BOTH chromes, and the
  * header and the rows read the same numbers, so they cannot disagree.
  *
- * LEVEL 0 (providers): see the block comment above `LEVEL0_FIXED`. The key id column takes only
- * its CONTENT (`keyW`, capped at W.keyId); surplus width is never poured into it, so the other
- * columns sit beside it. What the key id leaves buys the optional `free` block.
+ * LEVEL 0 (providers): see the block comment above `LEVEL0_FIXED`. The key id column takes its FULL
+ * content first (`keyW`, capped at KEYID_MAX); surplus width is never poured into it beyond that, so the
+ * other columns sit beside it. What the key id leaves buys, in this order, the optional `oldest probe` column (13) and then
+ * the `free` block (10): a narrower terminal loses `free` first, then `oldest probe`, and the full key id before neither.
  *
  * MODEL LEVEL (level 1 and flat scope), ONE view showing every column when it fits:
  *   gutter, id, status, ttft, [total], [tok/s], ctx, $in, $out, badge, modality, TVR, [output]
@@ -79,18 +80,29 @@ export function frameWidth(caps) {
  * additions on a path that already rebuilds every row, and a cache keyed on
  * width is a second source of truth for the geometry.
  */
-// LEVEL 0 (#114 redesign): key id | models | status | ok | free | empt | auth | pay | rate | gone | t/o | err.
+// LEVEL 0 (#114 redesign): key id | status | [oldest probe] | models | ok | % | [free | %] | empt | auth | pay | rate | gone | t/o | err.
 // Every cell is a dim rule plus right-aligned text. The raw status cells (all but `ok`, which is
 // folded into the `ok` element, and `skip`, which no longer occurs) are as wide as their label plus
-// the rule (`CELL_MIN` = a three-digit count). `ok` and `free` are `COUNT (PCT%)` cells.
+// the rule (`CELL_MIN` = a three-digit count). `ok` and `free` are each TWO sub-columns: the count
+// (4 wide, so the `free` header fits; `2k` from a thousand) and the percent of the provider's models (4 wide),
+// with no parentheses: rule + 4, rule + 4 = 10 columns apiece.
 const CELL_MIN = 3;
 export const statusCellW = (status) => Math.max(statusCode(status).length, CELL_MIN) + 1;
 export const L0_STATUSES = Object.freeze(["empty", "auth", "pay", "rate", "gone", "timeout", "error"]);
 const L0_RAW_W = L0_STATUSES.reduce((n, st) => n + statusCellW(st), 0);          // 32
-const STATUS_TXT_W = 6, PCT_TXT_W = 10, KEYID_MIN = 6, KEYID_FLOOR = 16;
-// mark 2, models 7 (rule + 6), status 7, ok 11, then the raw cells; `free` (11) is optional.
-const LEVEL0_FIXED = 2 + 7 + (1 + STATUS_TXT_W) + (1 + PCT_TXT_W) + L0_RAW_W;
-const FREE_W = 1 + PCT_TXT_W;
+const STATUS_TXT_W = 6, CNT_W = 4, PCT_W = 4, KEYID_MIN = 6;
+// The longest key id the column will ever be sized to (a hostile 200-character id must not starve every other column).
+export const KEYID_MAX = 64;
+const PCT_BLOCK_W = (1 + CNT_W) + (1 + PCT_W);              // 10: count sub-column + percent sub-column
+// The `models` cell is `N` or `N/M` (M withheld): 7 wide holds the worst real pair (`469/100`), and a wider pair
+// falls back to the abbreviated form, then to `big` -- it never overflows, so it can never move a column.
+const MODELS_TXT_W = 7, MODELS_W = 1 + MODELS_TXT_W;
+// mark 2, status 7 (rule + 6), models 8 (rule + 7), ok 10, then the raw cells; `free` (10) is optional.
+const LEVEL0_FIXED = 2 + (1 + STATUS_TXT_W) + MODELS_W + PCT_BLOCK_W + L0_RAW_W;          // 59
+const FREE_W = PCT_BLOCK_W;
+// `oldest probe`: the age of the provider's OLDEST probe record, sized to its own header (12) plus the rule. Optional: it
+// needs the FULL key id first, and `free` needs it in turn (a terminal too narrow for it loses `free` first, then it).
+const PROBE_TXT_W = 12, PROBE_W = 1 + PROBE_TXT_W;
 
 // Model level. Every cell carries its own leading gap, so no two cells can touch.
 // Text widths: stat 4 (`empt`), ttft/total/tok-s 5, ctx 6 (`nochat`), $in/$out 5 (`180.0`),
@@ -111,15 +123,16 @@ export function layoutFor(frameW, { keyW = W.keyId, idW = W.id } = {}) {
   const w = Math.max(FRAME_MIN, Math.min(FRAME_MAX, Math.floor(frameW) || FRAME_MIN));
   const inner = w - 3;
 
-  // LEVEL 0. The key id keeps KEYID_FLOOR (or its content, if shorter), then the optional `free`
-  // column, then the key id grows toward its content; what is left is empty space at the right.
+  // LEVEL 0. The key id is sized to the LONGEST FULL key id (`keyW`, from `keyIdWidth` over every provider row)
+  // FIRST, before the optional `free` block: it is only elided (distinctness-aware, with a visible marker) when
+  // even the mandatory columns plus the full id do not fit. What is left over buys `free`; the rest stays empty
+  // space at the right.
   const avail0 = inner - LEVEL0_FIXED;
-  const want0 = Math.max(KEYID_MIN, Math.min(keyW, W.keyId));
-  let keyId = Math.min(Math.min(want0, KEYID_FLOOR), avail0);
-  let s0 = avail0 - keyId;
-  const showFree = s0 >= FREE_W;
-  if (showFree) s0 -= FREE_W;
-  keyId += Math.max(0, Math.min(want0 - keyId, s0));
+  const want0 = Math.max(KEYID_MIN, Math.min(Math.floor(keyW) || W.keyId, KEYID_MAX));
+  const keyId = Math.max(1, Math.min(want0, avail0));
+  const spare0 = avail0 - keyId;
+  const showProbe = spare0 >= PROBE_W;
+  const showFree = showProbe && spare0 - PROBE_W >= FREE_W;
 
   // MODEL LEVEL. See the doc above.
   const want = Math.min(MODEL_ID_MAX, Math.max(1, Math.floor(idW) || W.id));
@@ -135,59 +148,32 @@ export function layoutFor(frameW, { keyW = W.keyId, idW = W.id } = {}) {
   // The output column takes ALL that is left (no cap): the stored reply is what limits it.
   const preview = showPreview ? PREVIEW_MIN + free : 0;
 
-  return { frameW: w, inner, showFree, showTotal, showTps, showPreview,
+  return { frameW: w, inner, showProbe, showFree, showTotal, showTps, showPreview,
            W: { ...W, keyId, id, preview } };
 }
 
 /**
- * The key id column's content width: the longest key id over ALL provider rows (not
- * the visible page, so the columns do not move while filtering or scrolling), at
- * least the header text, at most W.keyId. Code points, the measure `pad` uses.
+ * The key id column's content width: the longest FULL key id over ALL provider rows (not the visible
+ * page, so the columns do not move while filtering or scrolling), at least the header text, at most
+ * KEYID_MAX. Code points, the measure `pad` uses.
  */
-export function keyIdWidth(rows, bucket = "") {
+export function keyIdWidth(rows) {
   let n = KEYID_MIN;
   for (const r of rows ?? []) {
-    n = Math.max(n, [...sanitizeDisplay(keyIdShown(String(r?.keyId ?? ""), bucket), W.keyId + 1)].length);
+    n = Math.max(n, [...sanitizeDisplay(String(r?.keyId ?? ""), KEYID_MAX + 1)].length);
   }
-  return Math.min(n, W.keyId);
+  return Math.min(n, KEYID_MAX);
 }
 
 const keyPlanCache = new WeakMap();
 /** Head lengths for the level-0 key id column: the same distinctness-aware elision as model ids. */
-export function keyIdPlan(rows, bucket, n) {
+export function keyIdPlan(rows, n) {
   if (!Array.isArray(rows)) return null;
   let byKey = keyPlanCache.get(rows);
   if (!byKey) keyPlanCache.set(rows, byKey = new Map());
-  const key = `${bucket}:${n}`;
-  let plan = byKey.get(key);
-  if (!plan) byKey.set(key, plan = elisionHeads(rows.map((r) => keyIdShown(r?.keyId, bucket)), n).heads);
+  let plan = byKey.get(n);
+  if (!plan) byKey.set(n, plan = elisionHeads(rows.map((r) => String(r?.keyId ?? "")), n).heads);
   return plan;
-}
-/** A key id as drawn: without the shared bucket segment (`personal.`) when there is one. */
-export const keyIdShown = (keyId, bucket = "") =>
-  (bucket && String(keyId ?? "").startsWith(bucket) ? String(keyId).slice(bucket.length) : String(keyId ?? ""));
-
-/**
- * The leading segment (up to and including the first dot) that nearly every provider row
- * shares, or `""`. Every key id here is `<bucket>.<provider>.<tier>`, and the bucket is the
- * same noise on almost every row, so the provider list omits it and says so in its title.
- * Applied only when at least 80% of the rows carry it (a few rows may live in another
- * bucket and keep their full id, which is what tells them apart) and only if the
- * shortened ids are all still unique, so it can never merge two rows.
- */
-export function keyIdBucket(rows) {
-  const list = rows ?? [];
-  if (list.length < 2) return "";
-  const count = new Map();
-  for (const r of list) {
-    const m = /^[^.]+\./.exec(String(r?.keyId ?? ""));
-    if (m) count.set(m[0], (count.get(m[0]) ?? 0) + 1);
-  }
-  let best = "", n = 0;
-  for (const [k, c] of count) if (c > n) { best = k; n = c; }
-  if (!best || n / list.length < 0.8) return "";
-  const shown = new Set(list.map((r) => keyIdShown(r.keyId, best)));
-  return shown.size === list.length ? best : "";
 }
 
 /**
@@ -220,7 +206,7 @@ const INNER = FRAME_W - 3;
 
 // The base column widths (`layoutFor` resolves the real ones for a terminal). The provider
 // list's `health` column was replaced by the sweep columns (#114) and is gone.
-export const W = { keyId: 30, count: 7,
+export const W = { keyId: 30, count: MODELS_W,
                    id: 37, ctx: 6, price: 7, badge: 6, caps: 3, prov: 1 };
 
 const ESC = "\x1b";
@@ -259,6 +245,9 @@ export function motionEnabled({ env = process.env, flags = [], caps }) {
 const UNI = {
   marker: "▶", fav: "★", recent: "↺",
   check: "✔", arrow: "→", sep: "▸", caret: "▏", ell: "…", dash: "—",
+  // The id ELISION marker (one code point): an em dash in Unicode, and `~` in ASCII, where a plain `-` would read as
+  // a real hyphen in the id.
+  elide: "—",
   // The provenance ladder's five rungs, one glyph each, ordered exactly as
   // PROVENANCE_RUNGS (snapshot.mjs) names them: call-verified, config-asserted,
   // listing-verified, catalogue-only, null (blank). Each is exactly one column
@@ -280,6 +269,7 @@ const UNI = {
 const ASCII = {
   marker: ">", fav: "*", recent: "~",
   check: "OK", arrow: "->", sep: ">", caret: "_", ell: "...", dash: "-",
+  elide: "~",
   provCV: "#", provCA: "=", provLV: "+", provCO: ".",
   dashMatch: "!",
   colSep: ":",
@@ -292,11 +282,14 @@ export function glyphsFor(caps) {
   return (caps.colSep && UNI_COLSEP[caps.colSep]) || UNI;
 }
 
-const SGR = { dim: 2, bold: 1, inv: 7, red: 31, grn: 32, yel: 33, cya: 36, mag: 35 };
+const SGR = { dim: 2, bold: 1, inv: 7, red: 31, grn: 32, yel: 33, cya: 36, mag: 35, blu: 94 };
 export function painter(caps) {
   const wrap = (code) => (s) => (caps.colours ? `${ESC}[${code}m${s}${ESC}[0m` : String(s));
   const p = {};
   for (const [name, code] of Object.entries(SGR)) p[name] = wrap(code);
+  // A raw SGR parameter string (`38;5;n`, `32`, ...) and the colour depth, for the modality table (`modalityCell`).
+  p.raw = (code, str) => wrap(code)(str);
+  p.depth = caps.colours;
   // A 256-colour ramp for the title only. On a 16-colour host it degrades to cyan,
   // which is the same information with less of it.
   p.ramp = (s, from = 45, to = 39) => {
@@ -335,32 +328,69 @@ export function statusCount(n, unbenched, status, p, lead = " ") {
 /** `n` as a count that can never widen a cell: `Nk` from a thousand. */
 const cnt = (n) => (n > 99999 ? "big" : n > 999 ? `${Math.floor(n / 1000)}k` : String(n));
 /**
- * `COUNT (PCT%)` of a provider's total models: the nearest whole percent, but a non-zero count never
- * reads 0% (it is `<1%`) and a partial count never reads 100% (it is `99%`). `""` for an unknown count, `"-"` for zero.
+ * THE one place a share is rounded and clamped, so the label and the colour band can never drift apart. The nearest
+ * whole percent, but a non-zero count is never 0% (`low`: it reads `<1%`) and a PARTIAL count is never 100% (995 of
+ * 1000 reads 99%), so `100%` always means every one. `null` for an unknown count or a non-positive total.
  */
-export const pctLabel = (n, total) => {
+function share(n, total) {
+  if (!Number.isFinite(n) || n < 0 || !Number.isFinite(total) || total <= 0) return null;
   const pct = Math.round((100 * n) / total);
-  // The two ends are exact, never rounded into: a non-zero count is never 0% (`<1%`), and a PARTIAL count is
-  // never 100% (995 of 1000 reads 99%), so `(100%)` always means every one.
-  return `${n > 0 && pct < 1 ? "<1" : n < total && pct >= 100 ? 99 : Math.min(100, pct)}%`;
-};
-export function pctText(n, total) {
-  if (!Number.isFinite(n)) return "";
-  if (n <= 0) return "-";
-  if (!Number.isFinite(total) || total <= 0) return cnt(n);
-  return `${cnt(n)} (${pctLabel(n, total)})`;
+  if (n > 0 && pct < 1) return { value: 0, label: "<1%" };
+  const v = n < total && pct >= 100 ? 99 : Math.min(100, pct);
+  return { value: v, label: `${v}%` };
 }
-/** One `COUNT (PCT%)` cell: the rule, then the text right-aligned (`tone`: green ok, cyan free), dim zero. */
-export function pctCell(n, total, tone, p, lead = " ") {
-  const t = pctText(n, total);
-  if (t === "") return lead + " ".repeat(PCT_TXT_W);
-  const txt = rpad(t, PCT_TXT_W);
-  return lead + (t === "-" ? p.dim(txt) : p[tone](txt));
+/** The percent label of `n` in `total`: `12%`, `<1%`, `99%`, `100%`. */
+export const pctLabel = (n, total) => share(n, total)?.label ?? "-";
+/** The colour band of a share: 70% and up green, 30-69 yellow, under 30 red. `null` for zero or unknown. */
+export function pctTone(n, total) {
+  const sh = n > 0 ? share(n, total) : null;
+  return sh ? (sh.value >= 70 ? "grn" : sh.value >= 30 ? "yel" : "red") : null;
 }
-/** The provider-list status cell: `alive` (green), `dead` (red), blank when there is no verdict. */
-export function aliveCell(alive, p, lead = " ") {
-  if (typeof alive !== "boolean") return lead + " ".repeat(STATUS_TXT_W);
-  return lead + (alive ? p.grn(rpad("alive", STATUS_TXT_W)) : p.red(rpad("dead", STATUS_TXT_W)));
+/**
+ * The two sub-columns of an `ok` or `free` element: a rule and the COUNT right-aligned in 4 (`-` for zero, blank
+ * when unknown, `2k` from a thousand; `countTone`: green for `ok`, blue for `free`, dim for a dash), then a rule
+ * and the PERCENT of `total` right-aligned in 4 (`<1%`, `50%`, `100%`), with no parentheses. `total` is the
+ * DENOMINATOR the caller chose (`ok`: models minus gone; `free`: all models); a zero denominator reads `-`. The
+ * percent carries the indicative colour band; the numbers carry the whole meaning without any colour.
+ */
+export function pctBlock(n, total, p, lead = " ", countTone = "grn") {
+  if (!Number.isFinite(n)) return lead + " ".repeat(CNT_W) + lead + " ".repeat(PCT_W);
+  if (n <= 0) return lead + p.dim(rpad("-", CNT_W)) + lead + p.dim(rpad("-", PCT_W));
+  const count = lead + p[countTone](rpad(cnt(n), CNT_W));
+  const tone = pctTone(n, total);
+  if (!tone) return count + lead + p.dim(rpad("-", PCT_W));
+  return count + lead + p[tone](rpad(pctLabel(n, total), PCT_W));
+}
+/**
+ * The `oldest probe` age text: whole minutes under an hour (`45m`, `<1m` under a minute), whole hours under a day
+ * (`5h`), whole days from a day (`3d`, `12d`, `100d`). Every unit rounds DOWN, so `59m` becomes `1h` at 60 minutes,
+ * `23h` becomes `1d` at 24 hours, and `47h` reads `1d`.
+ */
+export function ageLabel(ageS) {
+  if (!Number.isFinite(ageS) || ageS < 0) return "-";
+  if (ageS < 60) return "<1m";
+  if (ageS < 3600) return `${Math.floor(ageS / 60)}m`;
+  if (ageS < 86400) return `${Math.floor(ageS / 3600)}h`;
+  return `${Math.floor(ageS / 86400)}d`;
+}
+/** An age band's ink: green, yellow, red as everywhere, and orange as 256-colour 208 (bright red, 91, on a 16-colour terminal). */
+const ageInk = (tone, text, p) => (tone === "ora" ? p.raw(p.depth >= 256 ? "38;5;208" : "91", text) : p[tone](text));
+/**
+ * The provider-list `oldest probe` cell: the age of the provider's OLDEST probe record right-aligned in 12, coloured
+ * green, yellow, orange (256-colour 208; bright red 91 on a 16-colour terminal) or red as it nears and passes the
+ * outdated threshold (`probeAgeTone`); `-` (dim) for a provider with no records, blank when there is no bench data
+ * (`undefined`). The colour is decoration: the text carries the meaning.
+ */
+export function probeCell(ageS, p, lead = " ") {
+  if (ageS === undefined) return lead + " ".repeat(PROBE_TXT_W);
+  if (ageS === null || !Number.isFinite(ageS)) return lead + p.dim(rpad("-", PROBE_TXT_W));
+  const text = rpad(ageLabel(ageS), PROBE_TXT_W), tone = probeAgeTone(ageS);
+  return lead + ageInk(tone, text, p);
+}
+/** The provider-list `status` cell: `alive` green, `down` yellow, `dead` red, blank when there is no verdict. */
+export function statusCell(status, p, lead = " ") {
+  const tone = status === "alive" ? "grn" : status === "down" ? "yel" : status === "dead" ? "red" : null;
+  return lead + (tone ? p[tone](rpad(status, STATUS_TXT_W)) : " ".repeat(STATUS_TXT_W));
 }
 
 // The provenance ladder's own dot: the glyph carries the state, colour is the enhancement. `call-verified` renders here
@@ -372,17 +402,22 @@ export function aliveCell(alive, p, lead = " ") {
 // this needs is the header's `discovered` stamp (Q1.3's pattern, restated for
 // this field), not a fifth mark competing with the other four for meaning.
 /**
- * The `modality` cell: the route's primary OUTPUT modality (`menu/modality.mjs`), left-aligned like the badge.
- * Dim for `chat` and for the two not-quite-known values (`chat?`, `?`), a calm cyan for every other known
- * word so the rows that are NOT chat models stand out. Anything that is not a word from the closed list
- * (an absent field, or a tampered snapshot) draws `?`: unknown reads as unknown, never as a guess, and a
- * stored string can never reach the terminal. COLOURED AFTER PADDING (see the badge cell's note).
+ * The `modality` cell: the route's primary OUTPUT modality (`menu/modality.mjs`), left-aligned like the badge, in
+ * its OWN colour from `MODALITY_COLOURS` (256-colour code, or an ANSI 8+8 code on a 16-colour terminal; the word
+ * alone with no colour). `?` (unknown, or anything that is not a word from the closed list -- an absent field or a
+ * tampered snapshot) is dim: unknown reads as unknown and a stored string can never reach the terminal. COLOURED AFTER
+ * PADDING (see the badge cell's note). The colour is decoration; the word carries the meaning.
  */
 export const MODALITY_TXT_W = 8;
+export function modalityHue(w, p) {
+  const c = Object.hasOwn(MODALITY_COLOURS, w) ? MODALITY_COLOURS[w] : null;
+  if (!c) return "2";                                   // not a known word: dim, never a colour
+  return p.depth >= 256 ? `38;5;${c.c256}` : String(c.c16);
+}
 export function modalityCell(v, p) {
   const w = modalityWord(v);
   const cell = pad(w ?? "?", MODALITY_TXT_W);
-  return w == null || w === "chat" || w === "chat?" ? p.dim(cell) : p.cya(cell);
+  return w == null ? p.dim(cell) : p.raw(modalityHue(w, p), cell);
 }
 
 export function provenanceDot(provenance, g, p) {
@@ -541,7 +576,7 @@ export function elisionPlan(row, flat, n) {
 // date, a version, a size) that right-truncation always drops is usually
 // exactly what a shared prefix hides.
 //
-// THE MARKER IS ONE CODE POINT IN BOTH GLYPH SETS (`g.dash`: "—" / "-"),
+// THE MARKER IS ONE CODE POINT IN BOTH GLYPH SETS (`g.elide`: "—" / "~", never a plain hyphen),
 // not `g.ell` ("…" is one code point in UNI but ASCII's "..." is three) --
 // using `g.ell` here would silently eat two extra columns from the tail in
 // the ASCII path only, an invariant break that only one glyph set's tests
@@ -590,7 +625,7 @@ export function padId(id, n, query, g, p, headHint = null) {
   // A distinct GLYPH (`dashMatch`), not a bolded ordinary dash: `p.bold` is a
   // no-op under `caps.colours === 0`, which would leave the marker a plain
   // `—` -- blind again, for the whole no-colour population.
-  const marker = hasMatch && !inHead && !inTail ? p.bold(g.dashMatch) : g.dash;
+  const marker = hasMatch && !inHead && !inTail ? p.bold(g.dashMatch) : g.elide;
   return highlight(head, query, p) + marker + highlight(tail, query, p);
 }
 // Context window, formatted to FIT ITS COLUMN. The previous form was
@@ -667,13 +702,10 @@ export function countCell(total, refused, width = W.count) {
   if (abbrev1.length <= width) return abbrev1;
   const abbrev0 = `${abbrevCount0(total)}/${abbrevCount0(refused)}`;
   if (abbrev0.length <= width) return abbrev0;
-  // Neither abbreviation reaches `width` (six-digit-plus counts on both
-  // sides -- unreached today, MEASURED max 434 on one real provider). CORRECT
-  // beats TRUNCATED even over width: `rpad` must not silently cut this to a
-  // plausible wrong pair, so the caller passes it through uncapped and any
-  // resulting overflow is the frame's own visible, already-tested row clip,
-  // not a lie inside the cell.
-  return exact;
+  // Neither abbreviation reaches `width` (six-digit counts on both sides). `big/big` is honest and always fits
+  // 7 columns: a cell must never be wider than its column (it would shift every column to its right).
+  const big = `${cnt(total)}/${cnt(refused)}`;
+  return big.length <= width ? big : exact;
 }
 
 // Pad OR TRUNCATE to the frame's inner width using the VISIBLE length, so a
@@ -715,10 +747,10 @@ const titleAt = (g, p, text, frameW) => {
   return p.ramp(head) + g.frame.h.repeat(Math.max(0, frameW - vis(head) - 1)) + g.frame.tr;
 };
 
-export const HELP0 = "[↑↓] move  [↵] open  [⇥] scope  [^f] fav  [?] all keys  [esc] back";
-export const HELP1 = "[↑↓] move  [↵] select  [^f] fav  [^o] ok  [^l] 1M+  [?] keys  [esc] back";
-const HELP0_A = "[up/dn] move [enter] open [tab] scope [^f] fav [?] all keys [esc] back";
-const HELP1_A = "[up/dn] move [enter] select [^f] fav [^o] ok [^l] 1M+ [?] keys [esc] back";
+export const HELP0 = "[↑↓] move [↵] open [⇥] scope [^f] fav [^x] gone [?] all keys [esc] back";
+export const HELP1 = "[↑↓] move [↵] pick [^f]fav [^o]ok [^l]1M+ [^x]gone [^e]free [?] keys [esc]";
+const HELP0_A = "[up/dn][enter] open [tab] scope [^f] fav [^x] gone [?] all keys [esc]";
+const HELP1_A = "[up/dn][ent] pick [^f]fav [^o]ok [^l]1M+ [^x]gone [^e]free [?] keys [esc]";
 
 const footerAt = (g, p, text, frameW) => {
   const head = `${g.frame.bl} ${text} `;
@@ -838,7 +870,7 @@ export function frame(v, meta, { caps }) {
   const crumb = flat
     ? "UW " + g.sep + " all models"
     : v.level === 0
-      ? "UW " + g.sep + " providers" + (meta.keyIdBucket ? ` ${g.sep} ids shown without ${sanitizeDisplay(meta.keyIdBucket, 30)}` : "")
+      ? "UW " + g.sep + " providers"
       : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
   L.push(title(g, p, crumb));
 
@@ -878,28 +910,47 @@ export function frame(v, meta, { caps }) {
                                       : `benched ${g.dash} run bench-cli --live`;
   const discoveredStamp = meta.discoveredAsOf ? `discovered ${stampOf(meta.discoveredAsOf)}`
                                               : `discovered ${g.dash}`;
-  // Model-level chips, next to the typed filter: the two toggles are otherwise invisible.
+  // Chips, next to the typed filter: the toggles are otherwise invisible. The provider list draws only `[no gone]` (the one
+  // toggle that works there: it changes the % figures, hides no row); model lists and flat scope draw all four.
   const atProviderLevel = !flat && v.level === 0;
-  const chips = atProviderLevel ? [] : [v.okOnly ? "[ok]" : "", v.oneM ? "[1M+]" : ""].filter(Boolean);
-  const chipText = chips.map((c) => " " + c).join("");
+  const chipNames = atProviderLevel ? [v.hideGone ? "no gone" : ""] : [v.okOnly ? "ok" : "", v.oneM ? "1M+" : "", v.hideGone ? "no gone" : "", v.freeOnly ? "free" : ""];
+  const chips = chipNames.filter(Boolean).map((c) => `[${c}]`);
+  // What FILTERS the list (the empty-state explanation): nothing at the provider level, where the toggle hides no row.
+  const filterChips = atProviderLevel ? [] : chips;
   // What the left side occupies with NO typed text. The stamps are chosen against this,
   // not against the live filter, so they do not appear and vanish keystroke by keystroke:
   // a stamp that would clip is worse than none.
   // The stamps are chosen against the TYPED text too (a candidate that would be cut mid-token by
   // the bar is never chosen); if even the shortest does not fit, the typed text is what gives way.
   const typed = sanitizeDisplay(v.filter, 40);
-  const leftBare = vis(`  filter: ${g.caret}`) + vis(chipText);
   // The right side is COUNTS ONLY (the data stamps moved to the id line): thousands separators and a
   // middle dot between the parts. `ok` carries its share of the same population's models.
   const okShown = v.okLive !== undefined ? v.okLive : (flat ? meta.okTotal : v.provider?.bench?.ok);
   const N = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  const okFig = (k, total) => (Number.isFinite(k) ? `${N(k)} ok${total > 0 ? ` (${pctLabel(k, total)})` : ""}` : "- ok");
+  // `P` is ok / models normally, and ok / (models minus gone) while [no gone] is on. The provider list uses the snapshot's
+  // baked gone total, the model levels the live one from the same reader as `K ok`.
+  const okFig = (k, total, gone = 0) => {
+    // `gone` is subtracted ONLY while [no gone] is on: off, the percent is over all routes.
+    const den = total - (v.hideGone && Number.isFinite(gone) ? gone : 0);
+    return Number.isFinite(k) ? `${N(k)} ok${den > 0 ? ` (${pctLabel(k, den)})` : ""}` : "- ok";
+  };
   const rightFor = (n) => (atProviderLevel
-    ? `${N(meta.providers)} providers ${g.dot} ${N(meta.models)} models ${g.dot} ${okFig(meta.okTotal, meta.models)}`
-    : flat ? `${N(n)} of ${N(meta.models)} models ${g.dot} ${okFig(okShown, meta.models)}`
-           : `${N(n)} of ${N(v.provider.models.length)} ${g.dot} ${okFig(okShown, v.provider.models.length)}`);
+    // The total follows [no gone]: all models normally, models minus gone while it is on, and the % over that same total.
+    ? `${N(meta.providers)} providers ${g.dot} ${N(meta.models - (v.hideGone && Number.isFinite(meta.goneTotal) ? meta.goneTotal : 0))} models ${g.dot} ${okFig(meta.okTotal, meta.models, meta.goneTotal)}`
+    : flat ? `${N(n)} of ${N(meta.models)} models ${g.dot} ${okFig(okShown, meta.models, v.goneLive)}`
+           : `${N(n)} of ${N(v.provider.models.length)} ${g.dot} ${okFig(okShown, v.provider.models.length, v.goneLive)}`);
   const matches = v.modelCount ?? (v.items.filter((it) => it.kind === "model").length + v.more);
   const right = rightFor(matches);
+  // The chip row degrades in three tiers so that, with every chip on, the counts on the right are never clipped: normal
+  // (`[ok] [1M+] [no gone] [free]`), then packed (no space between chips), then short (`[-gone]`, `[1M]`).
+  const worstRight = vis(rightFor(flat ? meta.models : v.provider?.models?.length ?? 0));
+  const tiers = [
+    chips.map((c) => " " + c).join(""),
+    " " + chips.join(""),
+    " " + chips.map((c) => (c === "[no gone]" ? "[-gone]" : c === "[1M+]" ? "[1M]" : c)).join(""),
+  ].map((t) => (chips.length ? t : ""));
+  const chipText = tiers.find((t) => vis(`  filter: ${g.caret}`) + vis(t) + 1 + worstRight <= INNER) ?? tiers[tiers.length - 1];
+  const leftBare = vis(`  filter: ${g.caret}`) + vis(chipText);
   // If even the counts do not fit beside the typed text, the typed text gives way (never the counts).
   const fit = leftBare + vis(typed) + 1 + vis(rightFor(flat ? meta.models : v.provider?.models?.length ?? 0)) <= INNER ? 0 : -1;
   let typedShown = typed;
@@ -924,7 +975,15 @@ export function frame(v, meta, { caps }) {
     // The offset comes from the reducer (`v.legendTop`), clamped there against
     // this same `avail` arithmetic, so the two can never disagree about how many
     // lines a page holds -- the discipline the refusals overlay already follows.
-    const all = legendLines(g, p, { provenanceDot });
+    // The legend draws its terms through the SAME colour tables the rows use (modality words, probe-status codes).
+    const codeToStatus = Object.fromEntries(STATUSES.map((st) => [statusCode(st), st]));
+    const stat = (code) => {
+      const tone = statusTone(codeToStatus[code]);
+      return (tone === "ok" ? p.grn : tone === "warn" ? p.yel : tone === "bad" ? p.red : p.dim)(code);
+    };
+    const modality = (w) => (modalityWord(w) ? p.raw(modalityHue(w, p), w) : w);
+    const age = (tone, text) => ageInk(tone, text, p);
+    const all = legendLines(g, p, { provenanceDot, modality, stat, age });
     const avail = Math.max(1, v.legendAvail ?? all.length);
     const top = Math.min(Math.max(0, v.legendTop ?? 0), Math.max(0, all.length - avail));
     for (const line of all.slice(top, top + avail)) L.push(bar(g, "  " + line));
@@ -992,16 +1051,17 @@ export function frame(v, meta, { caps }) {
       const r = it.row;
       const total = r.models.length;
       const sepd = p.dim(S);
-      const keyText = keyIdShown(r.keyId, meta.keyIdBucket);
-      const keyHead = keyIdPlan(meta.rows, meta.keyIdBucket ?? "", W.keyId)?.get(keyText) ?? null;
-      // key id | models | status | ok | [free] | the raw status cells, every one a rule plus
-      // right-aligned text. `ok` and `free` are COUNT (PCT%) of the provider's models; the plan
-      // count is reachable on the `id:` line of the selected provider.
+      const keyText = String(r.keyId ?? "");
+      const keyHead = keyIdPlan(meta.rows, W.keyId)?.get(keyText) ?? null;
+      // key id | status | [oldest probe] | models | ok | % | [free | %] | the raw status cells, every one a rule plus
+      // right-aligned text. `ok` and `free` are a count and a percent of the provider's models (ok count green, free count
+      // blue, the percent banded); the plan count is reachable on the `id:` line of the selected provider.
       body = `${mark} ` + padId(keyText, W.keyId, v.filter, g, p, keyHead) +
+             statusCell(r.benchFlags?.status, p, sepd) +
+             (layout.showProbe ? probeCell(v.probeAges?.has(r.keyId) ? v.probeAges.get(r.keyId) : undefined, p, sepd) : "") +
              sepd + rpadCount(countCell(total, r.refused?.length ?? 0, W.count - 1), W.count - 1) +
-             aliveCell(r.benchFlags?.alive, p, sepd) +
-             pctCell(r.bench == null ? NaN : r.bench.ok, total, "grn", p, sepd) +
-             (layout.showFree ? pctCell(r.free == null ? NaN : r.free, total, "cya", p, sepd) : "") +
+             pctBlock(r.bench == null ? NaN : r.bench.ok, total - (v.hideGone && Number.isFinite(r.bench?.gone) ? r.bench.gone : 0), p, sepd, "grn") +
+             (layout.showFree ? pctBlock(r.free == null ? NaN : r.free, total, p, sepd, "blu") : "") +
              L0_STATUSES.map((st) => statusCount(r.bench?.[st], r.bench == null, st, p, sepd)).join("");
     } else if (it.kind === "pinned") {
       body = `${mark} ` + (it.mark === "*" ? p.yel(g.fav) : p.dim(g.recent)) + " " +
@@ -1053,7 +1113,7 @@ export function frame(v, meta, { caps }) {
       // Only a FRESH record is drawn (the same rule the counts and the filter use): a 30-day-old
       // measurement is not shown as a current fact.
       const got = meta.benchOf ? meta.benchOf(it.target) : null;
-      const rec = isFresh(got, v.now ?? Date.now()) ? got : null;
+      const rec = isUsable(got, v.now ?? Date.now()) ? got : null;
       const tone = rec ? statusTone(rec.s) : "dim";
       const stat = pad(rec ? statusCode(rec.s) : "", 4);
       const statOut = tone === "ok" ? p.grn(stat) : tone === "warn" ? p.yel(stat)
@@ -1127,8 +1187,10 @@ export function frame(v, meta, { caps }) {
   // same columns because both are built from the same widths below: a cell is
   // `sep + text`, where text is `width - 1` wide.
   L.push(bar(g, p.dim(!flat && v.level === 0
-    ? "  " + pad("key id", W.keyId) + S + rpad("models", W.count - 1) + S + rpad("status", STATUS_TXT_W) +
-      S + rpad("ok", PCT_TXT_W) + (layout.showFree ? S + rpad("free", PCT_TXT_W) : "") +
+    ? "  " + pad("key id", W.keyId) + S + rpad("status", STATUS_TXT_W) +
+      (layout.showProbe ? S + rpad("oldest probe", PROBE_TXT_W) : "") + S + rpad("models", W.count - 1) +
+      S + rpad("ok", CNT_W) + S + rpad("%", PCT_W) +
+      (layout.showFree ? S + rpad("free", CNT_W) + S + rpad("%", PCT_W) : "") +
       L0_STATUSES.map((st) => S + rpad(statusCode(st), statusCellW(st) - 1)).join("")
     : "  " + "  " + pad(flat ? "provider/model" : "model", W.id) + S + pad("stat", 4) +
       S + rpad("ttft", 5) + (layout.showTotal ? S + rpad("total", 5) : "") +
@@ -1151,16 +1213,16 @@ export function frame(v, meta, { caps }) {
     if (v.filter) {
       L.push(bar(g, `  backspace to widen, esc to clear ${g.dash} no match for ` +
                     `"${sanitizeDisplay(v.filter, 20)}"`));
-    } else if (!chips.length) {
+    } else if (!filterChips.length) {
       L.push(bar(g, "  nothing to list here"));
     }
     // Which toggles are on is the reason a list can be empty with nothing typed, so it gets a
     // line of its own (the line above is already at the frame's width).
-    if (chips.length) {
-      const names = [v.okOnly ? "ok-only" : "", v.oneM ? "1M+ context only" : ""].filter(Boolean).join(" + ");
+    if (filterChips.length) {
+      const names = [v.okOnly ? "ok-only" : "", v.oneM ? "1M+ context only" : "", v.hideGone ? "gone routes hidden" : "", v.freeOnly ? "FREE / FREE? only" : ""].filter(Boolean).join(" + ");
       const nodata = v.okOnly && !(meta.benchAsOf && meta.benchOf?.records !== 0) ? ` ${g.dash} no benchmark data yet` : "";
       L.push(bar(g, `  filtered by ${names}${nodata}`));
-      L.push(bar(g, p.dim("  turn a toggle off: ctrl+o (ok-only), ctrl+l (1M+)")));
+      L.push(bar(g, p.dim("  toggles: ctrl+o ok, ctrl+l 1M+, ctrl+x gone, ctrl+e free")));
     }
   }
 
@@ -1210,7 +1272,7 @@ export function frame(v, meta, { caps }) {
     let reply = "";
     if (sel?.kind === "model") {
       const got = meta.benchOf ? meta.benchOf(sel.target) : null;
-      const rec = isFresh(got, v.now ?? Date.now()) ? got : null;
+      const rec = isUsable(got, v.now ?? Date.now()) ? got : null;
       // A cut stream and an ok record that hit a stream error after its first token say so up front.
       const note = rec?.s === "ok" && rec.x === 1 ? "[cut] " : rec?.s === "ok" && typeof rec.m === "string" && rec.m ? "[stream error] " : "";
       // The note already says "stream error", so the stored message loses its own `stream error after first token:` lead.
@@ -1221,6 +1283,21 @@ export function frame(v, meta, { caps }) {
         : text.slice(0, Math.max(0, room - vis(g.ell))).join("") + g.ell);
     }
     L.push(bar(g, reply));
+  }
+  // THE OUTDATED NOTICE: a dedicated line just above the footer (after the `id:` / `reply:` lines, so it never disturbs them),
+  // right-aligned, in the warn colour, while MORE than half of the bench records are over 7 days old (its date is the oldest record's). Old results stay visible; this only
+  // says so. It costs one line on every list screen, which pick-state's `extraLines` counts (`v.notice` is its own source, so
+  // the two cannot disagree). The date is `YYYY-MM-DD` from a validated ISO stamp. Narrow frames drop words from the FRONT in
+  // steps and keep the command whole; the last variant fits the 78-column floor.
+  if (v.notice) {
+    const cmd = "node refresh/bench-cli.mjs --live";
+    const variants = [
+      `Model Status might be outdated! Last time the list was fully updated was ${v.notice}, run ${cmd} to update your list fully`,
+      `Status may be outdated (full update ${v.notice}): ${cmd}`,
+      `Outdated since ${v.notice}: ${cmd}`,
+    ];
+    const text = variants.find((t) => vis(t) <= INNER - 1) ?? variants[variants.length - 1];
+    L.push(bar(g, " ".repeat(Math.max(0, INNER - 1 - vis(text))) + p.yel(text)));
   }
   const atProviders = !flat && v.level === 0;
   L.push(footer(g, p, caps.unicode ? (atProviders ? HELP0 : HELP1)

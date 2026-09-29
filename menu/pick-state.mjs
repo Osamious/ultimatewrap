@@ -13,7 +13,7 @@
 import { LEGEND_LENGTH } from "./legend.mjs";
 // Light (fs + two tiny modules), already in the picker's graph via snapshot.mjs. The
 // reducer needs the ONE definition of "fresh ok" so the filter and the header agree.
-import { freshOk, isFresh } from "./bench-data.mjs";
+import { isOk, isGone, isUsable, outdatedNotice, oldestAgeOf } from "./bench-data.mjs";
 import { liveAlias } from "./route-hints.mjs";
 
 const asTarget = (providerName, modelId) => `${providerName}/${modelId}`;
@@ -27,6 +27,21 @@ const asTarget = (providerName, modelId) => `${providerName}/${modelId}`;
  */
 export const isOneM = (m) => (Number.isFinite(m?.ctx) && m.ctx >= 1_000_000) || /\[1m\]$/i.test(String(m?.id ?? ""));
 
+// `gone` per target, memoised the same way as `ok` (the hide-gone toggle asks it for every row of a list).
+const goneCache = new WeakMap();
+function goneOf(s) {
+  if (typeof s.benchOf !== "function") return () => false;
+  let byNow = goneCache.get(s.benchOf);
+  if (!byNow) goneCache.set(s.benchOf, byNow = new Map());
+  let memo = byNow.get(s.now);
+  if (!memo) byNow.set(s.now, memo = new Map());
+  return (target) => {
+    let v = memo.get(target);
+    if (v === undefined) memo.set(target, v = isGone(s.benchOf(target), s.now));
+    return v;
+  };
+}
+
 // `ok` per target, computed once per (reader, clock): flat scope filters ~6,000 rows on
 // every keystroke and each lookup cleans a record, so an unmemoised filter is ~100 ms a key.
 const okCache = new WeakMap();
@@ -38,7 +53,7 @@ function okOf(s) {
   if (!memo) byNow.set(s.now, memo = new Map());
   return (target) => {
     let v = memo.get(target);
-    if (v === undefined) memo.set(target, v = freshOk(s.benchOf(target), s.now));
+    if (v === undefined) memo.set(target, v = isOk(s.benchOf(target), s.now));
     return v;
   };
 }
@@ -119,7 +134,7 @@ const settle = (list, i) => {
   return i;
 };
 
-export function initState(rows, { recents = [], favourites = [], termRows = 30, nowMs = Date.now() } = {}) {
+export function initState(rows, { recents = [], favourites = [], termRows = 30, nowMs = Date.now(), benchOldestAt = null } = {}) {
   const known = new Set();
   // Built from SELECTABLE models only, which is where the pinned path is handled.
   // A pin is a persisted target STRING -- state.mjs returns nothing else -- so
@@ -172,11 +187,17 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30, 
     // AND with each other and with the typed filter. They PERSIST across levels and
     // scope for the whole session (unlike the typed filter, which is per level): they are
     // a view preference, and the header chips keep them visible. Plain booleans.
-    okOnly: false, oneM: false,
+    okOnly: false, oneM: false, hideGone: false, freeOnly: false,
     // The lazily loaded bench reader (`loadBench().get`), handed in by uwpick as an event
     // `{ benchOf }` the first time a model screen is drawn, so the reducer does no I/O. `now`
     // is fixed at init so "fresh" cannot change under a session.
     benchOf: null, now: nowMs,
+    // The stamp (ISO) of the OLDEST bench record among the listed routes: the snapshot's until bench.json is loaded (then the
+    // live one replaces it). The outdated notice's line is counted in the page size below, so the reducer must know it.
+    benchOldestAt: typeof benchOldestAt === "string" ? benchOldestAt : null,
+    // The per-provider age histograms from the loaded bench.json (`Map<keyId, [[epochHour, count], ...]>`); null until then, and the
+    // rows' own baked `benchAgeHist` (the snapshot's) is read instead. Once loaded, bench.json wins.
+    benchHist: null,
     q: ["", "", ""], cur: [0, 0, 0], top: [0, 0, 0],
     provider: null, termRows,
     // #51 (§2.5(b)/(c)), R18: null when closed, otherwise
@@ -219,8 +240,14 @@ const slot = (s) => (s.scope === "flat" ? 2 : s.level);
 // `extra`: the lines a list screen spends OUTSIDE the rows and the six fixed ones -- the model level's
 // `reply:` line, and the rule under the pinned strip at level 0. Both renderer and reducer read the
 // page size from here, so they cannot disagree.
+// The outdated notice (a dedicated line above the footer) costs one more line on every list screen while it is showing.
+// The age histogram of one provider row: the loaded bench.json's once it is in, else the snapshot's baked one (`undefined`
+// when neither exists: no bench data, so nothing to say about its age).
+const histOfRow = (s, r) => (s.benchHist ? (s.benchHist.get(r.keyId) ?? []) : r.benchAgeHist);
+// `YYYY-MM-DD` when MORE than half of all the records are over 7 days old (the date is the OLDEST record's), else null.
+const noticeDate = (s) => outdatedNotice(s.benchOldestAt, s.rows.map((r) => histOfRow(s, r)), s.now);
 const extraLines = (s) => ((s.scope === "flat" || s.level === 1) ? 1
-  : (s.pinned?.length > 0 ? 1 : 0));
+  : (s.pinned?.length > 0 ? 1 : 0)) + (noticeDate(s) ? 1 : 0);
 const rowsAvail = (s) => Math.max(1, (s.termRows || 30) - 8 - extraLines(s));
 
 function flatItems(s) {
@@ -249,11 +276,12 @@ function liveTally(s, row) {
   const m = okBook(s);
   let t = m.byRow.get(row);
   if (!t) {
-    t = { ok: 0, fresh: 0 };
+    t = { ok: 0, fresh: 0, gone: 0 };
     for (const m2 of row.models) {
       const rec = s.benchOf(`${row.provider}/${m2.id}`);
-      if (isFresh(rec, s.now)) t.fresh += 1;
-      if (freshOk(rec, s.now)) t.ok += 1;
+      if (isUsable(rec, s.now)) t.fresh += 1;
+      if (isOk(rec, s.now)) t.ok += 1;
+      if (isGone(rec, s.now)) t.gone += 1;
     }
     m.byRow.set(row, t);
   }
@@ -271,6 +299,22 @@ function liveOk(s, row) {
   const t = liveTally(s, row);
   return t.fresh === 0 ? null : t.ok;
 }
+// How many routes of the open provider (or of every provider, in flat scope) have a fresh `gone` record: the
+// denominator of the header's percent is models minus these. `null` when there is no reader to ask.
+function liveGone(s, row) {
+  if (noReader(s) || !row) return null;
+  return liveTally(s, row).gone;
+}
+function liveGoneTotal(s) {
+  if (noReader(s)) return null;
+  const m = okBook(s);
+  if (m.goneTotal === undefined) {
+    let n = 0;
+    for (const r of s.rows) n += liveTally(s, r).gone;
+    m.goneTotal = n;
+  }
+  return m.goneTotal;
+}
 function liveOkTotal(s) {
   if (noReader(s)) return null;
   const m = okBook(s);
@@ -287,7 +331,11 @@ function items(s) {
   const has = (hay) => !needle || String(hay).toLowerCase().includes(needle);
   // The model-level toggles: ok-only (latest fresh bench status is exactly `ok`) and 1M+.
   const ok = s.okOnly ? okOf(s) : null;
-  const passes = (target, m) => (!s.oneM || isOneM(m)) && (!ok || ok(target));
+  // Hide-gone: a row whose FRESH bench record is `gone` is out; a row with no fresh record is shown.
+  const gone = s.hideGone ? goneOf(s) : null;
+  // Free-only: the badge AS DRAWN is FREE or FREE? (the snapshot already blanked a FREE? whose fresh probe said pay).
+  const passes = (target, m) => (!s.oneM || isOneM(m)) && (!ok || ok(target)) && (!gone || !gone(target))
+    && (!s.freeOnly || m.badge === "FREE" || m.badge === "FREE?");
 
   if (s.scope === "flat") return flatItems(s).filter((i) => has(i.target) && passes(i.target, i.model));
 
@@ -303,7 +351,7 @@ function items(s) {
     // narrows the models below is fine; a query MATCHING it as though it were
     // a model id would be the defect §2.5(b) names).
     const withheldCount = s.provider.refused?.length ?? 0;
-    if (!needle && !s.okOnly && !s.oneM && withheldCount > 0) {
+    if (!needle && !s.okOnly && !s.oneM && !s.hideGone && !s.freeOnly && withheldCount > 0) {
       return [{ kind: "withheld-list", count: withheldCount }, ...modelItems];
     }
     return modelItems;
@@ -388,7 +436,11 @@ export function reduce(state, ev) {
   if (ev && typeof ev === "object" && Object.hasOwn(ev, "benchOf")) {
     // The lazy bench reader arriving (see initState). The ok filter may change what the
     // list holds, so the cursor is re-clamped like any other list change.
-    return { ...NONE, state: clamp({ ...state, benchOf: typeof ev.benchOf === "function" ? ev.benchOf : null }) };
+    // `benchOldestAt` rides with it when the caller has computed it from the loaded reader (null: no records at all).
+    const oldest = Object.hasOwn(ev, "benchOldestAt") ? { benchOldestAt: typeof ev.benchOldestAt === "string" ? ev.benchOldestAt : null } : {};
+    // `benchHist` (a Map of keyId to age histogram) rides with it the same way.
+    const hist = Object.hasOwn(ev, "benchHist") ? { benchHist: ev.benchHist instanceof Map ? ev.benchHist : null } : {};
+    return { ...NONE, state: clamp({ ...state, ...oldest, ...hist, benchOf: typeof ev.benchOf === "function" ? ev.benchOf : null }) };
   }
   if (ev && typeof ev === "object" && Number.isFinite(ev.resize)) {
     let next = clamp({ ...state, termRows: ev.resize });
@@ -484,9 +536,16 @@ export function reduce(state, ev) {
   // and free in the terminal: not ctrl+c/f/r/g (handoff)/i/m/j/h/z/s/q/d, and not
   // ctrl+b, which is now a plain no-op (the bench view it toggled is gone). Both are
   // control bytes below 32, so the live filter below can never insert them.
-  if ((c0 === 15 || c0 === 12) && key.length === 1) {
-    if (state.scope !== "flat" && state.level === 0) return { ...NONE, state };
-    const next = c0 === 15 ? { ...state, okOnly: !state.okOnly } : { ...state, oneM: !state.oneM };
+  // ctrl+x (hide-gone) and ctrl+e (free-only) join them: free in the terminal and here (ctrl+g is the handoff key that opens
+  // the picker). ctrl+x works at EVERY level (one shared flag: at the provider list it hides no row, it switches the % figures
+  // to ok / (models - gone)); the other three are model-level only and do nothing at the provider list.
+  if ((c0 === 15 || c0 === 12 || c0 === 24 || c0 === 5) && key.length === 1) {
+    if (c0 !== 24 && state.scope !== "flat" && state.level === 0) return { ...NONE, state };
+    // At the provider list ctrl+x only flips the flag: no row changes, so the cursor and scroll stay where they are.
+    if (c0 === 24 && state.scope !== "flat" && state.level === 0) return { ...NONE, state: { ...state, hideGone: !state.hideGone } };
+    const next = c0 === 15 ? { ...state, okOnly: !state.okOnly }
+      : c0 === 12 ? { ...state, oneM: !state.oneM }
+      : c0 === 5 ? { ...state, freeOnly: !state.freeOnly } : { ...state, hideGone: !state.hideGone };
     return { ...NONE, state: clamp(reset(next)) };
   }
 
@@ -634,7 +693,16 @@ export function view(state) {
     // object would make `if (v.legend)` keep working while `=== true` silently
     // stopped -- the worst shape of change. The offset rides beside it.
     level: state.level, scope: state.scope, filter: state.q[i], legend: !!state.legend,
-    okOnly: !!state.okOnly, oneM: !!state.oneM,
+    okOnly: !!state.okOnly, oneM: !!state.oneM, hideGone: !!state.hideGone, freeOnly: !!state.freeOnly,
+    // `YYYY-MM-DD` while the list is outdated (more than half its records are over 7 days old), else null: drawn as the yellow notice.
+    notice: noticeDate(state),
+    // The OLDEST probe age in seconds (against the session clock, never negative) of each provider row on this page, by key id:
+    // `null` when the provider has no records, and no entry at all when there is no bench data to say (the `oldest probe` cell
+    // draws `-` and blank respectively). Plain data (a Map), so two views of the same state compare equal.
+    probeAges: new Map(shown.filter((it) => it.kind === "provider").flatMap((it) => {
+      const h = histOfRow(state, it.row);
+      return Array.isArray(h) ? [[it.row.keyId, oldestAgeOf(h, state.now)]] : [];
+    })),
     // The session clock the freshness rule reads (fixed at init), so the renderer never asks the wall.
     now: state.now,
     legendTop: state.legend?.top ?? 0,
@@ -652,6 +720,9 @@ export function view(state) {
     // The live ok figure for the model-level header: the open provider's, or every provider's in
     // flat scope; `null` when no bench data is loaded (drawn as a dash, never `0 ok`).
     okLive: state.scope === "flat" ? liveOkTotal(state) : state.level === 1 ? liveOk(state, state.provider) : undefined,
+    // How many of the open provider's routes (every provider's, in flat scope) have a fresh `gone` record; the header's
+    // percent leaves them out of its denominator. `null`/`undefined` when there is nothing to count.
+    goneLive: state.scope === "flat" ? liveGoneTotal(state) : state.level === 1 ? liveGone(state, state.provider) : undefined,
     // The FULL id of the selected row -- what enter or ctrl+f acts on -- or null when nothing is
     // selectable there (the withheld door, a non-chat row, an empty list).
     fullId: fullIdOf(all[state.cur[i]] ?? null, state.scope === "flat"),

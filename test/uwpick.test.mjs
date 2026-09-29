@@ -28,16 +28,16 @@ const plain = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const show = (v, caps = CAPS) => plain(screen(v, META, { caps }));
 
 test("the provider header names the required columns", () => {
-  // key id | models | status | ok | [free] | empt auth pay rate gone t/o err (#114 redesign). Every column is
+  // key id | status | models | ok | % | [free | %] | empt auth pay rate gone t/o err (#114 redesign). Every column is
   // introduced by a dim rule (`:` in these ASCII caps), so the labels never touch. The removed columns
   // (health, dead, needs $, skip, limit) are gone.
   assert.match(show(view(initState(ROWS))),
-    /key id\s+:models:status:\s*ok:empt:auth:pay:rate:gone:t\/o:err/);
+    /key id\s+:status:\s*models:\s*ok:\s*%\s*:empt:auth:pay:rate:gone:t\/o:err/);
   assert.doesNotMatch(show(view(initState(ROWS))), /health|needs \$|:dead|skip|limit/);
 });
 
-// `free` is not guaranteed at the 78-column floor: it needs a terminal of 91 columns
-// (and the `limit` column no longer exists), so the free-column cases read a wide one.
+// `free` is not guaranteed at the 78-column floor: it appears only after the FULL key id (so its threshold follows the
+// longest id), and the `limit` column no longer exists, so the free-column cases read a wide terminal.
 const WIDE = detectCaps({ TERM: "dumb" }, 134);
 
 test("a nullable free column renders blank when unknown, and a dash for a known zero, never a 0", () => {
@@ -45,15 +45,16 @@ test("a nullable free column renders blank when unknown, and a dash for a known 
   const lines = show(view(initState(rows)), WIDE).split("\n");
   const blank = lines.find((l) => l.includes("personal.blank.paid"));
   const zero = lines.find((l) => l.includes("personal.zero.free"));
-  const cell = (l) => l.split(":")[4];   // key id : models : status : ok : free
-  assert.equal(cell(blank).trim(), "", "free unknown: blank, not a claim");
-  assert.equal(cell(zero).trim(), "-", "free known to be zero: a dash");
-  assert.doesNotMatch(blank + zero, /\s0\s|\(0%\)/);
+  const cell = (l, n) => l.split(":")[n];   // 0 key id, 1 status, 2 oldest probe, 3 models, 4 ok, 5 ok%, 6 free, 7 free%
+  assert.equal(cell(blank, 6).trim() + cell(blank, 7).trim(), "", "free unknown: blank, not a claim");
+  assert.equal(cell(zero, 6).trim(), "-", "free known to be zero: a dash");
+  assert.equal(cell(zero, 7).trim(), "-");
+  assert.doesNotMatch(blank + zero, /\s0\s|\(0%\)|\b0%/);
 });
 
-test("a provider with plan-covered models shows its plan count on the id line, and free as COUNT (PCT%)", () => {
+test("a provider with plan-covered models shows its plan count on the id line, and free as a count and a percent", () => {
   const lines = show(view(initState(ROWS)), WIDE).split("\n");
-  assert.match(lines.find((l) => l.includes("personal.acme.free") && l.includes(":")), /12 \(100%\)/);
+  assert.match(lines.find((l) => l.includes("personal.acme.free") && l.includes(":")), / 12:100%/);
   assert.match(lines.find((l) => l.startsWith("|  id:")), /id: personal\.acme\.free\s+4 plan/);
 });
 
@@ -193,9 +194,9 @@ test("the first frame is produced synchronously, with no routability at all", ()
   const snap = { schemaVersion: 1, generatedAt: META.generatedAt, builtAt: "x", rows: ROWS };
   const f = firstFrame({ snap, recents: [], favourites: [], caps: CAPS, termRows: 30 });
   assert.equal(typeof f.text, "string");
-  // 12 columns of key id at 80 (#114), and every row here shares `personal.`, which is not drawn.
-  assert.equal(f.text.includes("acme.free") && f.meta.keyIdBucket === "personal.", true);
-  assert.equal(f.meta.keyIdW, 10, "the key id column is sized to the longest id AS DRAWN (blank.paid, 10), once");
+  // The key id is drawn in FULL, bucket included, and sized to the longest full id once.
+  assert.equal(f.text.includes("personal.acme.free"), true);
+  assert.equal(f.meta.keyIdW, 19, "the key id column is sized to the longest full id (personal.blank.paid, 19), once");
   assert.equal(f.meta.providers, 2);
   assert.equal(f.meta.models, 3);
   // Nothing here may be a promise: the whole point is that it runs before the RPC.
@@ -372,7 +373,7 @@ test("the legend scrolls, clamps at both ends, and shows every line across the s
     t = reduce(t, DOWN).state;
   }
   for (const probe of ["call-verified", "catalogue-only", "FREE?", "PAID",
-                       "PROVIDER LIST", "no benchmark data at all", "snapshot.mjs --build",
+                       "PROVIDER LIST", "nothing benched recently", "snapshot.mjs --build",
                        "not a chat model", "not listed now",
                        "ctrl+r", "backspace"]) {
     assert.ok([...seen].some((l) => l.includes(probe)),

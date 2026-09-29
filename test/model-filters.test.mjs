@@ -78,11 +78,11 @@ test("ctrl+o and ctrl+l are independent toggles at level 1 and in flat scope", (
   }
 });
 
-test("ok-only keeps exactly the models whose latest FRESH status is ok", () => {
+test("ok-only keeps exactly the models whose latest status is ok, however old the record", () => {
   const s = reduce(open(), CTRL_O).state;
-  assert.deepEqual(ids(s), ["big-ok", "big-tagged[1m]", "small-ok", "exact-ok", "zero-ctx"],
-    "empty, pay, an old ok and a never-benched model are out; the [1m] row resolves to its bare id");
-  assert.equal(view(s).modelCount, 5);
+  assert.deepEqual(ids(s), ["big-ok", "big-tagged[1m]", "small-ok", "small-old-ok", "exact-ok", "zero-ctx"],
+    "empty, pay and a never-benched model are out; a 20-day-old ok is still ok; the [1m] row resolves to its bare id");
+  assert.equal(view(s).modelCount, 6);
 });
 
 test("1M+ keeps ctx >= 1M and [1m]-tagged rows, whatever the tagged row's ctx", () => {
@@ -104,7 +104,7 @@ test("flat scope filters over every provider's models by target", () => {
   let s = flat();
   assert.equal(all(s).length, 11);
   s = reduce(s, CTRL_O).state;
-  assert.deepEqual(all(s), ["acme/big-ok", "acme/big-tagged[1m]", "acme/small-ok", "acme/exact-ok", "acme/zero-ctx", "zed/z-big"]);
+  assert.deepEqual(all(s), ["acme/big-ok", "acme/big-tagged[1m]", "acme/small-ok", "acme/small-old-ok", "acme/exact-ok", "acme/zero-ctx", "zed/z-big"]);
   s = reduce(s, CTRL_L).state;
   assert.deepEqual(all(s), ["acme/big-ok", "acme/big-tagged[1m]", "acme/exact-ok", "zed/z-big"]);
 });
@@ -219,7 +219,7 @@ test("the chips are visible next to the filter, and nothing clips at the 78-colu
     assert.ok(h.includes("filter: ") && h.includes("[ok] [1M+]"), h);
     assert.equal(cps(h), 78);
     // Anchored: the right side ends the line, whole (stamp and UTC marker), then the frame's own edge.
-    assert.ok(/3 of 9 . 5 ok \(56%\) .$/.test(h), h);
+    assert.ok(/3 of 9 . 6 ok \(67%\) .$/.test(h), h);
   }
   const one = header(view(reduce(s, CTRL_L).state));
   assert.ok(one.includes("[1M+]") && !one.includes("[ok]"));
@@ -229,24 +229,24 @@ test("the chips are visible next to the filter, and nothing clips at the 78-colu
 
 test("N of M counts the filtered list against the provider's models; K ok is computed live from the same records", () => {
   let s = open();
-  assert.ok(header(view(s)).includes("9 of 9 | 5 ok (56%)"), header(view(s)));
+  assert.ok(header(view(s)).includes("9 of 9 | 6 ok (67%)"), header(view(s)));
   s = reduce(s, CTRL_O).state;
-  assert.ok(header(view(s)).includes("5 of 9 | 5 ok ("), header(view(s)));
+  assert.ok(header(view(s)).includes("6 of 9 | 6 ok ("), header(view(s)));
   s = reduce(s, CTRL_L).state;
-  assert.ok(header(view(s)).includes("3 of 9 | 5 ok ("), header(view(s)));
+  assert.ok(header(view(s)).includes("3 of 9 | 6 ok ("), header(view(s)));
   // Flat scope: N of the whole catalogue, and the total ok figure after it.
   let f = flat();
-  assert.ok(header(view(f), 100).includes("11 of 11 models | 6 ok (55%)"), header(view(f), 100));
+  assert.ok(header(view(f), 100).includes("11 of 11 models | 7 ok (64%)"), header(view(f), 100));
   f = reduce(reduce(f, CTRL_O).state, CTRL_L).state;
-  assert.ok(header(view(f), 100).includes("4 of 11 models | 6 ok ("), header(view(f), 100));
+  assert.ok(header(view(f), 100).includes("4 of 11 models | 7 ok ("), header(view(f), 100));
 });
 
 test("the header at each level, exactly, with and without bench data (78 and 134 columns)", () => {
   const noBench = { providers: 2, models: 11, generatedAt: "x", discoveredAsOf: "2026-09-07T13:37:38Z", routableAsOf: "2026-09-29T09:18:00Z" };
   const lvl1 = view(open());
   // level 1: header `N of M | K ok (P%)`; the stamps are on the id line.
-  assert.ok(header(lvl1, 80).endsWith("9 of 9 | 5 ok (56%) |"));
-  assert.ok(header(lvl1, 134).endsWith("9 of 9 | 5 ok (56%) |"));
+  assert.ok(header(lvl1, 80).endsWith("9 of 9 | 6 ok (67%) |"));
+  assert.ok(header(lvl1, 134).endsWith("9 of 9 | 6 ok (67%) |"));
   assert.ok(stamps(lvl1, 80).endsWith("benched 09-29 12:34Z | discovered 09-07 13:37Z |"), stamps(lvl1, 80));
   assert.ok(stamps(lvl1, 134).endsWith("benched 09-29 12:34Z | discovered 09-07 13:37Z |"));
   // Real scale (424 models, 229 ok): the same header shape, thousands separators from 1,000.
@@ -259,7 +259,7 @@ test("the header at each level, exactly, with and without bench data (78 and 134
   assert.ok(header(zedView, 80).includes("2 of 2 | - ok"), "no bench counts on the provider: a dash, never `0 ok`");
   assert.ok(stamps(zedView, 100, ASCII, noBench).includes("benched - run bench-cli --live"), stamps(zedView, 100, ASCII, noBench));
   // flat: `N of M models | K ok (P%)`
-  assert.ok(header(view(flat()), 80).endsWith("11 of 11 models | 6 ok (55%) |"));
+  assert.ok(header(view(flat()), 80).endsWith("11 of 11 models | 7 ok (64%) |"));
   assert.ok(stamps(view(flat()), 134).endsWith("benched 09-29 12:34Z | discovered 09-07 13:37Z |"));
   assert.ok(header(view(reduce(initState(ROWS, { nowMs: NOW }), "\t").state), 80, ASCII, { ...noBench, okTotal: null }).includes("| - ok"));
   // level 0: `P providers | M models | K ok (P%)`, stamps on the id line

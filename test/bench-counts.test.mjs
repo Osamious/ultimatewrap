@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { STATUSES, statusCode, statusTone, countStatuses, providerFlags, loadBench, benchKey,
          BENCH_FRESH_MS } from "../menu/bench-data.mjs";
 import { buildSnapshot, loadSnapshot, writeSnapshotFile, SNAPSHOT_SCHEMA } from "../menu/snapshot.mjs";
-import { detectCaps, glyphsFor, painter, frame, frameWidth, layoutFor, statusCount, statusCellW, keyIdWidth, W, FRAME_MIN, FRAME_MAX,
+import { detectCaps, glyphsFor, painter, frame, frameWidth, layoutFor, statusCount, statusCellW, keyIdWidth, KEYID_MAX, W, FRAME_MIN, FRAME_MAX,
  } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
 import { firstFrame } from "../menu/uwpick.mjs";
@@ -34,22 +34,26 @@ test("countStatuses counts each raw status once, with no grouping", () => {
   for (const s of STATUSES) assert.equal(out[s], 1, s);
 });
 
-test("only records inside the 14-day window count, and the edge is inclusive", () => {
+test("records of ANY age count: there is no age window", () => {
   const byKey = {
     "p/fresh": rec("ok", DAY),
     "p/edge": rec("ok", BENCH_FRESH_MS),
     "p/old": rec("ok", BENCH_FRESH_MS + 2000),
   };
   const out = countStatuses("p", [M("fresh"), M("edge"), M("old")], getFrom(byKey), NOW);
-  assert.deepEqual(out, { ...zero(), ok: 2 });
+  assert.deepEqual(out, { ...zero(), ok: 3 }, "the 14-day edge, and 14 days and 2 s, both count");
+  const older = { "p/a": rec("ok", 100 * DAY), "p/b": rec("gone", 400 * DAY) };
+  assert.deepEqual(countStatuses("p", [M("a"), M("b")], getFrom(older), NOW), { ...zero(), ok: 1, gone: 1 }, "100- and 400-day-old records count");
+  const future = { "p/f": rec("ok", -3 * DAY) };
+  assert.deepEqual(countStatuses("p", [M("f")], getFrom(future), NOW), zero(), "a record dated in the future is still refused");
 });
 
-test("a model with no fresh record is in NO column, so the columns can sum to less than the models", () => {
-  const byKey = { "p/a": rec("ok"), "p/stale": rec("gone", 30 * DAY) };
-  const models = [M("a"), M("stale"), M("never")];
+test("a model with no record is in NO column, so the columns can sum to less than the models", () => {
+  const byKey = { "p/a": rec("ok"), "p/old": rec("gone", 30 * DAY) };
+  const models = [M("a"), M("old"), M("never")];
   const out = countStatuses("p", models, getFrom(byKey), NOW);
   const sum = Object.values(out).reduce((n, v) => n + v, 0);
-  assert.equal(sum, 1);
+  assert.equal(sum, 2, "the 30-day-old record counts; only the never-benched model is in no column");
   assert.ok(sum < models.length);
 });
 
@@ -76,7 +80,7 @@ test("a status outside the closed vocabulary is ignored, never counted or thrown
   assert.equal(Object.keys(out).length, STATUSES.length);
 });
 
-test("countStatuses over a real bench.json read: cleanRecord drops what is unusable", () => {
+test("countStatuses over a real bench.json read: cleanRecord drops what is unusable, and an old record still counts", () => {
   const dir = tmp();
   const file = path.join(dir, "bench.json");
   fs.writeFileSync(file, JSON.stringify({ schema: 1, generatedAt: "2026-09-29T00:00:00.000Z", models: {
@@ -84,7 +88,7 @@ test("countStatuses over a real bench.json read: cleanRecord drops what is unusa
     "p/c": { s: "nonsense", a: secs(1000) }, "p/d": { s: "gone", a: secs(20 * DAY) } } }));
   const b = loadBench(file);
   assert.deepEqual(countStatuses("p", [M("a"), M("b"), M("c"), M("d"), M("e")], b.get, NOW),
-    { ...zero(), ok: 1, auth: 1 });
+    { ...zero(), ok: 1, auth: 1, gone: 1 }, "the 20-day-old gone counts; the nonsense status and the unbenched model do not");
 });
 
 // -------------------------------------------------------------- providerFlags
@@ -107,10 +111,10 @@ test("dead: yes iff nothing responded and every fresh record is a refusal or fai
   assert.equal(flags({ "p/a": skip("unfunded"), "p/b": rec("gone") }).dead, false);
   assert.equal(flags({ "p/a": skip("spend-cap"), "p/b": rec("gone") }).dead, false, "any other skip");
   assert.equal(flags({ "p/a": skip("row-cost") }).dead, false);
-  // Freshness: an old answer no longer keeps a provider alive; an old failure no longer kills it.
-  assert.equal(flags({ "p/a": rec("ok", 20 * DAY), "p/b": rec("auth") }).dead, true, "the stale ok is ignored");
-  assert.equal(flags({ "p/a": rec("auth", 20 * DAY), "p/b": rec("ok") }).dead, false);
-  assert.equal(flags({ "p/a": rec("auth", 20 * DAY) }), null, "nothing fresh: no verdict at all");
+  // Age: there is no cutoff, so an old answer still keeps a provider alive and an old failure still counts.
+  assert.equal(flags({ "p/a": rec("ok", 20 * DAY), "p/b": rec("auth") }).dead, false, "the old ok answered");
+  assert.equal(flags({ "p/a": rec("auth", 20 * DAY), "p/b": rec("auth") }).dead, true, "the old auth counts");
+  assert.equal(flags({ "p/a": rec("auth", -3 * DAY) }), null, "only a future-dated record: no verdict at all");
 });
 
 test("needs $: yes only when EVERY fresh record is a payment refusal and none answered", () => {
@@ -143,11 +147,11 @@ test("dead and needs $ are mutually exclusive by construction, and skips still c
   assert.equal(countStatuses("p", models, getFrom(recs), NOW).skip, 2, "the raw skip column keeps them");
 });
 
-test("old records are ignored: only the fresh ones decide, and nothing fresh is no verdict", () => {
+test("old records decide like any other; nothing recorded is no verdict", () => {
   assert.deepEqual(flags({ "p/a": rec("pay", 20 * DAY), "p/b": rec("pay"), "p/c": rec("ok", 20 * DAY) }),
-    { dead: false, needsMoney: true }, "the old ok does not flip it");
-  assert.deepEqual(flags({ "p/a": rec("pay", BENCH_FRESH_MS) }), { dead: false, needsMoney: true }, "the edge is inclusive");
-  assert.equal(flags({ "p/a": rec("pay", 20 * DAY), "p/b": skip("provider-dead", 30 * DAY) }), null);
+    { dead: false, needsMoney: false }, "the 20-day-old ok answered: not needs-money");
+  assert.deepEqual(flags({ "p/a": rec("pay", 100 * DAY) }), { dead: false, needsMoney: true }, "a 100-day-old pay still says so");
+  assert.equal(flags({ "p/a": rec("pay", -3 * DAY) }), null, "a future-dated record is not evidence");
   assert.equal(flags({}, [M("a"), M("b")]), null, "never benched: null, drawn blank");
   assert.equal(flags({}, []), null);
   assert.equal(providerFlags("p", [M("a")], null, NOW), null, "no reader: null");
@@ -187,24 +191,24 @@ const BUILT = {
   ],
 };
 
-test("schema 7: buildSnapshot bakes per-status counts into every row, and stamps benchAsOf", () => {
-  assert.equal(SNAPSHOT_SCHEMA, 7);
+test("schema 9: buildSnapshot bakes per-status counts into every row, and stamps benchAsOf", () => {
+  assert.equal(SNAPSHOT_SCHEMA, 9);
   const bench = { generatedAt: "2026-09-29T10:39:05.361Z", size: 2,
                   get: getFrom({ "acme/acme-1": rec("ok"), "acme/acme-2": rec("gone") }) };
   const s = buildSnapshot(BUILT, { bench, nowMs: NOW });
-  assert.equal(s.schemaVersion, 7);
+  assert.equal(s.schemaVersion, 9);
   assert.equal(s.benchAsOf, "2026-09-29T10:39:05.361Z");
   assert.deepEqual(s.rows[0].bench, { ...zero(), ok: 2, gone: 1 }, "acme-1 and acme-1[1m] are two routes");
   assert.deepEqual(s.rows[1].bench, zero(), "benched providers with no fresh results are zeros, not null");
-  assert.deepEqual(s.rows[0].benchFlags, { dead: false, needsMoney: false, alive: true }, "acme answered (ok and gone are both responses)");
+  assert.deepEqual(s.rows[0].benchFlags, { dead: false, needsMoney: false, alive: true, status: "alive" }, "acme has a fresh ok: alive");
   assert.equal(s.rows[1].benchFlags, null, "nothing fresh to judge from: no verdict, not a `no`");
   const paid = { generatedAt: null, size: 2,
                  get: getFrom({ "zed/z1": { ...rec("skip"), w: "provider-dead" } }) };
   assert.deepEqual(buildSnapshot(BUILT, { bench: paid, nowMs: NOW }).rows[1].benchFlags,
-    { dead: true, needsMoney: false, alive: null }, "a legacy provider-dead skip is not a probe result: no alive verdict");
+    { dead: true, needsMoney: false, alive: null, status: null }, "a legacy provider-dead skip is not a probe result: no alive verdict, no status");
 });
 
-test("schema 7: with no bench data every row carries bench: null and benchAsOf is null, as own properties", () => {
+test("schema 9: with no bench data every row carries bench: null and benchAsOf is null, as own properties", () => {
   const s = JSON.parse(JSON.stringify(buildSnapshot(BUILT)));
   assert.equal(Object.hasOwn(s, "benchAsOf"), true);
   assert.equal(s.benchAsOf, null);
@@ -218,19 +222,21 @@ test("schema 7: with no bench data every row carries bench: null and benchAsOf i
   assert.equal(noStamp.benchAsOf, null, "an unstamped bench file stamps null");
 });
 
-test("a schema-5 snapshot (and a schema-6 one) is refused, so a stale file is rebuilt instead of drawing blanks", () => {
+test("a schema-5 snapshot (and schema-6, 7 and 8 ones) is refused, so a stale file is rebuilt instead of drawing blanks", () => {
   const dir = tmp();
   const f = path.join(dir, "snapshot.json");
   fs.writeFileSync(f, JSON.stringify({ ...buildSnapshot(BUILT), schemaVersion: 5 }));
   const r = loadSnapshot(f);
   assert.equal(r.ok, false);
   assert.equal(r.reason, "schema");
-  assert.match(r.detail, /7/);
+  assert.match(r.detail, /9/);
   assert.match(r.detail, /5/);
   writeSnapshotFile(buildSnapshot(BUILT), f);
   assert.equal(loadSnapshot(f).ok, true, "and the current schema loads");
-  fs.writeFileSync(f, JSON.stringify({ ...buildSnapshot(BUILT), schemaVersion: 6 }));
-  assert.equal(loadSnapshot(f).ok, false, "a schema-6 file has no alive flag and no outModality");
+  for (const old of [6, 7, 8]) {
+    fs.writeFileSync(f, JSON.stringify({ ...buildSnapshot(BUILT), schemaVersion: old }));
+    assert.equal(loadSnapshot(f).ok, false, `a schema-${old} file lacks the newer fields (an old file would silently never warn)`);
+  }
 });
 
 test("firstFrame carries the snapshot's bench stamp under its own name", () => {
@@ -270,12 +276,13 @@ test("the picker's import graph does not reach the bench engine, the gateway or 
 // -------------------------------------------------------------------- layout
 // (the level-0 layout and rendering tests moved to test/level0.test.mjs with the #114 redesign)
 
-test("keyIdWidth: the longest key id over all rows, at least the header, at most W.keyId", () => {
+test("keyIdWidth: the longest key id over all rows, at least the header, at most KEYID_MAX", () => {
   const rows = (...ids) => ids.map((keyId) => ({ keyId }));
   assert.equal(keyIdWidth(rows("personal.acme.free", "x")), 18);
   assert.equal(keyIdWidth(rows("a", "b")), 6, "never narrower than `key id`");
   assert.equal(keyIdWidth([]), 6);
   assert.equal(keyIdWidth(undefined), 6);
-  assert.equal(keyIdWidth(rows("z".repeat(500))), W.keyId, "a hostile id is capped");
+  assert.equal(keyIdWidth(rows("z".repeat(500))), KEYID_MAX, "a hostile id is capped");
+  assert.equal(keyIdWidth(rows("p".repeat(45))), 45, "a 45-character id is measured whole");
   assert.equal(keyIdWidth(rows("\x1b[31m" + "ab" + "\x1b[0m")), 6, "escapes are not measured");
 });

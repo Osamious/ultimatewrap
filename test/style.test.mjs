@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { detectCaps, motionEnabled, glyphsFor, painter, badgeColour,
          provenanceDot, padId, countCell, highlight, frame, confirmLine, sleepSync,
          slideFrames, flashFrames, revealFrames, FRAME_W, FRAME_MIN, FRAME_MAX,
-         frameWidth, layoutFor, MODEL_ID_MAX, W } from "../menu/style.mjs";
+         frameWidth, layoutFor, MODEL_ID_MAX, KEYID_MAX, W } from "../menu/style.mjs";
 
 const cps = (s) => [...s].length;
 // The data stamps live at the right end of the `id:` line (#114 redesign); this finds that line.
@@ -119,16 +119,16 @@ test("level 0 renders the exact provider row, columns included", () => {
   // `rows` lets the key id column elide across ALL providers (distinct cells, visible marker).
   const lines = frame(V0, { ...META, rows: ROWS }, { caps: PLAIN });
   const row = lines.find((l) => l.startsWith("|> perso"));
-  // Level 0 (#114 redesign): key id (16 at the floor) | models | status | ok | [free] | empt auth pay
-  // rate gone t/o err. This fixture has no `bench` data, so status, ok and the raw cells are blank;
-  // there is no `free` column at 78 (it needs a 91-column terminal). Each cell is a dim rule (`:`
-  // in ASCII) plus right-aligned text; the widths sum to the frame's 75 inner columns.
-  const cells = ":" + "     2" + ":" + " ".repeat(6) + ":" + " ".repeat(10) +
+  // Level 0: key id (16 at the floor: what the other columns leave) | status | models | ok | % | [free | %] | empt auth pay rate gone
+  // t/o err. This fixture has no `bench` data, so status, ok and the raw cells are blank; there is no `free`
+  // block at 78 (the full key id comes first, then free needs 10 more columns). Each cell is a dim rule (`:` in ASCII) plus right-aligned text;
+  // the widths sum to the frame's 75 inner columns.
+  const cells = ":" + " ".repeat(6) + ":" + "      2" + ":" + " ".repeat(4) + ":" + " ".repeat(4) +
     ":" + " ".repeat(4) + ":" + " ".repeat(4) + ":" + " ".repeat(3) + ":" + " ".repeat(4) +
     ":" + " ".repeat(4) + ":" + " ".repeat(3) + ":" + " ".repeat(3);
   assert.equal(row.slice(0, 3), "|> ");
   assert.equal(row.slice(3, 19).length, 16);
-  assert.ok(row.slice(3, 19).includes(glyphsFor(PLAIN).dash), "the 20-character key id is elided with a visible marker");
+  assert.ok(row.slice(3, 19).includes(glyphsFor(PLAIN).elide), "the 20-character key id is elided with a visible marker");
   assert.equal(row.slice(19), cells + " |");
   assert.equal(cps(row), 78);
 });
@@ -136,11 +136,11 @@ test("level 0 renders the exact provider row, columns included", () => {
 test("level 0 renders the exact status, ok and raw cells for a provider that was benched", () => {
   const row = { ...ROWS[0], bench: { ok: 1, empty: 0, auth: 0, pay: 0, rate: 0, gone: 1,
                                      timeout: 0, error: 0, skip: 0 },
-                benchFlags: { dead: false, needsMoney: true, alive: true } };
+                benchFlags: { dead: false, needsMoney: true, alive: true, status: "alive" } };
   const line = frame({ ...V0, items: [{ kind: "provider", row }] }, { ...META, rows: ROWS }, { caps: PLAIN })
     .find((l) => l.startsWith("|> perso"));
   assert.equal(line.slice(19),
-    ":" + "     2" + ":" + " alive" + ":" + "   1 (50%)" +
+    ":" + " alive" + ":" + "      2" + ":" + "   1" + ":" + " 50%" +
     ":" + "   -" + ":" + "   -" + ":" + "  -" + ":" + "   -" + ":" + "   1" + ":" + "  -" + ":" + "  -" + " |");
 });
 
@@ -157,27 +157,35 @@ test("level 1 renders the exact model row, columns included", () => {
 
 test("every column begins where the layout says it begins", () => {
   // Derived, not transcribed: if a cell width changes this names the column; if the header and the
-  // row drift apart, it fails too. A wide terminal, so the optional `free` column is drawn.
+  // row drift apart, it fails too. A wide terminal, so the optional `free` block is drawn.
   const caps0 = { ...PLAIN, cols: 134 };
   const LW0 = layoutFor(frameWidth(caps0), { keyW: 30 });
   assert.equal(LW0.showFree, true);
   const benched = { ...ROWS[0], bench: { ok: 1, empty: 0, auth: 0, pay: 0, rate: 0, gone: 0,
                                          timeout: 0, error: 0, skip: 0 },
-                    benchFlags: { dead: false, needsMoney: false, alive: false } };
+                    benchFlags: { dead: false, needsMoney: false, alive: false, status: "dead" } };
   const lines0 = frame({ ...V0, items: [{ kind: "provider", row: benched }] }, META, { caps: caps0 });
   const l0 = strip(lines0.find((l) => l.includes("personal.google.free")));   // 20 <= 30: not clipped at 134
   const h0 = strip(lines0.find((l) => l.includes("key id")));
-  const modelsCol = 1 + 2 + LW0.W.keyId;
-  const statusCol = modelsCol + 7, okCol = statusCol + 7, freeCol = okCol + 11, rawCol = freeCol + 11;
-  assert.equal(h0.slice(modelsCol, modelsCol + 7), ":models");
-  assert.equal(h0.slice(statusCol, statusCol + 7), ":status");
-  assert.equal(h0.slice(okCol, okCol + 11), ":        ok", "right-aligned dim headers over right-aligned cells");
-  assert.equal(h0.slice(freeCol, freeCol + 11), ":      free");
+  // key id | status | oldest probe | models | ok | ok% | free | free% | raw ...
+  assert.equal(LW0.showProbe, true);
+  const statusCol = 1 + 2 + LW0.W.keyId, probeCol = statusCol + 7, modelsCol = probeCol + 13, okCol = modelsCol + 8, okPctCol = okCol + 5;
+  const freeCol = okPctCol + 5, freePctCol = freeCol + 5, rawCol = freePctCol + 5;
+  assert.equal(h0.slice(statusCol, statusCol + 7), ":status", "status comes right after the key id");
+  assert.equal(h0.slice(probeCol, probeCol + 13), ":oldest probe", "oldest probe comes right after status");
+  assert.equal(h0.slice(modelsCol, modelsCol + 8), ": models");
+  assert.equal(h0.slice(okCol, okCol + 5), ":  ok", "right-aligned dim headers over right-aligned cells");
+  assert.equal(h0.slice(okPctCol, okPctCol + 5), ":   %");
+  assert.equal(h0.slice(freeCol, freeCol + 5), ":free");
+  assert.equal(h0.slice(freePctCol, freePctCol + 5), ":   %");
   assert.equal(h0.slice(rawCol, rawCol + 5), ":empt");
-  assert.equal(l0.slice(modelsCol, modelsCol + 7), ":     2");
   assert.equal(l0.slice(statusCol, statusCol + 7), ":  dead", "dead, right-aligned under `status`");
-  assert.equal(l0.slice(okCol, okCol + 11), ":   1 (50%)");
-  assert.equal(l0.slice(freeCol, freeCol + 11), ":   1 (50%)", "free: 1 of the provider's 2 models");
+  assert.equal(l0.slice(probeCol, probeCol + 13), ":" + " ".repeat(12), "no age data on this row: the cell is blank");
+  assert.equal(l0.slice(modelsCol, modelsCol + 8), ":      2");
+  assert.equal(l0.slice(okCol, okCol + 5), ":   1");
+  assert.equal(l0.slice(okPctCol, okPctCol + 5), ": 50%", "the percent, right-aligned in 4");
+  assert.equal(l0.slice(freeCol, freeCol + 5), ":   1", "free: 1 of the provider's 2 models");
+  assert.equal(l0.slice(freePctCol, freePctCol + 5), ": 50%");
 
   const l1 = frame(V1, META, { caps: PLAIN }).find((l) => l.includes("gemini-3.5-flash-lite"));
   const h1 = frame(V1, META, { caps: PLAIN }).find((l) => l.includes("model "));
@@ -318,12 +326,13 @@ test("layoutFor spends surplus width on the name columns and nothing else", () =
   const wide = layoutFor(FRAME_MIN + 20);
   // Level 0's other columns take 59 of the 75 inner columns (#114 redesign): the key id gets 16.
   assert.equal(base.W.keyId, 16, "at the floor the key id gets what the other level-0 columns leave");
-  // Level 0 has its own budget: the optional `free` column (11) comes before the key id grows, and
-  // the key id grows only to its content (default W.keyId = 30); surplus beyond that is NOT poured into it.
-  assert.equal(wide.W.keyId, 16 + (20 - 11), "20 spare columns: 11 buy `free`, the other 9 grow the key id");
-  assert.equal(layoutFor(FRAME_MAX, { keyW: 500 }).W.keyId, 30, "the provider key id stops at its content width");
+  // Level 0 has its own budget: the key id takes its FULL content first (default 30 here), then the optional `free`
+  // block (10); surplus beyond that is NOT poured into anything.
+  assert.equal(wide.W.keyId, 30, "20 spare columns: the id is whole (30)");
+  assert.equal(wide.showFree, false, "and the 7 left over do not buy `free`");
+  assert.equal(layoutFor(FRAME_MAX, { keyW: 45 }).W.keyId, 45, "a 45-character id is whole");
   assert.equal(layoutFor(FRAME_MAX, { keyW: 12 }).W.keyId, 12, "a narrower content narrows it");
-  assert.equal(layoutFor(FRAME_MAX, { keyW: 500 }).W.keyId, W.keyId, "and a hostile one is capped");
+  assert.equal(layoutFor(FRAME_MAX, { keyW: 500 }).W.keyId, KEYID_MAX, "and a hostile one is capped");
   // The model level is one view with a priority list (see layoutFor): the always-drawn
   // cells take 49, the id keeps MODEL_ID_MIN (22), `total` then `tok/s` and the preview
   // come next, and only what is left grows the id toward its content.
@@ -369,7 +378,7 @@ test("level 0 no longer draws the provider health label (the snapshot field stay
   for (const cols of [80, 134]) {
     const lines = frame(v, META, { caps: { ...PLAIN, cols } }).map(strip);
     assert.equal(lines.some((l) => /health/.test(l)), false, `cols ${cols}`);
-    // The header now has a `needs $` column of its own, so look at the ROW only.
+    // Look at the ROW only: the health string must not leak into any cell.
     const row = lines.find((l) => l.includes("personal.acme.p"));
     assert.equal(/needs \$/.test(row), false, `cols ${cols}: the health string leaked into a cell`);
   }
@@ -473,7 +482,7 @@ test("flat scope gets its own chrome, not the provider chrome with model rows", 
   assert.match(row, /google\/gemini-3\.5-flash-lite/, "the row must show the full target");
   // The footer belongs to the level whose keys are live: in flat scope enter
   // selects, so it must offer select rather than scope.
-  assert.match(lines[lines.length - 1], /select/);
+  assert.match(lines[lines.length - 1], /pick/);
 });
 
 test("the legend lists every key, including the ones with no visible affordance", () => {
@@ -486,7 +495,7 @@ test("the legend lists every key, including the ones with no visible affordance"
   // user who opened the legend to find out how to search found every key EXCEPT
   // the one that searches.
   const lines = frame({ ...V0, legend: true }, META, { caps: PLAIN }).map(strip).join("\n");
-  for (const k of ["up / down", "type to filter", "backspace", "enter", "tab",
+  for (const k of ["up/down", "type to filter", "backspace", "enter", "tab",
                    "ctrl+f", "ctrl+r", "esc", "ctrl+c", "?"]) {
     assert.ok(lines.includes(k), `legend does not mention ${k}`);
   }
@@ -809,8 +818,11 @@ test("the count cell is bare with nothing withheld, paired when something is, an
   // wide at any k-precision (MEASURED max real count today: 434, one
   // provider) -- CORRECT must beat TRUNCATED even past `width` here: the
   // function returns the honest exact pair rather than cut digits.
-  assert.equal(countCell(100000, 100000, 7), "100000/100000",
-    "unabbreviatable-to-width overflows honestly rather than truncating to a lie");
+  assert.equal(countCell(100000, 100000, 7), "big/big",
+    "unabbreviatable-to-width falls back to `big`: honest, and never wider than the cell");
+  assert.equal(countCell(469, 100, 7), "469/100", "the worst real pair fits the 7-wide cell exactly");
+  assert.equal(countCell(12345, 12345, 7), "12k/12k");
+  for (const [t, r] of [[1, 1], [469, 100], [1501, 1501], [12345, 99999], [99999, 99999], [100000, 100000], [5e6, 7e6]]) assert.ok(countCell(t, r, 7).length <= 7, `${t}/${r}`);
 });
 
 test("the count cell's honest overflow survives all the way to the rendered row, not just the function's return", () => {
@@ -988,8 +1000,8 @@ test("level 0 has no limit or needs-$ column at any width (they were removed wit
     assert.equal(lines.join("").includes("\x1b"), false, "nothing is clipped, so no reset escape leaks into a colourless render");
   }
   const at = (cols) => frame(V0, META, { caps: { ...PLAIN, cols } }).map(strip).some((l) => l.includes("free") && l.includes("key id"));
-  assert.equal(at(90), false, "the free column needs a 91-column terminal");
-  assert.equal(at(91), true);
+  assert.equal(at(116), false, "the free column needs the full 30-character key id plus oldest probe (13) plus 10: a 117-column terminal");
+  assert.equal(at(117), true);
 });
 
 

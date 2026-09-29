@@ -51,7 +51,7 @@ test("`- ok`, never `0 ok`, when the reader has no records at all (missing, empt
   }
 });
 
-test("level 1: `- ok` for a provider with no fresh record, `0 ok` only with a fresh record and no ok, a count otherwise", () => {
+test("level 1: `- ok` for a provider with no record, `0 ok` only with a record and no ok, a count otherwise (a record of any age counts)", () => {
   const A = prow("personal.a.free", [M("a1"), M("a2")], { provider: "a" });
   const B = prow("personal.b.free", [M("b1"), M("b2")], { provider: "b" });
   const C = prow("personal.c.free", [M("c1"), M("c2")], { provider: "c" });
@@ -59,7 +59,7 @@ test("level 1: `- ok` for a provider with no fresh record, `0 ok` only with a fr
   const t = tmpBench({
     "a/a1": { s: "gone", a: nowS() },                        // A: fresh, nothing ok  -> 0 ok
     "b/b1": { s: "ok", a: nowS() }, "b/b2": { s: "gone", a: nowS() },   // B: 1 ok
-    "c/c1": { s: "ok", a: nowS() - 30 * 86400 },             // C: only a STALE record -> no fresh -> dash
+    "c/c1": { s: "ok", a: nowS() - 30 * 86400 },             // C: only an OLD record -> it still counts: 1 ok
     // D: never benched -> dash
   });
   const b = loadBench(t.file); t.done();
@@ -72,15 +72,17 @@ test("level 1: `- ok` for a provider with no fresh record, `0 ok` only with a fr
   assert.ok(header(at(0), meta).includes("2 of 2 | 0 ok (0%)"), header(at(0), meta));
   assert.equal(view(at(1)).okLive, 1);
   assert.ok(header(at(1), meta).includes("| 1 ok (50%)"), header(at(1), meta));
-  assert.equal(view(at(2)).okLive, null, "only a stale record: nothing fresh");
-  assert.ok(header(at(2), meta).includes("| - ok"), header(at(2), meta));
+  assert.equal(view(at(2)).okLive, 1, "a 30-day-old ok still counts");
+  assert.ok(header(at(2), meta).includes("| 1 ok (50%)"), header(at(2), meta));
   assert.equal(view(at(3)).okLive, null, "never benched");
-  // flat total: a number when at least one record is fresh, a dash when none is
-  assert.equal(view(reduce(base, "\t").state).okLive, 1);
+  // flat total: a number when at least one record exists (any age), a dash when none does
+  assert.equal(view(reduce(base, "\t").state).okLive, 2);
   const stale = tmpBench({ "a/a1": { s: "ok", a: nowS() - 40 * 86400 } });
   const sb = loadBench(stale.file); stale.done();
   const sst = reduce(reduce(initState(rows), { benchOf: sb.get }).state, "\t").state;
-  assert.equal(view(sst).okLive, null, "no fresh record anywhere: `- ok`, not `0 ok`");
+  assert.equal(view(sst).okLive, 1, "a 40-day-old ok still counts");
+  const none = reduce(reduce(initState(rows), { benchOf: loadBench(path.join(os.tmpdir(), "uw-r2-missing.json")).get }).state, "\t").state;
+  assert.equal(view(none).okLive, null, "no record anywhere: `- ok`, not `0 ok`");
 });
 
 // -------------------------------------------- 2. allowlist, whole-BMP scan
@@ -189,11 +191,9 @@ test("flat scope keeps a stable head of the provider name when it has to elide t
 test("the legend says exactly which figures are baked (provider list) and which are live (model lists)", () => {
   const stub = new Proxy({}, { get: () => (x) => x });
   const text = legendLines({ dashMatch: "!" }, stub, { provenanceDot: () => "#" }).join("\n");
-  assert.match(text, /BAKED into the snapshot/);
-  assert.match(text, /model lists read\s+bench\.json LIVE/);
-  assert.match(text, /can differ after a new sweep/);
-  assert.match(text, /BAKED at snapshot build/);
-  assert.match(text, /Model lists count it LIVE/);
+  assert.match(text, /baked into the snapshot/);
+  assert.match(text, /Read\s+live\s+from\s+bench\.json,\s+so\s+it\s+can\s+differ\s+from\s+the\s+provider\s+list\s+after\s+a\s+new\s+sweep/);
+  assert.match(text, /node menu\/snapshot\.mjs --build/);
   assert.equal(/K ok is read when the snapshot is built/.test(text), false, "the old, wrong sentence is gone");
 });
 
@@ -223,7 +223,7 @@ test("a 10-row terminal fits every list screen, even at level 0 with recents and
 
 // ---------------------------------------- nit: carried counts are re-aged
 
-test("carried counts older than the 14-day window are dropped, not carried", () => {
+test("carried counts have no age limit; a missing or future stamp still stops the carry", () => {
   const COUNTS = { ok: 1, empty: 0, auth: 0, pay: 0, rate: 0, gone: 0, timeout: 0, error: 0, skip: 0 };
   const built = { generatedAt: "x", rows: [{ keyId: "personal.a.free", provider: "a", free: 0, planCount: 0, health: "ok", models: [{ id: "m" }] }] };
   const prev = (stamp) => ({ benchAsOf: stamp, rows: [{ keyId: "personal.a.free", provider: "a", bench: COUNTS, benchFlags: { dead: false, needsMoney: false } }] });
@@ -232,8 +232,8 @@ test("carried counts older than the 14-day window are dropped, not carried", () 
   assert.deepEqual(young.rows[0].bench, COUNTS);
   assert.equal(young.benchAsOf, "2026-09-25T00:00:00.000Z");
   const old = buildSnapshot(built, { previous: prev("2026-09-01T00:00:00.000Z"), bench: null, nowMs: now });
-  assert.equal(old.rows[0].bench, null, "30 days old: not carried");
-  assert.equal(old.benchAsOf, null);
+  assert.deepEqual(old.rows[0].bench, COUNTS, "30 days old: still carried (the outdated notice says so instead)");
+  assert.equal(old.benchAsOf, "2026-09-01T00:00:00.000Z");
   const future = buildSnapshot(built, { previous: prev("2026-11-01T00:00:00.000Z"), bench: null, nowMs: now });
   assert.equal(future.rows[0].bench, null, "a future stamp is not evidence either");
   assert.equal(buildSnapshot(built, { previous: prev("garbage"), bench: null, nowMs: now }).rows[0].bench, null);
@@ -272,7 +272,7 @@ test("a valid but EMPTY bench.json (models: {}) is 'no data': no sweep date, and
 
 test("level 0: the baked total reads `- ok` unless at least one provider has a fresh record", () => {
   const zero = { ok: 0, empty: 0, auth: 0, pay: 0, rate: 0, gone: 0, timeout: 0, error: 0, skip: 0 };
-  const mk = (bench) => ({ schemaVersion: 7, generatedAt: "x", builtAt: "x", rows: [
+  const mk = (bench) => ({ schemaVersion: 9, generatedAt: "x", builtAt: "x", rows: [
     prow("personal.a.free", [M("m1")], { provider: "a", bench }), prow("personal.b.free", [M("m1")], { provider: "b", bench }) ] });
   const okOf = (snap) => firstFrame({ snap, recents: [], favourites: [], caps: detectCaps(ASCII, 100), termRows: 30 }).meta.okTotal;
   assert.equal(okOf(mk(zero)), null, "built with bench data, but nothing fresh: unknown, not 0");

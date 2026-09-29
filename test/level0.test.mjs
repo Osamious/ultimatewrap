@@ -1,11 +1,13 @@
-// #114 redesign, LEVEL 0: key id | models | status | ok | [free] | empt | auth | pay | rate | gone | t/o | err,
+// #114 redesign, LEVEL 0: key id | status | [oldest probe] | models | ok | % | [free | %] | empt | auth | pay | rate | gone | t/o | err,
 // the pinned strip above the column header, the counts-only header, and the stamps on the id line.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { detectCaps, painter, glyphsFor, frame, frameWidth, layoutFor, pctText, pctLabel, pctCell, aliveCell,
-         statusCount, keyIdWidth, FRAME_MIN, FRAME_MAX, W } from "../menu/style.mjs";
+import { detectCaps, painter, glyphsFor, frame, frameWidth, layoutFor, pctLabel, pctBlock, pctTone, statusCell,
+         statusCount, keyIdWidth, KEYID_MAX, FRAME_MIN, FRAME_MAX, W } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
-import { providerAlive, isNoResponse, NO_RESPONSE } from "../menu/route-hints.mjs";
+import { buildSnapshot } from "../menu/snapshot.mjs";
+import { legendLines } from "../menu/legend.mjs";
+import { providerAlive, providerStatus, isNoResponse, NO_RESPONSE } from "../menu/route-hints.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const cps = (s) => [...s].length;
@@ -18,7 +20,8 @@ const mk = (n) => Array.from({ length: n }, (_, i) => ({ id: `m${i}`, ctx: null,
 const Z = { ok: 0, empty: 0, auth: 0, pay: 0, rate: 0, gone: 0, timeout: 0, error: 0, skip: 0 };
 const prow = (keyId, n, bench, flags = null, o = {}) =>
   ({ keyId, provider: "p", free: 3, planCount: 0, health: "ok", models: mk(n), bench, benchFlags: flags, ...o });
-const ALIVE = { dead: false, needsMoney: false, alive: true }, DEAD = { dead: true, needsMoney: false, alive: false };
+const ALIVE = { dead: false, needsMoney: false, alive: true, status: "alive" }, DEAD = { dead: true, needsMoney: false, alive: false, status: "dead" };
+const DOWN = { dead: false, needsMoney: false, alive: true, status: "down" };
 const ROWS = [
   prow("p.big.free", 469, { ...Z, ok: 236, empty: 3, auth: 6, pay: 119, rate: 1, gone: 86, timeout: 1, error: 17 }, ALIVE, { free: 20 }),
   prow("p.zero.free", 5, { ...Z }, DEAD, { free: 0 }),
@@ -32,66 +35,112 @@ const shot = (st, meta, env, cols) => frame(view(st), meta, { caps: detectCaps(e
 
 // ------------------------------------------------------------------ layout
 
-test("level 0 layout: the key id keeps 16, then the free column (11), then the key id grows to its content", () => {
-  for (const keyW of [6, 12, 16, 20, 30]) {
+test("level 0 layout: the key id gets its FULL width first, then oldest probe (13), then the free block (10); it is elided only when even the mandatory columns leave less", () => {
+  for (const keyW of [6, 12, 16, 20, 30, 45, KEYID_MAX, 200]) {
     for (let w = FRAME_MIN; w <= FRAME_MAX; w++) {
       const L = layoutFor(w, { keyW });
-      const avail = w - 3 - 59;                       // mark 2, models 7, status 7, ok 11, seven raw cells 32
-      const want = Math.max(6, Math.min(keyW, 30));
-      const k0 = Math.min(Math.min(want, 16), avail);
-      const rest = avail - k0;
-      const showFree = rest >= 11;
-      const key = k0 + Math.max(0, Math.min(want - k0, rest - (showFree ? 11 : 0)));
+      const avail = w - 3 - 59;                       // mark 2, status 7, models 8, ok 10 (count + percent), seven raw cells 32
+      const want = Math.max(6, Math.min(keyW, KEYID_MAX));
+      const key = Math.min(want, avail);
+      const showProbe = avail - key >= 13;
+      const showFree = showProbe && avail - key - 13 >= 10;          // free needs the oldest-probe column too
+      assert.equal(L.showProbe, showProbe, `showProbe at ${w} keyW ${keyW}`);
       assert.equal(L.showFree, showFree, `showFree at ${w} keyW ${keyW}`);
       assert.equal(L.W.keyId, key, `keyId at ${w} keyW ${keyW}`);
       assert.equal(Object.hasOwn(L, "showLimit0"), false, "the level-0 limit cell is gone");
-      assert.ok(2 + key + 7 + 7 + 11 + (showFree ? 11 : 0) + 32 <= L.inner, `fits at ${w}`);
+      assert.ok(2 + key + 7 + 8 + 10 + (showProbe ? 13 : 0) + (showFree ? 10 : 0) + 32 <= L.inner, `fits at ${w}`);
+      // the key id is never cut below its content while the terminal has the room, and free never steals from it
+      if (avail >= want) assert.equal(L.W.keyId, want, "whole");
     }
   }
-  assert.equal(layoutFor(FRAME_MIN).W.keyId, 16);
-  assert.equal(layoutFor(FRAME_MIN).showFree, false);
+  assert.equal(layoutFor(FRAME_MIN, { keyW: 30 }).W.keyId, 16, "the floor leaves the key id 16 (75 - 59)");
+  assert.equal(layoutFor(FRAME_MIN, { keyW: 12 }).W.keyId, 12);
+  assert.equal(layoutFor(FRAME_MIN, { keyW: 12 }).showFree, false);
+  assert.equal(layoutFor(FRAME_MIN, { keyW: 12 }).showProbe, false, "4 spare columns at the floor: not enough for oldest probe (13)");
+  assert.equal(layoutFor(FRAME_MAX, { keyW: 500 }).W.keyId, KEYID_MAX, "a hostile length is capped");
 });
 
-test("thresholds for the real longest key id (30): free from a 91-column terminal, the key id whole from 105", () => {
-  const first = (pred) => { for (let w = FRAME_MIN; w <= FRAME_MAX; w++) if (pred(layoutFor(w, { keyW: 30 }))) return w + 2; return null; };
-  assert.equal(first((L) => L.showFree), 91);
-  assert.equal(first((L) => L.W.keyId === 30), 105);
+test("thresholds: the key id is whole first, then oldest probe, then free; a 30-character and a 45-character id", () => {
+  const first = (keyW, pred) => { for (let w = FRAME_MIN; w <= FRAME_MAX; w++) if (pred(layoutFor(w, { keyW }))) return w + 2; return null; };
+  // 59 fixed + the id (+ 10 for free) + 3 (frame) + 2 (margin). The longest REAL full key id (bucket included, read
+  // from catalog/snapshot.json on 2026-09-30) is 30 characters: personal.experientiallabs.free and personal_maestro.deepseek.paid.
+  assert.equal(first(30, (L) => L.W.keyId === 30), 94, "a 30-character id is whole from a 94-column terminal");
+  assert.equal(first(30, (L) => L.showProbe), 107, "oldest probe appears 13 columns later");
+  assert.equal(first(30, (L) => L.showFree), 117, "and free 10 columns after that: it needs oldest probe too");
+  assert.equal(first(45, (L) => L.W.keyId === 45), 109);
+  assert.equal(first(45, (L) => L.showProbe), 122);
+  assert.equal(first(45, (L) => L.showFree), 132);
+  assert.equal(first(27, (L) => L.W.keyId === 27), 91);
+  assert.equal(first(27, (L) => L.showProbe), 104);
+  assert.equal(first(27, (L) => L.showFree), 114);
+  for (let w = FRAME_MIN; w <= FRAME_MAX; w++) { const L = layoutFor(w, { keyW: 30 }); assert.ok(!L.showFree || L.showProbe, "free never shows without oldest probe"); }
   assert.equal(layoutFor(FRAME_MAX, { keyW: 30 }).W.keyId, 30, "wide frames do not pour surplus into the key id");
   assert.equal(FRAME_MAX, 260);
 });
 
 // --------------------------------------------------------------- the cells
 
-test("COUNT (PCT%): nearest integer, <1% for a non-zero count, 100% whole, blank unknown, dash zero", () => {
-  assert.equal(pctText(236, 469), "236 (50%)");
-  assert.equal(pctText(20, 469), "20 (4%)");
-  assert.equal(pctText(1, 469), "1 (<1%)", "a non-zero count never reads 0%");
-  assert.equal(pctText(2, 1000), "2 (<1%)");
-  assert.equal(pctText(469, 469), "469 (100%)");
-  assert.equal(pctText(3, 8), "3 (38%)", "37.5 rounds up");
-  assert.equal(pctText(1, 200), "1 (1%)", "0.5 rounds to 1");
-  assert.equal(pctText(2500, 3000), "2k (83%)", "a count over 999 is Nk, so a cell never widens");
-  assert.equal(pctText(0, 469), "-");
-  assert.equal(pctText(NaN, 469), "");
-  assert.equal(pctText(undefined, 469), "");
-  assert.equal(pctText(5, 0), "5", "no total: the count alone, never a division by zero");
-  assert.equal(pctText(200000, 300000), "big (67%)");
-  assert.equal(pctLabel(1, 469), "<1%");
+test("the percent label: nearest integer, <1% for a non-zero count, never 100% for a partial one", () => {
+  assert.equal(pctLabel(236, 469), "50%");
+  assert.equal(pctLabel(20, 469), "4%");
+  assert.equal(pctLabel(1, 469), "<1%", "a non-zero count never reads 0%");
+  assert.equal(pctLabel(2, 1000), "<1%");
+  assert.equal(pctLabel(469, 469), "100%");
+  assert.equal(pctLabel(3, 8), "38%", "37.5 rounds up");
+  assert.equal(pctLabel(1, 200), "1%", "0.5 rounds to 1");
+  assert.equal(pctLabel(2500, 3000), "83%");
   assert.equal(pctLabel(0, 469), "0%");
-  for (const n of [0, 1, 9, 99, 999, 1234, 99999, 5e6]) assert.ok(cps(pctText(n, 6000)) <= 10, String(n));
 });
 
-test("the cells are a rule plus right-aligned text of fixed width; colours: ok green, free cyan, dim zero", () => {
+test("the count and percent sub-columns: no parentheses, right-aligned, 2k from a thousand, blank unknown, dash for zero", () => {
+  const p = painter({ ...detectCaps(ASCII, 100), colours: 0 });
+  const b = (n, t) => pctBlock(n, t, p, "|");
+  assert.equal(b(236, 469), "| 236| 50%", "count in 4, percent in 4");
+  assert.equal(b(20, 469), "|  20|  4%");
+  assert.equal(b(1, 469), "|   1| <1%", "a non-zero count is never blank or 0%");
+  assert.equal(b(469, 469), "| 469|100%");
+  assert.equal(b(2500, 3000), "|  2k| 83%");
+  assert.equal(b(200000, 300000), "| big| 67%");
+  assert.equal(b(0, 469), "|   -|   -", "zero: a dash in both");
+  assert.equal(b(NaN, 469), "|" + " ".repeat(4) + "|" + " ".repeat(4), "unknown is blank");
+  assert.equal(b(undefined, 469), "|" + " ".repeat(4) + "|" + " ".repeat(4));
+  assert.equal(b(5, 0), "|   5|   -", "no denominator: the count, a dash, never a division by zero");
+  for (const n of [0, 1, 9, 99, 999, 1234, 99999, 5e6]) assert.equal(cps(b(n, 6000)), 1 + 4 + 1 + 4, String(n));
+  for (const bad of [b(1, 469), b(0, 1), b(1, 1)]) assert.equal(/[()]/.test(bad), false);
+  assert.equal(/[\u2581-\u2588]/.test(b(300, 469) + b(469, 469)), false, "no block glyph");
+});
+
+test("the percent's colour band: 70+ green, 30-69 yellow, under 30 red, zero dim", () => {
+  assert.deepEqual([pctTone(70, 100), pctTone(69, 100), pctTone(30, 100), pctTone(29, 100), pctTone(100, 100), pctTone(1, 1000)], ["grn", "yel", "yel", "red", "grn", "red"]);
+  assert.equal(pctTone(0, 100), null);
+  assert.equal(pctTone(NaN, 100), null);
+  assert.equal(pctTone(5, 0), null);
+  assert.equal(pctTone(995, 1000), "grn", "a partial 99% is green");
+  assert.equal(pctTone(697, 1000), "grn", "the band follows the DISPLAYED percent (69.7% reads 70%)");
+  for (const env of [UNI, ASCII]) assert.equal(Object.hasOwn(glyphsFor(detectCaps(env, 100)), "bars"), false, "the block-glyph table is gone");
+});
+
+test("the cells are a rule plus right-aligned text of fixed width; ok count green, free count blue, the percent banded, zero dim", () => {
   const p = painter(detectCaps(UNI, 100));
-  assert.equal(strip(pctCell(236, 469, "grn", p, "┆")), "┆ 236 (50%)");
-  assert.equal(pctCell(236, 469, "grn", p, "|"), "|" + p.grn(" 236 (50%)"));
-  assert.equal(pctCell(20, 469, "cya", p, "|"), "|" + p.cya("   20 (4%)"));
-  assert.equal(pctCell(0, 469, "grn", p, "|"), "|" + p.dim("         -"), "zero is dim");
-  assert.equal(pctCell(NaN, 469, "grn", p, "|"), "|" + " ".repeat(10), "unknown is blank");
-  assert.equal(aliveCell(true, p, "|"), "|" + p.grn(" alive"));
-  assert.equal(aliveCell(false, p, "|"), "|" + p.red("  dead"));
-  assert.equal(aliveCell(null, p, "|"), "|" + " ".repeat(6));
-  assert.equal(aliveCell(undefined, p, "|"), "|" + " ".repeat(6), "an old snapshot has no verdict: blank");
+  assert.equal(strip(pctBlock(236, 469, p, "┆")), "┆ 236┆ 50%");
+  assert.equal(pctBlock(236, 469, p, "|", "grn"), "|" + p.grn(" 236") + "|" + p.yel(" 50%"), "ok: green count, yellow 50%");
+  assert.equal(pctBlock(236, 469, p, "|", "blu"), "|" + p.blu(" 236") + "|" + p.yel(" 50%"), "free: blue count, the same band");
+  assert.equal(pctBlock(400, 469, p, "|", "grn"), "|" + p.grn(" 400") + "|" + p.grn(" 85%"));
+  assert.equal(pctBlock(20, 469, p, "|", "blu"), "|" + p.blu("  20") + "|" + p.red("  4%"));
+  assert.equal(pctBlock(0, 469, p, "|"), "|" + p.dim("   -") + "|" + p.dim("   -"), "zero is dim");
+  assert.equal(pctBlock(NaN, 469, p, "|"), "|" + " ".repeat(4) + "|" + " ".repeat(4), "unknown is blank");
+  assert.equal(p.blu("x"), "\x1b[94mx\x1b[0m", "blue is bright blue (SGR 94)");
+  // colour off: the numbers alone, no escape codes
+  const bare = painter({ ...detectCaps(ASCII, 100), colours: 0 });
+  assert.equal(pctBlock(236, 469, bare, "|", "blu"), "| 236| 50%");
+  assert.equal(statusCell("alive", p, "|"), "|" + p.grn(" alive"));
+  assert.equal(statusCell("down", p, "|"), "|" + p.yel("  down"));
+  assert.equal(statusCell("dead", p, "|"), "|" + p.red("  dead"));
+  assert.equal(statusCell(null, p, "|"), "|" + " ".repeat(6));
+  assert.equal(statusCell(undefined, p, "|"), "|" + " ".repeat(6), "an old snapshot has no verdict: blank");
+  assert.equal(statusCell(true, p, "|"), "|" + " ".repeat(6), "a boolean (the old flag) is not a status");
+  assert.equal(statusCell("\x1b[2Jalive", p, "|"), "|" + " ".repeat(6), "a hostile string is not a status");
+  for (const w of ["alive", "down", "dead"]) assert.equal(statusCell(w, bare, "|"), "|" + w.padStart(6));
 });
 
 test("the frame draws status, ok and free as designed, on rows that are not selected", () => {
@@ -100,18 +149,18 @@ test("the frame draws status, ok and free as designed, on rows that are not sele
   const st = { ...initState(ROWS), cur: [4, 0, 0] };
   const raw = (id) => shot(st, META, UNI, 134).find((l) => strip(l).includes(id));
   const big = raw("p.big.free");
-  assert.ok(big.includes(p.grn("  alive")) === false && big.includes(p.grn(" alive")), "alive is green");
-  assert.ok(big.includes(p.grn(" 236 (50%)")) && big.includes(p.cya("   20 (4%)")));
+  assert.ok(big.includes(p.grn(" alive")), "alive is green");
+  assert.ok(big.includes(p.grn(" 236") + "\x1b[2m┆\x1b[0m" + p.yel(" 50%")), "ok: green count then a yellow 50% (236 of all 469 models: [no gone] is off)");
+  assert.ok(big.includes(p.blu("  20") + "\x1b[2m┆\x1b[0m" + p.red("  4%")), "free: blue count then a red 4%");
   assert.ok(raw("p.zero.free").includes(p.red("  dead")), "dead is red");
-  assert.ok(raw("p.zero.free").includes(p.dim("         -")), "zero ok and zero free are dim dashes");
+  assert.ok(raw("p.zero.free").includes(p.dim("   -")), "zero ok and zero free are dim dashes");
   const t = strip(raw("p.tiny.free"));
-  assert.ok(t.includes(" 1 (<1%)") && t.includes("469 (100%)"), t);
+  assert.ok(t.includes("   1┆ <1%") && t.includes(" 469┆100%"), t);
   const nb = strip(raw("p.nobench"));
-  assert.equal(/alive|dead/.test(nb), false, "no bench data: no verdict");
-  assert.ok(strip(raw("p.huge.free")).includes("2k (83%)"));
-  for (const gone of ["needs $", "skip", "limit", "▰", "▱", "plan"]) {
-    assert.equal(shot(st, META, UNI, 134).map(strip).join("\n").includes(gone), false, `${gone} is gone from the provider list`);
-  }
+  assert.equal(/alive|down|dead/.test(nb), false, "no bench data: no verdict");
+  assert.ok(strip(raw("p.huge.free")).includes("  2k┆ 83%"));
+  const table = shot(st, META, UNI, 134).map(strip).slice(3, 10).join("\n");
+  for (const gone of ["needs $", "skip", "limit", "▰", "▱", "plan", "(", "▁", "█"]) assert.equal(table.includes(gone), false, `${gone} is gone from the provider list`);
 });
 
 // -------------------------------------------- alignment and frame invariants
@@ -129,24 +178,27 @@ test("every line is exactly the frame width at every width, in both glyph sets, 
 test("header and rows share their rule columns at every width, and the columns sit tight (no gap after free)", () => {
   for (const env of [UNI, ASCII]) {
     const S = sepOf(env);
-    for (const cols of [80, 91, 100, 134, 240, 400]) {
+    for (const cols of [78, 80, 91, 100, 106, 107, 116, 117, 134, 240, 400]) {
       const caps = detectCaps(env, cols);
       const L = layoutFor(frameWidth(caps), { keyW: META.keyIdW });
       const lines = shot(initState(ROWS), META, env, cols).map(strip);
       const head = lines.find((l) => l.includes("key id"));
       const at = (l) => [...l].map((c, i) => (c === S ? i : -1)).filter((i) => i >= 0);
-      const want = 3 + (L.showFree ? 1 : 0) + 7;              // models, status, ok, [free], seven raw cells
+      const want = 4 + (L.showProbe ? 1 : 0) + (L.showFree ? 2 : 0) + 7;              // status, [oldest probe], models, ok, %, [free, %], seven raw cells
       assert.equal(at(head).length, want, `rules in the header at ${cols}`);
       for (const id of ["p.big.free", "p.zero.free", "p.nobench", "p.huge.free"]) {
         const row = lines.find((l) => l.includes(id));
         assert.deepEqual(at(row), at(head), `${id} at ${cols}`);
       }
-      const modelsCol = 1 + 2 + L.W.keyId;
-      assert.equal(head.slice(modelsCol, modelsCol + 7), `${S}models`);
+      const statusCol = 1 + 2 + L.W.keyId, probeCol = statusCol + 7, modelsCol = probeCol + (L.showProbe ? 13 : 0);
+      assert.equal(head.slice(statusCol, statusCol + 7), `${S}status`, "status comes right after the key id");
+      assert.equal(head.includes("oldest probe"), L.showProbe, `oldest probe at ${cols}`);
+      if (L.showProbe) assert.equal(head.slice(probeCol, probeCol + 13), `${S}oldest probe`, "oldest probe comes right after status");
+      assert.equal(head.slice(modelsCol, modelsCol + 8), `${S} models`);
       assert.equal(head.includes("free"), L.showFree, `free at ${cols}`);
       // the raw cells begin directly after the last of ok/free: `empt` follows with no blank gap
       const empt = head.indexOf("empt");
-      assert.equal(empt, modelsCol + 7 + 7 + 11 + (L.showFree ? 11 : 0) + 1);
+      assert.equal(empt, modelsCol + 8 + 10 + (L.showFree ? 10 : 0) + 1);
     }
   }
 });
@@ -231,8 +283,8 @@ test("alive = anything responded (errors included); dead = every fresh probe was
   assert.equal(alive(rec("timeout"), rec("error", "x: fetch failed"), rec("timeout")), false, "every one is a no-response");
   assert.equal(alive(rec("timeout"), rec("ok")), true, "one response is enough");
   assert.equal(alive(rec("timeout"), rec("error", "x: Upstream request failed.")), true);
-  assert.equal(alive(rec("ok", "", 20 * 24 * 3600 * 1000), rec("timeout")), false, "a stale answer does not keep it alive");
-  assert.equal(alive(rec("ok", "", 20 * 24 * 3600 * 1000)), null, "nothing fresh: no verdict");
+  assert.equal(alive(rec("ok", "", 20 * 24 * 3600 * 1000), rec("timeout")), true, "an old answer still keeps it alive: there is no age limit");
+  assert.equal(alive(rec("ok", "", -3 * 24 * 3600 * 1000)), null, "a future-dated record is not evidence: no verdict");
   assert.equal(alive(rec("skip")), null, "a skip is not a probe result");
   assert.equal(providerAlive("x", models, null, now), null);
   assert.equal(isNoResponse(null), false);
@@ -256,7 +308,7 @@ test("a hostile key id is contained and cannot move a cell", () => {
     const L = layoutFor(frameWidth(caps), { keyW: meta.keyIdW });
     const row = strip(lines[4]);                      // the hostile row is the first table row
     const S = sepOf(env);
-    assert.equal(row.slice(1 + 2 + L.W.keyId, 1 + 2 + L.W.keyId + 7), `${S}     4`, "the models cell is where it always is");
+    assert.equal(row.slice(1 + 2 + L.W.keyId + 7, 1 + 2 + L.W.keyId + 15), `${S}      4`, "the models cell (after status) is where it always is");
   }
 });
 
@@ -457,11 +509,11 @@ test("a partial count is never 100%: 995 of 1000 and 201 of 202 read 99%, and th
   assert.equal(pctLabel(1, 300), "<1%");
   assert.equal(pctLabel(1, 200), "1%", "0.5% rounds to 1");
   assert.equal(pctLabel(994, 1000), "99%");
-  assert.equal(pctText(995, 1000), "995 (99%)");
-  assert.equal(pctText(1000, 1000), "1k (100%)");
-  // the row cell
+  // the row cells
   const p = painter(detectCaps(ASCII, 100));
-  assert.equal(strip(pctCell(201, 202, "grn", p, ":")), ":" + "201 (99%)".padStart(10));
+  assert.equal(strip(pctBlock(995, 1000, p, ":")), ": 995: 99%", "a partial count reads 99%, never 100%");
+  assert.equal(strip(pctBlock(1000, 1000, p, ":")), ":  1k:100%");
+  assert.equal(strip(pctBlock(201, 202, p, ":")), ": 201: 99%");
   // the header's `K ok (P%)`, at level 1 and on the provider list
   const models = Array.from({ length: 202 }, (_, i) => ({ id: `m${i}`, ctx: null, pin: null, pout: null, badge: "", tools: false, vision: false, reason: false, routable: null }));
   const now = 1_800_000_000_000;
@@ -500,4 +552,131 @@ test("a timeout that got its first token shows that ttft; one that got nothing s
   assert.equal(cell(rowOf("slow"), 3), "35.0s");
   assert.equal(cell(rowOf("dead"), 2), "", "nothing came back");
   assert.equal(cell(rowOf("dead"), 3), "35.0s");
+});
+
+// ------------------------------------------------ the three-state status
+
+test("status: alive = a fresh ok; down = answered but nothing ok; dead = every fresh probe got no response; blank = nothing fresh", () => {
+  const now = 1_800_000_000_000;
+  const rec = (s, o = {}, ago = 1000) => ({ s, a: Math.floor((now - ago) / 1000), p: "", ...o });
+  const models = ["a", "b", "c", "d"].map((id) => ({ id }));
+  const get = (recs) => (t) => recs[Number(/\/(.)$/.exec(t)?.[1] ? "abcd".indexOf(/\/(.)$/.exec(t)[1]) : -1)] ?? null;
+  const st = (...recs) => providerStatus("x", models, get(recs), now);
+  // alive: one ok is enough, whatever else there is
+  assert.equal(st(rec("ok")), "alive");
+  assert.equal(st(rec("auth"), rec("ok"), rec("timeout")), "alive");
+  // down: at least one record, none ok, at least one that answered
+  for (const s of ["auth", "pay", "gone", "empty", "rate"]) assert.equal(st(rec(s)), "down", s);
+  assert.equal(st(rec("error", { p: "x: Upstream request failed." })), "down", "a provider-side error body is an answer");
+  assert.equal(st(rec("error", { m: "system disk overloaded" })), "down");
+  assert.equal(st(rec("timeout", { t: 900, d: 35000 })), "down", "a timeout that returned a first token answered");
+  assert.equal(st(rec("timeout"), rec("auth")), "down", "one answer among no-responses is enough");
+  assert.equal(st(rec("error", { m: "fetch failed" }), rec("gone")), "down");
+  // dead: every fresh record is a no-response
+  assert.equal(st(rec("timeout")), "dead", "an empty timeout");
+  assert.equal(st(rec("error", { m: "fetch failed" })), "dead");
+  assert.equal(st(rec("error", { m: "Failed to reach upstream provider." }), rec("timeout"), rec("error", { p: "terminated" })), "dead");
+  // blank: nothing usable
+  assert.equal(st(), null);
+  assert.equal(st(rec("ok", {}, 30 * 24 * 3600 * 1000)), "alive", "an old ok still counts");
+  assert.equal(st(rec("ok", {}, -3 * 24 * 3600 * 1000)), null, "a future-dated record is not evidence");
+  assert.equal(st(rec("skip")), null, "a skip is not a probe result");
+  assert.equal(st(rec("ok", {}, 30 * 24 * 3600 * 1000), rec("timeout")), "alive", "an old ok is still an ok");
+  assert.equal(st(rec("skip"), rec("auth")), "down", "a skip is ignored, not counted");
+  assert.equal(providerStatus("x", models, null, now), null);
+  assert.equal(providerStatus("x", [], get([]), now), null);
+});
+
+test("the tri-state is baked into benchFlags.status, next to the legacy alive/dead/needsMoney flags", () => {
+  const now = 1_800_000_000_000;
+  const a = Math.floor(now / 1000) - 60;
+  const m = (id) => ({ id, ctx: null, pin: null, pout: null, badge: "", tools: null, vision: null, reason: null, outputKind: null, routable: null, provenance: null, mode: false });
+  const built = (n, models) => ({ keyId: `p.${n}.free`, provider: n, free: 0, planCount: 0, health: "ok", models });
+  const recs = { "up/a": { s: "ok", a }, "dn/a": { s: "auth", a }, "dd/a": { s: "timeout", a }, "dd/b": { s: "error", m: "fetch failed", a } };
+  const bench = { generatedAt: "2026-09-29T00:00:00Z", size: 4, get: (t) => recs[t] ?? null };
+  const snap = buildSnapshot({ generatedAt: "x", rows: [built("up", [m("a")]), built("dn", [m("a")]), built("dd", [m("a"), m("b")]), built("nb", [m("a")])] }, { bench, nowMs: now });
+  const by = Object.fromEntries(snap.rows.map((r) => [r.provider, r.benchFlags]));
+  assert.equal(by.up.status, "alive");
+  assert.equal(by.dn.status, "down");
+  assert.equal(by.dd.status, "dead");
+  assert.equal(by.nb, null, "nothing fresh: no flags at all, drawn blank");
+  assert.equal(by.dn.alive, true, "the legacy two-state flag is unchanged: it answered");
+  assert.equal(by.dd.alive, false);
+  assert.ok("dead" in by.dn && "needsMoney" in by.dn, "the sweep's own flags are still there");
+  assert.equal(snap.schemaVersion, 9);
+});
+
+// ------------------------------------------- tampered data, legend, all widths
+
+test("tampered counts and statuses draw blank, never data, and every line keeps the frame width in both glyph sets", () => {
+  const evil = [{ ...prow("p.evil1.free", 10, { ...Z, ok: "\x1b[2J9", empty: {}, auth: "5" }, { ...ALIVE, status: "\x1b[31mdead" }, { free: "\x07" }) },
+                { ...prow("p.evil2.free", 10, { ...Z, ok: Infinity, gone: -4 }, { ...ALIVE, status: 3 }, { free: NaN }) },
+                { ...prow("p.evil3.free", 10, { ...Z, ok: 4 }, { ...ALIVE, status: "alive" }, { free: 1e12 }) }];
+  for (const env of [UNI, ASCII]) for (const cols of CT) {
+    const caps = detectCaps(env, cols);
+    const lines = frame(view(initState(evil)), { ...META, rows: evil, keyIdW: keyIdWidth(evil) }, { caps });
+    const all = lines.join("\n");
+    assert.equal(/\x07|\x1b\[2J|\x1b\[31m(?!.*\x1b\[0m)/.test(strip(all)), false);
+    assert.equal(/[\x00-\x08\x0b-\x1f\x7f]/.test(strip(all)), false);
+    for (const l of lines) assert.equal(cps(strip(l)), frameWidth(caps), `cols ${cols}`);
+    const row = (id) => strip(lines.find((l) => strip(l).includes(id)));
+    assert.equal(/alive|down|dead/.test(row("evil1") + row("evil2")), false, "a hostile status is blank");
+    assert.ok(row("evil3").includes("alive"));
+  }
+});
+
+test("the legend defines the three states and the percent bands, with no block glyph", () => {
+  const stub = new Proxy({}, { get: () => (x) => x });
+  for (const env of [UNI, ASCII]) {
+    const g = glyphsFor(detectCaps(env, 100));
+    const text = legendLines(g, stub, { provenanceDot: () => "#" }).join("\n");
+    for (const w of ["alive", "down", "dead", "70% and up", "30% to 69%", "under 30%", "%", "free"]) assert.ok(text.includes(w), `legend mentions ${w}`);
+    assert.equal(/[\u2581-\u2588]/.test(text), false, "no block glyph");
+    assert.equal(text.includes("(PCT%)"), false);
+    assert.equal(/\x1b/.test(text), false);
+  }
+});
+
+// ------------------------------------------------------ full key ids
+
+test("the longest key ids are drawn whole whenever the terminal has the width, and elided (with a marker) only below it", () => {
+  const long45 = "relay." + "x".repeat(12) + ".anthropic.subscription.longtier".slice(0, 27);       // 45 characters
+  assert.equal(long45.length, 45);
+  const ids = ["personal.google.free", "personal.openrouter.free", "personal_mxene.alibaba.paid", "personal.nousresearch.free", long45];
+  const rows = ids.map((id) => prow(id, 3, { ...Z, ok: 1 }, ALIVE));
+  const shown = (id) => id;                                  // the FULL id is drawn: no bucket is dropped
+  const keyW = keyIdWidth(rows);
+  assert.equal(keyW, 45, "the longest full id, over all rows");
+  const meta = { ...META, rows, keyIdW: keyW, providers: rows.length };
+  const need = 45 + 59 + 3 + 2;                              // the terminal width at which the 45-character id is whole
+  for (const env of [UNI, ASCII]) {
+    const ell = glyphsFor(detectCaps(env, 100)).elide;
+    for (const cols of [134, 240, need]) {
+      const lines = frame(view(initState(rows)), meta, { caps: detectCaps(env, cols) }).map(strip);
+      for (const id of ids) assert.ok(lines.some((l) => l.includes(shown(id))), `${shown(id)} whole at ${cols}`);
+      assert.equal(lines.some((l) => l.includes(ell) && /google|openrouter|alibaba|nousresearch|relay/.test(l) && l.split(sepOf(env))[0].includes(ell)), false, `no elision at ${cols}`);
+    }
+    const narrow = frame(view(initState(rows)), meta, { caps: detectCaps(env, need - 1) }).map(strip);
+    assert.equal(narrow.some((l) => l.includes(shown(long45))), false, "one column short: the 45-character id is elided");
+    assert.ok(narrow.some((l) => l.split(sepOf(env))[0].includes(ell)), "with a visible marker");
+    for (const cols of [80, 100, 134, 240]) {
+      const caps = detectCaps(env, cols);
+      const lines = frame(view(initState(rows)), meta, { caps });
+      for (const l of lines) assert.equal(cps(strip(l)), frameWidth(caps), `cols ${cols}`);
+      const text = lines.map(strip);
+      const head = text.find((l) => l.includes("key id"));
+      const at = (l) => [...l].map((c, i) => (c === sepOf(env) ? i : -1)).filter((i) => i >= 0);
+      const hi = text.indexOf(head);
+      ids.forEach((id, i) => assert.deepEqual(at(text[hi + 1 + i]), at(head), `${id} at ${cols}`));
+    }
+  }
+  // oldest probe and free never take the id's room: they appear only after the whole id
+  const L = (cols) => layoutFor(cols - 2, { keyW: 45 });
+  assert.equal(L(need).W.keyId, 45);
+  assert.equal(L(need).showFree, false);
+  assert.equal(L(need).showProbe, false);
+  assert.equal(L(need + 13).showProbe, true, "oldest probe appears 13 columns after the whole id");
+  assert.equal(L(need + 13).showFree, false);
+  assert.equal(L(need + 23).showFree, true, "and free 10 columns after that");
+  assert.equal(L(need + 23).W.keyId, 45);
 });
