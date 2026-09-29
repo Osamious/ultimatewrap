@@ -222,6 +222,83 @@ export function compact({ benchFile = BENCH_FILE, logFile = BENCH_LOG, keep = nu
   return Object.keys(models).length;
 }
 
+// ------------------------------------------------------------ dated history
+
+// A history name is exactly this shape; nothing else in the directory is read, compared or deleted.
+// `_NN` disambiguates two archives in the same second and sorts after the bare name ('_' > '.').
+const HISTORY_NAME = /^bench-\d{8}T\d{6}Z(_\d{2})?\.json$/;
+const HISTORY_TMP = /^bench-\d{8}T\d{6}Z(_\d{2})?\.json\.tmp-\d+$/;      // debris of an interrupted writeAtomic
+
+/**
+ * Safety net, not a queryable history: bench.json holds ONE record per model and every run rewrites it, so a
+ * route that was `ok` and later returns `gone` would otherwise lose its evidence. Before a run first writes,
+ * the current bench.json is copied to `<historyDir>/bench-<UTC>.json`, atomically.
+ *
+ * THE COPY IS ALWAYS REDACTED, whatever bench.json holds: a bench.json written before redaction existed can still
+ * carry provider text (a masked key fragment), and a history copy must never hold less-redacted text than the file
+ * the run is about to produce. Every record goes through `redactRecord` (what `compact` applies); the rest of the
+ * file is carried over. The copy is content-identical, not a byte copy: it is re-serialised as compact JSON, so it is
+ * identical for files the tool wrote (compact `JSON.stringify`), while a pretty-printed, CRLF, BOM or
+ * newline-terminated file comes out compact (no data is lost).
+ *
+ * Skipped when the newest copy (highest name, files only) has identical content. After a write the directory is
+ * pruned so that at most `keep` (>= 1) copies remain: the one just written is NEVER a prune candidate (so a clock
+ * behind an existing stamp cannot delete it), and the newest `keep - 1` others survive with it. Only files named
+ * `bench-<stamp>.json`, and `.tmp-*` debris of exactly that name, are ever deleted. `historyDir` defaults to
+ * `bench-history/` beside `benchFile`.
+ *
+ * NEVER throws: a failure is `{ archived: null, reason }`, so a history problem cannot stop a sweep. Nothing to
+ * copy yet (no bench.json, blank, no records) is `{ archived: null, skipped, reason }`, which is not a failure.
+ * Returns `{ archived, name?, unchanged?, skipped?, reason?, pruned, kept, of }` (`archived` is the path or null).
+ */
+export function archiveBench({ benchFile = BENCH_FILE, historyDir = path.join(path.dirname(benchFile), "bench-history"), keep = 30, now = () => new Date() } = {}) {
+  try {
+    let text;
+    try { text = fs.readFileSync(benchFile, "utf8"); }
+    catch (e) {
+      if (e?.code === "ENOENT") return { archived: null, skipped: true, reason: `no ${path.basename(benchFile)} yet`, pruned: 0 };
+      return { archived: null, reason: `cannot read ${path.basename(benchFile)}: ${e?.code ?? e?.message ?? e}`, pruned: 0 };
+    }
+    if (!text.trim()) return { archived: null, skipped: true, reason: `${path.basename(benchFile)} is empty`, pruned: 0 };
+    let raw = null;
+    try { raw = JSON.parse(text.replace(/^\uFEFF/, "")); } catch { /* reported below */ }
+    if (!raw || raw.schema !== BENCH_SCHEMA || !raw.models || typeof raw.models !== "object") {
+      return { archived: null, reason: `${path.basename(benchFile)} is corrupt or another schema`, pruned: 0 };
+    }
+    if (!Object.keys(raw.models).length) return { archived: null, skipped: true, reason: `${path.basename(benchFile)} has no records yet`, pruned: 0 };
+    const models = {};
+    for (const [k, v] of Object.entries(raw.models)) models[k] = redactRecord(v).rec;
+    const out = JSON.stringify({ ...raw, models });
+
+    fs.mkdirSync(historyDir, { recursive: true });
+    const entries = fs.readdirSync(historyDir, { withFileTypes: true });
+    const taken = new Set(entries.map((e) => e.name));                     // any entry, of any type, blocks a name
+    const files = entries.filter((e) => e.isFile() && HISTORY_NAME.test(e.name)).map((e) => e.name).sort();
+    for (const e of entries) if (e.isFile() && HISTORY_TMP.test(e.name)) fs.rmSync(path.join(historyDir, e.name), { force: true });
+    const newest = files[files.length - 1];
+    if (newest) {
+      let prev = null;
+      try { prev = fs.readFileSync(path.join(historyDir, newest), "utf8"); } catch { /* unreadable: archive anew */ }
+      if (prev === out) return { archived: null, unchanged: newest, reason: `identical to ${newest}`, pruned: 0, kept: files.length, of: files.length };
+    }
+    const stamp = now().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    let name = `bench-${stamp}.json`;
+    for (let i = 2; taken.has(name) && i < 100; i++) name = `bench-${stamp}_${String(i).padStart(2, "0")}.json`;
+    if (taken.has(name)) return { archived: null, reason: "no free history name in this second", pruned: 0 };
+    const dest = path.join(historyDir, name);
+    writeAtomic(dest, out);
+    const others = files.slice();                                          // never contains `name`: it was not in `taken`
+    const room = Math.max(1, Math.floor(keep) || 1) - 1;
+    let pruned = 0;
+    for (const old of others.slice(0, Math.max(0, others.length - room))) {
+      try { fs.rmSync(path.join(historyDir, old)); pruned += 1; } catch { /* left for the next run */ }
+    }
+    return { archived: dest, name, pruned, kept: others.length + 1 - pruned, of: others.length + 1 };
+  } catch (e) {
+    return { archived: null, reason: e?.code ?? e?.message ?? String(e), pruned: 0 };
+  }
+}
+
 // ------------------------------------------------------------ false ok -> notice
 
 /**

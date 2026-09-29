@@ -7,6 +7,7 @@
 //   node refresh/bench-cli.mjs --live --economy      the old breaker behaviour, opt-in
 //   node refresh/bench-cli.mjs --compact             fold an interrupted run's log into bench.json
 //   node refresh/bench-cli.mjs --redact              one-shot: redact provider text already stored
+//   node refresh/bench-cli.mjs --live --keep-history 60   keep the newest 60 dated copies of bench.json (default 30, min 1)
 //   node refresh/bench-cli.mjs --live --only-file list.txt --force --max-tokens 1024
 //                                                    re-probe exactly the rows in list.txt (provider/id per
 //                                                    line, # comments; combinable with --only). A row not in
@@ -18,6 +19,12 @@
 // refusal) into auth / pay / error, in bench.json and the log, once (same lock and atomic write as --redact).
 // --redact applies the same pass to bench.json once; it takes the sweep lock, so it refuses under a running sweep.
 // A probe sent with a non-default --max-tokens records that budget (`b`) on its result.
+//
+// HISTORY BACKUPS. Every run that WRITES bench.json or its log (--live, --compact, --redact, a real
+// --reclassify-notices; never a dry run) first copies the current bench.json, REDACTED (never less than the file the run writes), to
+// state/bench-history/bench-<UTC>.json (skipped when identical to the newest copy) and keeps at most --keep-history N
+// copies (default 30, at least 1; the new one always survives). It saves bench.json only, not an unfolded bench.jsonl.
+// A failure only prints a warning. There is deliberately NO --no-history: the safety net is not optional.
 //
 // EACH PROBE MAY TAKE 4 MINUTES (--timeout, default 240 s, both modes). Slow models and slow gateways
 // are the reason; the cost is that a provider whose rows all hang can take hours, so --max-minutes
@@ -75,14 +82,14 @@ import { loadSnapshot } from "../menu/snapshot.mjs";
 import { gatewayConnection } from "../menu/ccr-client.mjs";
 import { BENCH_MAX_TOKENS, BENCH_FILE, BENCH_FRESH_MS, benchKeyOf } from "../menu/bench-data.mjs";
 import { buildTargets, probeOne, runSweep, billedCost, STREAM_CUT_FACTOR, UNPRICED_PER_M } from "./bench.mjs";
-import { createLogWriter, loadExisting, isFresh, compact, redactBench, reclassifyNotices } from "./bench-store.mjs";
+import { createLogWriter, loadExisting, isFresh, compact, redactBench, reclassifyNotices, archiveBench } from "./bench-store.mjs";
 import fs from "node:fs";
 import { acquireLock, sweepStatus } from "./bench-lock.mjs";
 
 export const DEFAULTS = Object.freeze({
   concurrency: 8, perProvider: 2, maxSpend: 5, maxRowCost: 0.1,
   maxTokens: BENCH_MAX_TOKENS, streamCut: null, ttlDays: 7, timeoutSec: 240, limit: null,
-  coolAfter: 10, coolGapMs: 400, outageAfter: 30, outageWaitMin: 10, maxMinutes: 150,
+  coolAfter: 10, coolGapMs: 400, outageAfter: 30, outageWaitMin: 10, maxMinutes: 150, keepHistory: 30,
 });
 
 // What --economy puts the budget back to (the pre-probe-all behaviour), for any of these
@@ -179,6 +186,10 @@ export function parseArgs(argv) {
       const v = argv[++i];
       if (!v) return { error: "--only-file needs a path: one provider/id per line, # for comments" };
       o.onlyFile = v;
+    } else if (a === "--keep-history") {
+      const v = Number(argv[++i]);
+      if (!Number.isInteger(v) || v < 1) return { error: "--keep-history needs an integer of at least 1 (how many dated copies of bench.json to keep; history cannot be turned off, so 0 is refused)" };
+      o.keepHistory = v;
     } else if (a === "--stream-cut") {
       const v = Number(argv[++i]);
       if (!Number.isInteger(v) || v < 0) return { error: "--stream-cut needs a non-negative integer (tokens; 0 turns the cut off)" };
@@ -400,6 +411,17 @@ export async function gatewayUp(base, {
   return false;
 }
 
+/** One history copy of bench.json before a run writes (see `archiveBench`); prints one line and never fails the run. */
+function saveHistory(o, deps) {
+  const benchFile = deps.benchFile ?? BENCH_FILE;
+  const r = archiveBench({ benchFile, keep: o.keepHistory, ...(deps.historyDir ? { historyDir: deps.historyDir } : {}), ...(deps.now ? { now: deps.now } : {}) });
+  const dir = path.basename(deps.historyDir ?? path.join(path.dirname(benchFile), "bench-history"));
+  if (r.archived) console.log(`bench: history saved -> ${dir}/${r.name} (kept ${r.kept} of ${r.of}${r.pruned ? `; pruned ${r.pruned}` : ""})`);
+  else if (r.unchanged) console.log(`bench: history unchanged (identical to ${r.unchanged})`);
+  else if (r.skipped) console.log(`bench: history skipped (${r.reason})`);
+  else console.error(`bench: warning: history not saved (${r.reason}); continuing`);
+}
+
 /** Exit code for "another sweep is running" (and for a --compact refused because of one). */
 export const EXIT_BUSY = 5;
 
@@ -420,6 +442,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const got = acquireLock({ ...lockDeps, mode: "redact" });
     if (!got.ok) { console.error(`bench: cannot redact -- ${got.message.replace("; nothing was sent", "")}`); return EXIT_BUSY; }
     try {
+      saveHistory(o, deps);
       const r = redactBench({ ...(deps.benchFile ? { benchFile: deps.benchFile } : {}), ...(deps.logFile ? { logFile: deps.logFile } : {}) });
       if (!r.ok) { console.error(`bench: cannot redact -- ${r.reason}`); return 1; }
       if (!r.benchOk) console.error(`bench: note: no readable ${path.basename(deps.benchFile ?? BENCH_FILE)} (missing, corrupt or another schema); only the log was redacted`);
@@ -453,6 +476,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const got = acquireLock({ ...lockDeps, mode: "reclassify" });
     if (!got.ok) { console.error(`bench: cannot reclassify -- ${got.message.replace("; nothing was sent", "")}`); return EXIT_BUSY; }
     try {
+      saveHistory(o, deps);
       const r = reclassifyNotices(paths);
       if (!r.ok) { console.error(`bench: cannot reclassify -- ${r.reason}`); return 1; }
       show(r);
@@ -495,8 +519,9 @@ async function runMain(o, lockDeps, deps = {}) {
   const keep = new Set([...all.values()].flat().map((t) => t.key));
 
   if (o.compact) {
-    const n = compact({ keep, ttlMs: keepMs(o) });
-    console.log(`bench: compacted the log into ${BENCH_FILE} (${n} record(s))`);
+    saveHistory(o, deps);
+    const n = compact({ keep, ttlMs: keepMs(o), ...(deps.benchFile ? { benchFile: deps.benchFile } : {}), ...(deps.logFile ? { logFile: deps.logFile } : {}) });
+    console.log(`bench: compacted the log into ${deps.benchFile ?? BENCH_FILE} (${n} record(s))`);
     return 0;
   }
 
@@ -557,6 +582,7 @@ async function runMain(o, lockDeps, deps = {}) {
     ac.abort();
   });
 
+  saveHistory(o, deps);      // the lock is held and nothing has been written yet
   const writer = createLogWriter();
   const tally = {}; let done = 0;
   const started = Date.now();
