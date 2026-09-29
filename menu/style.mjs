@@ -380,6 +380,22 @@ const ctxS = (c) => {
 const money = (v) => (v == null ? "" : Number(v).toFixed(2));
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
+// Router-pool aliases: names that select a load-balanced GROUP of backend
+// models rather than one specific model, so their real availability can
+// legitimately drop to zero with no config error on either side -- MEASURED
+// 2026-09-19: openrouter/free returned a real upstream 404 "No endpoints
+// available" while every other openrouter row answered normally. Label only,
+// never excluded: this is a picker-display decision and does not touch
+// routing or selection. `keysync/keysync.mjs`'s own `POOL_IDS` governs a
+// DIFFERENT decision (withholding the [1m] context-suffix tag from a pool,
+// since a pool's context window is evidence about no model at all) and is
+// left untouched by this constant on purpose -- the two lists are allowed to
+// diverge; `free` earns a label here without earning a change to that tag
+// rule, since a pool's ctx is already null (see the real snapshot row) and
+// never reaches tagOneM's ctx>=1M gate regardless.
+const POOL_ALIAS_LABEL_IDS = /(^|\/)(auto|router|default|free)$/i;
+const withPoolLabel = (id) => (POOL_ALIAS_LABEL_IDS.test(String(id ?? "")) ? `${id} [pool]` : id);
+
 // #51 (§2.5(a)), revision 11: the model-count cell carries BOTH numbers
 // instead of a new column. A provider withholding nothing renders the BARE
 // count -- never `343/0` -- because the count itself is never suppressed,
@@ -732,7 +748,7 @@ export function frame(v, meta, { caps }) {
              (layout.showLimit ? limitOut(r.limit, p, W.limit) : "");
     } else if (it.kind === "pinned") {
       body = `${mark} ` + (it.mark === "*" ? p.yel(g.fav) : p.dim(g.recent)) + " " +
-             highlight(pad(it.target, W.keyId + W.count), v.filter, p);
+             highlight(pad(withPoolLabel(it.target), W.keyId + W.count), v.filter, p);
     } else {
       const m = it.model;
       // Three states, three glyphs. capsOf now distinguishes "the catalogue says
@@ -777,7 +793,7 @@ export function frame(v, meta, { caps }) {
       // the snapshot row (schema 3, R15) -- `null` for a synthetic/unknown
       // row (relay is `config-asserted`, never null; see catalog.mjs).
       body = `${mark} ` + provenanceDot(m.provenance, g, p) + " " +
-             padId(flat ? it.target : m.id, W.id, v.filter, g, p) +
+             padId(withPoolLabel(flat ? it.target : m.id), W.id, v.filter, g, p) +
              rpad(ctxCell, W.ctx) + " " +
              rpad(money(m.pin), W.price) + rpad(money(m.pout), W.price) + "  " +
              badgeOut +

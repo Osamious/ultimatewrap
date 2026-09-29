@@ -403,3 +403,72 @@ test("recordStartup keeps a bounded sample set and a median", () => {
   for (let i = 0; i < 30; i++) recordStartup(50, f);
   assert.equal(JSON.parse(fs.readFileSync(f, "utf8")).samples.length, 20);
 });
+
+// ------------------------------------------------------ router-pool labeling
+// A router-pool id (auto/router/default/free) selects a load-balanced GROUP
+// of backend models, not one specific model -- its real availability can
+// legitimately drop to zero with no config error on either side. MEASURED
+// 2026-09-19: openrouter/free returned a real upstream 404 "No endpoints
+// available" while every other openrouter row answered normally. Labeled
+// only, never excluded from the picker or from routing (menu/style.mjs's
+// `withPoolLabel`) -- this is a display decision, and it must never change
+// which string a selection actually resolves to.
+
+test("a router-pool model id is labeled [pool] in tree scope, an ordinary id is not", () => {
+  const rows = [{ keyId: "personal.acme.free", provider: "acme", free: null, planCount: 0,
+                  health: "ok", models: [M("free"), M("acme-chat-1")] }];
+  const s = reduce(initState(rows), "\r").state;
+  const lines = show(view(s)).split("\n");
+  // Excludes the header line, which names the KEY id ("personal.acme.free")
+  // and so also contains the substring "free" -- the model row itself is
+  // the line this test means to find.
+  const poolLine = lines.find((l) => l.includes("free") && !l.includes("UW >"));
+  const ordinaryLine = lines.find((l) => l.includes("acme-chat-1"));
+  assert.match(poolLine, /\[pool\]/);
+  assert.doesNotMatch(ordinaryLine, /\[pool\]/);
+});
+
+test("auto/router/default are labeled too, and a name merely containing one is not", () => {
+  const rows = [{ keyId: "personal.acme.free", provider: "acme", free: null, planCount: 0,
+                  health: "ok", models: [M("auto"), M("router"), M("default"),
+                                         M("autocoder"), M("routerworks")] }];
+  const s = reduce(initState(rows), "\r").state;
+  const lines = show(view(s)).split("\n");
+  for (const id of ["auto", "router", "default"]) {
+    const line = lines.find((l) => l.trimEnd().endsWith(id) || l.includes(`${id} [pool]`));
+    assert.match(line, /\[pool\]/, `${id} must be labeled`);
+  }
+  for (const id of ["autocoder", "routerworks"]) {
+    const line = lines.find((l) => l.includes(id));
+    assert.doesNotMatch(line, /\[pool\]/, `${id} must NOT be labeled -- it only contains the word`);
+  }
+});
+
+test("a pool alias is labeled in flat scope too, keyed on the tail of provider/model", () => {
+  const flatV = { level: 1, scope: "flat", filter: "", legend: false, cursor: 0, top: 0,
+                  empty: false, more: 0, provider: null,
+                  items: [
+                    { kind: "model", target: "openrouter/free", model: M("free") },
+                    { kind: "model", target: "openrouter/qwen3.8-flash", model: M("qwen3.8-flash") },
+                  ] };
+  const lines = show(flatV).split("\n");
+  const poolLine = lines.find((l) => l.includes("openrouter/free"));
+  const ordinaryLine = lines.find((l) => l.includes("openrouter/qwen3.8-flash"));
+  assert.match(poolLine, /\[pool\]/);
+  assert.doesNotMatch(ordinaryLine, /\[pool\]/);
+});
+
+test("the label is display-only: it never appears in a pinned row's underlying target elsewhere", () => {
+  // The label is applied only inside style.mjs's own render call sites, never
+  // to `it.target`/`m.id` themselves -- so the SELECTION machinery (pick-state.mjs)
+  // never sees the decorated string. This asserts the shape at the boundary
+  // this task actually touched: a pinned row renders the label without the
+  // underlying pin state (untouched here) ever being anything but the real id.
+  const pinnedV = { level: 1, scope: "flat", filter: "", legend: false, cursor: 0, top: 0,
+                    empty: false, more: 0, provider: null,
+                    items: [{ kind: "pinned", mark: "*", target: "openrouter/free" }] };
+  const line = show(pinnedV).split("\n").find((l) => l.includes("openrouter/free"));
+  assert.match(line, /\[pool\]/);
+  assert.equal(pinnedV.items[0].target, "openrouter/free",
+    "the state's own target string must stay undecorated -- only the render is labeled");
+});
