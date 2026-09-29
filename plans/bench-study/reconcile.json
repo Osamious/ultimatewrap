@@ -1,0 +1,64 @@
+{
+ "rev1": 467,
+ "critic": 454,
+ "nowFromBuild": 361,
+ "rev1NotCritic": 15,
+ "rev1NotCriticByProvider": {
+  "kilo": 2,
+  "zenmux": 10,
+  "cohere": 3
+ },
+ "rev1NotCriticRows": [
+  "kilo/hy3:free | kilo: The requested model 'hy3:free' doe",
+  "kilo/inkling:free | kilo: The requested model 'inkling:free'",
+  "zenmux/agnes-1.5-lite | zenmux: Requested model is not valid )",
+  "zenmux/agnes-1.5-pro | zenmux: Requested model is not valid )",
+  "zenmux/hy3-preview | zenmux: Requested model is not valid )",
+  "zenmux/kat-coder-pro-v2 | zenmux: Requested model is not valid )",
+  "zenmux/ling-1t | zenmux: Requested model is not valid )",
+  "zenmux/mimo-v2-flash | zenmux: Requested model is not valid (re",
+  "zenmux/mimo-v2-omni | zenmux: Requested model is not valid )",
+  "zenmux/ring-1t | zenmux: Requested model is not valid )",
+  "zenmux/step-3 | zenmux: Requested model is not valid )",
+  "zenmux/step-3.7-flash-free | zenmux: Requested model is not valid (re",
+  "cohere/c4ai-aya-vision-8b | cohere: model 'c4ai-aya-vision-8b' was r",
+  "cohere/command-light | cohere: model 'command-light' was remove",
+  "cohere/command-r-plus | cohere: model 'command-r-plus' was remov"
+ ],
+ "now": 361,
+ "nowNotCritic": 12,
+ "nowNotCriticByProvider": {
+  "zenmux": 10,
+  "cohere": 2
+ },
+ "nowNotCriticRows": [
+  "zenmux/agnes-1.5-lite | zenmux: Requested model is not valid )",
+  "zenmux/agnes-1.5-pro | zenmux: Requested model is not valid )",
+  "zenmux/hy3-preview | zenmux: Requested model is not valid )",
+  "zenmux/kat-coder-pro-v2 | zenmux: Requested model is not valid )",
+  "zenmux/ling-1t | zenmux: Requested model is not valid )",
+  "zenmux/mimo-v2-flash | zenmux: Requested model is not valid (re",
+  "zenmux/mimo-v2-omni | zenmux: Requested model is not valid )",
+  "zenmux/ring-1t | zenmux: Requested model is not valid )",
+  "zenmux/step-3 | zenmux: Requested model is not valid )",
+  "zenmux/step-3.7-flash-free | zenmux: Requested model is not valid (re",
+  "cohere/command-light | cohere: model 'command-light' was remove",
+  "cohere/command-r-plus | cohere: model 'command-r-plus' was remov"
+ ],
+ "criticNotNow": 105,
+ "criticNotNowByProvider": {
+  "alibaba": 6,
+  "mistral": 4,
+  "google": 90,
+  "cohere": 2,
+  "cerebras": 3
+ },
+ "criticNotRev1": 2,
+ "criticNotRev1ByProvider": {
+  "cerebras": 2
+ },
+ "criticNotRev1Rows": [
+  "cerebras/gemma-4-31b | cerebras: Model gemma-4-31b is archived ",
+  "cerebras/zai-glm-4.7 | cerebras: Model zai-glm-4.7 is archived "
+ ]
+}

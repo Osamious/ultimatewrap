@@ -1,0 +1,30 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+const H = os.homedir();
+const snap = JSON.parse(fs.readFileSync(path.join(H, ".uw/catalog/snapshot.json"), "utf8"));
+const bench = JSON.parse(fs.readFileSync(path.join(H, ".uw/state/bench.json"), "utf8"));
+const strip = (id) => String(id).replace(/\[1m\]$/i, "");
+let routes = 0, nontext = 0, unroutable = 0, eligible = 0;
+const kinds = {}, rout = {};
+const keys = new Set(), elig = new Set();
+for (const r of snap.rows) for (const m of r.models) {
+  routes++; kinds[m.outputKind] = (kinds[m.outputKind] || 0) + 1; rout[m.routable] = (rout[m.routable] || 0) + 1;
+  keys.add(r.provider + "/" + strip(m.id));
+  if (m.outputKind === "nontext" || m.routable === false) continue;
+  eligible++; elig.add(r.provider + "/" + strip(m.id));
+}
+console.log({ routes, uniqueKeys: keys.size, eligible, eligibleKeys: elig.size, kinds, rout });
+const bk = new Set(Object.keys(bench.models));
+let inSnap = 0, notInSnap = 0;
+for (const k of bk) keys.has(k) ? inSnap++ : notInSnap++;
+console.log({ benchKeys: bk.size, inSnap, notInSnap });
+let eligNoRec = 0; for (const k of elig) if (!bk.has(k)) eligNoRec++;
+console.log({ eligNoRec });
+let recNotElig = 0; for (const k of bk) if (!elig.has(k)) recNotElig++;
+console.log({ recNotElig });
+const ages = Object.values(bench.models).map((r) => r.a).sort((a, b) => a - b);
+console.log(new Date(ages[0] * 1000).toISOString(), new Date(ages.at(-1) * 1000).toISOString());
+const dist = {}; for (const r of Object.values(bench.models)) dist[r.s] = (dist[r.s] || 0) + 1; console.log(dist);
+console.log("withm", Object.values(bench.models).filter((r) => r.m).length, "nonok", Object.values(bench.models).filter((r) => r.s !== "ok").length);
+console.log("dupe id in provider", snap.rows.length, new Set(snap.rows.map(r=>r.provider)).size);

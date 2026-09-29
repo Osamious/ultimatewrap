@@ -1,0 +1,12 @@
+import { load, iso } from "../lib.mjs";
+const rows = load().filter((r) => r.eligible && r.rec);
+const ff = rows.filter((r) => r.rec.m === "fetch failed");
+const bp = {}; for (const r of ff) bp[r.provider] = (bp[r.provider] || 0) + 1; console.log("fetch failed by provider", JSON.stringify(bp));
+const hrs = {}; for (const r of ff) { const h = iso(r.rec.a).slice(0, 15); hrs[h] = (hrs[h] || 0) + 1; } console.log(JSON.stringify(hrs));
+console.log("d of fetch failed", ff.slice(0, 10).map((r) => r.rec.d));
+console.log("provider totals for those:", Object.keys(bp).map((p) => p + ":" + rows.filter((r) => r.provider === p).length + " ok=" + rows.filter((r) => r.provider === p && r.rec.s === "ok").length).join(" "));
+const und = rows.filter((r) => r.rec.s === "empty" && r.rec.p === "undefined"); console.log("undefined empties", und.length, und.slice(0, 5).map((r) => r.key + " " + JSON.stringify(r.rec) + " legacy=" + r.legacy));
+const em = rows.filter((r) => r.rec.s === "empty"); console.log("empty: legacy", em.filter((r) => r.legacy).length, "o dist", JSON.stringify(em.map((r) => r.rec.o)));
+const nonokNoM = rows.filter((r) => r.rec.s !== "ok" && !r.rec.m); console.log("non-ok without m", nonokNoM.length, "legacy", nonokNoM.filter((r) => r.legacy).length);
+const nonokM = rows.filter((r) => r.rec.s !== "ok" && r.rec.m); console.log("non-ok with m", nonokM.length, "legacy", nonokM.filter((r) => r.legacy).length);
+const perProv = {}; for (const r of nonokNoM.filter((r) => !r.legacy)) perProv[r.provider + "/" + r.rec.s] = (perProv[r.provider + "/" + r.rec.s] || 0) + 1; console.log("non-legacy nonok without m:", JSON.stringify(perProv));

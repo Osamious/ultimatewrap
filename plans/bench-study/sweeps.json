@@ -1,0 +1,2187 @@
+{
+ "meta": {
+  "firstGeneratedAt": "2026-09-29T11:56:31.329Z",
+  "midGeneratedAt": "2026-09-29T12:35:25.113Z",
+  "finalGeneratedAt": "2026-09-29T14:29:03.034Z",
+  "keysFirst": 5793,
+  "keysMid": 5793,
+  "keysFinal": 5793
+ },
+ "dist": {
+  "first": {
+   "empty": 47,
+   "ok": 1396,
+   "pay": 138,
+   "auth": 43,
+   "gone": 602,
+   "skip": 3125,
+   "error": 343,
+   "rate": 41,
+   "timeout": 58
+  },
+  "mid": {
+   "empty": 48,
+   "ok": 1404,
+   "pay": 179,
+   "auth": 47,
+   "gone": 605,
+   "error": 225,
+   "skip": 3203,
+   "rate": 39,
+   "timeout": 43
+  },
+  "final": {
+   "empty": 76,
+   "ok": 1787,
+   "pay": 1972,
+   "auth": 88,
+   "gone": 1138,
+   "error": 618,
+   "timeout": 42,
+   "rate": 72
+  }
+ },
+ "skipReasonFirst": {
+  "provider-dead": 974,
+  "unfunded": 1878,
+  "row-cost": 2,
+  "spend-cap": 271
+ },
+ "skipReasonMid": {
+  "provider-dead": 1091,
+  "unfunded": 1839,
+  "row-cost": 2,
+  "spend-cap": 271
+ },
+ "firstTimes": {
+  "min": "2026-09-29T10:26:25.000Z",
+  "max": "2026-09-29T11:56:31.000Z"
+ },
+ "run2": {
+  "changed": 225,
+  "trans": {
+   "skip->pay": 41,
+   "skip->error": 8,
+   "skip->auth": 4,
+   "skip->ok": 2,
+   "error->error": 14,
+   "rate->error": 1,
+   "rate->rate": 4,
+   "error->gone": 1,
+   "timeout->ok": 3,
+   "rate->ok": 1,
+   "skip->gone": 2,
+   "skip->empty": 1,
+   "timeout->error": 2,
+   "timeout->timeout": 3,
+   "error->ok": 2,
+   "error->skip": 126,
+   "timeout->skip": 10
+  }
+ },
+ "run3": {
+  "changed": 3510
+ },
+ "run2Window": {
+  "min": "2026-09-29T11:57:27.000Z",
+  "max": "2026-09-29T12:35:25.000Z"
+ },
+ "matrix": {
+  "ok": {
+   "ok": 1396,
+   "empty": 0,
+   "pay": 0,
+   "auth": 0,
+   "gone": 0,
+   "error": 0,
+   "timeout": 0,
+   "rate": 0,
+   "skip": 0
+  },
+  "empty": {
+   "ok": 0,
+   "empty": 47,
+   "pay": 0,
+   "auth": 0,
+   "gone": 0,
+   "error": 0,
+   "timeout": 0,
+   "rate": 0,
+   "skip": 0
+  },
+  "pay": {
+   "ok": 0,
+   "empty": 0,
+   "pay": 138,
+   "auth": 0,
+   "gone": 0,
+   "error": 0,
+   "timeout": 0,
+   "rate": 0,
+   "skip": 0
+  },
+  "auth": {
+   "ok": 0,
+   "empty": 0,
+   "pay": 0,
+   "auth": 43,
+   "gone": 0,
+   "error": 0,
+   "timeout": 0,
+   "rate": 0,
+   "skip": 0
+  },
+  "gone": {
+   "ok": 0,
+   "empty": 0,
+   "pay": 0,
+   "auth": 0,
+   "gone": 602,
+   "error": 0,
+   "timeout": 0,
+   "rate": 0,
+   "skip": 0
+  },
+  "error": {
+   "ok": 6,
+   "empty": 0,
+   "pay": 4,
+   "auth": 0,
+   "gone": 23,
+   "error": 303,
+   "timeout": 3,
+   "rate": 4,
+   "skip": 0
+  },
+  "timeout": {
+   "ok": 14,
+   "empty": 3,
+   "pay": 2,
+   "auth": 0,
+   "gone": 0,
+   "error": 6,
+   "timeout": 33,
+   "rate": 0,
+   "skip": 0
+  },
+  "rate": {
+   "ok": 4,
+   "empty": 0,
+   "pay": 3,
+   "auth": 0,
+   "gone": 0,
+   "error": 7,
+   "timeout": 0,
+   "rate": 27,
+   "skip": 0
+  },
+  "skip": {
+   "ok": 367,
+   "empty": 26,
+   "pay": 1825,
+   "auth": 45,
+   "gone": 513,
+   "error": 302,
+   "timeout": 6,
+   "rate": 41,
+   "skip": 0
+  }
+ },
+ "skip": {
+  "n": 3125,
+  "toFinal": {
+   "pay": 1825,
+   "error": 302,
+   "ok": 367,
+   "timeout": 6,
+   "auth": 45,
+   "gone": 513,
+   "empty": 26,
+   "rate": 41
+  },
+  "byReason": {
+   "provider-dead": {
+    "pay": 299,
+    "error": 91,
+    "ok": 90,
+    "timeout": 3,
+    "auth": 28,
+    "gone": 408,
+    "empty": 17,
+    "rate": 38
+   },
+   "unfunded": {
+    "pay": 1526,
+    "ok": 128,
+    "error": 150,
+    "gone": 70,
+    "auth": 3,
+    "timeout": 1
+   },
+   "row-cost": {
+    "rate": 2
+   },
+   "spend-cap": {
+    "gone": 35,
+    "error": 61,
+    "ok": 149,
+    "timeout": 2,
+    "empty": 9,
+    "auth": 14,
+    "rate": 1
+   }
+  },
+  "byProvider": {
+   "commandcode": {
+    "skip": 83,
+    "ok": 2,
+    "answered": 2,
+    "empty": 0,
+    "pay": 62,
+    "auth": 0,
+    "gone": 0,
+    "error": 19,
+    "timeout": 0,
+    "rate": 0
+   },
+   "teamorouter": {
+    "skip": 44,
+    "ok": 2,
+    "answered": 2,
+    "empty": 0,
+    "pay": 34,
+    "auth": 0,
+    "gone": 0,
+    "error": 7,
+    "timeout": 1,
+    "rate": 0
+   },
+   "sambanova": {
+    "skip": 6,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 0,
+    "auth": 6,
+    "gone": 0,
+    "error": 0,
+    "timeout": 0,
+    "rate": 0
+   },
+   "agentrouter": {
+    "skip": 4,
+    "ok": 1,
+    "answered": 1,
+    "empty": 0,
+    "pay": 0,
+    "auth": 3,
+    "gone": 0,
+    "error": 0,
+    "timeout": 0,
+    "rate": 0
+   },
+   "tokenrouter": {
+    "skip": 141,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 132,
+    "auth": 0,
+    "gone": 1,
+    "error": 5,
+    "timeout": 0,
+    "rate": 0
+   },
+   "opencode": {
+    "skip": 97,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 57,
+    "auth": 11,
+    "gone": 0,
+    "error": 26,
+    "timeout": 0,
+    "rate": 0
+   },
+   "experientiallabs": {
+    "skip": 292,
+    "ok": 10,
+    "answered": 10,
+    "empty": 0,
+    "pay": 262,
+    "auth": 0,
+    "gone": 0,
+    "error": 20,
+    "timeout": 0,
+    "rate": 0
+   },
+   "seekai": {
+    "skip": 11,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 0,
+    "auth": 0,
+    "gone": 0,
+    "error": 11,
+    "timeout": 0,
+    "rate": 0
+   },
+   "openai": {
+    "skip": 322,
+    "ok": 46,
+    "answered": 62,
+    "empty": 16,
+    "pay": 0,
+    "auth": 0,
+    "gone": 255,
+    "error": 5,
+    "timeout": 0,
+    "rate": 0
+   },
+   "mistral": {
+    "skip": 198,
+    "ok": 20,
+    "answered": 20,
+    "empty": 0,
+    "pay": 0,
+    "auth": 7,
+    "gone": 144,
+    "error": 7,
+    "timeout": 0,
+    "rate": 20
+   },
+   "gmicloudai": {
+    "skip": 71,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 61,
+    "auth": 0,
+    "gone": 2,
+    "error": 8,
+    "timeout": 0,
+    "rate": 0
+   },
+   "nararouter": {
+    "skip": 52,
+    "ok": 9,
+    "answered": 9,
+    "empty": 0,
+    "pay": 14,
+    "auth": 1,
+    "gone": 0,
+    "error": 10,
+    "timeout": 0,
+    "rate": 18
+   },
+   "veniceai": {
+    "skip": 121,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 109,
+    "auth": 0,
+    "gone": 0,
+    "error": 9,
+    "timeout": 0,
+    "rate": 0
+   },
+   "deepseek": {
+    "skip": 101,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 89,
+    "auth": 0,
+    "gone": 0,
+    "error": 12,
+    "timeout": 0,
+    "rate": 0
+   },
+   "bai": {
+    "skip": 54,
+    "ok": 2,
+    "answered": 2,
+    "empty": 0,
+    "pay": 47,
+    "auth": 0,
+    "gone": 0,
+    "error": 5,
+    "timeout": 0,
+    "rate": 0
+   },
+   "apinex": {
+    "skip": 25,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 22,
+    "auth": 0,
+    "gone": 0,
+    "error": 3,
+    "timeout": 0,
+    "rate": 0
+   },
+   "bluesminds": {
+    "skip": 16,
+    "ok": 4,
+    "answered": 5,
+    "empty": 1,
+    "pay": 0,
+    "auth": 0,
+    "gone": 8,
+    "error": 1,
+    "timeout": 2,
+    "rate": 0
+   },
+   "chutes": {
+    "skip": 9,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 9,
+    "auth": 0,
+    "gone": 0,
+    "error": 0,
+    "timeout": 0,
+    "rate": 0
+   },
+   "routllm": {
+    "skip": 7,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 7,
+    "auth": 0,
+    "gone": 0,
+    "error": 0,
+    "timeout": 0,
+    "rate": 0
+   },
+   "llm7": {
+    "skip": 41,
+    "ok": 4,
+    "answered": 4,
+    "empty": 0,
+    "pay": 34,
+    "auth": 0,
+    "gone": 0,
+    "error": 3,
+    "timeout": 0,
+    "rate": 0
+   },
+   "zenmux": {
+    "skip": 194,
+    "ok": 4,
+    "answered": 4,
+    "empty": 0,
+    "pay": 136,
+    "auth": 0,
+    "gone": 37,
+    "error": 17,
+    "timeout": 0,
+    "rate": 0
+   },
+   "tokenharbor": {
+    "skip": 50,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 46,
+    "auth": 0,
+    "gone": 0,
+    "error": 1,
+    "timeout": 0,
+    "rate": 0
+   },
+   "kiraai": {
+    "skip": 44,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 38,
+    "auth": 0,
+    "gone": 0,
+    "error": 6,
+    "timeout": 0,
+    "rate": 0
+   },
+   "orcarouter": {
+    "skip": 167,
+    "ok": 2,
+    "answered": 2,
+    "empty": 0,
+    "pay": 154,
+    "auth": 0,
+    "gone": 0,
+    "error": 11,
+    "timeout": 0,
+    "rate": 0
+   },
+   "xkiro": {
+    "skip": 96,
+    "ok": 26,
+    "answered": 26,
+    "empty": 0,
+    "pay": 62,
+    "auth": 2,
+    "gone": 0,
+    "error": 5,
+    "timeout": 1,
+    "rate": 0
+   },
+   "kilo": {
+    "skip": 372,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 345,
+    "auth": 0,
+    "gone": 0,
+    "error": 24,
+    "timeout": 0,
+    "rate": 0
+   },
+   "pollinations": {
+    "skip": 83,
+    "ok": 66,
+    "answered": 66,
+    "empty": 0,
+    "pay": 7,
+    "auth": 0,
+    "gone": 0,
+    "error": 10,
+    "timeout": 0,
+    "rate": 0
+   },
+   "openrouter": {
+    "skip": 151,
+    "ok": 5,
+    "answered": 5,
+    "empty": 0,
+    "pay": 98,
+    "auth": 1,
+    "gone": 31,
+    "error": 16,
+    "timeout": 0,
+    "rate": 0
+   },
+   "google": {
+    "skip": 2,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 0,
+    "auth": 0,
+    "gone": 0,
+    "error": 0,
+    "timeout": 0,
+    "rate": 2
+   },
+   "nousresearch": {
+    "skip": 163,
+    "ok": 114,
+    "answered": 118,
+    "empty": 4,
+    "pay": 0,
+    "auth": 0,
+    "gone": 25,
+    "error": 18,
+    "timeout": 2,
+    "rate": 0
+   },
+   "aihubmix": {
+    "skip": 108,
+    "ok": 35,
+    "answered": 40,
+    "empty": 5,
+    "pay": 0,
+    "auth": 14,
+    "gone": 10,
+    "error": 43,
+    "timeout": 0,
+    "rate": 1
+   }
+  },
+  "realAnswer": 3125,
+  "answeredOkEmpty": 393,
+  "ok": 367,
+  "top15": [
+   {
+    "provider": "kilo",
+    "skip": 372,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 345,
+    "auth": 0,
+    "gone": 0,
+    "error": 24,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "openai",
+    "skip": 322,
+    "ok": 46,
+    "answered": 62,
+    "empty": 16,
+    "pay": 0,
+    "auth": 0,
+    "gone": 255,
+    "error": 5,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "experientiallabs",
+    "skip": 292,
+    "ok": 10,
+    "answered": 10,
+    "empty": 0,
+    "pay": 262,
+    "auth": 0,
+    "gone": 0,
+    "error": 20,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "mistral",
+    "skip": 198,
+    "ok": 20,
+    "answered": 20,
+    "empty": 0,
+    "pay": 0,
+    "auth": 7,
+    "gone": 144,
+    "error": 7,
+    "timeout": 0,
+    "rate": 20
+   },
+   {
+    "provider": "zenmux",
+    "skip": 194,
+    "ok": 4,
+    "answered": 4,
+    "empty": 0,
+    "pay": 136,
+    "auth": 0,
+    "gone": 37,
+    "error": 17,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "orcarouter",
+    "skip": 167,
+    "ok": 2,
+    "answered": 2,
+    "empty": 0,
+    "pay": 154,
+    "auth": 0,
+    "gone": 0,
+    "error": 11,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "nousresearch",
+    "skip": 163,
+    "ok": 114,
+    "answered": 118,
+    "empty": 4,
+    "pay": 0,
+    "auth": 0,
+    "gone": 25,
+    "error": 18,
+    "timeout": 2,
+    "rate": 0
+   },
+   {
+    "provider": "openrouter",
+    "skip": 151,
+    "ok": 5,
+    "answered": 5,
+    "empty": 0,
+    "pay": 98,
+    "auth": 1,
+    "gone": 31,
+    "error": 16,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "tokenrouter",
+    "skip": 141,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 132,
+    "auth": 0,
+    "gone": 1,
+    "error": 5,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "veniceai",
+    "skip": 121,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 109,
+    "auth": 0,
+    "gone": 0,
+    "error": 9,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "aihubmix",
+    "skip": 108,
+    "ok": 35,
+    "answered": 40,
+    "empty": 5,
+    "pay": 0,
+    "auth": 14,
+    "gone": 10,
+    "error": 43,
+    "timeout": 0,
+    "rate": 1
+   },
+   {
+    "provider": "deepseek",
+    "skip": 101,
+    "ok": 0,
+    "answered": 0,
+    "empty": 0,
+    "pay": 89,
+    "auth": 0,
+    "gone": 0,
+    "error": 12,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "opencode",
+    "skip": 97,
+    "ok": 3,
+    "answered": 3,
+    "empty": 0,
+    "pay": 57,
+    "auth": 11,
+    "gone": 0,
+    "error": 26,
+    "timeout": 0,
+    "rate": 0
+   },
+   {
+    "provider": "xkiro",
+    "skip": 96,
+    "ok": 26,
+    "answered": 26,
+    "empty": 0,
+    "pay": 62,
+    "auth": 2,
+    "gone": 0,
+    "error": 5,
+    "timeout": 1,
+    "rate": 0
+   },
+   {
+    "provider": "commandcode",
+    "skip": 83,
+    "ok": 2,
+    "answered": 2,
+    "empty": 0,
+    "pay": 62,
+    "auth": 0,
+    "gone": 0,
+    "error": 19,
+    "timeout": 0,
+    "rate": 0
+   }
+  ],
+  "stillSkip": 0
+ },
+ "err": {
+  "n": 343,
+  "toFinal": {
+   "gone": 23,
+   "error": 303,
+   "ok": 6,
+   "timeout": 3,
+   "pay": 4,
+   "rate": 4
+  },
+  "goneCauses": {
+   "gone:no-channel-for-account-group(entitlement)": 1,
+   "gone:model-does-not-exist": 9,
+   "gone:decommissioned-or-deprecated": 1,
+   "gone:404-opaque-upstream-message": 4,
+   "gone:invalid-or-unsupported-model-name": 8
+  },
+  "goneWithMessage": 22,
+  "sameMessage": 0,
+  "byProviderGone": {
+   "kiosapi": 1,
+   "openai": 1,
+   "groq": 1,
+   "cloudflare": 3,
+   "openrouter": 1,
+   "nvidia": 1,
+   "huggingface": 8,
+   "aihubmix": 7
+  },
+  "firstPreviewSample": [
+   "kiosapi/deepseek-v4.1-flash-free | first p=\"kiosapi: No available channel for model \" -> final m=\"kiosapi: No available channel for model deepseek-v4.1-flash-free under\"",
+   "openai/text-moderation-latest | first p=\"fetch failed\" -> final m=\"openai: The model `text-moderation-lates\"",
+   "groq/gemma-7b-it | first p=\"groq: The model `gemma-7b-it` has been d\" -> final m=\"groq: The model `gemma-7b-it` has been decommissioned and is no longer\"",
+   "cloudflare/granite-4.0-h-micro | first p=\"cloudflare: Upstream request failed.\" -> final m=\"cloudflare: Upstream request failed.\"",
+   "cloudflare/nemotron-3-120b-a12b | first p=\"cloudflare: Upstream request failed.\" -> final m=\"cloudflare: Upstream request failed.\"",
+   "cloudflare/gemma-sea-lion-v4-27b-it | first p=\"cloudflare: Upstream request failed.\" -> final m=\"cloudflare: Upstream request failed.\""
+  ],
+  "byFinalProvider": {
+   "kiosapi": {
+    "gone": 1
+   },
+   "gorouter": {
+    "error": 1
+   },
+   "tabiai": {
+    "error": 1
+   },
+   "seekai": {
+    "error": 1
+   },
+   "openai": {
+    "gone": 1
+   },
+   "nararouter": {
+    "ok": 1
+   },
+   "gmicloudai": {
+    "error": 1
+   },
+   "fanar": {
+    "error": 5
+   },
+   "llm7": {
+    "error": 2
+   },
+   "groq": {
+    "error": 4,
+    "gone": 1
+   },
+   "agnes": {
+    "error": 6,
+    "timeout": 2
+   },
+   "cohere": {
+    "error": 8
+   },
+   "pollinations": {
+    "ok": 1
+   },
+   "cloudflare": {
+    "gone": 3,
+    "error": 28
+   },
+   "anymodel": {
+    "ok": 2,
+    "error": 1
+   },
+   "openrouter": {
+    "pay": 4,
+    "gone": 1,
+    "error": 1
+   },
+   "alibaba": {
+    "error": 62,
+    "timeout": 1
+   },
+   "nvidia": {
+    "gone": 1,
+    "error": 2
+   },
+   "aihubmix": {
+    "rate": 3,
+    "error": 23,
+    "gone": 7,
+    "ok": 1
+   },
+   "infron": {
+    "error": 128
+   },
+   "huggingface": {
+    "gone": 8,
+    "ok": 1,
+    "error": 2
+   },
+   "google": {
+    "error": 19
+   },
+   "nousresearch": {
+    "rate": 1,
+    "error": 8
+   }
+  },
+  "toGoneN": 23,
+  "toGoneFirstHadNotFoundText": 7,
+  "toGoneFirstWasFetchFailed": 1,
+  "toGoneFirstOther": [
+   "cloudflare/granite-4.0-h-micro | first p=\"cloudflare: Upstream request failed.\"",
+   "cloudflare/nemotron-3-120b-a12b | first p=\"cloudflare: Upstream request failed.\"",
+   "cloudflare/gemma-sea-lion-v4-27b-it | first p=\"cloudflare: Upstream request failed.\"",
+   "openrouter/virtuoso-large | first p=\"openrouter: virtuoso-large is not a vali\"",
+   "nvidia/deepseek-ai/deepseek-v4-flash-0731 | first p=\"nvidia: Upstream request failed.\"",
+   "huggingface/step-3.5-flash | first p=\"huggingface: The requested model 'step-3\"",
+   "huggingface/mimo-v2-flash | first p=\"huggingface: The requested model 'mimo-v\"",
+   "huggingface/hy3 | first p=\"huggingface: The requested model 'hy3' d\"",
+   "huggingface/step-3.7-flash | first p=\"huggingface: The requested model 'step-3\"",
+   "huggingface/inkling-small | first p=\"huggingface: The requested model 'inklin\"",
+   "huggingface/mimo-v2.5 | first p=\"huggingface: The requested model 'mimo-v\"",
+   "aihubmix/coding-glm-5-turbo-free | first p=\"aihubmix: Unknown Model, please check th\"",
+   "huggingface/mimo-v2.5-pro | first p=\"huggingface: The requested model 'mimo-v\"",
+   "huggingface/inkling | first p=\"huggingface: The requested model 'inklin\"",
+   "aihubmix/mimo-v2-flash | first p=\"aihubmix: model MiMo-V2-Flash is not sup\""
+  ],
+  "firstFetchFailed": 21,
+  "firstFetchFailedToFinal": {
+   "gone": 1,
+   "error": 12,
+   "ok": 4,
+   "pay": 1,
+   "rate": 2,
+   "timeout": 1
+  },
+  "finalErrorTextLooksGone": 10,
+  "errorReprobedByRun3": 340
+ },
+ "trans": {
+  "error": {
+   "n": 343,
+   "toFinal": {
+    "gone": 23,
+    "error": 303,
+    "ok": 6,
+    "timeout": 3,
+    "pay": 4,
+    "rate": 4
+   }
+  },
+  "timeout": {
+   "n": 58,
+   "toFinal": {
+    "ok": 14,
+    "timeout": 33,
+    "pay": 2,
+    "error": 6,
+    "empty": 3
+   }
+  },
+  "rate": {
+   "n": 41,
+   "toFinal": {
+    "rate": 27,
+    "ok": 4,
+    "error": 7,
+    "pay": 3
+   }
+  }
+ },
+ "nt": {
+  "n": 2226,
+  "unchanged": 2226,
+  "reprobed": 0,
+  "changedToNonTransient": [],
+  "changedToTransient": [],
+  "sameStatusReprobed": 0
+ },
+ "run3Start": "2026-09-29T12:43:36.000Z",
+ "fresh": {
+  "sweep1Only": 2226,
+  "sweep2Only": 3075,
+  "both": 435,
+  "neither": 50,
+  "midOnly": 7,
+  "realFirst": 2668,
+  "realSecond": 3510,
+  "firstRealNotReprobedByRun3": 2233,
+  "firstRealNotReprobedAtAll": 2226
+ },
+ "outage": {
+  "noRun3Result": 2283,
+  "ofWhichFirstSkip": 50,
+  "finalSkipRecords": 0,
+  "gaps45s": [
+   {
+    "from": "14:16:28",
+    "to": "14:17:50",
+    "seconds": 82
+   },
+   {
+    "from": "14:17:50",
+    "to": "14:19:40",
+    "seconds": 110
+   },
+   {
+    "from": "14:19:40",
+    "to": "14:22:46",
+    "seconds": 186
+   },
+   {
+    "from": "14:25:22",
+    "to": "14:26:53",
+    "seconds": 91
+   }
+  ],
+  "gapCount": 4,
+  "gapSeconds": 469,
+  "reprobedRightAfterGap": 264,
+  "reprobedRightAfterGapByProvider": {
+   "commandcode": 2,
+   "tokenrouter": 31,
+   "opencode": 8,
+   "experientiallabs": 69,
+   "veniceai": 17,
+   "zenmux": 2,
+   "orcarouter": 52,
+   "kilo": 83
+  },
+  "reprobedRightAfterGapFirst": {
+   "skip": 264
+  },
+  "reprobedRightAfterGapFinal": {
+   "error": 5,
+   "pay": 254,
+   "ok": 4,
+   "gone": 1
+  }
+ },
+ "providers": [
+  {
+   "provider": "inceptionlabs",
+   "keys": 2,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 2,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "xkiro",
+   "keys": 132,
+   "firstOk": 27,
+   "finalOk": 53,
+   "firstSkip": 96,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 27,
+   "finalAnswered": 53
+  },
+  {
+   "provider": "vyceai",
+   "keys": 7,
+   "firstOk": 6,
+   "finalOk": 6,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 6,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "alibaba",
+   "keys": 419,
+   "firstOk": 105,
+   "finalOk": 107,
+   "firstSkip": 0,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 106,
+   "finalAnswered": 108
+  },
+  {
+   "provider": "infron",
+   "keys": 411,
+   "firstOk": 253,
+   "finalOk": 253,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 264,
+   "finalAnswered": 265
+  },
+  {
+   "provider": "experientiallabs",
+   "keys": 297,
+   "firstOk": 0,
+   "finalOk": 10,
+   "firstSkip": 292,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "kilo",
+   "keys": 403,
+   "firstOk": 3,
+   "finalOk": 7,
+   "firstSkip": 372,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 3,
+   "finalAnswered": 7
+  },
+  {
+   "provider": "aihubmix",
+   "keys": 424,
+   "firstOk": 229,
+   "finalOk": 272,
+   "firstSkip": 108,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 242,
+   "finalAnswered": 292
+  },
+  {
+   "provider": "openrouter",
+   "keys": 469,
+   "firstOk": 229,
+   "finalOk": 236,
+   "firstSkip": 151,
+   "firstVerdict": "partial",
+   "finalVerdict": "healthy",
+   "firstAnswered": 232,
+   "finalAnswered": 239
+  },
+  {
+   "provider": "nousresearch",
+   "keys": 393,
+   "firstOk": 173,
+   "finalOk": 288,
+   "firstSkip": 163,
+   "firstVerdict": "partial",
+   "finalVerdict": "healthy",
+   "firstAnswered": 177,
+   "finalAnswered": 296
+  },
+  {
+   "provider": "zenmux",
+   "keys": 208,
+   "firstOk": 1,
+   "finalOk": 6,
+   "firstSkip": 194,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 1,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "orcarouter",
+   "keys": 180,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 167,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "pollinations",
+   "keys": 131,
+   "firstOk": 39,
+   "finalOk": 106,
+   "firstSkip": 83,
+   "firstVerdict": "partial",
+   "finalVerdict": "healthy",
+   "firstAnswered": 39,
+   "finalAnswered": 106
+  },
+  {
+   "provider": "nvidia",
+   "keys": 111,
+   "firstOk": 9,
+   "finalOk": 9,
+   "firstSkip": 0,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 10,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "veniceai",
+   "keys": 126,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 121,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "huggingface",
+   "keys": 134,
+   "firstOk": 121,
+   "finalOk": 123,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 121,
+   "finalAnswered": 123
+  },
+  {
+   "provider": "deepseek",
+   "keys": 106,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 101,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "no-answer (mixed/skip)",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "anymodel",
+   "keys": 75,
+   "firstOk": 64,
+   "finalOk": 68,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 65,
+   "finalAnswered": 69
+  },
+  {
+   "provider": "cloudflare",
+   "keys": 59,
+   "firstOk": 17,
+   "finalOk": 17,
+   "firstSkip": 0,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 20,
+   "finalAnswered": 20
+  },
+  {
+   "provider": "commandcode",
+   "keys": 84,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 83,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "bai",
+   "keys": 59,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 54,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "nararouter",
+   "keys": 54,
+   "firstOk": 0,
+   "finalOk": 10,
+   "firstSkip": 52,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "gmicloudai",
+   "keys": 77,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 71,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "no-answer (mixed/skip)",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "kiraai",
+   "keys": 60,
+   "firstOk": 2,
+   "finalOk": 2,
+   "firstSkip": 44,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 9,
+   "finalAnswered": 9
+  },
+  {
+   "provider": "cohere",
+   "keys": 37,
+   "firstOk": 18,
+   "finalOk": 18,
+   "firstSkip": 0,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 18,
+   "finalAnswered": 18
+  },
+  {
+   "provider": "teamorouter",
+   "keys": 45,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 44,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "tokenharbor",
+   "keys": 63,
+   "firstOk": 6,
+   "finalOk": 9,
+   "firstSkip": 50,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "partial",
+   "firstAnswered": 6,
+   "finalAnswered": 9
+  },
+  {
+   "provider": "apinex",
+   "keys": 34,
+   "firstOk": 2,
+   "finalOk": 2,
+   "firstSkip": 25,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 2,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "ollama",
+   "keys": 31,
+   "firstOk": 6,
+   "finalOk": 6,
+   "firstSkip": 0,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 6,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "llm7",
+   "keys": 49,
+   "firstOk": 1,
+   "finalOk": 5,
+   "firstSkip": 41,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "partial",
+   "firstAnswered": 1,
+   "finalAnswered": 5
+  },
+  {
+   "provider": "nscale",
+   "keys": 21,
+   "firstOk": 21,
+   "finalOk": 21,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 21,
+   "finalAnswered": 21
+  },
+  {
+   "provider": "chutes",
+   "keys": 14,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 9,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "needs-money",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "groq",
+   "keys": 12,
+   "firstOk": 5,
+   "finalOk": 5,
+   "firstSkip": 0,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 5,
+   "finalAnswered": 5
+  },
+  {
+   "provider": "anthropic",
+   "keys": 13,
+   "firstOk": 13,
+   "finalOk": 13,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 13,
+   "finalAnswered": 13
+  },
+  {
+   "provider": "routllm",
+   "keys": 12,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 7,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "needs-money",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "fanar",
+   "keys": 11,
+   "firstOk": 6,
+   "finalOk": 6,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 6,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "cerebras",
+   "keys": 7,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "no-answer (mixed/skip)",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "bigmodel",
+   "keys": 11,
+   "firstOk": 11,
+   "finalOk": 11,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 11,
+   "finalAnswered": 11
+  },
+  {
+   "provider": "sambanova",
+   "keys": 7,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 6,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "xai",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "needs-money",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "agentrouter",
+   "keys": 5,
+   "firstOk": 0,
+   "finalOk": 1,
+   "firstSkip": 4,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 1
+  },
+  {
+   "provider": "aionlabs",
+   "keys": 6,
+   "firstOk": 6,
+   "finalOk": 6,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 6,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "indeedwebid",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "justdowork",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "kktoken",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "tokenrouter",
+   "keys": 142,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 141,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "opencode",
+   "keys": 98,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 97,
+   "firstVerdict": "dead",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "bluesminds",
+   "keys": 18,
+   "firstOk": 0,
+   "finalOk": 4,
+   "firstSkip": 16,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "partial",
+   "firstAnswered": 1,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "hcnsec",
+   "keys": 20,
+   "firstOk": 11,
+   "finalOk": 12,
+   "firstSkip": 0,
+   "firstVerdict": "healthy",
+   "finalVerdict": "healthy",
+   "firstAnswered": 11,
+   "finalAnswered": 12
+  },
+  {
+   "provider": "kiosapi",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "gorouter",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "openai",
+   "keys": 324,
+   "firstOk": 0,
+   "finalOk": 46,
+   "firstSkip": 322,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 62
+  },
+  {
+   "provider": "mistral",
+   "keys": 200,
+   "firstOk": 0,
+   "finalOk": 20,
+   "firstSkip": 198,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 20
+  },
+  {
+   "provider": "google",
+   "keys": 161,
+   "firstOk": 9,
+   "finalOk": 9,
+   "firstSkip": 2,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 9,
+   "finalAnswered": 9
+  },
+  {
+   "provider": "tabiai",
+   "keys": 1,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 0,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "seekai",
+   "keys": 12,
+   "firstOk": 0,
+   "finalOk": 0,
+   "firstSkip": 11,
+   "firstVerdict": "dead",
+   "finalVerdict": "dead",
+   "firstAnswered": 0,
+   "finalAnswered": 0
+  },
+  {
+   "provider": "agnes",
+   "keys": 12,
+   "firstOk": 3,
+   "finalOk": 3,
+   "firstSkip": 0,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 3,
+   "finalAnswered": 3
+  }
+ ],
+ "movers": [
+  {
+   "provider": "experientiallabs",
+   "keys": 297,
+   "firstOk": 0,
+   "finalOk": 10,
+   "firstSkip": 292,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "orcarouter",
+   "keys": 180,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 167,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "veniceai",
+   "keys": 126,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 121,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "commandcode",
+   "keys": 84,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 83,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "bai",
+   "keys": 59,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 54,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "nararouter",
+   "keys": 54,
+   "firstOk": 0,
+   "finalOk": 10,
+   "firstSkip": 52,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "teamorouter",
+   "keys": 45,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 44,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "agentrouter",
+   "keys": 5,
+   "firstOk": 0,
+   "finalOk": 1,
+   "firstSkip": 4,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 1
+  },
+  {
+   "provider": "tokenrouter",
+   "keys": 142,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 141,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "opencode",
+   "keys": 98,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 97,
+   "firstVerdict": "dead",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "openai",
+   "keys": 324,
+   "firstOk": 0,
+   "finalOk": 46,
+   "firstSkip": 322,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 62
+  },
+  {
+   "provider": "mistral",
+   "keys": 200,
+   "firstOk": 0,
+   "finalOk": 20,
+   "firstSkip": 198,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 20
+  }
+ ],
+ "moversSkipped": [
+  {
+   "provider": "xkiro",
+   "keys": 132,
+   "firstOk": 27,
+   "finalOk": 53,
+   "firstSkip": 96,
+   "firstVerdict": "partial",
+   "finalVerdict": "partial",
+   "firstAnswered": 27,
+   "finalAnswered": 53
+  },
+  {
+   "provider": "experientiallabs",
+   "keys": 297,
+   "firstOk": 0,
+   "finalOk": 10,
+   "firstSkip": 292,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "kilo",
+   "keys": 403,
+   "firstOk": 3,
+   "finalOk": 7,
+   "firstSkip": 372,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 3,
+   "finalAnswered": 7
+  },
+  {
+   "provider": "zenmux",
+   "keys": 208,
+   "firstOk": 1,
+   "finalOk": 6,
+   "firstSkip": 194,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 1,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "orcarouter",
+   "keys": 180,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 167,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "pollinations",
+   "keys": 131,
+   "firstOk": 39,
+   "finalOk": 106,
+   "firstSkip": 83,
+   "firstVerdict": "partial",
+   "finalVerdict": "healthy",
+   "firstAnswered": 39,
+   "finalAnswered": 106
+  },
+  {
+   "provider": "veniceai",
+   "keys": 126,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 121,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "commandcode",
+   "keys": 84,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 83,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "bai",
+   "keys": 59,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 54,
+   "firstVerdict": "needs-money",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "nararouter",
+   "keys": 54,
+   "firstOk": 0,
+   "finalOk": 10,
+   "firstSkip": 52,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 10
+  },
+  {
+   "provider": "teamorouter",
+   "keys": 45,
+   "firstOk": 0,
+   "finalOk": 2,
+   "firstSkip": 44,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 2
+  },
+  {
+   "provider": "tokenharbor",
+   "keys": 63,
+   "firstOk": 6,
+   "finalOk": 9,
+   "firstSkip": 50,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "partial",
+   "firstAnswered": 6,
+   "finalAnswered": 9
+  },
+  {
+   "provider": "llm7",
+   "keys": 49,
+   "firstOk": 1,
+   "finalOk": 5,
+   "firstSkip": 41,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "partial",
+   "firstAnswered": 1,
+   "finalAnswered": 5
+  },
+  {
+   "provider": "agentrouter",
+   "keys": 5,
+   "firstOk": 0,
+   "finalOk": 1,
+   "firstSkip": 4,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 1
+  },
+  {
+   "provider": "tokenrouter",
+   "keys": 142,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 141,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "opencode",
+   "keys": 98,
+   "firstOk": 0,
+   "finalOk": 3,
+   "firstSkip": 97,
+   "firstVerdict": "dead",
+   "finalVerdict": "mostly-blocked",
+   "firstAnswered": 0,
+   "finalAnswered": 3
+  },
+  {
+   "provider": "bluesminds",
+   "keys": 18,
+   "firstOk": 0,
+   "finalOk": 4,
+   "firstSkip": 16,
+   "firstVerdict": "mostly-blocked",
+   "finalVerdict": "partial",
+   "firstAnswered": 1,
+   "finalAnswered": 6
+  },
+  {
+   "provider": "openai",
+   "keys": 324,
+   "firstOk": 0,
+   "finalOk": 46,
+   "firstSkip": 322,
+   "firstVerdict": "dead",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 62
+  },
+  {
+   "provider": "mistral",
+   "keys": 200,
+   "firstOk": 0,
+   "finalOk": 20,
+   "firstSkip": 198,
+   "firstVerdict": "no-answer (mixed/skip)",
+   "finalVerdict": "partial",
+   "firstAnswered": 0,
+   "finalAnswered": 20
+  }
+ ],
+ "verdictTransitions": {
+  "mostly-blocked -> mostly-blocked": 7,
+  "partial -> partial": 7,
+  "healthy -> healthy": 11,
+  "needs-money -> mostly-blocked": 3,
+  "partial -> healthy": 3,
+  "no-answer (mixed/skip) -> mostly-blocked": 4,
+  "needs-money -> no-answer (mixed/skip)": 1,
+  "dead -> partial": 3,
+  "no-answer (mixed/skip) -> no-answer (mixed/skip)": 2,
+  "mostly-blocked -> partial": 3,
+  "needs-money -> needs-money": 3,
+  "dead -> dead": 8,
+  "dead -> mostly-blocked": 1,
+  "no-answer (mixed/skip) -> partial": 1
+ },
+ "okDelta": [
+  {
+   "provider": "nousresearch",
+   "from": 173,
+   "to": 288
+  },
+  {
+   "provider": "pollinations",
+   "from": 39,
+   "to": 106
+  },
+  {
+   "provider": "openai",
+   "from": 0,
+   "to": 46
+  },
+  {
+   "provider": "aihubmix",
+   "from": 229,
+   "to": 272
+  },
+  {
+   "provider": "xkiro",
+   "from": 27,
+   "to": 53
+  },
+  {
+   "provider": "mistral",
+   "from": 0,
+   "to": 20
+  },
+  {
+   "provider": "experientiallabs",
+   "from": 0,
+   "to": 10
+  },
+  {
+   "provider": "nararouter",
+   "from": 0,
+   "to": 10
+  },
+  {
+   "provider": "openrouter",
+   "from": 229,
+   "to": 236
+  },
+  {
+   "provider": "zenmux",
+   "from": 1,
+   "to": 6
+  },
+  {
+   "provider": "kilo",
+   "from": 3,
+   "to": 7
+  },
+  {
+   "provider": "anymodel",
+   "from": 64,
+   "to": 68
+  },
+  {
+   "provider": "llm7",
+   "from": 1,
+   "to": 5
+  },
+  {
+   "provider": "bluesminds",
+   "from": 0,
+   "to": 4
+  },
+  {
+   "provider": "veniceai",
+   "from": 0,
+   "to": 3
+  },
+  {
+   "provider": "tokenharbor",
+   "from": 6,
+   "to": 9
+  },
+  {
+   "provider": "tokenrouter",
+   "from": 0,
+   "to": 3
+  },
+  {
+   "provider": "opencode",
+   "from": 0,
+   "to": 3
+  },
+  {
+   "provider": "alibaba",
+   "from": 105,
+   "to": 107
+  },
+  {
+   "provider": "orcarouter",
+   "from": 0,
+   "to": 2
+  },
+  {
+   "provider": "huggingface",
+   "from": 121,
+   "to": 123
+  },
+  {
+   "provider": "commandcode",
+   "from": 0,
+   "to": 2
+  },
+  {
+   "provider": "bai",
+   "from": 0,
+   "to": 2
+  },
+  {
+   "provider": "teamorouter",
+   "from": 0,
+   "to": 2
+  },
+  {
+   "provider": "agentrouter",
+   "from": 0,
+   "to": 1
+  },
+  {
+   "provider": "hcnsec",
+   "from": 11,
+   "to": 12
+  }
+ ]
+}
