@@ -20,6 +20,7 @@ import os from "node:os";
 import { readJsonOr } from "./atomic.mjs";
 import { sanitizeDisplay, sanitizeCells } from "./sanitize.mjs";
 import { redactClip } from "./redact.mjs";
+import { loadObserved } from "./observed-data.mjs";
 
 const STATE_DIR = path.join(os.homedir(), ".uw", "state");
 export const BENCH_FILE = path.join(STATE_DIR, "bench.json");
@@ -104,6 +105,12 @@ export function cleanRecord(raw) {
     ...(Number.isInteger(raw.b) && raw.b > 0 ? { b: raw.b } : {}),
     // 1 when the stream was CUT for ignoring max_tokens (`o` and `r` are then estimates over the part seen).
     ...(raw.x === 1 ? { x: 1 } : {}),
+    // The live-status overlay's flags (see `loadBench`): `l` seen in real use, `q` the request id, `v` confirmed by our own probe, `cf`
+    // a confirmation is in flight (`cfa`: since when). Present only when set, so every other record keeps exactly today's shape.
+    ...(raw.l === 1 ? { l: 1 } : {}),
+    ...(typeof raw.q === "string" && raw.q ? { q: sanitizeDisplay(raw.q, 40) } : {}),
+    ...(raw.v === 1 ? { v: 1 } : {}),
+    ...(raw.cf === 1 ? { cf: 1, ...(Number.isFinite(raw.cfa) && raw.cfa >= 0 ? { cfa: raw.cfa } : {}) } : {}),
     ...(typeof raw.m === "string" && raw.m ? { m: redactClip(raw.m, MESSAGE_CHARS) } : {}),
   };
 }
@@ -147,38 +154,96 @@ const ISO_STAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d/;
 // missing or empty" (an unknown, drawn as a dash) from "benched, and none were ok" (a real 0).
 const emptyGet = () => null;
 emptyGet.records = 0;
-const EMPTY = Object.freeze({ generatedAt: null, size: 0, get: emptyGet });
+emptyGet.isLive = () => false;
+const EMPTY = Object.freeze({ generatedAt: null, size: 0, get: emptyGet, probe: emptyGet, live: 0, liveAt: null, overlay: null });
+/** Whether a merged record came from the live overlay (the flag survives `cleanRecord`). */
+export const isLive = (rec) => !!rec && rec.l === 1;
+// A probe record's live flags are not the probe's to set: a hand-edited bench.json cannot make a row read live.
+const probeShape = (rec) => { if (!rec) return rec; const { l: _l, q: _q, v: _v, cf: _cf, cfa: _cfa, ...rest } = rec; return rest; };
 
 /**
- * Read `bench.json` once. Total: a missing, corrupt or wrong-schema file is an
+ * Read `bench.json` once, and merge the live overlay over it. Total: a missing, corrupt or wrong-schema file is an
  * empty result, never a throw -- the toggle must not be able to take the picker
  * down. `get` cleans on access, so 6,000 rows cost nothing until they are drawn
  * and only the ~25 on screen are ever cleaned.
+ *
+ * THE OVERLAY (live status, `menu/observed-data.mjs`). `state/observed.json`, a SIBLING of `file` (so a test that hands in a temp bench
+ * file gets a temp, absent overlay and never the real one), holds records the recorder built from the router's own usage log. Per key
+ * the record with the NEWER `a` wins; a tie goes to the probe record; an overlay entry older than the probe record is ignored; a
+ * `skip` is not a measurement and never beats a live record; a record dated in the future (beyond the skew allowance) is ignored on
+ * either side. An overlay record carries `l: 1`. It is IGNORED ENTIRELY while the sentinel `observe.off` exists beside it, and with no
+ * overlay file nothing changes: the result is exactly the bench.json reader.
+ * `{ observed: false }` reads the probe file alone (the recorder's own view of "what a probe said"); `{ observed: <path> }` names the overlay.
+ *
+ * What the result carries beyond `get`:
+ *   size / get.records  the union of the two key sets (a key the overlay alone knows counts once);
+ *   live                how many keys the overlay currently wins; liveAt the newest such record's `a` (epoch seconds), else null;
+ *   overlay             `{ writtenAt, feed, wm, prov, entries, dropped }` of the file read (null without one): what the picker's notes need;
+ *   probe               the reader with the PROBE records alone (with its own `stamp`);
+ *   get.isLive(target)  whether the merged record for a target is the overlay's.
+ * AGE CREDIT IS FROM PROBES ONLY: `get.stamp` is the PROBE record's `a` and null for an overlay-only key, so `oldestStampOf`, `ageHistOf`, the
+ * provider list's `oldest probe` and the outdated notice never count a live observation as a fresh measurement (one observed 200 says
+ * nothing about the provider's other models). The display path (`get(target).a`, `recordAge`) uses the merged record's own time.
  */
-export function loadBench(file = BENCH_FILE) {
+export function loadBench(file = BENCH_FILE, { observed } = {}) {
   const raw = readJsonOr(file, null);
-  if (!raw || raw.schema !== BENCH_SCHEMA || !raw.models || typeof raw.models !== "object") return EMPTY;
-  const models = raw.models;
-  const size = Object.keys(models).length;
-  const get = (target) => {
-    const k = benchKeyOf(target);
-    return Object.hasOwn(models, k) ? cleanRecord(models[k]) : null;
-  };
-  get.records = size;
-  // The stamp of a PROBE result only, without cleaning the text: what `oldestStampOf` and `ageHistOf` read for every listed
-  // route. The validity rule is `cleanRecord`'s (a known status), and a `skip` is not a probe result (the sweep rewrites it on
-  // every run), so neither has a stamp.
-  get.stamp = (target) => {
-    const k = benchKeyOf(target);
+  const good = !!raw && raw.schema === BENCH_SCHEMA && !!raw.models && typeof raw.models === "object";
+  const ov = observed === false ? null : loadObserved(typeof observed === "string" ? observed : path.join(path.dirname(file), "observed.json"));
+  if (!good && !ov) return EMPTY;
+  // bench.json missing or unusable but an overlay file exists (even with no entries): a reader of its own, so the overlay's metadata (the
+  // feed note) survives a model screen loading; nothing else about it is different from EMPTY.
+  if (!good && !ov.models.size) {
+    const none = () => null; none.records = 0; none.isLive = () => false;
+    return { generatedAt: null, size: 0, get: none, probe: none, live: 0, liveAt: null,
+             overlay: { writtenAt: ov.writtenAt, feed: ov.feed, wm: ov.wm, prov: ov.prov, entries: 0, dropped: ov.dropped } };
+  }
+  const models = good ? raw.models : {};
+  const probeCount = Object.keys(models).length;
+  const ovModels = ov ? ov.models : new Map();
+
+  // The stamp of a PROBE result only, without cleaning the text: the validity rule is `cleanRecord`'s (a known status), and a
+  // `skip` is not a probe result (the sweep rewrites it on every run), so neither has a stamp.
+  const stampOf = (k) => {
     const rec = Object.hasOwn(models, k) ? models[k] : null;
     if (!rec || typeof rec !== "object" || !STATUSES.includes(rec.s) || rec.s === "skip") return null;
     return Number.isFinite(rec.a) ? rec.a : null;
   };
+  const probeGet = (target) => {
+    const k = benchKeyOf(target);
+    return Object.hasOwn(models, k) ? probeShape(cleanRecord(models[k])) : null;
+  };
+  probeGet.records = probeCount;
+  probeGet.stamp = (target) => stampOf(benchKeyOf(target));
+  probeGet.isLive = () => false;
+
+  const clock = Date.now();
+  const future = (a) => a * 1000 - clock > FUTURE_SKEW_MS;
+  // THE merge rule, in one place: the overlay record when it is usable and newer than a usable probe record (a tie is the probe's).
+  const overlayWins = (k) => {
+    const o = ovModels.get(k);
+    if (!o || future(o.a)) return false;
+    const p = stampOf(k);
+    return p === null || future(p) || o.a > p;
+  };
+  let live = 0, liveAt = null;
+  for (const [k, o] of ovModels) if (overlayWins(k)) { live += 1; if (liveAt === null || o.a > liveAt) liveAt = o.a; }
+  let extra = 0;
+  for (const k of ovModels.keys()) if (!Object.hasOwn(models, k)) extra += 1;
+
+  const get = (target) => {
+    const k = benchKeyOf(target);
+    if (ovModels.size && overlayWins(k)) return cleanRecord(ovModels.get(k));
+    return probeGet(k);
+  };
+  get.records = probeCount + extra;
+  get.stamp = probeGet.stamp;
+  get.isLive = (target) => ovModels.size > 0 && overlayWins(benchKeyOf(target));
   return {
     // A stamp is drawn, so it must LOOK like one: anything else is no stamp at all.
-    generatedAt: typeof raw.generatedAt === "string" && ISO_STAMP.test(raw.generatedAt) ? raw.generatedAt : null,
-    size,
-    get,
+    generatedAt: good && typeof raw.generatedAt === "string" && ISO_STAMP.test(raw.generatedAt) ? raw.generatedAt : null,
+    size: probeCount + extra,
+    get, probe: probeGet, live, liveAt,
+    overlay: ov ? { writtenAt: ov.writtenAt, feed: ov.feed, wm: ov.wm, prov: ov.prov, entries: ovModels.size, dropped: ov.dropped } : null,
   };
 }
 

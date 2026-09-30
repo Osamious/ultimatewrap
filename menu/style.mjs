@@ -945,16 +945,19 @@ export function frame(v, meta, { caps }) {
   const N = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   // `P` is ok / models normally, and ok / (models minus gone) while [no gone] is on. The provider list uses the snapshot's
   // baked gone total, the model levels the live one from the same reader as `K ok`.
-  const okFig = (k, total, gone = 0) => {
+  // `live`: how many of the `ok` came from the live overlay, said next to the figure (`812 ok (2 live) (63%)`) so it never mixes the two
+  // populations silently; nothing is added while there are none.
+  const okFig = (k, total, gone = 0, live = 0) => {
     // `gone` is subtracted ONLY while [no gone] is on: off, the percent is over all routes.
     const den = total - (v.hideGone && Number.isFinite(gone) ? gone : 0);
-    return Number.isFinite(k) ? `${N(k)} ok${den > 0 ? ` (${pctLabel(k, den)})` : ""}` : "- ok";
+    const liveTxt = Number.isFinite(k) && k > 0 && Number.isSafeInteger(live) && live > 0 ? ` (${N(Math.min(live, k))} live)` : "";
+    return Number.isFinite(k) ? `${N(k)} ok${liveTxt}${den > 0 ? ` (${pctLabel(k, den)})` : ""}` : "- ok";
   };
   const rightFor = (n) => (atProviderLevel
     // The total follows [no gone]: all models normally, models minus gone while it is on, and the % over that same total.
-    ? `${N(meta.providers)} providers ${g.dot} ${N(meta.models - (v.hideGone && Number.isFinite(meta.goneTotal) ? meta.goneTotal : 0))} models ${g.dot} ${okFig(meta.okTotal, meta.models, meta.goneTotal)}`
-    : flat ? `${N(n)} of ${N(meta.models)} models ${g.dot} ${okFig(okShown, meta.models, v.goneLive)}`
-           : `${N(n)} of ${N(v.provider.models.length)} ${g.dot} ${okFig(okShown, v.provider.models.length, v.goneLive)}`);
+    ? `${N(meta.providers)} providers ${g.dot} ${N(meta.models - (v.hideGone && Number.isFinite(meta.goneTotal) ? meta.goneTotal : 0))} models ${g.dot} ${okFig(meta.okTotal, meta.models, meta.goneTotal, meta.liveOkTotal)}`
+    : flat ? `${N(n)} of ${N(meta.models)} models ${g.dot} ${okFig(okShown, meta.models, v.goneLive, v.liveOkLive)}`
+           : `${N(n)} of ${N(v.provider.models.length)} ${g.dot} ${okFig(okShown, v.provider.models.length, v.goneLive, v.liveOkLive)}`);
   const matches = v.modelCount ?? (v.items.filter((it) => it.kind === "model").length + v.more);
   const right = rightFor(matches);
   // The chip row degrades in three tiers so that, with every chip on, the counts on the right are never clipped: normal
@@ -1131,7 +1134,11 @@ export function frame(v, meta, { caps }) {
       const got = meta.benchOf ? meta.benchOf(it.target) : null;
       const rec = isUsable(got, v.now ?? Date.now()) ? got : null;
       const tone = rec ? statusTone(rec.s) : "dim";
-      const stat = pad(rec ? statusCode(rec.s) : "", 4);
+      // THE LIVE MARKER: a record the live overlay wrote (`l: 1`: seen in real use since the last probe) draws its code in UPPERCASE
+      // (`OK`, `RATE`, `T/O`): the same four columns, the same tone colour, and it survives colour off. A record a confirmation probe verified
+      // (`v: 1`) is a probe measurement again and draws lowercase.
+      const code = rec ? statusCode(rec.s) : "";
+      const stat = pad(rec && rec.l === 1 && rec.v !== 1 ? code.toUpperCase() : code, 4);
       const statOut = tone === "ok" ? p.grn(stat) : tone === "warn" ? p.yel(stat)
         : tone === "bad" ? p.red(stat) : p.dim(stat);
       const timed = rec?.s === "ok";
@@ -1148,7 +1155,7 @@ export function frame(v, meta, { caps }) {
       // Surface, never substitute: enter still selects THIS row.
       const alias = liveAlias(flat ? it.row?.provider : v.provider?.provider, m, meta.benchOf, v.now ?? Date.now());
       body = `${mark} ` + provenanceDot(m.provenance, g, p) + " " + idCell + sepd + statOut +
-             (layout.showProbed ? probedCell(rec ? recordAge(rec, v.now ?? Date.now()) : null, p, sepd) : "") +
+             (layout.showProbed ? probedCell(rec ? recordAge(rec, rec.l === 1 ? Math.max(v.now ?? 0, v.liveNow ?? 0, Date.now()) : v.now ?? Date.now()) : null, p, sepd) : "") +
              sepd + rpad(timed || (rec?.s === "timeout" && Number.isFinite(rec.t)) ? fmtMs(rec.t) : "", 5) +
              (layout.showTotal ? sepd + rpad(!cut && (timed || rec?.s === "timeout") ? fmtMs(rec.d) : "", 5) : "") +
              (layout.showTps ? sepd + rpad(timed ? (cut ? (Number.isFinite(rec.r) ? "~" + fmtTps(rec.r) : "-") : fmtTps(rec.r)) : "", 5) : "") +
@@ -1282,9 +1289,12 @@ export function frame(v, meta, { caps }) {
     }
     const both = (a, b) => [a, b].filter(Boolean).join(` ${g.dot} `);
     const benchDate = meta.benchCountsAsOf ? `bench ${stampOf(meta.benchCountsAsOf)}` : "";
-    const cands = atProviderLevel
-      ? [both(routableStamp, benchDate), benchDate, routableStamp]
-      : [both(benchedStamp, discoveredStamp), benchedStamp];
+    // `live HH:MMZ` (UTC): the newest live record merged into what is drawn, present ONLY while the overlay affects the screen, so the user
+    // can always tell the live feed is on. It outranks the older stamps: dropped last.
+    const liveStamp = Number.isFinite(meta.liveAt) && meta.liveAt > 0 ? `live ${hhmmZ(meta.liveAt)}` : "";
+    const cands = (atProviderLevel
+      ? [both(both(routableStamp, benchDate), liveStamp), both(benchDate, liveStamp), both(routableStamp, liveStamp), benchDate, routableStamp]
+      : [both(both(benchedStamp, discoveredStamp), liveStamp), both(benchedStamp, liveStamp), benchedStamp]);
     const spare = INNER - vis(fid) - 2;
     const stamp = cands.find((c) => c && vis(c) <= spare) ?? "";
     L.push(bar(g, fid + (stamp ? " ".repeat(INNER - vis(fid) - vis(stamp)) + p.dim(stamp) : "")));
@@ -1302,7 +1312,8 @@ export function frame(v, meta, { caps }) {
       const note = rec?.s === "ok" && rec.x === 1 ? "[cut] " : rec?.s === "ok" && typeof rec.m === "string" && rec.m ? "[stream error] " : "";
       // The note already says "stream error", so the stored message loses its own `stream error after first token:` lead.
       const tail = note === "[stream error] " ? sanitizeDisplay("  (" + rec.m.replace(/^stream error( after first token)?:?\s*/i, "") + ")", 400) : "";
-      const text = rec ? [...(note + previewText(rec, 10_000) + tail)] : [];
+      const lv = liveReplyLead(rec, v.liveNow ?? Date.now());        // the LIVE clock: the open time is frozen
+      const text = rec ? [...(lv ? lv.lead + (lv.body ?? note + previewText(rec, 10_000) + tail) : note + previewText(rec, 10_000) + tail)] : [];
       const room = INNER - vis("  reply: ");
       if (text.length) reply = p.dim("  reply: ") + (text.length <= room ? text.join("")
         : text.slice(0, Math.max(0, room - vis(g.ell))).join("") + g.ell);
@@ -1324,10 +1335,45 @@ export function frame(v, meta, { caps }) {
     const text = variants.find((t) => vis(t) <= INNER - 1) ?? variants[variants.length - 1];
     L.push(bar(g, " ".repeat(Math.max(0, INNER - 1 - vis(text))) + p.yel(text)));
   }
+  // THE LIVE FEED NOTE (`feedNote(overlay)`: "live feed unavailable (schema changed)", "live feed: key mapping changed", ...): the same line
+  // and place as the outdated notice, drawn only while that notice is not (the outdated notice wins), dim yellow, right-aligned. It costs
+  // one line exactly as the notice does, and pick-state's `extraLines` counts the two as one line.
+  else if (v.feedNote) {
+    const text = sanitizeDisplay(v.feedNote, INNER - 1);
+    L.push(bar(g, " ".repeat(Math.max(0, INNER - 1 - vis(text))) + p.dim(p.yel(text))));
+  }
   const atProviders = !flat && v.level === 0;
   L.push(footer(g, p, caps.unicode ? (atProviders ? HELP0 : HELP1)
                                    : (atProviders ? HELP0_A : HELP1_A)));
   return L;
+}
+
+/** `HH:MMZ` (UTC) of an epoch-seconds time, or `` when it is not one. */
+export function hhmmZ(epochS) {
+  if (!Number.isFinite(epochS) || epochS <= 0 || epochS >= 253402300799) return "";        // year 9999: beyond it toISOString cannot be trusted
+  try { return `${new Date(epochS * 1000).toISOString().slice(11, 16)}Z`; } catch { return ""; }
+}
+
+/**
+ * The `reply:` line's lead for a record the LIVE overlay wrote (`l: 1`), or `null` for an ordinary probe record. `nowMs` is the picker's clock.
+ *   unconfirmed live ok   `[live 14:32Z] answered HTTP 200 in 1.2 s; no reply text is kept for real requests`
+ *   cf:1 within 2 minutes `[live 14:32Z] worked live; confirming...`   (an older `cf` reads as the plain live ok above)
+ *   live failure          `[live 14:32Z] <the provider's sentence, redacted>`
+ *   confirmed (v:1)       `[live+probe 14:33Z] ` and then the probe's own reply, as for any probe record
+ * `body` is null when the ordinary text of the record follows the lead (the confirmed case).
+ */
+export function liveReplyLead(rec, nowMs) {
+  if (!rec || rec.l !== 1) return null;
+  const at = hhmmZ(rec.a);
+  if (rec.v === 1) return { lead: `[live+probe${at ? ` ${at}` : ""}] `, body: null };
+  const lead = `[live${at ? ` ${at}` : ""}] `;
+  if (rec.s === "ok") {
+    if (rec.cf === 1 && Number.isFinite(rec.cfa) && nowMs / 1000 - rec.cfa >= 0 && nowMs / 1000 - rec.cfa <= 120) return { lead, body: "worked live; confirming..." };
+    const d = Number.isFinite(rec.d) && rec.d >= 0 ? ` in ${Math.round(rec.d) < 1000 ? `${Math.round(rec.d)} ms` : `${(rec.d / 1000).toFixed(1)} s`}` : "";
+    return { lead, body: `answered HTTP 200${d}; no reply text is kept for real requests` };
+  }
+  const word = { empty: "empty reply", auth: "auth refusal", pay: "payment refusal", rate: "rate limit", gone: "model not found", timeout: "timeout", error: "error" }[rec.s] ?? "failure";
+  return { lead, body: typeof rec.m === "string" && rec.m ? sanitizeDisplay(rec.m, 400) : `${word} seen in real use` };
 }
 
 export function confirmLine(target, g, p) {

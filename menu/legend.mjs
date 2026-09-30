@@ -113,7 +113,7 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   note("It is the OLDEST probe, not the latest: one stale model makes the provider read old, and a fresh one hides nothing. '-' the provider has no probe result, blank no bench data. Shown only on a wide terminal, after the whole key id.");
   entry("models", "models", "how many models the provider lists; N/M means N listed and M withheld (ctrl+r shows them)");
   entry("header", "header", "'P providers, M models, K ok (P%)': while [no gone] is on the header M excludes gone routes and the % is ok / M; the models column always counts all, so M can be less than the sum of the visible cells");
-  entry("ok", p.grn("ok"), "models that answered ok on their latest probe");
+  entry("ok", p.grn("ok"), "models that answered ok on their latest probe. '(n live)' in the header: n = oks that came from real use (the live feed) and are not yet confirmed by a probe; shown only when n is above 0");
   entry("free", p.blu("free"), "models badged FREE or FREE? when the catalogue was read, and their share of ALL models (never changed by [no gone]); blank when the provider has no price data. Shown only when the terminal is wide enough (after oldest probe). The [free] filter uses the badge as drawn, so a FREE? row whose fresh probe said payment is required does not match");
   entry("%", "%", "the share beside ok and free. Beside ok: % = ok / models normally; % = ok / (models - gone) while [no gone] is on (ctrl+x, works here too; it hides no provider). Beside free: always of all models. '<1%' for a small non-zero count; '100%' only when every one. Coloured by band, as a hint:");
   L.push("  " + " ".repeat(TERM_W) + p.grn("70% and up") + "   " + p.yel("30% to 69%") + "   " + p.red("under 30%") + "   " + p.dim("- none"));
@@ -136,8 +136,8 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   gut(null, "(blank)", "nobody looked");
   entry("model", "model", "the model id, sized to the longest id; a longer one is elided in the middle, keeping the part that differs");
   entry("provider/model", "provider/model", "in flat search (tab) the first column reads provider/model: the full target, what enter selects");
-  entry("stat", "stat", "what the last probe got back (see PROBES); blank = not benched");
-  entry("probed", "probed", "age of this model's own probe record, from its timestamp: how long ago stat, ttft and the rest of the row were measured. Same colour bands as oldest probe: green under 2d, yellow under 4d, orange under 7d, red 7d or older. Blank = never probed, or the record has no usable stamp (a skipped row has none). Sits right after stat on a wide terminal (from 97-99 columns depending on id length); output shrinks first to make room, and while it is under 8 columns wide it leaves the = alias hint and skipped text blank.");
+  entry("stat", "stat", "what the last probe got back (see PROBES); blank = not benched. UPPERCASE (OK, RATE, PAY, AUTH, GONE, ERR, T/O, EMPT) = seen in REAL use after the last probe (live); lowercase = measured by a probe, or a live result a confirmation probe then verified");
+  entry("probed", "probed", "age of this model's own probe record, from its timestamp: how long ago stat, ttft and the rest of the row were measured. Same colour bands as oldest probe: green under 2d, yellow under 4d, orange under 7d, red 7d or older. Blank = never probed, or the record has no usable stamp (a skipped row has none). A live (UPPERCASE) row shows the age of its live observation. Sits right after stat on a wide terminal (from 97-99 columns depending on id length); output shrinks first to make room, and while it is under 8 columns wide it leaves the = alias hint and skipped text blank.");
   L.push("  " + " ".repeat(TERM_W) + age("grn", "<1m 5h") + "  " + age("yel", "2d 3d") + "  " + age("ora", "4d 6d") + "  " + age("red", "7d 40d"));
   entry("ttft", "ttft", "request sent to first streamed token");
   entry("total", "total", "request sent to stream closed; blank for a cut stream");
@@ -170,6 +170,8 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   entry("[free]", "[free]", "the ctrl+e filter is on: only models badged FREE or FREE? as drawn");
   entry("id:", "id:", "the FULL id of the selected row (what enter or ctrl+f acts on), then the data dates: routable, benched, discovered");
   entry("reply:", "reply:", "the whole stored reply of the selected row; '[cut]' the probe stopped a stream that ignored its token limit; '[stream error]' it failed after the first token");
+  entry("[live]", "[live]", "reply: lead for a live record: '[live 14:32Z] answered HTTP 200 in 1.2 s; no reply text is kept for real requests' (UTC), '... worked live; confirming...' for up to 2 minutes while the confirmation probe runs, or the provider's own sentence for a failure");
+  entry("[live+probe]", "[live+probe]", "reply: lead once a confirmation probe has verified the live result: the reply is the probe's own, stat is lowercase again");
   note("A dimmed row is one of two things: 'not a chat model' (cannot be selected) or 'not listed now' (the gateway did not list it at snapshot time; it may still work).");
   note("Columns drop as the terminal narrows: output first, then probed, then tok/s, then total. All show from 103 columns. The frame is never narrower than 78 (an 80-column terminal is the minimum).");
   note("A long id is elided keeping the part that differs; wide and emoji characters draw as '?'. A filter that matched inside the elided middle shows " + g.dashMatch + ".");
@@ -184,6 +186,8 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   entry("benched", "benched", "model list: when the probe records behind the row cells (stat, ttft, total, tok/s, reply:) were written, read live from bench.json. 'benched " + dash + " run bench-cli --live' means no probe data yet; an old record is still drawn (see outdated below).");
   entry("discovered", "discovered", "model list: when the providers' own model listings were last fetched; 'discovered " + dash + "' (never) explains a blank provenance gutter.");
 
+  entry("live", "live", "'live 14:32Z' (UTC) on the id: line: the newest live record merged into what is drawn. Absent when the live feed has nothing to add or is switched off. Live results never refresh oldest probe, probed ages or the outdated line.");
+  entry("feed note", "feed note", "a dim yellow line above the footer (the outdated line takes its place when both apply): 'live feed unavailable (schema changed)', '(no router data)', 'key mapping changed', or 'locked, showing the last update HH:MMZ'. It only says the live feed is not trustworthy; probes are unaffected.");
   entry("outdated", p.yel("outdated"), "a yellow line just above the footer, on both lists: 'Model Status might be outdated! Last time the list was fully updated was DATE, run node refresh/bench-cli.mjs --live to update your list fully' (a --live sweep also rebuilds the snapshot, so both lists update). It shows when MORE than half of the probe records are more than 7 days old (the sweep's own re-probe age); DATE is the OLDEST record, i.e. when the list was last fully updated. Old records stay visible and are never hidden or dimmed: this line and the oldest probe column show how old the data is. On a narrow terminal the words shorten but the command stays whole. With no probe data at all there is no such line (see benched).");
 
   // ------------------------------------------------------------------ 5. PROBES
@@ -198,6 +202,8 @@ export function legendLines(g, p, { provenanceDot, modality = (w) => w, stat = (
   entry("gone", stat("gone"), "model not found upstream");
   entry("t/o", stat("t/o"), "too slow (timed out)");
   entry("err", stat("err"), "provider or network error");
+  note("LIVE FEED: on open a one-shot background job reads the router's own usage log and records real successes (200) and failures (429 rate, 402 pay, 401/403 auth, 404 gone; a 5xx only after two 2+ minutes apart with no 200 between). When a failing model answers again, ONE tiny confirmation probe (5 words) may run, never for the Anthropic subscription route. No reply text of real use is ever stored.");
+  note("Switch it off and on: create or delete the file state/observe.off. Or: node refresh/observe-cli.mjs --status, --off, --on, --reset (deletes every live record, the feed position AND the confirmation spend caps: observed.json and observed.run).");
   note("The probe is a bare chat message with NO tools and 96 output tokens. A model can pass it and still fail a real Claude Code session (tool schemas, large prompts). It is one sample, taken under sweep load: read it as a ranking, not a benchmark.");
 
   return L;

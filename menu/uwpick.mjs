@@ -16,7 +16,9 @@
 
 import fs from "node:fs";
 import { openSync, readSync, closeSync } from "node:fs";
-import { loadSnapshot, SNAPSHOT_FILE } from "./snapshot.mjs";
+import { loadSnapshot, applyLive, SNAPSHOT_FILE } from "./snapshot.mjs";
+import { openOverlay, decideOverlayReload, feedNote } from "./observed-data.mjs";
+import { launchObserver } from "./observe-launch.mjs";
 // NOTE: catalog.mjs is deliberately NOT imported here. It pulls in keysync and a
 // 19.7 MB catalogue parse, and the picker's whole input is the pre-built
 // snapshot (Q1.1). Routability arrives on the snapshot rows (Q1.3).
@@ -44,11 +46,22 @@ function paint(out, lines) {
   out.write(HOME + lines.map((l) => l + EL).join("\n") + `${ESC}[J`);
 }
 
-export function firstFrame({ snap, recents, favourites, caps, termRows }) {
+/**
+ * The header/stamp figures the renderer reads from the snapshot rows, and from the live overlay when `applyLive` laid it over them. Pure.
+ * `observed` is `loadObserved()`: the newest live record's time (`liveAt`) is drawn only while the overlay is actually applied to a row
+ * (`benchLive` above zero), and `liveOkTotal` is how many of the header's ok are live-derived.
+ */
+export function metaFor(snap, observed = null, nowMs = Date.now()) {
   const rows = snap.rows;
-  // The provider list's outdated notice comes from the snapshot's baked stamp until bench.json is loaded.
-  const state = initState(rows, { recents, favourites, termRows, benchOldestAt: snap.benchOldestAt ?? null });
-  const meta = {
+  const on = !!observed;                                    // the kill switch (or no overlay) means no live figure at all
+  let liveAt = null;
+  // The newest live record's time, from the overlay itself, whether `applyLive` fired or the snapshot was rebuilt after the overlay and baked the
+  // live counts in (`benchLive` on the rows either way). A future-dated entry (past the skew allowance) is not evidence and is ignored; whether a probe
+  // has since superseded an entry is only knowable once bench.json is read, and the exact figure replaces this one when a model screen loads it.
+  if (on && observed.models?.size && rows.some((r) => r.benchLive > 0)) {
+    for (const o of observed.models.values()) if (o.a * 1000 - nowMs <= 5 * 60_000 && (liveAt === null || o.a > liveAt)) liveAt = o.a;
+  }
+  return {
     providers: rows.length,
     models: rows.reduce((n, r) => n + r.models.length, 0),
     generatedAt: snap.generatedAt,
@@ -82,7 +95,17 @@ export function firstFrame({ snap, recents, favourites, caps, termRows }) {
       ? rows.reduce((n, r) => n + (r.bench?.ok ?? 0), 0) : null,
     // The header percent leaves `gone` routes out of its denominator (models minus gone), from the same baked counts.
     goneTotal: rows.reduce((n, r) => n + (Number.isFinite(r.bench?.gone) ? r.bench.gone : 0), 0),
+    // How many of that ok total came from the live overlay (drawn `812 ok (2 live)`), and the newest live record's time (epoch s).
+    liveOkTotal: on ? rows.reduce((n, r) => n + (Number.isSafeInteger(r.benchLiveOk) ? r.benchLiveOk : 0), 0) : 0,
+    liveAt,
   };
+}
+
+export function firstFrame({ snap, recents, favourites, caps, termRows, observed = null }) {
+  const rows = snap.rows;
+  // The provider list's outdated notice comes from the snapshot's baked stamp until bench.json is loaded.
+  const state = initState(rows, { recents, favourites, termRows, benchOldestAt: snap.benchOldestAt ?? null, feedNote: feedNote(observed) });
+  const meta = metaFor(snap, observed);
   return { state, meta, text: screen(view(state), meta, { caps }) };
 }
 
@@ -181,8 +204,16 @@ export function main() {
   }
 
   const { recents, favourites } = loadPickerState();
+  // THE LIVE OVERLAY AT OPEN: one small file (`observed.json`, about a millisecond), never bench.json. `applyLive` lays the recorder's
+  // precomputed per-provider recount over the rows when it is newer than the snapshot; with no overlay, the kill switch on, or a
+  // snapshot built after it, the snapshot comes back untouched. `loaded.snap` stays the BASE so a later change can re-apply cleanly.
+  // The overlay's mtime is taken BEFORE it is read (`openOverlay`), so a write landing between the two is seen on the next keystroke.
+  const opened = openOverlay();
+  let observed = opened.observed;
+  let snap = applyLive(loaded.snap, observed);
+  let obsMtime = opened.mtime;
   let { state, meta } = firstFrame({
-    snap: loaded.snap, recents, favourites, caps, termRows: out.rows || 30,
+    snap, observed, recents, favourites, caps, termRows: out.rows || 30,
   });
 
   const lines = () => frame(view(state), meta, { caps });
@@ -211,6 +242,8 @@ export function main() {
   out.write(HIDE + CLEAR);
   run("open");                                     // startup reveal, inside the budget
   recordStartup(Number(process.hrtime.bigint() - t0) / 1e6);
+  // After the first frame and the startup record: the one-shot catch-up child (detached, exits by itself; never throws into the picker).
+  launchObserver();
 
   // NOTHING ASYNCHRONOUS HAPPENS BELOW THIS LINE, and nothing may be added.
   // The loop is a blocking readSync with no yield in its body, so the JS stack
@@ -318,8 +351,28 @@ export function main() {
       const next = toggleFavourite(refav);
       // initState rebuilds everything, so what is not derived from the snapshot (the view toggles, the bench reader with
       // its stamp and histograms) is carried across by `carryAcrossRebuild`.
-      state = carryAcrossRebuild(state, initState(loaded.snap.rows, { ...next, termRows: out.rows || 30, nowMs: state.now }));
+      state = carryAcrossRebuild(state, initState(snap.rows, { ...next, termRows: out.rows || 30, nowMs: state.now }));
     }
+    // THE OVERLAY CHANGED ON DISK (the recorder's child finished, or a confirmation landed): one `stat` per keystroke, inside a try/catch
+    // (an error reads as "unchanged"). On a new mtime the overlay is read again and laid over the rows in place (the cursor, the level and the
+    // filters stay where they are), the header figures are recomputed, and the bench reader is dropped from `meta` so the SINGLE `loadBench`
+    // site below reloads it if a model screen is showing.
+    // `decideOverlayReload` says what to do; a torn or half-written file is "keep" (the previous state stays, and it is tried again on the next
+    // keystroke), only a missing file or the kill switch clears the overlay.
+    const re = decideOverlayReload(obsMtime);
+    if (re.kind === "keep") obsMtime = re.mtime;
+    else if (re.kind === "apply" || re.kind === "clear") {
+      obsMtime = re.mtime;
+      observed = re.observed;
+      snap = applyLive(loaded.snap, observed);
+      const keep = state.provider?.keyId;
+      state = { ...state, rows: snap.rows, provider: keep ? snap.rows.find((r) => r.keyId === keep) ?? state.provider : state.provider,
+                feedNote: feedNote(observed) };
+      meta = { ...meta, ...metaFor(snap, observed), benchOf: undefined };
+    }
+    // The live clock, refreshed per keystroke: the "confirming..." window and the age of a record written after the picker opened read it
+    // (the open time `state.now` stays frozen so probe ages and bands do not tick while the picker is open).
+    state = { ...state, liveNow: Date.now() };
     // #114: bench.json is read ONCE, synchronously, the first time a MODEL screen (level 1
     // or flat scope) is about to be drawn -- never at startup and never while only the
     // provider list is used. loadBench is total (a missing or corrupt file is an empty
@@ -327,12 +380,13 @@ export function main() {
     // through `meta` and to the reducer (the ok-only filter) as an event.
     if ((state.level > 0 || state.scope === "flat") && !meta.benchOf) {
       const b = loadBench();
-      meta = { ...meta, benchOf: b.get, benchAsOf: b.size ? b.generatedAt : null };
+      // `liveAt` (the newest merged live record) and the feed note come from the SAME read: exact now that the reader is merged.
+      meta = { ...meta, benchOf: b.get, benchAsOf: b.size ? b.generatedAt : null, liveAt: b.live > 0 ? b.liveAt : null };
       // bench.json wins over the snapshot's baked stamp and histograms once it is loaded: the oldest record among the listed
       // routes, and each provider's age histogram. An empty or missing file has nothing to say: the snapshot's stay.
-      const fromFile = b.size ? { benchOldestAt: oldestStampOf(loaded.snap.rows, b.get, state.now),
-        benchHist: new Map(loaded.snap.rows.map((r) => [r.keyId, ageHistOf(r.provider, r.models, b.get, state.now)])) } : {};
-      state = reduce(state, { benchOf: b.get, ...fromFile }).state;
+      const fromFile = b.size ? { benchOldestAt: oldestStampOf(snap.rows, b.get, state.now),
+        benchHist: new Map(snap.rows.map((r) => [r.keyId, ageHistOf(r.provider, r.models, b.get, state.now)])) } : {};
+      state = reduce(state, { benchOf: b.get, ...fromFile, feedNote: feedNote(b.overlay) }).state;
     }
     if (exited) {
       closeSync(CONIN);

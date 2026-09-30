@@ -13,7 +13,7 @@
 import { LEGEND_LENGTH } from "./legend.mjs";
 // Light (fs + two tiny modules), already in the picker's graph via snapshot.mjs. The
 // reducer needs the ONE definition of "fresh ok" so the filter and the header agree.
-import { isOk, isGone, isUsable, outdatedNotice, oldestAgeOf } from "./bench-data.mjs";
+import { isOk, isGone, isUsable, isLive, outdatedNotice, oldestAgeOf } from "./bench-data.mjs";
 import { liveAlias } from "./route-hints.mjs";
 
 const asTarget = (providerName, modelId) => `${providerName}/${modelId}`;
@@ -138,7 +138,7 @@ const settle = (list, i) => {
 // added here is carried across a rebuild without anyone remembering to.
 export const TOGGLE_DEFAULTS = Object.freeze({ okOnly: false, oneM: false, hideGone: false, freeOnly: false });
 // What the bench reader loaded into the state (see `reduce`'s `{ benchOf }` event): not derived from the snapshot rows.
-export const BENCH_FIELDS = Object.freeze(["benchOf", "benchOldestAt", "benchHist"]);
+export const BENCH_FIELDS = Object.freeze(["benchOf", "benchOldestAt", "benchHist", "feedNote"]);
 
 /**
  * A rebuilt state (`initState` after a favourite was toggled) with what the session had accumulated carried over: every
@@ -151,7 +151,7 @@ export function carryAcrossRebuild(oldState, newState) {
   return out;
 }
 
-export function initState(rows, { recents = [], favourites = [], termRows = 30, nowMs = Date.now(), benchOldestAt = null } = {}) {
+export function initState(rows, { recents = [], favourites = [], termRows = 30, nowMs = Date.now(), benchOldestAt = null, feedNote = null } = {}) {
   const known = new Set();
   // Built from SELECTABLE models only, which is where the pinned path is handled.
   // A pin is a persisted target STRING -- state.mjs returns nothing else -- so
@@ -209,12 +209,18 @@ export function initState(rows, { recents = [], favourites = [], termRows = 30, 
     // `{ benchOf }` the first time a model screen is drawn, so the reducer does no I/O. `now`
     // is fixed at init so "fresh" cannot change under a session.
     benchOf: null, now: nowMs,
+    // The LIVE clock: refreshed by the picker on every keystroke (`now` stays frozen at open so probe ages and bands do not tick). The
+    // "confirming..." window and the age of a record written after the picker opened read it.
+    liveNow: nowMs,
     // The stamp (ISO) of the OLDEST bench record among the listed routes: the snapshot's until bench.json is loaded (then the
     // live one replaces it). The outdated notice's line is counted in the page size below, so the reducer must know it.
     benchOldestAt: typeof benchOldestAt === "string" ? benchOldestAt : null,
     // The per-provider age histograms from the loaded bench.json (`Map<keyId, [[epochHour, count], ...]>`); null until then, and the
     // rows' own baked `benchAgeHist` (the snapshot's) is read instead. Once loaded, bench.json wins.
     benchHist: null,
+    // The live feed's one-line note (`feedNote(overlay)`: "live feed unavailable (schema changed)", ...) or null. It shares the outdated notice's
+    // line: drawn only while that notice is not, and counted in `extraLines` exactly as the notice is.
+    feedNote: typeof feedNote === "string" && feedNote ? feedNote : null,
     q: ["", "", ""], cur: [0, 0, 0], top: [0, 0, 0],
     provider: null, termRows,
     // #51 (§2.5(b)/(c)), R18: null when closed, otherwise
@@ -264,8 +270,9 @@ const slot = (s) => (s.scope === "flat" ? 2 : s.level);
 const histOfRow = (s, r) => (s.benchHist ? (s.benchHist.get(r.keyId) ?? []) : r.benchAgeHist);
 // `YYYY-MM-DD` when MORE than half of all the records are over 7 days old (the date is the OLDEST record's), else null.
 const noticeDate = (s) => outdatedNotice(s.benchOldestAt, s.rows.map((r) => histOfRow(s, r)), s.now);
+// The feed note takes the same line when the outdated notice is absent (the outdated notice wins), so the two never cost two lines.
 const extraLines = (s) => ((s.scope === "flat" || s.level === 1) ? 1
-  : (s.pinned?.length > 0 ? 1 : 0)) + (!s.legend && !s.refusals && noticeDate(s) ? 1 : 0);
+  : (s.pinned?.length > 0 ? 1 : 0)) + (!s.legend && !s.refusals && (noticeDate(s) || s.feedNote) ? 1 : 0);
 const rowsAvail = (s) => Math.max(1, (s.termRows || 30) - 8 - extraLines(s));
 
 function flatItems(s) {
@@ -294,11 +301,11 @@ function liveTally(s, row) {
   const m = okBook(s);
   let t = m.byRow.get(row);
   if (!t) {
-    t = { ok: 0, fresh: 0, gone: 0 };
+    t = { ok: 0, fresh: 0, gone: 0, liveOk: 0 };
     for (const m2 of row.models) {
       const rec = s.benchOf(`${row.provider}/${m2.id}`);
       if (isUsable(rec, s.now)) t.fresh += 1;
-      if (isOk(rec, s.now)) t.ok += 1;
+      if (isOk(rec, s.now)) { t.ok += 1; if (isLive(rec) && rec.v !== 1) t.liveOk += 1; }
       if (isGone(rec, s.now)) t.gone += 1;
     }
     m.byRow.set(row, t);
@@ -316,6 +323,22 @@ function liveOk(s, row) {
   if (noReader(s) || !row) return null;
   const t = liveTally(s, row);
   return t.fresh === 0 ? null : t.ok;
+}
+// How many of the `ok` above came from the LIVE overlay AND are not yet confirmed by a probe (a record of real use, `l: 1` without `v: 1`: exactly the
+// ones drawn UPPERCASE): the header's `(n live)`, so an ok total never mixes the two populations without saying so. `0` when there is no reader.
+function liveLive(s, row) {
+  if (noReader(s) || !row) return 0;
+  return liveTally(s, row).liveOk;
+}
+function liveLiveTotal(s) {
+  if (noReader(s)) return 0;
+  const m = okBook(s);
+  if (m.liveTotal === undefined) {
+    let n = 0;
+    for (const r of s.rows) n += liveTally(s, r).liveOk;
+    m.liveTotal = n;
+  }
+  return m.liveTotal;
 }
 // How many routes of the open provider (or of every provider, in flat scope) have a fresh `gone` record: the
 // denominator of the header's percent is models minus these. `null` when there is no reader to ask.
@@ -457,8 +480,9 @@ export function reduce(state, ev) {
     // `benchOldestAt` rides with it when the caller has computed it from the loaded reader (null: no records at all).
     const oldest = Object.hasOwn(ev, "benchOldestAt") ? { benchOldestAt: typeof ev.benchOldestAt === "string" ? ev.benchOldestAt : null } : {};
     // `benchHist` (a Map of keyId to age histogram) rides with it the same way.
+    const note = Object.hasOwn(ev, "feedNote") ? { feedNote: typeof ev.feedNote === "string" && ev.feedNote ? ev.feedNote : null } : {};
     const hist = Object.hasOwn(ev, "benchHist") ? { benchHist: ev.benchHist instanceof Map ? ev.benchHist : null } : {};
-    return { ...NONE, state: clamp({ ...state, ...oldest, ...hist, benchOf: typeof ev.benchOf === "function" ? ev.benchOf : null }) };
+    return { ...NONE, state: clamp({ ...state, ...oldest, ...hist, ...note, benchOf: typeof ev.benchOf === "function" ? ev.benchOf : null }) };
   }
   if (ev && typeof ev === "object" && Number.isFinite(ev.resize)) {
     let next = clamp({ ...state, termRows: ev.resize });
@@ -714,6 +738,9 @@ export function view(state) {
     okOnly: !!state.okOnly, oneM: !!state.oneM, hideGone: !!state.hideGone, freeOnly: !!state.freeOnly,
     // `YYYY-MM-DD` while the list is outdated (more than half its records are over 7 days old), else null: drawn as the yellow notice.
     notice: noticeDate(state),
+    // The live feed's note (drawn on the notice's line while there is no outdated notice), and how many of the shown `ok` are live.
+    feedNote: state.feedNote ?? null,
+    liveOkLive: state.scope === "flat" ? liveLiveTotal(state) : state.level === 1 ? liveLive(state, state.provider) : undefined,
     // The OLDEST probe age in seconds (against the session clock, never negative) of each provider row on this page, by key id:
     // `null` when the provider has no records, and no entry at all when there is no bench data to say (the `oldest probe` cell
     // draws `-` and blank respectively). Plain data (a Map), so two views of the same state compare equal.
@@ -723,6 +750,7 @@ export function view(state) {
     })),
     // The session clock the freshness rule reads (fixed at init), so the renderer never asks the wall.
     now: state.now,
+    liveNow: Number.isFinite(state.liveNow) ? state.liveNow : state.now,
     legendTop: state.legend?.top ?? 0,
     legendTotal: LEGEND_LENGTH,
     // The page size, from the SAME `rowsAvail` the arrow-scroll clamp above

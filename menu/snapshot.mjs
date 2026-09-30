@@ -101,6 +101,77 @@ const ROUTABLE_TIMEOUT_MS = 5000;
  */
 const withAlive = (flags, alive, status) => (flags ? { ...flags, alive, status } : null);
 
+const liveTally = (row, get, nowMs) => {
+  if (typeof get?.isLive !== "function") return {};
+  let live = 0, liveOk = 0;
+  for (const m of row.models ?? []) {
+    const t = benchKey(row.provider, m?.id ?? "");
+    if (!get.isLive(t)) continue;
+    const rec = get(t);
+    if (!rec || rec.v === 1 || !isUsable(rec, nowMs)) continue;
+    live += 1;
+    if (rec.s === "ok") liveOk += 1;
+  }
+  return { live, liveOk };
+};
+
+/**
+ * The three baked fields of one provider row over a reader `get` (`loadBench().get`, or any merged view): the per-status counts
+ * (`bench`), the provider's verdicts (`benchFlags`: `dead`, `needsMoney`, `alive`, and the three-state `status`) and the age histogram
+ * (`benchAgeHist`, from PROBE stamps only). `buildSnapshot` bakes them at build time; the live-status recorder bakes them again over the
+ * merged view (probe + live overlay) into `observed.json` (`prov`), so a build and an at-open recount are ONE code path.
+ * `row` needs `provider` and `models`.
+ *
+ * When `get` is the merged reader (it has `get.isLive`) the result also carries `live` and `liveOk`: how many of the row's routes are LIVE and NOT
+ * YET CONFIRMED by a probe (the ones the picker draws UPPERCASE), and how many of those are `ok`. They are what the header's `(n live)` sums, baked
+ * beside the counts they qualify, so a snapshot rebuilt while the overlay was on says the same thing at level 0 as level 1 does. A reader without
+ * `isLive` (a plain bench.json reader) gets neither key.
+ */
+export function bakeBench(row, get, nowMs = Date.now()) {
+  const live = liveTally(row, get, nowMs);
+  return {
+    ...live,
+    bench: countStatuses(row.provider, row.models, get, nowMs),
+    // `{dead, needsMoney, alive, status}`. `status` (schema 8) is what the provider list draws: `alive` (a fresh ok), `down` (answered, but
+    // nothing ok), `dead` (every fresh probe got no response at all), or null with nothing fresh (route-hints.mjs `providerStatus`).
+    // `alive` stays the two-state "responded in any shape" boolean, and `dead` / `needsMoney` the sweep's own flags, for other readers.
+    benchFlags: withAlive(providerFlags(row.provider, row.models, get, nowMs), providerAlive(row.provider, row.models, get, nowMs),
+                          providerStatus(row.provider, row.models, get, nowMs)),
+    // Schema 9. `[[epochHour, count], ...]` (see `ageHistOf`); `[]` for a provider with no records.
+    benchAgeHist: ageHistOf(row.provider, row.models, get, nowMs),
+  };
+}
+
+/**
+ * THE AT-OPEN LIVE RECOUNT (live status, plan R2-4). The recorder's child computes, per provider that has a live record, the baked fields over
+ * the merged (probe + live) view and stores them in `observed.json` as `prov`, stamped by the file's `writtenAt`. At open the picker reads ONLY
+ * that file (never bench.json) and, when it is NEWER than the snapshot (`writtenAt > builtAt`: a snapshot built after it already baked the
+ * overlay in), lays those fields over the rows it names, plus `benchLive` / `benchLiveOk` (how many routes are live-derived, and how many of the
+ * `ok` count) so the header can say `ok 812 (2 live)`. Pure: the input snapshot and observed objects are not changed; with nothing to apply the
+ * SAME snapshot object comes back. `snap.benchOldestAt` and every row's `benchAgeHist` are untouched by design: age credit comes from probe
+ * records only, and a live record is not one.
+ */
+export function applyLive(snap, observed) {
+  if (!snap || !Array.isArray(snap.rows) || !observed || !(observed.prov instanceof Map) || observed.prov.size === 0) return snap;
+  const wrote = Date.parse(observed.writtenAt ?? ""), built = Date.parse(snap.builtAt ?? "");
+  if (!Number.isFinite(wrote) || !Number.isFinite(built) || wrote <= built) return snap;
+  let touched = false;
+  const rows = snap.rows.map((r) => {
+    const p = r?.keyId ? observed.prov.get(r.keyId) : undefined;
+    if (!p) return r;
+    touched = true;
+    // A count can never exceed the row's own model count (the file is not trusted: a huge number would widen a cell or the header).
+    const cap = Array.isArray(r.models) ? r.models.length : 0;
+    const fit = (n) => Math.min(Number.isSafeInteger(n) && n >= 0 ? n : 0, cap);
+    const counts = {};
+    for (const st of ["ok", "empty", "auth", "pay", "rate", "gone", "timeout", "error", "skip"]) counts[st] = fit(p.bench?.[st]);
+    // `prov` REPLACES the flags, a null included: it is the recorder's verdict over the merged view ("nothing fresh to judge from"), and keeping the
+    // snapshot's older non-null verdict would show a status the counts beside it no longer support.
+    return { ...r, bench: counts, benchFlags: p.benchFlags, benchAgeHist: r.benchAgeHist, benchLive: fit(p.live), benchLiveOk: Math.min(fit(p.liveOk), fit(p.live)) };
+  });
+  return touched ? { ...snap, rows } : snap;
+}
+
 /**
  * The picker's `modality` column (schema 7): `outModality` is one word from the closed list in
  * `menu/modality.mjs` or `null` (unknown), `outModalitySrc` names the evidence (`listing`, `mode`, `output`,
@@ -156,7 +227,11 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null,
   const carry = !bench && Number.isFinite(prevAt) && nowMs >= prevAt
     && (previous?.rows ?? []).some((r) => r?.bench);
   const priorBench = new Map();
-  if (carry) for (const r of previous.rows) priorBench.set(r.keyId, { bench: r.bench ?? null, flags: r.benchFlags ?? null, hist: cleanAgeHist(r.benchAgeHist) });
+  if (carry) for (const r of previous.rows) priorBench.set(r.keyId, { bench: r.bench ?? null, flags: r.benchFlags ?? null, hist: cleanAgeHist(r.benchAgeHist), live: r.benchLive, liveOk: r.benchLiveOk });
+  const liveFields = (b) => (Number.isSafeInteger(b?.live) && Number.isSafeInteger(b?.liveOk) ? { benchLive: b.live, benchLiveOk: b.liveOk } : {});
+  // One `bakeBench` per row, however many of its three fields are read below.
+  const bakedRows = new Map();
+  const baked = (r) => { let b = bakedRows.get(r); if (!b) bakedRows.set(r, b = bakeBench(r, bench.get, nowMs)); return b; };
   return {
     schemaVersion: SNAPSHOT_SCHEMA,
     generatedAt: built.generatedAt ?? null,
@@ -185,19 +260,19 @@ export function buildSnapshot(built, { modalityOf = () => null, previous = null,
       planCount: r.planCount, health: r.health,
       // #114. Raw per-status model counts, or `null` when there was no bench data
       // (an own property either way, so "no sweep" survives JSON.stringify).
-      bench: bench ? countStatuses(r.provider, r.models, bench.get, nowMs) : (priorBench.get(r.keyId)?.bench ?? null),
+      bench: bench ? baked(r).bench : (priorBench.get(r.keyId)?.bench ?? null),
       // `{dead, needsMoney}` booleans from the sweep's skip decisions, or `null` when
       // there is no data or nothing fresh to judge from (drawn blank, never "no").
       // `{dead, needsMoney, alive, status}`. `status` (schema 8) is what the provider list draws:
       // `alive` (a fresh ok), `down` (answered, but nothing ok), `dead` (every fresh probe got no response at
       // all), or null with nothing fresh (route-hints.mjs `providerStatus`). `alive` stays the two-state
       // "responded in any shape" boolean, and `dead` / `needsMoney` the sweep's own flags, for other readers.
-      benchFlags: bench ? withAlive(providerFlags(r.provider, r.models, bench.get, nowMs),
-                                    providerAlive(r.provider, r.models, bench.get, nowMs),
-                                    providerStatus(r.provider, r.models, bench.get, nowMs))
-                        : (priorBench.get(r.keyId)?.flags ?? null),
+      benchFlags: bench ? baked(r).benchFlags : (priorBench.get(r.keyId)?.flags ?? null),
       // Schema 9. `[[epochHour, count], ...]` (see `ageHistOf`); `[]` for a provider with no records, `null` with no bench data.
-      benchAgeHist: bench ? ageHistOf(r.provider, r.models, bench.get, nowMs) : (priorBench.get(r.keyId)?.hist ?? null),
+      benchAgeHist: bench ? baked(r).benchAgeHist : (priorBench.get(r.keyId)?.hist ?? null),
+      // OPTIONAL, additive (no schema bump: a reader that does not know them ignores them, and a file without them means "none"): how many routes
+      // are live and unconfirmed, and how many of those are ok, when the build merged the live overlay (see `bakeBench`).
+      ...liveFields(bench ? baked(r) : priorBench.get(r.keyId)),
       // Schema 4. The free-tier limit, aggregated over this provider's free
       // rows by `menu/payload-cap.mjs`'s `aggregate`. `?? null` for the same
       // reason `provenance` two literals down carries it: an own property,
