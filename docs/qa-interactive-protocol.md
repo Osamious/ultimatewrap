@@ -1,7 +1,7 @@
 # UW picker — interactive verification protocol
 
-Twenty steps against live Claude Code in a real Windows Terminal. Each declares
-**Do**, **Expected** and **Fail means**. Phase A is not complete until every step
+Twenty-seven steps against live Claude Code in a real Windows Terminal (P22 has five
+sub-steps, P22a to P22e). Each declares **Do**, **Expected** and **Fail means**. Phase A is not complete until every step
 passes.
 
 ## Before you start
@@ -591,3 +591,166 @@ wider than the terminal.
 **Fail means:** any older column missing at 103 columns or wider, the id column narrower than 22 characters, an age
 that differs from the record's real age by more than a minute, a wrong colour at 2d, 4d or 7d, a ragged frame, or
 `probed` drawn for a model with no record.
+
+### P22-live-status
+
+**Do:** with a recorder-written `state/observed.json` in place (run `node refresh/observe-cli.mjs --catchup` after some real use, or use the
+hand-made data of P22b), open the picker. Look at the provider list header and the `id:` line; open a provider whose model had a real success or
+failure; select that model and read `stat`, `probed` and `reply:`; press `esc` twice to leave the picker. Then run `node refresh/observe-cli.mjs --off`,
+open the picker again and repeat; run `node refresh/observe-cli.mjs --on` and open it once more. Also run `node refresh/observe-cli.mjs --status`.
+
+**Expected:** a live-observed model shows its `stat` in UPPERCASE (`OK`, `RATE`, ...) in the same width; `reply:` starts with `[live HH:MMZ]` (an ok says
+"answered HTTP 200 in ... ; no reply text is kept for real requests", a failure quotes the provider's sentence); after a confirmation probe the stat is
+lowercase again and `reply:` starts with `[live+probe HH:MMZ]`. The header ok reads `N ok (n live) (P%)` only while some ok are live, and the `id:` line
+ends with `live HH:MMZ`. The provider list counts and the model list agree. `oldest probe` and the outdated line do not change because of live results, and
+the `probed` cell of a live row shows the age of its live observation. A broken feed shows one dim yellow line above the footer. With `state/observe.off`
+present none of this appears and nothing is spawned; removing it brings it back at the next open. `--status` prints `enabled` or `DISABLED (remove observe.off
+or run --on)`, the time of the last run, the feed, the watermark and the overlay's record count. The picker opens at the same speed with or without an overlay.
+
+**Fail means:** a live result drawn as a probe (lowercase, no lead) or the reverse, a stat wider than 4 columns, a `live` stamp or `(n live)` with the switch
+off or with no live records, `oldest probe` or the outdated line moving because of a live result, the provider list and the model list disagreeing about
+the counts, a frame taller than the terminal, or a picker that hangs or shows an error when `observed.json` is missing, torn or locked.
+
+The sub-steps below cover what P22 cannot reach with real traffic. They are part of P22: it passes only when all of them pass. They touch real state
+files, so each says what to back up and how to put it back. Every command runs from the repository root (`C:\Users\osami\.uw`) in PowerShell.
+
+#### P22a-tag-check
+
+**Do:** run `node refresh/spike-client-tag.mjs --only openrouter/laguna-s-2.1:free` (a dry run: it prints what it would do and sends nothing), then
+`node refresh/spike-client-tag.mjs --live --only openrouter/laguna-s-2.1:free` (ONE real request to a free row, so it costs nothing) and read its last
+line and its exit code (`$LASTEXITCODE`).
+
+**Expected:** the dry run says it would send ONE probe carrying the header `x-ccr-client: uw-probe` and ends `no request was made`. The live run ends with
+`TAG CONFIRMED: client = uw-probe` and exit code 0: the router recorded the probe's usage row with the client `uw-probe`, which is how the recorder tells UW's
+own probes from real use.
+
+**Fail means:** `TAG NOT RECORDED (observed client: X)` (exit 3): the router does not record the header, every sweep probe would look like real use, and the
+feed must stay off (`node refresh/observe-cli.mjs --off`) until that is fixed. `INCONCLUSIVE` (exit 4): no usage row appeared in time; run it again. Exit 1 is a
+refusal (the row is not in the snapshot, or costs more than $0.01); exit 2 is bad arguments.
+
+#### P22b-hand-made-usage-log
+
+Real traffic rarely produces a 429 followed by a 200 on demand, so this step builds a small usage database of its own and points the recorder at it with
+`UW_CCR_DATA_DIR`. It uses the real `state/` files, so back them up first. The picker starts no catch-up of its own here (`UW_OBSERVE_NO_SPAWN=1`); you run each
+one by hand.
+
+Save this as `%TEMP%\make-usage.mjs`. It adds one row to `<dir>\usage.sqlite`, shaped like the router's usage table:
+
+```js
+// Usage: node make-usage.mjs <dir> <429|200> <provider> <model id>
+import fs from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const [dir, kind, provider, model] = process.argv.slice(2);
+fs.mkdirSync(dir, { recursive: true });
+const db = new DatabaseSync(path.join(dir, "usage.sqlite"));
+db.exec(`create table if not exists usage_events (
+  id integer primary key autoincrement, created_at text, request_id text, client text, provider text,
+  model text, status_code integer, duration_ms integer, output_tokens integer)`);
+db.exec(`create table if not exists request_logs (
+  request_id text, response_body_text text, response_body_size_bytes integer, error text, gateway_error text)`);
+const now = new Date().toISOString();
+const rid = `qa-${kind}-${Date.now()}`;
+if (kind === "429") {
+  const body = JSON.stringify({ error: { message: "Rate limit exceeded: free-models-per-day", code: 429 } });
+  db.prepare("insert into request_logs values (?, ?, ?, '', '')").run(rid, body, body.length);
+}
+db.prepare("insert into usage_events (created_at, request_id, client, provider, model, status_code, duration_ms, output_tokens) values (?, ?, 'Profile: Claude Code', ?, ?, ?, 300, ?)")
+  .run(now, rid, provider, model, Number(kind), kind === "200" ? 12 : 0);
+db.close();
+console.log(`added a ${kind} row for ${provider}/${model}`);
+```
+
+**Do:** in the PowerShell window you will start Claude Code from, pick a FREE row that has a probe record (the example uses `openrouter/laguna-s-2.1:free`;
+the gateway must be running for the confirmation) and run:
+
+```powershell
+$env:UW_CCR_DATA_DIR = "$env:TEMP\uw-qa-data"      # the recorder reads the usage log from here instead of the router's
+$env:UW_OBSERVE_NO_SPAWN = "1"                     # the picker starts no catch-up of its own
+Copy-Item state\observed.json "$env:TEMP\observed.json.qa-backup" -ErrorAction SilentlyContinue
+Copy-Item state\observed.run  "$env:TEMP\observed.run.qa-backup"  -ErrorAction SilentlyContinue
+node --no-warnings "$env:TEMP\make-usage.mjs" $env:UW_CCR_DATA_DIR 429 openrouter "laguna-s-2.1:free"
+node --no-warnings refresh/observe-cli.mjs --catchup --backfill-days 1
+```
+
+The catch-up should print `wrote 1 record(s) {"rate":1}` (its watermark is re-initialised because the hand-made log is a different database). Start Claude Code
+from this window, open the picker (`m`, then `ctrl+g`), open `personal.openrouter.free` and select `laguna-s-2.1:free`. Leave the picker (`esc` twice). Then add the
+200 a little later, so its time is newer, and catch up again:
+
+```powershell
+node --no-warnings "$env:TEMP\make-usage.mjs" $env:UW_CCR_DATA_DIR 200 openrouter "laguna-s-2.1:free"
+node --no-warnings refresh/observe-cli.mjs --catchup
+```
+
+Wait about 10 seconds for the confirmation probe, open the picker and select the same row again.
+
+**Expected:** after the 429, `stat` reads `RATE` (uppercase, 4 columns), `reply:` reads `[live HH:MMZ] Rate limit exceeded: free-models-per-day`, and the `id:` line ends with
+`live HH:MMZ`; the header has no `(n live)` because there is no live `ok` yet. After the 200, the second catch-up prints `wrote 1 record(s) {"ok":1}` and
+`confirmation probes: requested 1`. For the few seconds until the probe returns the row reads `OK` with `[live HH:MMZ] worked live; confirming...` and the header reads
+`... ok (1 live) ...` (you see this only if you open the picker inside that window). Once the probe has answered, `stat` reads `ok` in lowercase and `reply:` reads
+`[live+probe HH:MMZ]` followed by a real reply to "Say hello in 5 words.": it is now a probe measurement, so `(n live)` no longer counts it. If the gateway is down the row stays
+`OK` with `[live HH:MMZ] answered HTTP 200 in 0.3 s; no reply text is kept for real requests` after 2 minutes.
+
+**Put it back:**
+
+```powershell
+Remove-Item Env:UW_CCR_DATA_DIR, Env:UW_OBSERVE_NO_SPAWN
+Copy-Item "$env:TEMP\observed.json.qa-backup" state\observed.json -Force    # if there was no backup, run instead: node refresh/observe-cli.mjs --reset
+Copy-Item "$env:TEMP\observed.run.qa-backup" state\observed.run -Force
+```
+
+Restoring the backup also removes this test's confirmation reservation, which would otherwise hold that row for 6 hours.
+
+**Fail means:** an uppercase stat wider than 4 columns; no `RATE` after the first catch-up (read `--status` and the catch-up's output); `OK` where the probe should have
+overruled it; `[live+probe` without a real reply; no probe request at all with the gateway up (add a fresh 429 and 200 pair and run `--catchup --dry`, then read
+`not requested by reason`); or any change to `state/bench.json` (its modified time must not move).
+
+#### P22c-schema-change
+
+**Do:** with the environment of P22b still set, rename a column in the hand-made log and catch up:
+
+```powershell
+node --no-warnings -e "const {DatabaseSync}=require('node:sqlite'); const d=new DatabaseSync(process.env.UW_CCR_DATA_DIR+'/usage.sqlite'); d.exec('alter table usage_events rename column status_code to status_code_old'); d.close()"
+node --no-warnings refresh/observe-cli.mjs --catchup
+node refresh/observe-cli.mjs --status
+```
+
+Open the picker, read the provider list, then open a provider.
+
+**Expected:** the catch-up prints `feed unavailable:schema` and `--status` prints `feed: unavailable:schema` and, on the next line, `usage_events columns missing: status_code`. The picker opens normally, keeps the last live records on screen,
+shows one dim yellow line above the footer, `live feed unavailable (schema changed)` (the outdated notice takes that line's place when both apply), and every probe column
+is unchanged. The catch-up prints no "messages from ..." line while the feed is unavailable. `bench.json` is not written. Put it back as in P22b; the restore also brings back the healthy
+`feed`.
+
+**Fail means:** a crash or a hang in the picker, a status drawn from the broken log, a live record lost, or no note at all.
+
+#### P22d-kill-switch
+
+**Do:** with live records on screen (P22b), run `node refresh/observe-cli.mjs --off`, then `node refresh/observe-cli.mjs --status`, then
+`node refresh/observe-cli.mjs --catchup`, then open the picker. Close it, run `node refresh/observe-cli.mjs --on` and open it again.
+
+**Expected:** `--off` prints `disabled (created ...observe.off)`; `--status` starts with `DISABLED (remove observe.off or run --on)`; `--catchup` prints nothing and exits 0. The picker shows no
+uppercase stat, no `live HH:MMZ`, no `(n live)` and no `[live` reply, exactly what `bench.json` alone would draw, and the modified time of `state/observed.run` does not move (no child
+started). After `--on` (`enabled (removed ...observe.off)`) the live rows are back at the next open. Creating `state/observe.off` while a picker is already open changes that picker only at
+its next open.
+
+**Fail means:** any live marker with the switch off, a catch-up that reads the database or writes a file while off, or a live feed that does not return after `--on`.
+
+#### P22e-lock-held
+
+**Do:** create a lock that looks like a live run, then catch up and open the picker, all within two minutes:
+
+```powershell
+$ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+'{"pid":' + $PID + ',"startedAt":' + $ms + ',"maxMinutes":2}' | Set-Content state\observed.lock
+node --no-warnings refresh/observe-cli.mjs --catchup
+```
+
+Open the picker (with `UW_OBSERVE_NO_SPAWN` unset, so the launcher's own lock gate is the one under test). Afterwards remove the lock: `Remove-Item state\observed.lock`.
+
+**Expected:** the catch-up prints `observe: skipped (locked: another run holds the lock)` and exits 0. The picker opens at its usual speed, draws the last known live records and starts
+no child (no new `node` process, no new `observed.json`); the lock file stays as you made it until you remove it. A lock whose process is gone, or that is older than 3 minutes, is taken
+over by the next run.
+
+**Fail means:** a second catch-up that runs anyway, a picker that waits on the lock, an error line, or a damaged `observed.json`.

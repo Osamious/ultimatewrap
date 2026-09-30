@@ -223,6 +223,11 @@ drawn, never at startup and never while only the provider list is used. The numb
 real streamed chat request per model, sent **through the CCR gateway** (the path
 a real session takes), so they include routing overhead.
 
+**Live observations never change `bench.json`.** Since the live feed (6f) the picker can draw a status from your real
+requests, in UPPERCASE, but that comes from a separate file (`state/observed.json`) merged over `bench.json` when a list is drawn.
+A sweep, `--compact` and `--reclassify-notices` work on `bench.json` exactly as before (`--redact` also redacts the overlay, see 6f), and a probe newer than a live record
+wins. Live results never refresh `oldest probe`, the `probed` ages or the outdated notice; only a sweep does.
+
 ```powershell
 # Dry (default): the plan — rows, providers, free/paid split, spend, wall time. Sends nothing.
 node refresh/bench-cli.mjs
@@ -828,8 +833,336 @@ counts, a future-dated one changes nothing). Both are **additive optional fields
   7, nousresearch 2, openrouter 1, cohere 1), exactly the study's count; the test replays
   the study's frozen table (`plans/bench-study/models.csv`) to keep that true.
 
+### 6f. Live model status (the live feed)
+
+The bench sweep (6d) measures a model only when you run it. The live feed adds a second, cheaper source: what
+the router already recorded about your real requests. A model that answered `429` in your last session shows
+`RATE` in the picker without a sweep, and a model that was failing and then answered again shows `OK`.
+
+**What it does.** On every picker open, right after the first frame, the picker starts one detached,
+short-lived Node process (`node --no-warnings refresh/observe-cli.mjs --catchup`). That process opens the router's own usage
+database read-only, reads the rows added since the last run (a stored row id, the "watermark"), classifies each
+one with the same classifier the sweep uses, and writes the result to `state/observed.json`. The picker merges
+that file over `state/bench.json`, model by model. The child exits by itself in tens of milliseconds (two dry
+runs on 2026-09-30 examined 282 new usage rows in 40 and 54 ms).
+
+**What it does not do.**
+
+- It is not a daemon and has no timer. Nothing runs between picker opens. The gateway is never restarted.
+- It never writes to the router's database, and it never touches `state/bench.json`, its log, its lock or
+  `bench-history/`. A sweep and the live feed do not share a file.
+- The catch-up never contacts the gateway. The only request it can cause is the one confirmation probe (below).
+- It does not replace a sweep. A live record says "this model answered or failed for a real request at this
+  time". It does not refresh `oldest probe`, the `probed` ages of probe records, the age histograms or the
+  outdated notice (see "What the picker shows").
+- Nothing from your prompts or the model's replies is stored. Only a status, a time, the router's request id and,
+  for six failure statuses, the provider's own redacted error sentence (see "Privacy").
+
+**Timing.** The first frame is drawn from what the previous run found. This open's result appears on the next
+keystroke, a moment later (Node's start-up plus the tens of milliseconds of reading; the design measured a spawn at 11 ms on the picker's side, and a real-console check is still open, issue #142). A new child starts at most once every 30 seconds.
+
+#### Commands
+
+```powershell
+# What is it doing? Read-only: two small files, no database.
+node refresh/observe-cli.mjs --status
+
+# Switch it off, and back on. No source edit; see "The kill switch".
+node refresh/observe-cli.mjs --off
+node refresh/observe-cli.mjs --on
+
+# Delete every live record, the feed's position (watermark) AND the confirmation spend caps (deletes observed.json and observed.run).
+# The next run starts at the first UW-probe row in the last 3 days, else at the router's current last row.
+node refresh/observe-cli.mjs --reset
+
+# Dry run: read new usage rows, print what WOULD be recorded, write nothing (no overlay, run file or lock).
+# It does read the router's database, read-only. Prints counts only, never message text.
+node --no-warnings refresh/observe-cli.mjs --catchup --dry
+
+# Run a catch-up by hand (the same thing the picker starts on open).
+node --no-warnings refresh/observe-cli.mjs --catchup
+
+# Dry run as if the first run had started 3 days back (1 to 30). Honoured only when there is no watermark yet
+# (a fresh install, after --reset, or after the router's table was reset); otherwise ignored.
+node --no-warnings refresh/observe-cli.mjs --catchup --dry --backfill-days 3
+```
+
+Exactly one mode flag per run (`--catchup` is the default). Two are refused with exit code 2, as are `--dry` or
+`--backfill-days` without `--catchup`. Exit codes: 0 done or skipped, 1 a failed run (`observe: failed: <why>`), 2 bad
+arguments, 3 the watchdog (a child that runs longer than 10 seconds is ended; 90 seconds for a confirmation).
+`--confirm <provider/id>` also exists but is started only by the catch-up; run by hand it does nothing unless the
+overlay holds a fresh reservation for that key.
+
+Example `--status` output (the numbers are the state on 2026-09-30):
+
+```text
+observe: enabled
+observe: last run: 2026-09-30T00:08:12.297Z; no error
+observe: feed: ok
+observe: watermark: id 70759 (row time 2026-09-30T00:08:01.894Z)
+observe: overlay: 0 model record(s), 0 pending, written 2026-09-30T00:08:12.297Z
+observe: last run examined 7; skipped {"okSeen":7}
+```
+
+After a router schema change the same command adds one line right after `feed:` (only while the feed is `unavailable:schema`):
+
+```text
+observe: feed: unavailable:schema
+observe: usage_events columns missing: status_code, duration_ms
+```
+
+`0 model record(s)` with `okSeen` is normal and healthy: a real 200 for a model that is already `ok` changes
+nothing (it would only replace a reply preview with an empty one), so a quiet feed means everything you used
+worked. `skipped` names the reasons rows were passed over (below).
+
+#### The kill switch
+
+`state/observe.off` is the persistent switch. `--off` creates it, `--on` removes it (creating or deleting the empty
+file by hand is the same). While it exists:
+
+- the picker starts no child;
+- every reader ignores `observed.json`, so the picker draws exactly what `bench.json` says, with no `live` stamp and no
+  uppercase marker;
+- `--catchup` and `--confirm` exit at once, silently (`--status`, `--reset`, `--on`, `--off` always work).
+
+`observed.json` is kept, not deleted. The picker does not re-read the switch on every keystroke: creating
+`state/observe.off` while a picker is open takes effect at the next open (or the next change of `observed.json`).
+
+Two environment variables exist for shells and tests. They stop only the child launch; the overlay file is still
+read and drawn, so they are not a way to turn the display off:
+
+| Variable | Effect |
+|---|---|
+| `UW_OBSERVE=0` | the picker starts no catch-up child |
+| `UW_OBSERVE_NO_SPAWN=1` | same, for tests and QA (read the overlay, never start a child) |
+
+The picker is started by a Claude Code wrapper, so these apply only when set in the shell that starts Claude Code. Use
+`--off` for a lasting switch. (`UW_PICKER_QUIT_IMMEDIATELY=1`, used by the startup benchmark, also blocks the launch.)
+
+#### Probe tagging
+
+Every request the sweep and the confirmation probe send (`probeOne`) carries the header `x-ccr-client: uw-probe`. The
+router records that value as the row's `client` in its usage log and removes the header before the request is forwarded
+to the provider; this was verified live. The recorder skips every row whose client is `uw-probe` (counted as `probe` in `--status`), so
+UW's own probes are never mistaken for your real use, and a confirmation can never trigger a confirmation. Before the tag
+existed there was no way to tell probes from real requests (of 69,633 usage rows read on 2026-09-30, 69,557 were
+`Profile: Claude Code` and 76 were `Local Gateway`), which is why the first run never reads old, untagged history: with no
+watermark it starts at the first tagged row inside the last 3 days, and with no tagged row at the current last row.
+To check the tag yourself, see step P22a in `docs/qa-interactive-protocol.md`.
+
+Untagged scripts that call `/v1/messages` (some `keysync/` and `harness/` dev scripts) are indistinguishable from real use, so
+their successes and failures can appear as live records (issue #135; tag each when it is next edited).
+
+#### What is recorded: the status rules
+
+Rows come from the router's usage table, named columns only. Two things are always dropped and counted, never stored:
+client `uw-probe`, and a row whose completion time is more than 5 minutes ahead of your clock (`skew`).
+A model key is `provider/model`; if that is not a route in the picker's snapshot and the model already starts with
+`provider/`, the prefix is stripped and tried again (this keeps nvidia, whose real ids start with `nvidia/`, right,
+and joins an Anthropic model that appears as both `claude-x` and `anthropic/claude-x`). A row with no matching route is
+dropped (`unknownKey`).
+
+| Router status | Picker class | Rule |
+|---|---|---|
+| 200 with at least 1 output token | `ok` | Proof of life. A 200 with 0 output tokens is ignored (`zeroTok`): providers deliver notices that way. An `ok` over an already-`ok` record writes nothing (`okSeen`). |
+| 429 | `rate` | Hard signal: recorded at once. `pay` instead when the provider's text says the account is empty. |
+| 402 | `pay` | Hard: at once. |
+| 401 | `auth` | Hard: at once. |
+| 403 | `auth`, or `pay` when the text says so | Hard: at once. |
+| 404, 410 | `gone` | Hard: at once, with the provider-wide guard below. |
+| 500, 502, 503, 529 and other 5xx | `error` | Ambiguous: needs the two-failure rule. |
+| 504, 522, 524 | `timeout` | Ambiguous: same rule. A gateway-made 502 with an empty body counts as an ordinary ambiguous failure. |
+| 400, 413, 422 | ignored (`ignored400`) | Invalid request, tool schema, context too long: not the model's health. A hard class is taken only from a TIGHT anchor in the failure text (below). |
+| 499 | ignored (`abort499`) | The client gave up. |
+| any other status | ignored (`otherStatus`) | |
+
+A **tight anchor** is a phrase that names the account or the model, not the request: an empty balance said in words (`pay`),
+an account-state sentence such as "no longer available to new users" (`auth`), or a strong "this model is gone" phrase or
+the provider's machine code (`gone`). Loose words such as "rate limit" or "balance" are not enough on a 400 or a 5xx,
+because a validation error can quote your own prompt or a tool name. A 5xx worded as throttling stays an ambiguous failure.
+
+**The two-failure rule (5xx and timeouts).** A model is marked `error` or `timeout` only when the same key has two
+ambiguous failures that are at least 2 minutes apart, no more than 24 hours apart, with no 200 for that key between them.
+A second failure under 2 minutes after the first is a retry burst (Claude Code retries by itself) and is not counted
+(`retry`). The first failure waits in `pend`; a `pend` entry older than 24 hours is dropped, and a later failure over 24 hours
+after it starts a fresh one. A hard signal or a 200 clears `pend` for the key. When the rule is met the record's `m` reads
+`2 failures >= 2 min apart, no 200 between: HTTP <status>`. The reason for the 2-minute gap: of 854 same-key consecutive 5xx
+pairs in the router's usage log (measured 2026-09-30), 37% were within 60 seconds and 44% within 120 seconds.
+
+**Guards.**
+
+- *Gateway outage:* ambiguous failures spanning at most 60 seconds across 3 or more different providers, with no `ok` within a
+  minute of that span, are the gateway or the network failing, not the models. They are dropped (`outage`).
+- *Provider-wide 404:* 404s on 3 or more different models of one provider in a single run, with no 200 for that provider in the
+  run and no provider sentence, look like a wrong path or base URL. They are downgraded to ambiguous `error` (`m` reads
+  `404 across N models of <provider>: path or base URL?`), but only if that provider had an `ok` (probe or live) in the last
+  14 days; otherwise the 404s stay `gone`. (Of 954 keys that ever returned 404, none later returned 200, so a removed model
+  does not come back; the guard exists only for a wrong path on a provider that recently worked.)
+- *Same class again:* a hard failure with the same class and sentence as the current record, within 6 hours of it, writes
+  nothing (`dup`). An event not newer than the current record is `stale`. A request id seen twice counts once (`dupId`).
+- *Order:* events in one run are sorted by completion time (start plus duration), then row id, because the router can insert older rows with new ids.
+- *Anthropic subscription route:* rows with provider `anthropic` are observed like any other (a 429 usage limit is meaningful) but
+  never trigger a confirmation probe (it would spend subscription quota).
+
+**Watermark.** The catch-up reads rows with `id > watermark` in batches of 5,000, stops after 1.5 s or 100,000 rows (the next open continues), and
+stores the last row id it examined, so passed-over rows are read once. If the router's table is reset (the stored id is above the current
+maximum, the row at that id has a different time, or the router's sequence went backwards), the run starts again like a first run;
+`--status` says so (`the last run re-initialised it`) and records are kept.
+
+#### The confirmation probe
+
+A real 200 proves the model answered, not that it answered usefully (a provider can deliver a notice as a 200). When a model
+whose current record (the newer of probe and live) was not `ok` answers with a real 200, the catch-up writes the live `ok`
+straight away and may ask for ONE tiny probe of that model with UW's own prompt ("Say hello in 5 words.", 96 tokens, tagged
+`uw-probe`, 45 s timeout, one attempt, through the gateway, streamed like a sweep probe). The catch-up decides and reserves; a separate detached child sends it.
+A model with no earlier record is shown `ok` unconfirmed (no spend for an unknown), and a flip older than 1 hour is no longer confirmed.
+
+| Gate (checked in this order) | Value | Counted as |
+|---|---|---|
+| no hand-back hold in force | 10 minutes after a child could not reach the gateway or found a sweep | `hold` |
+| at most one probe per key | 6 hours | `capKey` |
+| provider is not `anthropic` | never probed | `anthropic` |
+| the key is a probeable text row in the snapshot | | `notRoutable` |
+| no sweep running (`bench.lock` held) | | `sweep` |
+| at most per catch-up | 3 | `capRun` |
+| at most per UTC day | 10 | `capDay` |
+| worst-case cost of the row | at most $0.01 (the `--economy` ceiling; free rows always pass) | `cost` |
+
+The reservation (`conf`, `confDay`) is written in the same write as the record, before any child exists, so a slow or
+crashed child, or a second picker, cannot cause a second probe of the same key inside the 6 hours. The child skips, and hands
+its reservation back, when there are no gateway settings, `/health` does not answer, or a sweep started meanwhile; it then
+sets a 10-minute hold (`confHold`) so every open does not reserve and release again. The probe's result overrules the flip:
+
+| Probe says | Record becomes | Picker |
+|---|---|---|
+| `ok` | the probe's record, marked `v:1`, with its time, ttft, tokens and reply | lowercase `ok`, `[live+probe HH:MMZ] <the reply>` |
+| `auth`, `pay`, `gone`, `empty`, or a 200 that was really a notice | that class, marked `v:1` | lowercase class, `[live+probe HH:MMZ] ...` |
+| `rate`, `error`, `timeout` (a transient failure) | the live `ok` stays, unmarked | plain live `OK`; not re-probed for 6 hours |
+| aborted, lock busy for 3 s, or a newer event replaced the flip | file left as it was | plain live `OK` after 2 minutes |
+
+The `--catchup` output line `confirmation probes: requested N; not requested by reason {...}` shows what was asked and why not.
+The spend is bounded even if tagging failed: 10 a day, 3 a run, 1 per key per 6 hours, $0.01 a row.
+
+#### The overlay and how it merges
+
+`state/observed.json` (schema 1, key order fixed). A live record is a bench record plus `l: 1`, `q` (the router's request id) and,
+after a confirmation, `v: 1`. All times are epoch seconds; `a` is the request's completion time.
+
+| Field | Meaning |
+|---|---|
+| `writtenAt` | when this content was written; moves only when the content changes |
+| `feed` | `ok`, `warn:key-mapping`, `unavailable:schema`, `unavailable:missing`, `unavailable:locked`, `unavailable:node-sqlite` |
+| `prov` | per provider row (`keyId`): baked `bench` counts, `benchFlags`, `benchAgeHist`, `live`, `liveOk`, computed with the picker's own `bakeBench` over the merged view |
+| `wm` | the watermark: `{ id, seq, at }` |
+| `tagId` | the first id of a `uw-probe` row seen |
+| `models` | `provider/id` to a live record: `{ s, d, a, q, l:1, o }` for ok; `{ s, d, a, q, l:1, m }` for a failure; `cf`/`cfa` while a confirmation is pending; `v:1` after one |
+| `pend` | the waiting first ambiguous failure per key |
+| `conf`, `confDay`, `confHold` | confirmation reservations, the day's count, the hand-back hold |
+
+Merge (`loadBench`, per model key): the record with the newer `a` wins; a tie goes to the probe; an overlay record older than the
+probe is ignored and pruned; a probe record whose status is `skip` is not a measurement and never beats a live one; a record dated
+more than 5 minutes in the future is ignored on either side. Pruning, on every write: keys no longer in the snapshot, records not newer than
+the probe, records older than 14 days, then above 800 records the oldest; `pend` over 24 hours; `conf` over 7 days.
+
+`observed.json` is written only when its content changes. Per-run bookkeeping lives in `state/observed.run` so the picker's mtime check does not
+fire on every open. The reader is total: a missing, torn, over 4 MB, wrong-schema or hand-edited file reads as no overlay, never an error, and every
+entry is rebuilt from a closed vocabulary.
+
+#### What the picker shows
+
+- **`stat` in UPPERCASE** (`OK`, `RATE`, `PAY`, `AUTH`, `GONE`, `ERR`, `T/O`, `EMPT`) means seen in real use after that row's last probe. It
+  keeps the 4-column width and the status colour, and survives colour off. **Lowercase** means a probe measured it, or a
+  confirmation probe verified a live result (`v: 1`).
+- **`reply:`** leads with `[live 14:32Z] answered HTTP 200 in 1.2 s; no reply text is kept for real requests`, or
+  `[live 14:32Z] worked live; confirming...` (only while a confirmation is pending and the flip is under 2 minutes old), or
+  `[live 14:32Z] <the provider's sentence>` for a failure, or `[live+probe 14:33Z] <the probe's own reply>` once verified. Times are UTC.
+- **Header:** `312 ok (2 live) (52%)`. `n` is the oks that came from real use and are not yet probe-verified (exactly the rows drawn
+  uppercase `OK`); shown only when above 0, so the figure never silently mixes the two populations. The `id:` line ends with `live 14:32Z`, the newest
+  live record merged into the screen, only while the overlay affects the screen.
+- **Level 0 recount at open.** The child stores per-provider baked counts (`prov`). At open the picker reads only `observed.json` (never
+  `bench.json`, about a millisecond) and, when its `writtenAt` is strictly newer than the snapshot's `builtAt`, lays those counts over the provider rows, so
+  level 0 and level 1 agree. A snapshot built after the overlay already contains it (`node menu/snapshot.mjs --build` bakes it in).
+- **Age is probe-only.** `oldest probe`, the age histograms and the outdated notice read probe stamps only. The `probed` cell of a live row shows
+  the age of its live observation.
+- **One feed note line** above the footer (the outdated notice takes its place when both apply): `live feed unavailable (schema changed)`,
+  `live feed unavailable (no router data)`, `live feed unavailable (no node:sqlite)`, `live feed: key mapping changed`, or
+  `live feed: locked, showing the last update HH:MMZ`. It says the feed is not trustworthy; probes are unaffected.
+- **Reload.** The picker stats `observed.json` once per keystroke; on any change of its mtime it re-reads the overlay and re-applies it in place (cursor,
+  level and filters stay). A file that exists but does not read (torn, mid-rename) keeps the previous state and is retried on the next keystroke.
+
+See `docs/visual-design.md` for frames generated by the real renderer.
+
+#### Files and paths
+
+| Path | What | Written by |
+|---|---|---|
+| `state/observed.json` | the overlay | the catch-up, and a confirmation child, both under `observed.lock`; the picker only reads |
+| `state/observed.run` | last run time, examined and skip counts, last error, feed | every non-dry run that the kill switch does not stop (stamped first, so even a crash moves its mtime; the launcher throttles on it) |
+| `state/observed.lock` | single writer lock; a dead holder or a lock older than 3 minutes is taken over | the writers |
+| `state/observe.off` | the kill switch | `--off` / `--on` |
+| `state/observed.json.tmp-*` | debris of a killed write; swept after 5 minutes | nobody (swept at child start) |
+| `usage.sqlite` in the router's data directory (next to `service.json`; `UW_CCR_DATA_DIR` overrides the directory) | the router's usage log | read-only, by the child; `request-logs.sqlite` is read only when `request_logs` is not inside `usage.sqlite` |
+
+The overlay is derived from the router's log and small (about 250 bytes a record, capped at 800), so it gets no history copies and can be deleted safely
+(`--reset`). The launcher starts a child only when the last run finished over 30 seconds ago, `observed.lock` is absent or older than 2 minutes, and
+its own process has not spawned in the last 30 seconds. The child is started with fixed arguments, no shell, no window, the repository as its working directory
+and an allowlisted environment (`PATH`, system variables, `UW_*`, `CCR_INTERNAL_*`), not the picker's whole one.
+
+#### Privacy
+
+Stored: a status class, the duration, the output-token count, the time, the router's request id, and the flags `l`, `v`, `cf`. For a failure with status
+401, 402, 403, 404, 410 or 429, also the provider's own error sentence, at most 160 characters, redacted (keys and key shapes, URLs, e-mail addresses and opaque
+ids are masked). For every other failing status (400, 413, 422 and all 5xx) the fixed text `HTTP <status> (provider message not kept)`, because those bodies can
+echo the conversation. A live `ok` carries no text. A confirmation probe stores the reply to UW's own prompt, like a sweep probe.
+
+Never stored: prompts, replies, request or response bodies, headers, URLs, credentials, tokens. What the child reads: the named columns of the usage table
+(`id, created_at, request_id, client, provider, model, status_code, duration_ms, output_tokens`) and, for failing rows only, the fields `$.error.message`,
+`$.error.code`, `$.error.type` and `$.error.status` extracted inside SQLite from the response body (guarded by `json_valid` and a 256 KB size limit, at most 200 failing
+rows a run), plus the two short gateway columns `error` and `gateway_error`. The body itself never enters the process, there is no prefix or raw-text fallback (a
+body that is not valid JSON, has no `error.message` or is too large gets the fixed text), and the complete sentence is used in memory only to classify. Tests
+assert the SQL text and that no `substr(response_body_text` exists under `refresh/`. Redaction runs on write and again on load;
+`node refresh/bench-cli.mjs --redact` also redacts `m` and any non-ok `p` in `observed.json` (under `observed.lock`; the overlay pass is reported as skipped if the lock is
+held) beside the bench file and log.
+
+#### Troubleshooting
+
+| Symptom | Cause | Action |
+|---|---|---|
+| No uppercase rows, no `live` stamp, ever | it is off (`--status` prints `DISABLED`), or nothing you used changed status (`0 model record(s)` with `okSeen`), or the launch is blocked (`UW_OBSERVE=0` in the shell that started Claude Code) | `--status`; `--on`; unset the variable. An empty overlay is normal when everything you used worked. |
+| `live feed unavailable (schema changed)` | a router upgrade renamed or dropped a column the reader needs (`id, created_at, request_id, client, provider, model, status_code, duration_ms, output_tokens`) | Nothing wrong is written and probes are unaffected. `--status` prints the missing column names on a line right after `feed:` (`usage_events columns missing: status_code, duration_ms`; at most 12 names), taken from the `missing` field of `state/observed.run`. The reader needs updating for the router's new schema; `--off` hides the note meanwhile. Records are kept but stop growing. |
+| `live feed unavailable (no router data)` | `usage.sqlite` is missing: router not installed or moved, or `UW_CCR_DATA_DIR` points at the wrong place | Check the router's data directory; unset `UW_CCR_DATA_DIR`. The note appears only once an overlay exists. |
+| `live feed: key mapping changed` | in one run over half of at least 10 non-anthropic rows matched no route in the snapshot: the router now writes provider or model names differently, or the snapshot is old | Rebuild the snapshot (`node menu/snapshot.mjs --build`); if it persists the key derivation needs updating. Unknown rows are only dropped, nothing wrong is written. |
+| `live feed: locked, showing the last update HH:MMZ` | three runs in a row found the router's database busy (over 250 ms) | Usually clears itself on a later open. Nothing is lost; the watermark waits. |
+| `live feed unavailable (no node:sqlite)` | Node without built-in `node:sqlite` (this machine runs v25.0.0) | Use a Node that has it. |
+| `--status` says `last error: overlay-unreadable: EBUSY` (or `EPERM`) | antivirus or another process holds `observed.json` | The run is skipped, records and watermark are safe; the next open retries. |
+| `--status` says `last error: no usable snapshot (...)` | the picker's snapshot is missing or old | `node menu/snapshot.mjs --build`. |
+| `--catchup` prints `skipped (locked: another run holds the lock)` | another catch-up or a confirmation write is in flight | Wait a moment. A dead holder or a lock over 3 minutes is taken over by itself; delete `state/observed.lock` only if no `observe-cli` process is running. |
+| A model stays `ERR` or `RATE` after you fixed it | a live record stays until newer evidence: your next real request that succeeds, or a probe newer than it | Use the model once, or re-probe: `node refresh/bench-cli.mjs --live --only provider/id --force`. |
+| A model shows uppercase `OK` but returns notices | a 200 with output tokens can still be a notice | The confirmation probe overrules it (except `anthropic`, never probed); otherwise re-probe as above. |
+| No confirmation probe ran after a flip | a gate refused it | `node --no-warnings refresh/observe-cli.mjs --catchup --dry` prints `not requested by reason {...}`; the reasons are in the table above. |
+| Picker did not change after you fixed a provider | the first frame shows the previous run; the child starts at most every 30 seconds | Press a key a moment later, or reopen after 30 seconds. |
+| `watermark re-initialised` in the output | the router's table was reset or rebuilt under the stored id | Expected once; records are kept and the run starts like a first run. |
+
+#### Known limits
+
+- Real traffic through non-Anthropic models is thin (2,402 non-anthropic usage rows between 2026-09-01 and 2026-09-28, many of them sweeps), so the
+  signal is mostly the `anthropic` subscription route plus occasional free-model use. A value review will decide how much of the feed to keep (issue #139).
+- The router logs only the final provider. With fallback routing on, a request that failed on one provider and succeeded on another is one row for the second.
+  Fallback is off today; the plan (`plans/live-observer-plan.md`, risk 3) says where the attempt count lives.
+- `request_logs` keeps roughly the last 1.5 hours, so older failures carry the fixed text instead of the provider's sentence (issue #134).
+- The reader's SQLite calls are synchronous and cannot be interrupted, so the child's watchdog cannot cut one short; the 256 KB and 200-row caps bound them (issue #140).
+- The spend caps (`conf`, `confDay`) live in `observed.json`, so `--reset` deletes them together with every live record and the feed position, and allows a fresh round of confirmations (issue #141).
+- Detached-child behaviour on Windows (no console window, exits on its own) is reasoned from the code, not observed on a real console (issue #142).
+- A 401 or 402 marks one model, not the whole provider (issue #136). There is no doctor line yet (issue #137).
+- Untagged dev scripts count as real use (issue #135).
+
+Issues: #126 tagging, #127 overlay, #128 usage feed, #129 classifier and rules, #130 confirmation probe, #131 picker, #132 `--redact` / `--status` / `--reset`, #133 docs, #138 kill switch, all in
+`Osamious/ultimatewrap`; the follow-ups are the ones named above.
+
 ## 7. Troubleshooting
 
+- **The picker shows a `live feed ...` note, or a status in UPPERCASE you did not expect:** that is the live feed; see 6f (Troubleshooting
+  table) and run `node refresh/observe-cli.mjs --status`. `node refresh/observe-cli.mjs --off` switches it off without a source edit.
 - **Picker doesn't open on `ctrl+g`:** run `node menu/doctor.mjs`. If
   `editor-wiring` isn't GREEN, re-run `. menu/install.ps1`.
 - **`keysync/run.mjs` throws "multi-key provider(s) with no deliberate
