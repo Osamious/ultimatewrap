@@ -134,10 +134,12 @@ afterward — that's the same check `key.mjs` runs for you automatically.
 
 ## 6. Phase B — catalogue refresh and health
 
-Three independent refresh actions. None of them run on a schedule; every one
-is a deliberate, manually-invoked command by design (a scheduler that
-supplies its own "yes, do this" on every tick turns a safety gate into a
-constant "yes").
+Refresh actions 6a to 6d are deliberate, manually-invoked commands by design; none
+runs on a schedule (a scheduler that supplies its own "yes, do this" on every
+tick turns a safety gate into a constant "yes"). 6e describes what the snapshot
+build derives from the bench data. 6f is the one exception to "manual": the picker
+starts a short, read-only catch-up of live model status each time it opens (no timer,
+no daemon, never a request to a provider), and it has a kill switch.
 
 ### 6a. Catalogue insulation — keeping the model list off `node_modules`
 
@@ -226,7 +228,13 @@ a real session takes), so they include routing overhead.
 **Live observations never change `bench.json`.** Since the live feed (6f) the picker can draw a status from your real
 requests, in UPPERCASE, but that comes from a separate file (`state/observed.json`) merged over `bench.json` when a list is drawn.
 A sweep, `--compact` and `--reclassify-notices` work on `bench.json` exactly as before (`--redact` also redacts the overlay, see 6f), and a probe newer than a live record
-wins. Live results never refresh `oldest probe`, the `probed` ages or the outdated notice; only a sweep does.
+wins. Live results never refresh `oldest probe`, its age histograms or the outdated notice; only a sweep does. (The model list's
+own `probed` cell is the exception in display only: a live row shows the age of its live observation.)
+
+**"Fresh" in this section means usable, not recent.** The picker has no age limit: a bench record is used whatever its age,
+unless it has no timestamp or is dated more than 5 minutes ahead of the clock (`isUsable` in `menu/bench-data.mjs`). Where the text
+below says a "fresh" record, that is what it means; how old a record is shows in `oldest probe`, `probed` and the outdated notice.
+The sweep's own `--ttl` (7 days) and the 14-day protection of real records (below) are a separate, sweep-only matter.
 
 ```powershell
 # Dry (default): the plan — rows, providers, free/paid split, spend, wall time. Sends nothing.
@@ -242,6 +250,9 @@ node refresh/bench-cli.mjs --live --economy
 # A sample (round-robin, so every provider's first row is in it) or specific providers/models.
 node refresh/bench-cli.mjs --live --limit 40
 node refresh/bench-cli.mjs --live --only aihubmix,openrouter/some-model
+
+# Keep more (or fewer) dated copies of bench.json in state/bench-history (default 30, at least 1; there is no way to turn it off).
+node refresh/bench-cli.mjs --live --keep-history 60
 
 # Fold an interrupted run's log into bench.json without probing.
 node refresh/bench-cli.mjs --compact
@@ -339,20 +350,20 @@ What a live run does, so its cost is predictable:
   picks those rows up.
 - **Spend caps:** `--max-spend` (default $5.00 across the run; $2.00 under `--economy`)
   and `--max-row-cost` (default $0.10 per row; $0.01 under `--economy`; judged on the
-  worst case at the full 96-token budget). Explicit flags always win over either
-  mode's default. Rows over the ceiling are recorded `skip` (`row-cost`), and paid rows
+  worst case at the stream-cut allowance: 384 tokens by default, or `--max-tokens` when `--stream-cut 0`
+  turns the cut off). Explicit flags always win over either mode's default. Rows over the ceiling are recorded `skip` (`row-cost`), and paid rows
   past the cap `skip` (`spend-cap`). A row being retried faces the cap again (a cap
   leak: retries used to bypass it, and a $2.00 cap reached an estimated $2.12; a retry
   that no longer fits is recorded `skip:spend-cap`). **The cap is an estimate, not a
   hard bound on the invoice**: each probe is charged from the output tokens the
   provider reported (a timeout at its worst case), and each probe in flight holds its
-  worst case (the full `max_tokens`) until it finishes, so concurrency cannot push the
+  worst case (the cut allowance, 384 tokens by default) until it finishes, so concurrency cannot push the
   estimate past the cap. A row that fits only until those holds are released waits
   instead of being skipped. Refused or errored requests (401/402/404/5xx) are normally
   not billed; a stream that fails after tokens flowed can be, and is charged when
   reported. The dry run says which mode it is (`probe-all (default)` or `economy`),
-  prints both the typical-answer estimate and the worst case (every paid row at full
-  `max_tokens`), and when the cap can bind says it cuts the late, expensive rows (paid
+  prints both the typical-answer estimate and the worst case (every paid row at the full
+  cut allowance), and when the cap can bind says it cuts the late, expensive rows (paid
   rows are queued cheapest-first within each provider). It lists the costliest rows
   over the ceiling, and a finished run prints how many rows remain unprobed and why,
   by count (`row-cost`, `spend-cap`). Re-run to resume; skips are always re-probed.
@@ -361,7 +372,7 @@ What a live run does, so its cost is predictable:
   `--compact` while a sweep runs, is refused (`another sweep is running (pid N since
   HH:MM); nothing was sent`, exit code 5) before anything is sent or written, and the
   dry plan says so too. A lock whose process is gone, or that outlived its
-  `--max-minutes` plus 10 min, is taken over with a printed notice; it is released on a
+  `--max-minutes` plus 10 min (24 h plus 10 min for a run with no limit), is taken over with a printed notice; it is released on a
   normal finish, Ctrl-C, an outage stop and an uncaught error. A `bench-cli.mjs --live`
   process started before the lock existed is looked for through the OS (best effort)
   and blocks a new run as well. The cap and ceiling are **per invocation**: a resumed
@@ -402,9 +413,13 @@ What a live run does, so its cost is predictable:
   even beside `--only`; when both contribute, the selection is their union and the plan prints both counts.
 - **Start-up health gate:** the first `/health` call gets 10 s and one retry after 2 s
   before the run refuses to start ("the gateway is not answering; nothing was sent").
-- **Exit code:** 0 for a normal outcome or a Ctrl-C; 3 when probes were sent and not
-  one model answered `ok` (check the gateway and the keys); 4 when the gateway never
-  came back; 5 when another sweep is running.
+- **Exit code:** 0 for a normal outcome or a Ctrl-C (also the dry plan, `--compact`,
+  `--redact` and `--reclassify-notices` when they succeed); 1 for a failure before or outside the
+  sweep (no usable snapshot, no gateway settings or the gateway not answering at start-up, a
+  `--only` / `--only-file` that matches nothing, an unreadable list, a failed `--redact` or
+  `--reclassify-notices`); 2 for a bad argument; 3 when probes were sent and not one model
+  answered `ok` (check the gateway and the keys); 4 when the gateway never came back; 5 when
+  another sweep is running. The closing snapshot rebuild never changes the code.
 - **Ctrl-C** stops scheduling, **drops the probes still in flight** (they are not
   recorded and are re-probed on resume), saves what finished and compacts; run again
   to resume. A second Ctrl-C exits immediately (the log is still on disk and
@@ -447,15 +462,18 @@ What a live run does, so its cost is predictable:
   it, so a route that was `ok` and later returns `gone` would lose its evidence. Every run
   that writes `bench.json` or its log (`--live`, `--compact`, `--redact`, a real
   `--reclassify-notices`; never a dry run) first copies the current `bench.json` to
-  `~/.uw/state/bench-history/bench-<UTC yyyymmddThhmmssZ>.json` and prints
-  `bench: history saved -> ...`. **The copy is always redacted** (every record goes
+  `~/.uw/state/bench-history/bench-<UTC yyyymmddThhmmssZ>.json` (a second copy in the same
+  second gets a `_NN` suffix) and prints
+  `bench: history saved -> bench-history/bench-<stamp>.json (kept N of M)` (M copies existed once the
+  new one was written, N remain after pruning, `; pruned K` when older ones were removed; `kept 1 of 1`
+  when it is the only one). **The copy is always redacted** (every record goes
   through the same provider-text redaction as compaction, so a `bench.json` written
   before redaction existed cannot leak a key fragment into history; measurements and
   statuses are untouched; the copy is content-identical, re-serialised as compact JSON,
   so identical for files the tool wrote). It
   saves `bench.json` only, not an unfolded `bench.jsonl` log: the sweep's end-of-run
   compaction folds the log into `bench.json` later, and the next run's copy has it. A
-  copy identical to the newest one is not repeated (`history unchanged`). At most 30
+  copy identical to the newest one is not repeated (`bench: history unchanged (identical to <name>)`). At most 30
   copies are kept (about 1 MB each), the one just written always among them;
   `--keep-history N` changes that (at least 1: there is deliberately no way to turn
   history off). Older copies are pruned by name, and only files named
@@ -469,8 +487,11 @@ What a live run does, so its cost is predictable:
   (finished, or stopped by Ctrl-C or the time limit; a run whose only results were
   transient ones that older real records outrank changes nothing and does not rebuild)
   runs `node menu/snapshot.mjs --build` itself as a background child process (5 minute
-  limit) and prints one line,
-  `bench: snapshot rebuilt (<N providers, M models, catalogue ...; routability: ...>)`.
+  limit) and prints one line, `bench: snapshot rebuilt (<summary>)`, where the summary is the
+  build's own `N providers, M models, catalogue <date>` line and its `routability: ...` line joined
+  with `; `, **clipped to 120 characters** (so a long routability timestamp can be cut off; the real
+  routability stamp is in the snapshot). Example from a one-row run on 2026-09-30:
+  `bench: snapshot rebuilt (57 providers, 6032 models, ...; routability: ...)`.
   When the gateway is up and the vault registry, providers and catalogue files exist,
   `node refresh/bench-cli.mjs --live` alone therefore brings both picker levels up to
   date: the rebuild recomputes the bench counts and flags from `bench.json`, and also
@@ -576,10 +597,11 @@ and with no colour the word alone is drawn. The words:
 deciding source as `outModalitySrc` (present only when known); both arrived with snapshot
 schema 7 (a schema-6 file is rejected and rebuilt rather than drawn with blank `status` and `?`); the
 provider `status` became three-state in schema 8. The existing `modality` field is unchanged: it
-is still the listing's raw capability token. On the real 2026-09-29 data (6,032 routes) this
-gives: `chat` 3,672 (`mode` 2,097, `output` 1,346, `listing` 229), `chat?` 628 (`bench-ok`),
-`image` 106, `embed` 87, `video` 44, `audio` 33, `stt` 31, `live` 20, `rank` 11, `ocr` 9,
-`mod` 6, `other` 5, and `?` 1,380 (22.9%; every one of those has only failed probes).
+is still the listing's raw capability token. On the 2026-09-30 snapshot (6,032 routes) this
+gives: `chat` 3,657, `chat?` 590 (`bench-ok`, so it moves with every sweep), `image` 106, `embed` 87,
+`video` 44, `audio` 33, `stt` 31, `live` 20, `rank` 11, `ocr` 9, `mod` 6, `other` 5, and `?` 1,433
+(23.8%: routes with no positive evidence). The per-source split of `chat` was measured on
+2026-09-29 only (3,672 `chat`: `mode` 2,097, `output` 1,346, `listing` 229) and was not re-measured.
 
 A long id is **elided to keep what differs**: for each provider the picker picks the
 head/tail split that leaves the fewest rows drawing an identical cell (then re-splits
@@ -615,11 +637,12 @@ combine with each other and with typed text (logical AND), and the header shows 
 - `ctrl+l` **1M+**: `ctx >= 1,000,000` **or** an id ending in `[1m]` (any case).
   Both are needed: in the real catalogue 1,062 ids carry the tag, one of them
   (`teamorouter/kimi-k3[1M]`) with a null ctx, and two reach 1M without the tag.
-- `ctrl+x` **no gone**: on model lists and in flat scope it hides every model whose latest *fresh*
-  bench record is `gone` (the route is not found upstream); a route with no fresh record is shown
-  and a `gone` record hides whatever its age. **On either level it also changes the percent figures**:
+- `ctrl+x` **no gone**: on model lists and in flat scope it hides every model whose latest usable
+  bench record is `gone` (the route is not found upstream), whatever its age; a route with no
+  record is shown. **On either level it also changes the percent figures**:
   the provider list's `ok` `%` and both headers' `K ok (P%)` are ok / models while the toggle is
-  off, and ok / (models minus gone) while it is on (a zero denominator reads `-`). At the provider
+  off, and ok / (models minus gone) while it is on (a zero denominator reads `-` in the provider
+  list's `%` cell, and the header then shows the `K ok` count without a `(P%)`). At the provider
   list it hides no provider row and leaves the cursor where it is; on a model list turning it on or
   off returns the cursor to the top. The `free` `%` is always over ALL models (a catalogue price
   fact) and the `ok` count, `models` and the raw `gone` column never change. Pure reducer toggle over
@@ -631,8 +654,9 @@ combine with each other and with typed text (logical AND), and the header shows 
   blanks it), so it does not match. The provider list's `free` count is different: it counts the
   `FREE` / `FREE?` badges the catalogue gave at snapshot time, before that blanking, so the two can
   differ by exactly those rows. The chip is `[free]`. With all four chips on, the chip row shortens in
-  two steps (packed, then `[1M]` and `[-gone]`) so the counts on the right are never clipped: at 78
-  columns the left part (`filter:` plus the four chips) is 32 columns wide.
+  two steps (packed, then `[1M]` and `[-gone]`) so the counts on the right are never clipped
+  (`menu/style.mjs`). The provider list draws only `[no gone]`. Real-console delivery of `ctrl+x` and
+  `ctrl+e` was confirmed by the owner on 2026-09-30.
 
 The header's right side is **counts only**: `N of M | K ok (P%)` on a provider
 (N = models matching the filters, M = the provider's models, K = that provider's
@@ -656,7 +680,7 @@ or `N plan` (plan-covered models) after the id when it fits.
 
 **Baked versus live.** The provider list (level 0) is BAKED: its counts, verdicts and
 its `(K ok)` total come from the snapshot and are as of the last `node menu/snapshot.mjs
---build` (the header's `bench MM-DD` is that date). Model lists (level 1 and flat scope)
+--build` (the `bench MM-DD` stamp at the right end of the `id:` line is that date). Model lists (level 1 and flat scope)
 are LIVE: their rows, `benched` stamp, `K ok` and the ok-only filter all read
 `bench.json` on first draw. After a new sweep the two can therefore disagree (for
 example `1396 ok` on the provider list and `1404 ok` in flat scope) until the snapshot
@@ -665,8 +689,9 @@ is rebuilt.
 **The provider list's sweep columns.** Level 0 is, left to right: `key id`, `status`,
 `oldest probe` (only when the terminal has room after the full key id), `models`, `ok` and its `%`,
 `free` and its `%` (only when it has room after `oldest probe`), then seven raw
-counts in this order: `empt`, `auth`, `pay`, `rate`, `gone`, `t/o`, `err`. The `dead`
-and `needs $` *yes/no* columns, `skip`, `limit` and the health label are gone.
+counts in this order: `empt`, `auth`, `pay`, `rate`, `gone`, `t/o`, `err` (the `ok` count is
+the `ok` sub-column; `skip` is not a column). There is no health column and no `probed` column at
+this level: `probed` exists only on model lists, and the provider's age is `oldest probe`.
 
 - `status` has three states over the provider's probe records (of any age; `skip` records
   are not probe results and are ignored):
@@ -681,8 +706,8 @@ and `needs $` *yes/no* columns, `skip`, `limit` and the health label are gone.
   - **blank**: no probe record (a provider nobody benched has no verdict).
   It is a label only: routing never prunes a provider for reading `down` or `dead`. It is
   baked as `benchFlags.status` at snapshot build (schema 8); the older two-state
-  `benchFlags.alive` (answered in any shape) stays in the file for other readers. On the real
-  2026-09-29 data (57 providers): 42 alive, 15 down, 0 dead. The 15 down are the providers
+  `benchFlags.alive` (answered in any shape) stays in the file for other readers. On the
+  2026-09-30 snapshot (57 providers): 42 alive, 15 down, 0 dead. The 15 down are the providers
   with no `ok` model at all (`pollinations`, `maestro`-`deepseek`, `gmicloudai`, `chutes`, `routllm`,
   `seekai`, `cerebras`, `sambanova`, `xai`, `tabiai`, `gorouter`, `indeedwebid`, `kiosapi`,
   `kktoken`, `justdowork`). The two-state version read all 57 as alive.
@@ -768,7 +793,7 @@ or `N/M` with M withheld; the worst real pair `469/100` fits, a wider one abbrev
   disclosure). The line costs one row on every list screen while it shows (`rowsAvail`, shared by
   the reducer and the renderer, so no frame exceeds the terminal height). The provider list uses
   the stamp and the per-provider age histograms baked into the snapshot (`benchOldestAt` and each row's
-  `benchAgeHist`, schema 9; about 3.8 KB more on the real 57-provider file); once `bench.json` has been
+  `benchAgeHist`, schema 9; about 3.9 KB more on the real 57-provider file); once `bench.json` has been
   loaded (first model screen) its own oldest stamp and histograms replace them (an empty or missing file leaves
   the snapshot's). The sweep engine keeps its own
   7-day `--ttl` and retention window; none of that changed.
@@ -778,7 +803,9 @@ or `N/M` with M withheld; the worst real pair `469/100` fits, a wider one abbrev
   describes. (The provider list's `ok`..`err` columns can therefore add up to more than
   the number of distinct ids.)
 - *Stamps are UTC* and say so: `benched 09-29 12:35Z`, `routable ...Z`, `discovered
-  ...Z`. The provider list's `bench MM-DD` is a date only.
+  ...Z`, `live HH:MMZ`. They sit at the right end of the `id:` line. On the provider list that
+  line carries `routable`, `bench MM-DD` (a date only) and `live`; on model lists it carries
+  `benched`, `discovered` and `live`.
 - *Cells never lie:* a count of 100,000 or more draws `big` (never a truncated number),
   and a duration over 9999 s draws `long`.
 - *Snapshot builds:* `node menu/snapshot.mjs --build` prints one line saying what the
@@ -793,15 +820,16 @@ or `N/M` with M withheld; the worst real pair `469/100` fits, a wider one abbrev
   font). Anything else, and any ASCII terminal, keeps the default.
 
 The counts and verdicts are a snapshot of the last sweep, **baked into the
-snapshot**, not read live: the provider list never opens `bench.json` at startup. After a sweep, refresh them by rebuilding
-the snapshot, which also adds `bench MM-DD` (the sweep's date) to the header
+snapshot**, not read live: the provider list never opens `bench.json` at startup. A `--live` sweep rebuilds
+the snapshot itself when it ends (see the sweep notes above); after any other bench writer, refresh them by
+rebuilding it by hand, which also updates the `bench MM-DD` stamp (the sweep's date) on the `id:` line
 where it fits:
 
 ```powershell
 node menu/snapshot.mjs --build
 ```
 
-A snapshot built before this change is schema 5 and is refused (the picker says
+A snapshot of any other schema than the current one (9) is refused (the picker says
 to rebuild); a rebuild with no `bench.json` shows blank cells.
 
 ### 6e. Route hints baked at snapshot build: blank `FREE?` badges and alias labels
@@ -816,7 +844,7 @@ counts, a future-dated one changes nothing). Both are **additive optional fields
   credits" is not (possibly) free. The badge becomes blank (still inside the closed set
   `FREE` / `FREE?` / `PLAN` / `PAID` / blank) and the row gets `badgeNote: "probe: payment
   required"`. `FREE` (real zero price and a grant), `PLAN` and `PAID` are never touched.
-  Example (the 2026-09-29 snapshot and bench file): 12 routes change (kilo 2, xkiro 4,
+  Example (the 2026-09-30 snapshot): 12 routes change (kilo 2, xkiro 4,
   commandcode 2, teamorouter 3, tokenrouter 1). Refreshed on every rebuild, so a provider
   that is funded later gets its `FREE?` back once the probe stops saying `pay`.
 - **Dead aliases point at the working route.** A route whose own fresh status is `gone`, and
@@ -829,9 +857,10 @@ counts, a future-dated one changes nothing). Both are **additive optional fields
   `= <sibling> (works)` (dim), and the `id:` line reads `id: <id>  = <sibling>` when it fits.
   The pointer is baked, but it is honoured only while both records are still fresh **now**
   (a sibling that has since stopped answering shows nothing). It is a label: enter still
-  selects the row you are on. Example (same data): 59 routes (alibaba 26, openai 22, google
-  7, nousresearch 2, openrouter 1, cohere 1), exactly the study's count; the test replays
-  the study's frozen table (`plans/bench-study/models.csv`) to keep that true.
+  selects the row you are on. Example (the 2026-09-30 snapshot): 76 routes (alibaba 30, openai 27, google
+  15, nousresearch 2, openrouter 1, cohere 1). The study's count on the 2026-09-29 data was 59 (alibaba 26, openai 22,
+  google 7, nousresearch 2, openrouter 1, cohere 1); the test replays the study's frozen table
+  (`plans/bench-study/models.csv`) to keep that true; the live count moves with each sweep.
 
 ### 6f. Live model status (the live feed)
 
@@ -844,7 +873,9 @@ short-lived Node process (`node --no-warnings refresh/observe-cli.mjs --catchup`
 database read-only, reads the rows added since the last run (a stored row id, the "watermark"), classifies each
 one with the same classifier the sweep uses, and writes the result to `state/observed.json`. The picker merges
 that file over `state/bench.json`, model by model. The child exits by itself in tens of milliseconds (two dry
-runs on 2026-09-30 examined 282 new usage rows in 40 and 54 ms).
+runs on 2026-09-30 examined 282 new usage rows in 40 and 54 ms; a real detached catch-up started by the picker
+launcher on 2026-09-30 took about 13 ms to spawn, updated `state/observed.run` within about a second, examined 9 usage
+rows and exited cleanly).
 
 **What it does not do.**
 
@@ -859,7 +890,7 @@ runs on 2026-09-30 examined 282 new usage rows in 40 and 54 ms).
   for six failure statuses, the provider's own redacted error sentence (see "Privacy").
 
 **Timing.** The first frame is drawn from what the previous run found. This open's result appears on the next
-keystroke, a moment later (Node's start-up plus the tens of milliseconds of reading; the design measured a spawn at 11 ms on the picker's side, and a real-console check is still open, issue #142). A new child starts at most once every 30 seconds.
+keystroke, a moment later (Node's start-up plus the tens of milliseconds of reading; the design measured a spawn at 11 ms on the picker's side, and a real launch measured about 13 ms). A new child starts at most once every 30 seconds.
 
 #### Commands
 
@@ -893,15 +924,15 @@ arguments, 3 the watchdog (a child that runs longer than 10 seconds is ended; 90
 `--confirm <provider/id>` also exists but is started only by the catch-up; run by hand it does nothing unless the
 overlay holds a fresh reservation for that key.
 
-Example `--status` output (the numbers are the state on 2026-09-30):
+Example `--status` output (the state after the real catch-up on 2026-09-30):
 
 ```text
 observe: enabled
-observe: last run: 2026-09-30T00:08:12.297Z; no error
+observe: last run: 2026-09-30T06:33:49.944Z; no error
 observe: feed: ok
-observe: watermark: id 70759 (row time 2026-09-30T00:08:01.894Z)
-observe: overlay: 0 model record(s), 0 pending, written 2026-09-30T00:08:12.297Z
-observe: last run examined 7; skipped {"okSeen":7}
+observe: watermark: id 71258 (row time 2026-09-30T06:33:49.051Z)
+observe: overlay: 0 model record(s), 0 pending, written 2026-09-30T06:33:49.944Z
+observe: last run examined 9; skipped {"unknownKey":1,"probe":1,"ignored400":1,"okSeen":6}
 ```
 
 After a router schema change the same command adds one line right after `feed:` (only while the feed is `unavailable:schema`):
@@ -1104,7 +1135,7 @@ See `docs/visual-design.md` for frames generated by the real renderer.
 | `usage.sqlite` in the router's data directory (next to `service.json`; `UW_CCR_DATA_DIR` overrides the directory) | the router's usage log | read-only, by the child; `request-logs.sqlite` is read only when `request_logs` is not inside `usage.sqlite` |
 
 The overlay is derived from the router's log and small (about 250 bytes a record, capped at 800), so it gets no history copies and can be deleted safely
-(`--reset`). The launcher starts a child only when the last run finished over 30 seconds ago, `observed.lock` is absent or older than 2 minutes, and
+(`--reset`). The launcher starts a child only when the last run started over 30 seconds ago (`observed.run` is stamped at the start of a run), `observed.lock` is absent or older than 2 minutes, and
 its own process has not spawned in the last 30 seconds. The child is started with fixed arguments, no shell, no window, the repository as its working directory
 and an allowlisted environment (`PATH`, system variables, `UW_*`, `CCR_INTERNAL_*`), not the picker's whole one.
 
@@ -1152,7 +1183,9 @@ held) beside the bench file and log.
 - `request_logs` keeps roughly the last 1.5 hours, so older failures carry the fixed text instead of the provider's sentence (issue #134).
 - The reader's SQLite calls are synchronous and cannot be interrupted, so the child's watchdog cannot cut one short; the 256 KB and 200-row caps bound them (issue #140).
 - The spend caps (`conf`, `confDay`) live in `observed.json`, so `--reset` deletes them together with every live record and the feed position, and allows a fresh round of confirmations (issue #141).
-- Detached-child behaviour on Windows (no console window, exits on its own) is reasoned from the code, not observed on a real console (issue #142).
+- Detached-child behaviour on Windows: a real launch from the picker on 2026-09-30 spawned in about 13 ms, updated `state/observed.run`
+  within about a second and exited cleanly. That the child opens no console window is reasoned from the spawn options (`detached`,
+  `windowsHide`), not separately observed (issue #142).
 - A 401 or 402 marks one model, not the whole provider (issue #136). There is no doctor line yet (issue #137).
 - Untagged dev scripts count as real use (issue #135).
 
