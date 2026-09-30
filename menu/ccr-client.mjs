@@ -41,6 +41,16 @@ export function ccrVersion() {
   } catch { return null; }
 }
 
+// The gateway library CCR bundles beside its own cli.js; recipe E patches its dist/index.js and is verified
+// against one version of it, so the installed one is read the same way `ccrVersion()` reads CCR's.
+const GATEWAY_LIB_DIR = path.join(INSTALL_DIR, "node_modules", "@the-next-ai", "ai-gateway");
+
+export function gatewayLibVersion() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(GATEWAY_LIB_DIR, "package.json"), "utf8")).version;
+  } catch { return null; }
+}
+
 
 // WHERE THE ROUTER KEEPS ITS FILES, as CCR 3.0.22's own bundle resolves them (dist/main/cli.js, identifiers
 // `$i`, `uq`, `Tpe`, `hw`, `Nx`; Windows branch -- this project is Windows-only). An env value counts only when
@@ -95,6 +105,8 @@ export const CONTRACT = Object.freeze({
   // layout, and because `npm i -g` reverting that patch is the single
   // highest-severity CCR coupling this project has (report 10, P1 #10).
   gatewayBundle: path.join(INSTALL_DIR, "dist", "main", "cli.js"),
+  // The bundled ai-gateway library, patched by recipe E (surface the upstream failure reason).
+  gatewayLibBundle: path.join(GATEWAY_LIB_DIR, "dist", "index.js"),
   // The RPC methods this project actually calls. Probed at doctor time rather than
   // assumed: they are wire strings and not minified, which makes them the most
   // solid CCR dependency available -- and still worth checking, because an

@@ -1,0 +1,18 @@
+{
+ "ccrVersion": "3.0.22",
+ "libVersion": "1.0.18",
+ "note": "Stock (unpatched) hunks with 80 chars of context each, cut from the real stock bytes. Minified code only.",
+ "cli": {
+  "A": "er(\"abort\",o),r()};t?.addEventListener(\"abort\",o,{once:!0}),n=setTimeout(o,e)})}var PN=\"gateway\",K7=5e3,z7=15e3,aVe=4e3,J7=448,X7=384,DN=new WeakMap;function oee(e,t,r,n,o){let i=aee()",
+  "B": "ar udt=\"service.json\",ldt=\"service-start.lock\",fdt=\"profile-gateway-leases\",ppe=\"CCR_SERVICE_INSTANCE_TOKEN\",pdt=2e3,yx=3e4,L2=1e4,gdt=2e3,Adt=500,mdt=\"x-ccr-web-auth\",hdt=\"ccr_web_token\",ydt=\"ccr\",Cdt=\"C",
+  "C": "odels:[\"kimi-for-coding\"],provider:\"kimi-for-coding\",providerName:\"Kimi Code\"}},Ag;function Pd(e){let t=rQe(),r=eQe(e);if(r){let{metadataModelAliases:o,...i}=r;return{loadedFrom:t.loadedFrom,...i,modelMetadata:tQe(t.providers,r,o)}}let n=AQe(t.providers,e);return n?{loadedFrom:t.loadedFrom,matchedBy:n.matchedBy,modelDisplayNames:hM(n.entry.modelDisplayNames),modelMetadata:hM(n.entry.modelMetadata),models:n.entry.models,provider:n.entry.provider,providerName:n.entry.providerName}:{loadedFrom:t.loadedFrom,models:[]}}function eQe(e){let t=e.providerPresetId?.trim()||\"\",r=N3[t];if(r)return{matched",
+  "D": "rim().toLowerCase();return e.models.find(n=>n.trim().toLowerCase()===r)?.trim()}function QQe(e){return new Set([e.name,e.id,e.provider,Cr(e)].map(t=>t?.trim().toLowerCase()).filter(t=>!!t))}function NQe(e){let t=e?.trim()??\"\",r=t.indexOf(\"::\");if(r<0)return t;let n=t.sl",
+  "Duse": "(t){let r=NQe(t).toLowerCase();if(r)return this.config.Providers.find(n=>Oe(n)&&QQe(n).has(r))}resolveProviderModel(t){let r=this.resolve(t);return r?.kind===\"p"
+ },
+ "lib": {
+  "E": [
+   "t t=n[n.length-1];return{status:t&&typeof t.status==\"number\"&&t.status>=100&&t.status<=599?t.status:502,payload:{error:{message:\"All target providers failed.\",target_providers:e.map(o=>o.provider),target_provider_names:e.map(o=>o.providerConfig?.name).filter(Boolean),attempts:",
+   "t t=n[n.length-1];return{status:t&&typeof t.status==\"number\"&&t.status>=100&&t.status<=599?t.status:502,payload:{error:{message:\"All target providers failed.\",target_providers:e.map(o=>o.provider),target_provider_names:e.map(o=>o.providerConfig?.name).filter(Boolean),attempts:"
+  ]
+ }
+}
