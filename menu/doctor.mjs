@@ -22,6 +22,7 @@ import os from "node:os";
 import { execFileSync } from "node:child_process";
 import * as CC from "./cc-contract.mjs";
 import * as CCR from "./ccr-client.mjs";
+import { PATCHES, MARKERS, classify, describe } from "./ccr-patches.mjs";
 import { transform } from "./hud-shim.mjs";
 import { writeAtomic } from "./atomic.mjs";
 
@@ -225,7 +226,10 @@ export function checkHud({ install, wrappedExists, roundTrip }) {
 export const GATEWAY_ANCHOR = 'var PN="gateway",';
 export const GATEWAY_TIMEOUT_MIN_MS = 20000;
 
-export function checkCcrPatch({ file, read = null }) {
+// version/verified are deliberately NOT defaulted: a standalone call that passes neither
+// (the pre-existing contract, no version context at all) keeps the plain RED verdict, while
+// any caller that supplies context, even null, is judged against it (null = unknown = AMBER).
+export function checkCcrPatch({ file, read = null, version, verified }) {
   let raw;
   try { raw = read ? read(file) : fs.readFileSync(file, "utf8"); }
   catch {
@@ -249,6 +253,10 @@ export function checkCcrPatch({ file, read = null }) {
     return { name: "ccr-gateway-patch", ok: false, verdict: "amber",
       evidence: `found the anchor but could not read the timeout after it — re-derive the check` };
   }
+  if (ms < GATEWAY_TIMEOUT_MIN_MS && (version !== undefined || verified !== undefined) && (!verified || version !== verified)) {
+    return { name: "ccr-gateway-patch", ok: false, verdict: "amber",
+      evidence: `gateway handshake timeout is ${ms} ms (below ${GATEWAY_TIMEOUT_MIN_MS}) but ${unverifiedNote(version, verified)}. ${FIX_CMD}` };
+  }
   if (ms < GATEWAY_TIMEOUT_MIN_MS) {
     return { name: "ccr-gateway-patch", ok: false, verdict: "red",
       evidence: `CCR's gateway handshake timeout is ${ms} ms, below the patched ` +
@@ -256,10 +264,95 @@ export function checkCcrPatch({ file, read = null }) {
                 `reverted the local patch. Symptom: "Core gateway did not accept runtime config ` +
                 `within ${ms}ms" — INTERMITTENT and only under load, so it will read as ` +
                 `flakiness. Re-apply: in ${file}, replace the first assignment after ` +
-                `${GATEWAY_ANCHOR} with 2e4, keeping the file's existing line endings` };
+                `${GATEWAY_ANCHOR} with 2e4, keeping the file's existing line endings. ${FIX_CMD}` };
   }
   return { name: "ccr-gateway-patch", ok: true, verdict: "green",
     evidence: `gateway handshake timeout ${ms} ms (patched; stock is 5000)` };
+}
+
+// Patches B-E. `menu/ccr-patches.mjs` is the single source of what "patched"
+// looks like (steps, markers, severity); nothing about the recipes is spelled
+// here. The file bytes are trusted, never any manifest's patchIds (review note L3).
+const FIX_CMD = "Check: `node keysync/ccr-patch.mjs --check`; fix: `node keysync/ccr-patch.mjs --apply`, " +
+                "then restart the gateway (the running process keeps the old code until then; announce " +
+                "the restart first, this doctor never restarts anything).";
+// A missing patch is only RED when this exact CCR version is the one the recipes were verified
+// for. An unknown version (package.json unreadable) or an unrecorded verified version cannot
+// support that claim, so both demote to AMBER with their own wording.
+const unverifiedNote = (version, verified) =>
+  !verified ? `the version the recipes were verified for is not recorded, so this doctor cannot claim they apply`
+  : !version ? `CCR version unknown (its package.json is unreadable), so the recipes verified for ${verified} cannot be confirmed to apply`
+  : `CCR ${version} is not the ${verified} the recipes were verified for (Pd/QQe were fixed upstream in 3.1.0; the other patches are unverified on this version)`;
+
+const patch = (id) => PATCHES.find((p) => p.id === id);
+const CHECK_NAME = { B: "ccr-savecfg-patch", C: "ccr-pd-cache-patch", D: "ccr-findprovider-patch", E: "ccr-error-detail-patch" };
+
+// Accepted by design (review F4): B counts as applied for ANY value >= 12e4, not only the
+// exact recipe value. That is the tolerant numeric detector's contract (menu/ccr-patches.mjs);
+// a larger hand-set timeout is still a working patch, so it is not reported as modified.
+function judgePatch(p, text, ctx) {
+  const name = CHECK_NAME[p.id];
+  const stale = `the anchor for patch ${p.id} (${p.title}) is gone from ${ctx.file} — anchor gone: CCR was ` +
+                `rebuilt and this check needs re-deriving. Do NOT assume the patch is absent; assume the check is stale`;
+  const modified = (c) => ({ name, ok: false, verdict: "amber",
+    evidence: `patch ${p.id} (${p.title}) is modified/unexpected, neither stock nor exactly the recipe: ` +
+              `${describe(c)}. Do not re-apply blindly; inspect with \`node keysync/ccr-patch.mjs --check\`` });
+  let state, detail = "";
+  if (p.detect) {                                       // B: tolerant numeric detector
+    const d = p.detect(text);
+    if (d.state === "anchor-gone") return { name, ok: false, verdict: "amber", evidence: stale };
+    state = d.state === "applied" ? "applied" : "stock";
+    detail = `${d.value} ms`;
+    // Below threshold is "missing" only when it is exactly the stock recipe;
+    // any other value is a modified file, not an unpatched one.
+    if (state === "stock") { const c = classify(text, p); if (c.state !== "stock") return modified(c); }
+  } else {
+    const c = classify(text, p);
+    state = c.state;
+    if (state === "unexpected") {
+      const gone = c.steps.every((s) => s.find === 0 && s.replace === 0);
+      const hasMarker = MARKERS[p.id].some((m) => text.includes(m));
+      if (gone && !hasMarker) return { name, ok: false, verdict: "amber", evidence: stale };
+      return modified(c);
+    }
+    detail = MARKERS[p.id][0];
+  }
+  if (state === "applied") {
+    return { name, ok: true, verdict: "green", evidence: `${p.title}: patched (${detail})` };
+  }
+  const demote = !ctx.verified || ctx.version !== ctx.verified;
+  const libOff = p.id === "E" && ctx.libVersion && p.verifiedFor?.gatewayLib && ctx.libVersion !== p.verifiedFor.gatewayLib;
+  const verdict = p.severity === "red" && !demote && !libOff ? "red" : "amber";
+  const why = demote ? unverifiedNote(ctx.version, ctx.verified)
+    : libOff ? `ai-gateway ${ctx.libVersion} is not the ${p.verifiedFor.gatewayLib} recipe E was verified for`
+    : `patch ${p.id} is missing`;
+  return { name, ok: false, verdict,
+    evidence: `${p.title} is NOT applied${detail ? ` (${detail})` : ""}: ${why}. ${FIX_CMD}` };
+}
+
+/**
+ * Doctor coverage for patches B (saveConfig timeout), C (Pd cache), D (QQe cache)
+ * and E (error detail). A is `checkCcrPatch`. `cliText` / `libText` are the file
+ * contents already read (one read of the 2.3 MB cli.js is shared with A), or null
+ * when unreadable; an unreadable file or a vanished anchor is AMBER, never "absent".
+ */
+export function checkCcrPatches({ cliText = null, libText = null, cliFile = "cli.js", libFile = "the ai-gateway bundle",
+                                  version = null, verified = null, libVersion = null } = {}) {
+  const out = [];
+  for (const id of ["B", "C", "D", "E"]) {
+    const p = patch(id);
+    const [text, file] = p.file === "cli" ? [cliText, cliFile] : [libText, libFile];
+    if (text == null) {
+      out.push({ name: CHECK_NAME[id], ok: false, verdict: "amber",
+        evidence: id === "E"
+          ? `cannot read ${file} — anchor gone or moved: not at CCR.CONTRACT.gatewayLibBundle; if CCR now bundles ` +
+            `ai-gateway inside cli.js, re-derive this check. Do NOT assume the patch is absent`
+          : `cannot read ${file} — patch ${id} (${p.title}) cannot be verified` });
+      continue;
+    }
+    out.push(judgePatch(p, text, { file, version, verified, libVersion }));
+  }
+  return out;
 }
 
 /**
@@ -400,12 +493,13 @@ export function checkBundled({ dir, catalogue, version, verified }) {
 }
 
 export function diagnose({ env, handoff, current, pinned, contracts, hud, handoffOpts,
-                           bundled, ccrPatch, rpcSurface, gatewayDiscovery }) {
+                           bundled, ccrPatch, ccrPatches, rpcSurface, gatewayDiscovery }) {
   const checks = [checkEnv(env), checkHandoff(handoff, handoffOpts),
                   checkFingerprint(current, pinned)];
   if (contracts) checks.push(checkContracts(contracts));
   if (bundled) checks.push(checkBundled(bundled));
   if (ccrPatch) checks.push(checkCcrPatch(ccrPatch));
+  if (ccrPatches) checks.push(...checkCcrPatches(ccrPatches));
   if (gatewayDiscovery) checks.push(checkGatewayDiscovery(gatewayDiscovery));
   if (rpcSurface) checks.push(checkRpcSurface(rpcSurface));
   if (hud) checks.push(checkHud(hud));
@@ -483,14 +577,23 @@ export async function main() {
   let claudeRunSince = null;
   try { claudeRunSince = fs.statSync(CC.CONTRACT.paths.settings).mtimeMs; } catch { }
 
+  // cli.js is 2.3 MB: read it ONCE and share it between patch A and B-D.
+  const readOrNull = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+  const cliText = readOrNull(CCR.CONTRACT.gatewayBundle);
+  const libText = readOrNull(CCR.CONTRACT.gatewayLibBundle);
+  const ccrVersion = CCR.ccrVersion();
+
   const r = diagnose({
     env: process.env, handoff: readLines(HANDOFF), current, pinned,
     handoffOpts: { now: Date.now(), claudeRunSince },
     contracts: { ccObserved: current.ccVersion, ccPinned: CC.CONTRACT.verifiedVersion ?? CC.CONTRACT.fingerprint,
                  service: CCR.readService() },
     bundled: { dir: CCR.CONTRACT.installDir, catalogue: CCR.CONTRACT.bundledCatalogue,
-               version: CCR.ccrVersion(), verified: CCR.CONTRACT.verifiedVersion },
-    ccrPatch: { file: CCR.CONTRACT.gatewayBundle },
+               version: ccrVersion, verified: CCR.CONTRACT.verifiedVersion },
+    ccrPatch: { file: CCR.CONTRACT.gatewayBundle, read: () => { if (cliText == null) throw new Error("unreadable"); return cliText; },
+                version: ccrVersion, verified: CCR.CONTRACT.verifiedVersion },
+    ccrPatches: { cliText, libText, cliFile: CCR.CONTRACT.gatewayBundle, libFile: CCR.CONTRACT.gatewayLibBundle,
+                  version: ccrVersion, verified: CCR.CONTRACT.verifiedVersion, libVersion: CCR.gatewayLibVersion() },
     gatewayDiscovery: gatewayDiscoveryInputs(),
     rpcSurface: await CCR.probeRpcSurface(),
     hud: install && {
@@ -501,7 +604,7 @@ export async function main() {
   });
 
   for (const c of r.checks) {
-    console.log(`${c.verdict.toUpperCase().padEnd(6)} ${c.name.padEnd(20)} ${c.evidence}`);
+    console.log(`${c.verdict.toUpperCase().padEnd(6)} ${c.name.padEnd(22)} ${c.evidence}`);
   }
   console.log(`\nverdict: ${r.verdict}`);
 
