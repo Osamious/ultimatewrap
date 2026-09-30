@@ -28,6 +28,7 @@ import {
 import { sanitizeDisplay } from "../menu/sanitize.mjs";
 import { redactClip } from "../menu/redact.mjs";
 import { looksLikeNotice } from "./bench.mjs";
+import { acquireLock } from "./bench-lock.mjs";
 
 // `b` is the max_tokens the probe was sent with, stored only when it is not the default budget
 // (a 1024-token re-probe of a hidden-reasoning `empty` reads differently from a 96-token one).
@@ -157,12 +158,40 @@ export function redactRecord(rec) {
 }
 
 /**
+ * The live-status overlay (`state/observed.json`, beside bench.json): its `m` and non-ok `p` get the same redaction. It is already
+ * redacted on write and on load, so this is belt and braces. Taken under `observed.lock` (the overlay has its own writer), written
+ * atomically, skipped (not failed) when the lock is held. `null` when there is no overlay file.
+ */
+function redactObserved(file) {
+  if (!fs.existsSync(file)) return null;
+  const pass = () => {
+    const raw = readJsonOr(file, null);
+    if (!raw || !raw.models || typeof raw.models !== "object") return { records: 0, changed: 0 };
+    let changed = 0;
+    const models = {};
+    for (const [k, v] of Object.entries(raw.models)) {
+      const r = redactRecord(v);
+      if (r.changed) changed += 1;
+      models[k] = r.rec;
+    }
+    if (changed) writeAtomic(file, JSON.stringify({ ...raw, models }));
+    return { records: Object.keys(models).length, changed };
+  };
+  const got = acquireLock({ file: path.join(path.dirname(file), "observed.lock"), findRunning: () => [], maxMinutes: 2, marginMs: 60000, mode: "redact" });
+  if (!got.ok) return { records: 0, changed: 0, skipped: true };
+  try { return pass(); } finally { got.release(); }
+}
+
+/**
  * The one-shot maintenance pass behind `bench-cli --redact`: rewrite bench.json (and a
  * non-empty log) with every record's provider text redacted. Atomic, idempotent, and it
  * touches nothing else: generatedAt, params and every measurement are carried over as they
  * were. Returns `{ ok, records, changed, logRecords, logChanged }`.
  */
-export function redactBench({ benchFile = BENCH_FILE, logFile = BENCH_LOG } = {}) {
+export function redactBench({ benchFile = BENCH_FILE, logFile = BENCH_LOG, observedFile = path.join(path.dirname(benchFile), "observed.json") } = {}) {
+  // A transient EPERM/EBUSY on the overlay must not stop bench.json and the log from being redacted: the overlay pass reports itself skipped.
+  let obs;
+  try { obs = redactObserved(observedFile); } catch { obs = { records: 0, changed: 0, skipped: true }; }
   const raw = readJsonOr(benchFile, null);
   // A bench.json that is missing or corrupt does not stop the LOG from being redacted: the log may hold
   // unredacted lines of its own (an interrupted run), and it is folded into bench.json later.
@@ -195,8 +224,9 @@ export function redactBench({ benchFile = BENCH_FILE, logFile = BENCH_LOG } = {}
     }
     if (logChanged) writeAtomic(logFile, `${lines.join("\n")}\n`);
   }
-  if (!benchOk && !logRecords) return { ok: false, reason: "no readable bench.json (missing, corrupt or another schema) and no log records" };
-  return { ok: true, benchOk, records: Object.keys(models).length, changed, logRecords, logChanged };
+  const overlay = obs ? { observedRecords: obs.records, observedChanged: obs.changed, ...(obs.skipped ? { observedSkipped: true } : {}) } : {};
+  if (!benchOk && !logRecords && !obs?.records) return { ok: false, reason: "no readable bench.json (missing, corrupt or another schema) and no log records" };
+  return { ok: true, benchOk, records: Object.keys(models).length, changed, logRecords, logChanged, ...overlay };
 }
 
 /**

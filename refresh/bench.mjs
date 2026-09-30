@@ -81,7 +81,7 @@ const QUOTA = /only try \d+ times|rate.?limit|too many requests/i;
 // The account's PLAN, not its balance, is what stands between us and the model.
 // "Model xyz not found in your plan, upgrade" is a `pay` row: the model exists and
 // funding or upgrading is the fix, so calling it `gone` would bury a usable model.
-const PAY_5XX = /insufficient[_ ](?:(?:account|user|available|wallet) )?(?:credits?|balance|funds|quota)|(?:credit )?limit is insufficient|balance|credits?\b.*\b(used up|exhaust)|requires? (an? )?(active )?(paid|lite|premium)|top[ -]?up|tier[_ ]required/i;
+const PAY_5XX = /insufficient[_ ](?:(?:account|user|available|wallet) )?(?:credits?|balance|funds|quota)|(?:credit )?limit is insufficient|\bbalance\b|credits?\b.*\b(used up|exhaust)|requires? (an? )?(active )?(paid|lite|premium)|top[ -]?up|tier[_ ]required/i;
 const PLAN_STRICT =/\b(in|on|under|with|for) your (current |free )?(plan|subscription|tier)\b/i;
 const PLAN = /\b(in|on|under|with|for) your (current |free )?(plan|subscription|tier)\b|\bupgrade (your|to|plan)|subscription (is )?(required|needed)/i;
 
@@ -219,6 +219,22 @@ export function classifyHttp(status, body = "") {
   if (status >= 500 ? (PAY_5XX.test(text) && !TRANSIENT_MARK.test(msg)) : (PAY.test(text) || PLAN.test(text))) return "pay";
   if (saysGone(status, msg, text)) return "gone";
   return "error";
+}
+
+/**
+ * The TIGHT reading of a failure text, for callers that cannot trust the sentence to be the provider's own: a live request's
+ * error can echo the user's prompt or a tool name ("purchase_item", "billing_lookup", "output tokens for balance-sonnet"), which
+ * the loose payment, quota and rate words of `classifyHttp` would misread. Only anchors that name the ACCOUNT or the MODEL count:
+ * an empty balance said in words (`pay`), an account-state sentence (`auth`), and a strong "this model is gone" phrase or the
+ * provider's machine code (`gone`; a 5xx retry-style sentence never is). Anything else is null.
+ */
+export function classifyTight(body = "") {
+  const text = String(body);
+  const msg = extractMessage(text);
+  if (EMPTY_BALANCE.test(msg)) return "pay";
+  if (ACCOUNT_STATE.test(msg)) return "auth";
+  if (saysGone(500, msg, text)) return "gone";
+  return null;
 }
 
 // Both are provider text, so both are REDACTED before they can be stored (see menu/redact.mjs);
