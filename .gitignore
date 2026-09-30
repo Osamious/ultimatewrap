@@ -36,6 +36,9 @@ state/
 catalog/
 research/phase6/_tmp/
 
+# stock CCR bytes seeded by keysync/ccr-patch.mjs --seed-store; local only
+ccr-pristine/
+
 # The supervisor's own runtime state. Written by the scheduled task that keeps
 # the CCR gateway and OAuth relay alive, so it churns on its own schedule and
 # would otherwise be swept into every task commit by `git add -A`. Discovered at
