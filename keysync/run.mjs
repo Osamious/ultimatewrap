@@ -62,7 +62,10 @@ const dry = has("--dry") || target === "dry";
 // (456 ids).
 // 56 since 2026-09-19: inceptionlabs (inceptionlabs.ai) added, discovery-admitted
 // (2 ids, mercury-2.5/mercury-2).
-const EXPECTED_PROVIDERS = 56;
+// 62 since 2026-09-30: six providers added, user-approved tripwire raise (+6):
+// cleanapis, codecraftapi, routewayai, apmixai, lightningai, tokenforgeaistudio.
+// 63 since 2026-09-30: hashneuronspace (hashneuron.space) added, user-approved tripwire raise (+1).
+const EXPECTED_PROVIDERS = 63;
 const BUILT_ROWS = "C:\\Users\\osami\\.uw\\keysync\\built-rows.json";
 
 /**
