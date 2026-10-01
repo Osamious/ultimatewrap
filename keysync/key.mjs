@@ -20,6 +20,8 @@ import { spawnSync, execFileSync } from "node:child_process";
 import { writeAtomic } from "../menu/atomic.mjs";
 import { loadVault, filterRegistry, chooseKeys, loadKeyChoices, KEY_CHOICES_FILE }
   from "./keysync.mjs";
+import { setDefaultModel, clearDefaultModel, showDefaultModel, formatShow, SET_NOTE, CLEAR_NOTE, DefaultModelError }
+  from "./default-model.mjs";
 
 const VAULT_SCRIPT = path.join(os.homedir(), ".llmkeys", "ApiKeyVault.ps1");
 const dotSource = (cmd) => `. '${VAULT_SCRIPT.replace(/'/g, "''")}'; ${cmd}`;
@@ -171,6 +173,36 @@ function cmdPrefer(args) {
   }
 }
 
+// The model every NEW session starts on; a /model pick lasts only for the running
+// session while this is set. SHAPE validation only here -- the authoritative row
+// check is run.mjs against the post-relay built picker (keysync/built-rows.json is
+// snapshotted before relay rows are added, so it cannot answer this).
+function cmdDefaultModel(args) {
+  const [action, id] = args._;
+  try {
+    if (action === "show") {
+      console.log(formatShow(showDefaultModel()));
+    } else if (action === "set" && id) {
+      const r = setDefaultModel({ id, force: Boolean(args.force) });
+      console.log(`default model set: ${r.model} -> ${r.file}`);
+      for (const w of r.warnings) console.warn(`WARNING: ${w}`);
+      console.log(`Note: ${SET_NOTE}.`);
+    } else if (action === "clear") {
+      const r = clearDefaultModel();
+      console.log(r.existed ? `removed ${r.file}` : `no default model file at ${r.file}`);
+      if (r.markerRemoved) console.log(`removed the last-applied marker ${r.marker}`);
+      console.log(`Note: ${CLEAR_NOTE}.`);
+    } else {
+      console.error("usage: key.mjs default-model show | set <id> [--force] | clear");
+      process.exitCode = 1;
+    }
+  } catch (e) {
+    if (!(e instanceof DefaultModelError)) throw e;
+    console.error(e.message);
+    process.exitCode = 1;
+  }
+}
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -190,7 +222,8 @@ switch (sub) {
   case "list": cmdList(); break;
   case "test": cmdTest(args); break;
   case "prefer": cmdPrefer(args); break;
+  case "default-model": cmdDefaultModel(args); break;
   default:
-    console.error("usage: key.mjs <add|remove|list|test|prefer> ...");
+    console.error("usage: key.mjs <add|remove|list|test|prefer|default-model> ...");
     process.exitCode = 1;
 }

@@ -24,6 +24,11 @@ import {
 } from "./keysync.mjs";
 import { cacheRoot, readCacheRecord } from "../refresh/discover.mjs";
 import {
+  DefaultModelError, load as loadDefaultModel, resolveDefault, withDefaultModel, applyDefaultModel,
+  assertDefaultModel, assertSavedProfile, savedProfileModels, envModelChangeWarning, envFormOf,
+  resolveDefaultModelFile, assertNoOrphanMarker, writeMarker, postCommitNotice
+} from "./default-model.mjs";
+import {
   snapshotConfigDb, deleteStaleWifToken, retainOnSuccess, capFailedSnapshots,
   restoreSettings, restoreConfigDbHint, assertSettingsInvariants, listSettingsBackups,
   liveConfigDir, liveConfigDb,
@@ -1614,6 +1619,63 @@ console.log("validation OK: count, alias uniqueness, picker<=models, credentials
   if (collisions.fatal) process.exit(1);
 }
 
+// ---- fixed default model: owner data, never decided by keysync ---------------
+// Resolved HERE: the relay rows are already in built.picker, and this precedes
+// --dry's exit and every lock/backup/snapshot/save, so an absent row (relay down,
+// pruned, typo) or a corrupt file refuses a profile-writing run with nothing
+// written and the previous values kept, the same placement and reason as
+// collisions.fatal. --no-profile writes no profile and no settings, so it only warns.
+// A LIVE run ignores UW_DEFAULT_MODEL_FILE unless --default-model-file <path> is given:
+// an ambient env var must not repoint the real profile at another (or an absent) file.
+let dmf;
+try {
+  dmf = resolveDefaultModelFile({ target, args });
+} catch (e) {
+  if (!(e instanceof DefaultModelError)) throw e;
+  console.error(e.message);
+  process.exit(2);
+}
+if (dmf.ignoredEnv) {
+  console.warn(`WARNING: UW_DEFAULT_MODEL_FILE is set and IGNORED for a live run (using ${dmf.file}); ` +
+    "pass --default-model-file <path> to read a different file");
+}
+let def = null;
+let defFailed = false;
+try {
+  const loaded = loadDefaultModel(dmf.file);
+  // File absent but a previous live run applied a default: refuse rather than silently
+  // revert to the anchor. Same placement and exit as the other default-model refusals.
+  if (!has("--no-profile") && (target === "live" || dry)) assertNoOrphanMarker(loaded, dmf.file);
+  def = resolveDefault(loaded, built.picker, { anthropicOn, file: dmf.file });
+} catch (e) {
+  if (!(e instanceof DefaultModelError)) throw e;
+  if (!has("--no-profile")) {
+    console.error(`REFUSING (default model): ${e.message}`);
+    process.exit(1);
+  }
+  console.warn(`WARNING (default model, --no-profile so not refusing): ${e.message}`);
+  defFailed = true;
+}
+if (def && has("--no-profile")) {
+  console.log(`default model: ${def.model} (not applied: --no-profile writes no profile)`);
+  def = null;
+} else if (def) {
+  console.log(`default model: ${def.model} (source: ${dmf.file})`);
+  if (dry) {
+    // Expected values only: --dry never reads settings.json.
+    console.log(`  dry: profile.model and profile.claudeCode.model would be ${def.model}; ` +
+      `env ANTHROPIC_MODEL / CCR_CLAUDE_CODE_MODEL / CODEXL_CLAUDE_CODE_MODEL would be ${envFormOf(def.model)}; ` +
+      (anthropicOn
+        ? `tier mappings unchanged: opus ${ANTHROPIC_TIERS.opusModel}, sonnet ${ANTHROPIC_TIERS.sonnetModel}, ` +
+          `haiku ${ANTHROPIC_TIERS.haikuModel}, fable ${ANTHROPIC_TIERS.fableModel}`
+        : "tier mappings follow the profile anchor (relay not live)"));
+  }
+} else if (defFailed) {
+  console.log("default model: not applied (see warning above)");
+} else {
+  console.log(`default model: none (${dmf.file} absent; profile anchor decides)`);
+}
+
 if (dry) {
   console.log("\n--dry: nothing written.");
   // THE MEASUREMENT R13b's GATE IS ARGUED FROM, printed rather than asserted.
@@ -1754,12 +1816,17 @@ const anchorModel = anchor.model;
 // the preference list matched nothing and all six tiers are now pointed at
 // whatever sorted first -- a config that works, serves badly, and looks normal.
 console.log(`profile anchor: ${anchorModel} (via ${anchor.via})`);
+if (def) {
+  console.log(`default model: ${def.model} (from default-model.json; overrides the anchor for profile.model)`);
+}
 // With Claude available, keep Claude Code's normal tiering rather than pointing
-// every tier at one model.
-const tiers = anthropicOn ? ANTHROPIC_TIERS : {
+// every tier at one model. withDefaultModel returns a NEW object overriding only
+// `model` (ANTHROPIC_TIERS is shared and must never be mutated), or the same
+// object when no default is set.
+const tiers = withDefaultModel(anthropicOn ? ANTHROPIC_TIERS : {
   model: anchorModel, opusModel: anchorModel, sonnetModel: anchorModel,
   haikuModel: anchorModel, smallFastModel: anchorModel, fableModel: anchorModel
-};
+}, def);
 const p = cfg.profile?.profiles?.find((x) => x.agent === "claude-code" && x.enabled !== false)
   ?? cfg.profile?.profiles?.find((x) => x.agent === "claude-code");
 if (!p) throw new Error("no claude-code profile to configure (cfg.profile.profiles is empty or missing)");
@@ -1852,6 +1919,14 @@ console.log(willRestart
   ? "config changed -> CCR will restart the gateway"
   : "config identical -> no gateway restart expected");
 
+// No default set: this run still rewrites env.ANTHROPIC_MODEL from the profile
+// anchor (CCR derives it). Say so BEFORE saveConfig if that would change a hand-set
+// value. READ-ONLY, never refuses (--dry never gets here, so it never reads settings).
+if (applyProfile && !def) {
+  const warn = envModelChangeWarning(SETTINGS, tiers.model);
+  if (warn) console.warn(warn);
+}
+
 // A restart interrupts in-flight requests in OTHER Claude Code sessions. This
 // is the failure class behind the 2026-09-01 outage, so it is surfaced rather
 // than assumed harmless.
@@ -1909,7 +1984,12 @@ if (!applyProfile) {
   // Only claim a profile.model when a profile was actually applied. Printing it
   // unconditionally put this line AFTER "keysync complete (--no-profile)",
   // naming an anchor that run had deliberately not written.
-  console.log(`saved: ${saved.Providers?.length ?? "?"} providers, profile.model=${anchorModel}`);
+  // The persisted INPUT CCR re-derives the three env vars from. A default that did not
+  // persist would be reverted by the next CCR-initiated apply, so it throws into the
+  // restore-on-failure catch below.
+  assertSavedProfile(saved, p.id, def);
+  const savedModels = savedProfileModels(saved, p.id);
+  console.log(`saved: ${saved.Providers?.length ?? "?"} providers, profile.model=${savedModels.profileModel ?? "?"}`);
 }
 
 if (!noProfileDone) {
@@ -1924,6 +2004,15 @@ if (!noProfileDone) {
   // CCR has legitimately rewritten apiKeyHelper and env by this point; this
   // scopes the check to keysync's own merge, which is what it can be strict about.
   const settingsBefore = JSON.parse(settingsRaw);
+  // CCR just cleared and re-derived the three model env vars from profile.model;
+  // re-assert the default BEFORE the strip so the strip stays the last word on
+  // third-party `[1m]` suffixes and assertDefaultModel compares against envFormOf.
+  const healed = applyDefaultModel(settings, def);
+  if (def) {
+    console.log(healed
+      ? `default model: re-asserted ${healed} env var(s) CCR rewrote`
+      : "default model: held by CCR (env already matches)");
+  }
   const stripped = stripOneMSuffix(settings);
   if (stripped) console.log(`stripped [1m] suffix from ${stripped} third-party model env var(s)`);
   // CCR re-adds this on every profile apply, so it is removed HERE, on the file
@@ -1956,7 +2045,10 @@ if (!noProfileDone) {
     // valid can still disagree with the profile anchor indefinitely (a leftover
     // from a one-off /model switch becomes the permanent default for new
     // sessions). Surface the disagreement rather than silently honouring it.
-    if (pin.pinned.toLowerCase() !== tiers.model.toLowerCase()) {
+    // With a default, compare in the form each side takes in settings.json (envFormOf):
+    // a third-party default carrying [1m] lands without it, so it must not read as "differs".
+    if ((def ? envFormOf(pin.pinned) : pin.pinned).toLowerCase() !==
+        (def ? envFormOf(def.model) : tiers.model).toLowerCase()) {
       // MEASURED (#74, #47), and the opposite of what this line said until
       // now: a NEW session defaults to `env.ANTHROPIC_MODEL` (the anchor),
       // not `settings.model` (the pin), while the anchor is set -- which
@@ -1969,9 +2061,15 @@ if (!noProfileDone) {
       // ALREADY-RUNNING session does reach the wire immediately (confirmed
       // by upstream error identity a reseller-specific 403 could not have
       // come from the anchor).
-      console.log(`  NOTE: that pin differs from the profile anchor (${tiers.model}).\n` +
-        `  New sessions use the ANCHOR, not the pin, while ANTHROPIC_MODEL is set -- this is normal.\n` +
-        `  The pin still applies immediately if you /model-switch within an already-running session.`);
+      if (def) {
+        console.log(`  NOTE: that pin differs from the default model (${def.model}).\n` +
+          `  New sessions start on the default (~/.llmkeys/default-model.json), not on the pin; /model applies to the running session only.\n` +
+          `  Change the default with: node keysync/key.mjs default-model set <id>`);
+      } else {
+        console.log(`  NOTE: that pin differs from the profile anchor (${tiers.model}).\n` +
+          `  New sessions use the ANCHOR, not the pin, while ANTHROPIC_MODEL is set -- this is normal.\n` +
+          `  The pin still applies immediately if you /model-switch within an already-running session.`);
+      }
     }
   }
   if (pin.action === "cleared") console.log(`cleared stale /model pin "${pin.pinned}" (no longer a picker row)`);
@@ -2022,6 +2120,7 @@ if (!noProfileDone) {
   // hooks, autoMode) are not among the three. REJECT rather than warn: this throw
   // lands in the catch above, which restores from the backup.
   assertSettingsInvariants(settingsBefore, final);
+  assertDefaultModel(final, def);
   const ok = final.apiKeyHelper && final.env?.ANTHROPIC_BASE_URL && final.modelPicker?.options?.length;
   if (!ok) throw new Error("post-write verification failed: apiKeyHelper / ANTHROPIC_BASE_URL / modelPicker not all present");
   console.log(`verified: apiKeyHelper + ANTHROPIC_BASE_URL=${final.env.ANTHROPIC_BASE_URL} + ` +
@@ -2034,6 +2133,13 @@ if (!noProfileDone) {
   // A working Providers[] with no picker is a safe partial state; a half-merged
   // settings.json is not. Restore it and leave both restore points in place.
   const restored = restoreSettings(backup, SETTINGS);
+  // Everything in this try runs AFTER saveConfig, so CCR's DB already holds the new
+  // profile.model/Providers; only settings.json is restored. Say so before anything else.
+  if (def) {
+    console.error(postCommitNotice({
+      snapshot: dbSnapshot, restoreHint: dbSnapshot ? restoreConfigDbHint(dbSnapshot) : null, settingsRestored: restored.ok
+    }));
+  }
   console.error(`\nWRITE FAILED: ${err.message}`);
   // The two failure modes call for opposite responses, and the backup path is
   // named ONLY in the mode where it exists. The previous single message reported
@@ -2060,6 +2166,17 @@ if (!noProfileDone) {
 // Retention runs only after a verified-good write, and outside the try: a
 // cleanup failure must never trigger the rollback of a write that succeeded.
 if (writeVerified) {
+  // Last-applied marker (live only): a later run that finds the default FILE absent while
+  // this exists refuses instead of silently reverting to the anchor. Outside the try:
+  // a marker failure must not roll back a write that verified.
+  if (target === "live" && def) {
+    try {
+      console.log(`default model marker written: ${writeMarker({ file: dmf.file, model: def.model })}`);
+    } catch (e) {
+      console.log(`WARNING: could not write the default-model marker (${String(e.message).slice(0, 160)}); ` +
+        "the apply itself succeeded, but a later deletion of the default file will not be caught");
+    }
+  }
   try {
     const removed = retainOnSuccess({ snapshot: dbSnapshot, settingsFile: SETTINGS });
     const { dated } = listSettingsBackups(SETTINGS);

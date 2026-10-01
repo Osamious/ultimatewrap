@@ -132,6 +132,67 @@ If you ever add a provider profile with `Set-ProviderProfile` directly in
 PowerShell instead of through `key.mjs`, run `node keysync/run.mjs --dry`
 afterward — that's the same check `key.mjs` runs for you automatically.
 
+### 5a. The fixed default model (the model every new session starts on)
+
+The default is owner data in `~/.llmkeys/default-model.json` (`{"model": "...", "setAt": "..."}`),
+not a constant and not something a keysync run decides. Resolves #74 (the issue is
+closed by the owner after a verified live apply, not by this change).
+
+```powershell
+node keysync/key.mjs default-model show
+node keysync/key.mjs default-model set "anthropic/claude-sonnet-5-5[1m]"   # --force (last) silences the advisory
+node keysync/key.mjs default-model clear                                    # anchor behaviour returns
+```
+
+- **What it changes:** only the profile's `model` (`profile.model`,
+  `profile.claudeCode.model`), and so the three env vars CCR derives from it
+  (`ANTHROPIC_MODEL`, `CCR_CLAUDE_CODE_MODEL`, `CODEXL_CLAUDE_CODE_MODEL`). keysync
+  re-asserts them after CCR's rewrite and again at its final verify. The four
+  `ANTHROPIC_DEFAULT_*` tier mappings, `settings.model`, `effortLevel` and
+  `modelSettings` are never touched.
+- **`sonnetModel` stays `anthropic/claude-sonnet-5`:** `/model sonnet` and
+  sonnet-alias subagents still resolve to sonnet-5, not 5.5. Subagents that
+  inherit the main model get the default (5.5).
+- **A `/model` pick lasts only for the running session.** `env.ANTHROPIC_MODEL`
+  beats `settings.model` for new sessions (#74), so the next session starts on the
+  default again.
+- **`set` is shape-checked only** (no whitespace/control characters, `"`, `,` or
+  backslash; must be `<provider>/<id>`), plus an advisory warning for an
+  `anthropic/` id missing from `state/anthropic-ids-cache.json`. The row's existence
+  is checked by `keysync/run.mjs` against the built picker, including in `--dry`.
+- **It takes effect at the next live keysync run.** Until then any CCR re-apply
+  (gateway start, saveApiKeys, profile launch) can revert the settings env to the
+  previous anchor: set the file and apply in one sitting.
+- **Relay down / row absent / corrupt file refuses a profile-writing run:** exit 1
+  before any write, previous values kept, the message names the cause. Fix the id,
+  bring the relay up, or `default-model clear`. `--no-profile` (gateway only, no
+  profile, no settings.json) still works and only warns.
+- **Which file a run reads:** a live run (`--target live`) ALWAYS reads
+  `~/.llmkeys/default-model.json`. `UW_DEFAULT_MODEL_FILE` is IGNORED for a live run
+  (a loud `UW_DEFAULT_MODEL_FILE is set and IGNORED for a live run` line is printed)
+  unless `--default-model-file <path>` is passed. `--dry` and `--target isolated` honour
+  the env var (tests, one-off dry runs). Every run prints `source: <path>`, or
+  `default model: none (<path> absent; profile anchor decides)`.
+- **Last-applied marker:** after a successful live profile-writing apply with a default,
+  keysync writes `state/default-model.applied.json` (`{model, appliedAt}`, local,
+  gitignored). If a later live profile-writing run (or `--dry`) finds the default file
+  ABSENT while the marker exists, it refuses (exit 1, nothing written) instead of
+  silently reverting new sessions to the anchor. Restore the file
+  (`node keysync/key.mjs default-model set <id>`) or deliberately return to the anchor
+  (`node keysync/key.mjs default-model clear`, which removes the file AND the marker).
+  `--no-profile` is unaffected. A default file over 4 KB, or not a regular file, is a
+  loud error; ids are also run through the repo id sanitiser (max 128 code points).
+- **If a live apply fails after `saveConfig`:** CCR's config DB has ALREADY committed the
+  new `profile.model` and Providers; only `settings.json` is restored. A later
+  CCR-initiated apply (gateway start, saveApiKeys, profile launch) rewrites
+  `settings.json` from the DB value. The failure output leads with this, the
+  restore-point path and the restore command; re-running keysync once the cause is
+  fixed re-commits and re-asserts the default.
+- `set` on a non-`anthropic/` id warns that it is shape-checked only; keysync verifies
+  it against the live picker rows at the next run and refuses a profile run if absent.
+- With **no** default set, a live profile run prints a WARNING first if it is about
+  to change a hand-set `env.ANTHROPIC_MODEL` to the profile anchor.
+
 ## 6. Phase B — catalogue refresh and health
 
 Refresh actions 6a to 6d are deliberate, manually-invoked commands by design; none
