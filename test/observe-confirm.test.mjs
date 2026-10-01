@@ -392,7 +392,7 @@ test("stale observed.json.tmp-* debris is swept when a confirm child starts", as
   seed(e, { "prov/m1": flipRec() }, { reserved: ["prov/m1"] });
   const old = path.join(e.stateDir, "observed.json.tmp-999");
   fs.writeFileSync(old, "x");
-  const past = new Date(Date.now() - 10 * 60000);
+  const past = new Date(NOWC - 10 * 60000);
   fs.utimesSync(old, past, past);
   await runConfirm({ key: "prov/m1", ...harness(e, { probe: probeReturning(reply()) }).opts });
   assert.equal(fs.existsSync(old), false);
