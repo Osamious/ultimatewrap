@@ -763,6 +763,18 @@ const titleAt = (g, p, text, frameW) => {
   return p.ramp(head) + g.frame.h.repeat(Math.max(0, frameW - vis(head) - 1)) + g.frame.tr;
 };
 
+// The model-list header title around a key id: the whole id up to KEYID_MAX, clipped (with the glyph set's
+// ellipsis) only when `titleAt`'s head (`┌─ ` + text + ` `) plus the closing corner would not fit the frame.
+const crumbWithKey = (g, keyId, frameW) => {
+  const tail = ` ${g.sep} models`;
+  const head = `UW ${g.sep} `;
+  const room = Math.min(KEYID_MAX, frameW - 5 - vis(head) - vis(tail));
+  const full = sanitizeDisplay(keyId, KEYID_MAX);
+  const text = vis(full) <= room ? full
+    : sanitizeDisplay(full, Math.max(1, room - vis(g.ell))) + g.ell;
+  return head + text + tail;
+};
+
 export const HELP0 = "[↑↓] move [↵] open [⇥] scope [^f] fav [^x] gone [?] all keys [esc] back";
 export const HELP1 = "[↑↓] move [↵] pick [^f]fav [^o]ok [^l]1M+ [^x]gone [^e]free [?] keys [esc]";
 const HELP0_A = "[up/dn][enter] open [tab] scope [^f] fav [^x] gone [?] all keys [esc]";
@@ -887,7 +899,7 @@ export function frame(v, meta, { caps }) {
     ? "UW " + g.sep + " all models"
     : v.level === 0
       ? "UW " + g.sep + " providers"
-      : `UW ${g.sep} ${sanitizeDisplay(v.provider.keyId, 30)} ${g.sep} models`;
+      : crumbWithKey(g, v.provider.keyId, layout.frameW);
   L.push(title(g, p, crumb));
 
   // Q1.3: the routability stamp is printed, not implied. An undimmed row means

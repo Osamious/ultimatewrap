@@ -37,6 +37,12 @@ import { priceOf, hasPricedOffer, buildJoinIndex, joinCatalogEntry,
          trustedContextTokens } from "../keysync/catalog-join.mjs";
 export { priceOf };
 
+// The snapshot stores a key id WHOLE. This is a safety bound on a hostile or runaway id, in code points,
+// not a display limit: vault ids are owner-typed `bucket.provider.tier` and the longest real one is ~32.
+// Anything shorter than this is stored exactly, so the tier suffix and lookups by the vault id survive (#148).
+// Render-time clipping is style.mjs's job (KEYID_MAX and the frame width).
+export const KEYID_STORE_MAX = 256;
+
 export const SLOT = path.join(os.homedir(), ".uw", "state", "slot.json");
 
 // `priceOf` used to be defined here. It now lives in
@@ -772,7 +778,7 @@ export function buildFrom({ chosen, providers, catalog, relay,
     }
     const priced = models.some((m) => m.badge !== "");
     rows.push({
-      keyId: sanitizeDisplay(cred.id, 30), provider: cred.provider, models,
+      keyId: sanitizeDisplay(cred.id, KEYID_STORE_MAX), provider: cred.provider, models,
       // NULLABLE: "0 free" is a measurement, "no price data" is the absence of one.
       free: priced ? models.filter((m) => FREEISH.has(m.badge)).length : null,
       planCount: models.filter((m) => m.badge === "PLAN").length,
