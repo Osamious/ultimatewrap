@@ -218,7 +218,11 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
 - **Running the examples in a fixture.** A test run names its own files instead of the real ones
   (`T=$(mktemp -d); F=$(node test/fixtures/subagent-flags.mjs --dir "$T")`), and the flags it needs
   depend on the command. `set`, `show`, `status`, `explain`, `rebuild`, `preset`, `wizard`, `resume`
-  and `undo` take the full set `$F`. `last` takes only `--state-dir "$T/state"`. `pause`, `rollback`
+  and `undo` take the full set `$F`. `last` takes only `--state-dir "$T/state"`; `report` takes
+  `--state-dir "$T/state"` and optionally `--snapshot-file "$T/snapshot.json"` (the prices) and
+  `--logs-file <a fixture request log>` (for `--outcomes yes`; a fixture run that names none reads none),
+  and `selftest` takes no file flag at all (its approval file has one fixed place that no flag can
+  move). `pause`, `rollback`
   and `clear` take only `--policy-file "$T/llmkeys/subagent-policy.json" --state-dir "$T/state"`.
   `why` and `help` take no file flag. `$F` given to `last`, `pause`, `rollback`, `clear` or `why` is
   refused as E_USAGE ("unknown or not applicable flag"), and a half set is refused as "incomplete
@@ -298,6 +302,49 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   no memory of a failure that happened "consecutively" in the strict sense: it approximates it with
   the rest period plus one quiet hour, so a model that fails every 30 to 60 minutes reaches the 6 h
   rung in about 3 hours.
+- **The report and the self-test.** Examples (a test runs each one in a fixture with the flags its
+  command takes):
+
+      node keysync/key.mjs subagent-policy report --since 24h     # asked -> ran per agent, the policy's choice, an input-token cost estimate against main's model
+      node keysync/key.mjs subagent-policy report --outcomes yes  # adds the gateway request log, read only (--json yes for scripts)
+      node keysync/key.mjs subagent-policy selftest --plan yes    # what a sandbox self-test would do, and its plan hash; it starts nothing
+
+  `report` answers "what did my subagents run on, and what would
+  that have cost on main's own model?" without the policy being enforced. It lists the newest 20
+  agents (asked -> ran, what the policy would use or chose, why), then totals, each over the
+  population it was counted on ("6 of 8 agent decisions would move to another model"), the router's
+  own counters (these are for the router's whole lifetime, not for `--since`), and one savings
+  line. The savings line is always labelled "estimate, input tokens only, snapshot prices": it
+  multiplies the token count of the FIRST request of each agent (the log holds one line per new
+  agent, so later requests are not in it, and real totals are higher) by the input price the model
+  snapshot lists, for main's own model, for what ran and for what the policy chose. An agent with no
+  token count, with no known main, or on a model whose price the snapshot does not list is left
+  out and counted ("2 without a token count ... 2 with an unlisted price"). `--session` takes the
+  logged session id (the log keeps the first 8 characters of a session id) or a longer id that starts
+  with exactly those 8; a shorter fragment matches nothing. The log file holds only new-agent lines and
+  hand-over lines; sampled repeat requests are in the other log and are not reported. `--outcomes yes` adds ground truth:
+  it reads the gateway's request log READ ONLY (never written, never by the router, never on a
+  timer), pairs each agent with the request of the same session and agent within 2 seconds, and says
+  how many of the matched requests the gateway served on the logged model, on another model, or
+  answered with an error status; the gateway keeps only recent request rows (how long is not
+  specified here; the observer notes in section 6 report roughly 1.5 hours on one machine, issue
+  #134, not a guarantee), so older agents show as "no matching request". An unreadable log or snapshot is said in the report, never left out.
+  `--json yes` prints one JSON object whose shape is frozen (`schema` 1, a fixed key order, pinned
+  by a test); `last --json yes` keeps its own shape.
+  `selftest` is the one-run check that the policy really changes a subagent's model and leaves
+  helper calls alone, on a real headless Claude Code inside the isolated sandbox. `selftest --plan
+  yes` prints what a run would do and its plan hash; it reads no data file and starts no process.
+  `selftest --approve-plan yes --live yes` is yours to run in a terminal: the command refuses without
+  one and needs the first 12 hex characters of that hash typed. That blocks a pipe and an accidental
+  run and pins the plan and the files; it does not prove a person typed it (a program that opens a
+  pseudo-terminal passes the terminal check, the same documented limit as the sandbox approval).
+  An approval is refused while the sandbox runner is missing. `selftest --run
+  yes --live yes` needs that approval (one use, valid 24 hours, void if the plan or any file the run
+  executes changed), uses it up, and prints PASS or FAIL for the two checks (a subagent request
+  reached the stub on the policy's model and the sandbox router's own log shows it chose it; a helper
+  call stayed on the model it asked for). A check
+  that sees no matching request fails. A run is refused, with the approval left unused, while the
+  sandbox runner `harness/subagent-scenarios.mjs` does not exist yet.
 - **Counts carry their denominator.** Every figure printed says what it is a count of ("7 of 7
   eligible models are not tool-tested"). "Eligible" means allowed by the toggles; "usable" means it
   can stand in for a subagent (a known context of at least 128,000) and fits the request.

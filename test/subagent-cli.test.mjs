@@ -731,7 +731,7 @@ test("G1: parseArgs and resolvePaths (pure) reject a blank file flag, and resolv
 });
 
 test("G1: a test-flag path under a real vault, Claude, state or catalog folder is refused however it is spelled (absent tail, .., case, junction), and a look-alike sibling is not", () => {
-  const home = tmp(), protect = lib.protectedDirs(home);
+  const home = tmp(), protect = lib.protectedDirs(home, {});          // an empty environment: no CCR data folder (the loop below creates every protected folder it is given)
   for (const d of protect) fs.mkdirSync(d, { recursive: true });
   const base = fixtureFlagMap(tmp());                                  // every path in another temp folder
   assert.doesNotThrow(() => lib.resolvePaths(base, { protect }));
@@ -997,7 +997,7 @@ test("CLI-1 (D5): set, rebuild and clear with NO file flag and no --live yes exi
 
 test("S-F8: a UNC path (\\\\localhost\\C$\\..., \\\\127.0.0.1\\C$\\..., a device path) is refused for every file flag; a plain local temp path is not", { skip: process.platform !== "win32" && "UNC paths are a Windows form" }, () => {
   const s = setup();
-  const real = lib.protectedDirs();
+  const real = lib.protectedDirs(os.homedir(), {});                   // the four home folders; CCR's own data folder is added when the environment names one
   const uncs = [
     "\\\\localhost\\" + path.join(os.homedir(), ".uw", "state").replace(":", "$"),
     "\\\\127.0.0.1\\" + path.join(os.homedir(), ".llmkeys").replace(":", "$"),
@@ -1006,6 +1006,7 @@ test("S-F8: a UNC path (\\\\localhost\\C$\\..., \\\\127.0.0.1\\C$\\..., a device
     "\\\\" + "nowhere-host" + "\\share\\x",
   ];
   assert.ok(real.length === 4);
+  assert.equal(lib.protectedDirs(os.homedir(), { UW_CCR_DATA_DIR: "C:\\ccr-data" }).length, 5, "the CCR data folder (the request log lives there) is the fifth");
   for (const k of lib.FILE_FLAGS) {
     for (const unc of uncs) {
       const flags = { [k]: unc };

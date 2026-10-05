@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { writeAtomic } from "../menu/atomic.mjs";
 import { loadSnapshot } from "../menu/snapshot.mjs";
 import { loadBench, BENCH_FILE, BENCH_OUTDATED_DAYS } from "../menu/bench-data.mjs";
@@ -17,7 +18,7 @@ import { capBand, sizeCell } from "../menu/payload-cap.mjs";
 import { load as loadDefaultModel, DEFAULT_MODEL_FILE } from "./default-model.mjs";
 import { filterRegistry, chooseKeys } from "./keysync.mjs";
 import { CONTRACT as CC } from "../menu/cc-contract.mjs";
-import { CONTRACT as CCR, rpc } from "../menu/ccr-client.mjs";
+import { CONTRACT as CCR, rpc, requestLogsDb, dataDir } from "../menu/ccr-client.mjs";
 import { funnel, emptyStage, FREE_TAG, SCOPE_NAMES, FREE_SCOPES, DEFAULT_MIN_SET, SUBSTITUTE_FLOOR, SUBSTITUTE_K, PREMIUM_RULE,
   providerOf, stripOneM } from "../menu/subagent-funnel.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
@@ -37,6 +38,8 @@ export const STATE_DIR = path.join(STATE_ROOT, "subagent");
 export const OWNER_MAX_BYTES = 4096;
 export const COMPILED_MAX_BYTES = 1024 * 1024;
 export const ALLOW_MAX = 24, ALLOW_PIN_MAX = 100;                  // keeps a saved owner file under OWNER_MAX_BYTES: it must always load again
+/** The owner's one-use approval of a self-test plan (harness/g1-* is gitignored); a fixture run keeps its own under the fixture state folder. */
+export const SELFTEST_APPROVAL_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "harness", "g1-selftest-approval.json");
 export const INJECT_MAX_BYTES = 2048;
 export const INJECT_MAX_ENTRIES = 20;
 export const INJECT_PER_PROVIDER = 3;
@@ -53,7 +56,7 @@ export const ENUMS = Object.freeze({
   source: ["same-provider", "all-providers"], mode: ["dynamic", "inherit", "free"], "free-scope": [...FREE_SCOPES],
   ctx: ["any", "prefer-1m", "1m"], enforce: ["shadow", "enforce"], inject: ["off", "on"], unverified: ["allow-warn", "allow-t", "pin-only"],
 });
-const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause"];
+const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause", "outcomes", "plan", "approve-plan", "run"];
 export const FILE_FLAGS = Object.freeze(["policy-file", "state-dir", "providers-file", "snapshot-file", "bench-file", "observed-file",
   "default-model-file", "registry-file", "key-choices-file", "vault-providers-file", "settings-file", "tool-fidelity-file"]);
 const OWNER_FLAGS = ["source", "mode", "free-scope", "ctx", "enforce", "inject", "unverified", "allow", "banded", "handoff-notice"];
@@ -67,6 +70,8 @@ const CMD_FLAGS = Object.freeze({
   status: [...FILE_FLAGS], last: ["since", "json", "state-dir"], pause: ["policy-file", "state-dir"],
   resume: ["min-set", "live", ...FILE_FLAGS], undo: ["min-set", "live", "lift-pause", ...FILE_FLAGS],
   preset: ["confirm", "dry", "live", "detail", "min-set", ...FILE_FLAGS], wizard: ["min-set", "live", ...FILE_FLAGS], why: [],
+  // S2a and S2c: report only reads (the prices come from the snapshot, the ground truth from the request log, both named by a fixture run); selftest prints, approves or runs
+  report: ["since", "session", "json", "outcomes", "logs-file", "state-dir", "snapshot-file"], selftest: ["plan", "approve-plan", "run", "live"],
 });
 export const COMMANDS = Object.freeze(Object.keys(CMD_FLAGS));
 
@@ -172,10 +177,14 @@ export function parseArgs(argv) {
   if (cmd === "explain") { if (pos.length !== 1) throw usage("usage: subagent-policy explain <provider/model> [--source ..] [--mode ..] [--free-scope ..] [--ctx ..] [flags]"); }
   else if (cmd === "why") { if (pos.length > 1) throw usage("usage: subagent-policy why [CODE]"); }
   else if (cmd === "preset") { if (pos.length > 1 || (pos[0] !== undefined && !Object.hasOwn(PRESETS, pos[0]))) throw usage(`usage: subagent-policy preset [${Object.keys(PRESETS).join("|")}] [--confirm yes]`); }
+  else if (cmd === "report" || cmd === "selftest") { if (pos.length) throw usage(`unexpected argument ${JSON.stringify(pos[0])} for ${cmd}`); }
   else if (cmd === "last") {
     if (pos.length > 1 || (pos[0] !== undefined && !/^[1-9]\d{0,2}$/.test(pos[0]))) throw usage("usage: subagent-policy last [N] [--since 1h|24h|7d] [--json yes] (N is a number from 1 to 999)");
   } else if (pos.length) throw usage(`unexpected argument ${JSON.stringify(pos[0])} for ${cmd}`);
   if (flags.since !== undefined && !/^[1-9]\d{0,3}[mhd]$/.test(flags.since)) throw usage(`flag --since takes a number and a unit, like 1h, 24h or 7d, found ${JSON.stringify(String(flags.since).slice(0, 40))}`);
+  if (flags.session !== undefined && !/^[A-Za-z0-9_-]{1,64}$/.test(flags.session)) throw usage(`flag --session takes a session id of letters, digits, _ and - (at most 64), found ${JSON.stringify(String(flags.session).slice(0, 40))}`);
+  if (flags["logs-file"] !== undefined && !("state-dir" in flags)) throw usage("incomplete test-flag set: --logs-file requires --state-dir too (the request log is read from the real data folder only when no test flag is given)");
+  if ([flags.plan, flags["approve-plan"], flags.run].filter(Boolean).length > 1) throw usage("selftest: --plan, --approve-plan and --run are separate steps: give one");
   if (allow.length) flags.allow = allow;
   // The all-or-nothing safety rule (4): a half-fixtured run must never mix fixture input with the real ~/.llmkeys or state/.
   // rollback and clear read no input file, but they write the owner file and the state folder: --policy-file alone would pair a
@@ -188,14 +197,14 @@ export function parseArgs(argv) {
   // one word must work in an emergency.
   // resume and undo write the owner file again (the direction away from safety), and a preset that is confirmed is a set: all three need it too. So does the wizard: a real save never
   // happens without an explicit `--live yes` on the command line, so the wizard is refused up front (before it asks a question) rather than after the answers.
-  const writes = (cmd === "set" && !flags.dry) || cmd === "rebuild" || cmd === "clear" || cmd === "resume" || cmd === "undo" || cmd === "wizard" || (cmd === "preset" && flags.confirm === true && !flags.dry);
+  const writes = (cmd === "set" && !flags.dry) || cmd === "rebuild" || cmd === "clear" || cmd === "resume" || cmd === "undo" || cmd === "wizard" || (cmd === "preset" && flags.confirm === true && !flags.dry) || (cmd === "selftest" && (flags["approve-plan"] === true || flags.run === true));
   if (!given.length && writes && flags.live !== true) {
-    const real = [OWNER_FILE, path.join(STATE_DIR, "policy.json"), ...(cmd === "set" || cmd === "clear" || cmd === "preset" || cmd === "resume" || cmd === "undo" || cmd === "wizard" ? [path.join(STATE_DIR, "shadow.flag")] : []), ...(cmd === "clear" ? [path.join(STATE_DIR, "<session, cooling and status files>")] : [])];
+    const real = cmd === "selftest" ? [SELFTEST_APPROVAL_FILE] : [OWNER_FILE, path.join(STATE_DIR, "policy.json"), ...(cmd === "set" || cmd === "clear" || cmd === "preset" || cmd === "resume" || cmd === "undo" || cmd === "wizard" ? [path.join(STATE_DIR, "shadow.flag")] : []), ...(cmd === "clear" ? [path.join(STATE_DIR, "<session, cooling and status files>")] : [])];
     throw usage(`${cmd} with no file flags writes the REAL files ${real.join(", ")}; pass --live yes to confirm (a fixture run names its own files with the test flags; --dry yes previews a set; rollback and pause need no flag)`);
   }
   if (given.length) {
     const need = cmd === "set" || cmd === "explain" || cmd === "rebuild" || cmd === "preset" || cmd === "wizard" || cmd === "resume" || cmd === "undo" ? ["policy-file", "state-dir", "providers-file"]
-      : cmd === "show" || cmd === "status" ? ["policy-file", "state-dir"] : cmd === "last" ? ["state-dir"] : [];
+      : cmd === "show" || cmd === "status" ? ["policy-file", "state-dir"] : cmd === "last" || cmd === "report" ? ["state-dir"] : [];
     const missing = need.filter((f) => !(f in flags));
     if (missing.length) throw usage(`incomplete test-flag set: ${given.map((f) => "--" + f).join(" ")} requires ${need.map((f) => "--" + f).join(" ")} too (missing ${missing.map((f) => "--" + f).join(" ")})`);
   }
@@ -203,7 +212,7 @@ export function parseArgs(argv) {
 }
 
 /** The folders a fixture run must never name: the real vault, Claude settings, UW state and catalog (resolved against the home folder in use). */
-export const protectedDirs = (home = os.homedir()) => [path.join(home, ".llmkeys"), path.join(home, ".claude"), path.join(home, ".uw", "state"), path.join(home, ".uw", "catalog")];
+export const protectedDirs = (home = os.homedir(), env = process.env) => [path.join(home, ".llmkeys"), path.join(home, ".claude"), path.join(home, ".uw", "state"), path.join(home, ".uw", "catalog"), ...(dataDir(env) ? [dataDir(env)] : [])];   // the last is CCR's own data folder (the request log lives there)
 const realNative = (p) => (fs.realpathSync.native ?? fs.realpathSync)(p);
 /** realpath of the deepest existing ancestor plus the not-yet-existing tail: a path that does not exist yet (or sits behind a junction) still resolves. */
 function realish(p) {
@@ -218,9 +227,9 @@ function realish(p) {
 const normCase = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
 const isUnder = (child, dir) => { const c = normCase(child), d = normCase(dir); return c === d || c.startsWith(d.endsWith(path.sep) ? d : d + path.sep); };
 
-export function resolvePaths(flags, { protect = protectedDirs() } = {}) {
+export function resolvePaths(flags, { env = process.env, protect = protectedDirs(os.homedir(), env) } = {}) {
   const given = (k) => flags[k] !== undefined;
-  for (const k of FILE_FLAGS) if (given(k) && String(flags[k]).trim() === "") throw usage(`flag --${k} needs a file path, found an empty or blank value`);   // truthiness would send it to a REAL default
+  for (const k of [...FILE_FLAGS, "logs-file"]) if (given(k) && String(flags[k]).trim() === "") throw usage(`flag --${k} needs a file path, found an empty or blank value`);   // truthiness would send it to a REAL default
   // `--state-dir` names the state ROOT (the stand-in for ~/.uw/state); the policy files live in its `subagent` folder, as the
   // router's own location-derived path does, and the tool-fidelity file sits at its top level.
   const stateRoot = given("state-dir") ? path.resolve(flags["state-dir"]) : STATE_ROOT;
@@ -233,7 +242,7 @@ export function resolvePaths(flags, { protect = protectedDirs() } = {}) {
   // ancestor's) lies under a real folder is refused, however it was spelled (a junction, a `..`, a different case, a short name).
   if (fixture) {
     const real = protect.flatMap((d) => [path.resolve(d), realish(d)]);
-    for (const k of FILE_FLAGS) {
+    for (const k of [...FILE_FLAGS, "logs-file"]) {
       if (!given(k)) continue;
       // SEC-3: the RESOLVED path is tested for a UNC prefix BEFORE realish() runs: realish() calls realpath, and realpath of a remote UNC path makes Windows open an SMB connection (42 s to be refused). A local junction that leads to a UNC target is still caught by the second test below.
       const abs = path.resolve(flags[k]);
@@ -252,6 +261,7 @@ export function resolvePaths(flags, { protect = protectedDirs() } = {}) {
     fixture, stateRoot, stateDir, compiledFile: path.join(stateDir, "policy.json"),
     statusFile: path.join(stateDir, "status.json"), flagFile: path.join(stateDir, "shadow.flag"),
     providersFile: given("providers-file") ? path.resolve(flags["providers-file"]) : null,
+    logsFile: given("logs-file") ? path.resolve(flags["logs-file"]) : fixture ? null : requestLogsDb(env),     // the request log of CCR: a fixture run reads one only when it names it
     snapshotFile: f("snapshot-file", undefined), benchFile: f("bench-file", BENCH_FILE), observedFile: f("observed-file", undefined),
     defaultModelFile: f("default-model-file", DEFAULT_MODEL_FILE),
     registryFile: f("registry-file", path.join(LLMKEYS, "registry.json")),
@@ -587,11 +597,11 @@ export function readCompiled(file, opts) {
   return ok ? r : { ok: false, reason: "schema" };
 }
 /** Router-written strings are untrusted when printed: control and bidi-control characters (an escape sequence or a reordering mark in a model name) become "?". */
-export const printable = (v, max = 160) => String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "?").slice(0, max);   // C0, DEL, C1 (U+009B is a CSI), bidi overrides and isolates
+export const printable = (v, max = 160) => (typeof v === "string" ? v : typeof v === "number" ? String(v) : v === null || v === undefined ? "" : "?").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "?").slice(0, max);   // C0, DEL, C1 (U+009B is a CSI), bidi overrides and isolates
 /** One handoff line for people: `HANDOFF groq/x -> sambanova/y (retry 1, hop 1)`, from an agents.jsonl line with act "handoff" (pure; router-written text is made printable). */
 export function formatHandoff(line) {
   const l = isObject(line) ? line : {};
-  const m = /^retry:[a-z]{1,8}:(\d{1,3})$/.exec(String(l.reason ?? l.why ?? ""));
+  const m = /^retry:[a-z]{1,8}:(\d{1,3})$/.exec(printable(l.reason ?? l.why ?? "", 80));
   return `HANDOFF ${printable(l.from ?? "?", 160)} -> ${printable(l.to ?? l.ret ?? "?", 160)} (retry ${m ? m[1] : "?"}, hop ${Number.isInteger(l.hop) ? l.hop : "?"})`;
 }
 /** The provider of the most recently learned main (live status, router seen recently), else of the likely main (default model). */
@@ -941,7 +951,7 @@ function describeCompiled(c, age, detail = false) {
       ...FREE_SCOPES.map((s) => { const f = c.counts.freeScopes?.[s]; return `    ${dots(SCOPE_NAMES[s], 30)} ${!f || f.unavailable ? "unavailable" : `${f.n} on ${f.providers} providers`}`; }),
       `  owner in the compiled file: mode ${o.mode}, source ${o.source}, ctx ${o.ctx}, enforcement ${o.enforcement}, inject ${o.inject}${o.banded === undefined ? "" : `, banded ${o.banded}`}${o.handoffNotice === undefined ? "" : `, handoff notice ${o.handoffNotice}`}${c.minRouter === undefined ? "" : `; needs router v${c.minRouter}`}`] : [])];
 }
-const ago = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 120 ? `${s}s` : s < 7200 ? `${Math.round(s / 60)}m` : s < 172800 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`; };
+export const ago = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 120 ? `${s}s` : s < 7200 ? `${Math.round(s / 60)}m` : s < 172800 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`; };
 /** Content of shadow.flag as the verdict wants it: false when absent, else the text (or true when it cannot be read). */
 function readFlag(p) {
   if (!fs.existsSync(p.flagFile)) return false;
@@ -1076,15 +1086,15 @@ export function readAgentLog(stateDir) {
       if (!raw.trim()) continue;
       let o;
       try { o = JSON.parse(raw); } catch { unreadable += 1; continue; }
-      if (!isObject(o) || !Number.isFinite(Date.parse(o.t ?? ""))) { unreadable += 1; continue; }
+      if (!isObject(o) || typeof o.t !== "string" || !Number.isFinite(Date.parse(o.t))) { unreadable += 1; continue; }
       lines.push(o);
     }
   }
   lines.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));        // rotated generations are older, but a clock step must not scramble the list
   return { lines, unreadable, files };
 }
-const UNITS = { m: 60000, h: 3600000, d: 86400000 };
-const sinceMs = (v) => Number(v.slice(0, -1)) * UNITS[v.slice(-1)];
+export const UNITS = { m: 60000, h: 3600000, d: 86400000 };
+export const sinceMs = (v) => Number(v.slice(0, -1)) * UNITS[v.slice(-1)];
 const sel = (v) => printable(v ?? "", 160);
 /** One agents.jsonl line (the router's v2 line: no role and no sticky marker, those live in decisions.jsonl) as a stable record of plain fields. */
 function lastRecord(o) {
@@ -1100,7 +1110,7 @@ function lastRecord(o) {
 }
 const pad2 = (v) => String(v).padStart(2, "0");
 /** Local time of a log line plus how long ago it was (the UTC ISO time is in --json only): `2026-10-05 13:30:00 (30m ago)`. */
-const localWhen = (iso, nowMs) => { const d = new Date(iso); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())} (${ago(nowMs - d.getTime())} ago)`; };
+export const localWhen = (iso, nowMs) => { const d = new Date(iso); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())} (${ago(nowMs - d.getTime())} ago)`; };
 function lastText(r, nowMs) {
   const when = localWhen(r.t, nowMs);
   const tail = r.flags.length ? `  [${r.flags.join("; ")}]` : "";
@@ -1109,8 +1119,8 @@ function lastText(r, nowMs) {
   const pol = r.would === null ? (r.why ? `no policy choice (${r.why})` : "no policy choice") : r.would === r.asked ? "policy agrees" : `${verb} ${r.would}`;
   return `${when}  asked ${r.asked ?? "?"}  ran ${r.ran ?? "?"}  ${pol}${r.why && r.would !== null ? `  because ${r.why}` : ""}${tail}`;
 }
-const tally = (vals) => { const m = new Map(); for (const v of vals) m.set(v, (m.get(v) ?? 0) + 1); return [...m.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)); };
-const provOf = (s) => (s ? providerOf(stripOneM(s)) : "?");
+export const tally = (vals) => { const m = new Map(); for (const v of vals) m.set(v, (m.get(v) ?? 0) + 1); return [...m.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)); };
+export const provOf = (s) => (s ? providerOf(stripOneM(s)) : "?");
 
 async function cmdLast(p, flags, io, target, opts = {}) {
   const nowMs = opts.now ?? Date.now();
@@ -1120,7 +1130,7 @@ async function cmdLast(p, flags, io, target, opts = {}) {
   const inWin = sinceT === null ? all : all.filter((o) => Date.parse(o.t) >= sinceT);
   const recs = inWin.slice(-limit).map(lastRecord);
   const real = recs.filter((r) => r.handoff === null);
-  const sessions = new Set(inWin.map((o) => String(o.sid ?? "")));
+  const sessions = new Set(inWin.map((o) => printable(o.sid ?? "", 64)));
   const moved = real.filter((r) => r.moved === true).length;
   const den = { agentLines: inWin.length, shown: recs.length, sessions: sessions.size, unreadableLines: unreadable, filesRead: files };
   if (flags.json) {
@@ -1496,7 +1506,7 @@ export async function runSubagentPolicy(argv, io, env = process.env, opts = {}) 
   try {
     for (const k of AMBIENT_ENV) if (env[k]) io.err(`NOTE: ambient ${k} is set and IGNORED (the policy is steered only by explicit flags and its default locations)`);
     const { cmd, flags, target } = parseArgs(argv);
-    const p = resolvePaths(flags);
+    const p = resolvePaths(flags, { env });
     switch (cmd) {
       case "set": return await cmdSet(p, flags, io, opts);
       case "show": return await cmdShow(p, flags, io, opts);
@@ -1510,6 +1520,9 @@ export async function runSubagentPolicy(argv, io, env = process.env, opts = {}) 
       case "resume": return await cmdResume(p, flags, io, opts);
       case "undo": return await cmdUndo(p, flags, io, opts);
       case "why": return await cmdWhy(p, flags, io, target);
+      // loaded on demand, like key.mjs loads this module: the report pulls in the SQLite reader, the self-test the sandbox harness constants, and no other command needs either
+      case "report": return await (await import("./subagent-report.mjs")).cmdReport(p, flags, io, opts);
+      case "selftest": return await (await import("./subagent-selftest.mjs")).cmdSelftest(p, flags, io, opts);
       case "rebuild": return await cmdRebuild(p, flags, io);
       case "explain": return await cmdExplain(p, flags, io, target);
       default: throw usage(`unknown subcommand ${cmd}`);
@@ -1549,6 +1562,8 @@ export const usageText = [
   "  set [toggles and switches] [--dry yes] [--detail yes]   compute and (without --dry yes) save; --detail yes prints the whole funnel and every raw warning",
   "  show [--detail yes]       the saved policy, the compiled copy and what the router reported",
   "  explain <provider/model> [--source ..] [--mode ..] [--free-scope ..] [--ctx ..]   would this model be allowed? the flags ask 'what if' and save nothing",
+  "  report [--since 1h|24h|7d] [--session ID] [--json yes] [--outcomes yes]   asked -> ran per agent, what the policy would have used, and an input-token cost estimate against main's own model; --outcomes yes joins the gateway request log (read only)",
+  "  selftest --plan yes       what a sandbox self-test would do, and its plan hash; it starts nothing (the run needs your typed approval: --approve-plan yes, then --run yes)",
   "  why [CODE]                what a warning or error code means in plain words, and the command that fixes it",
   "  pause | resume | undo     pause: subagents run as they asked from the next request (your toggles are kept); resume: continue (checked like set --enforce enforce); undo: back one step (refused while paused unless --lift-pause yes)",
   "  rebuild [--if-stale yes]  recompile the saved policy after a bench sweep, keysync run or key change",
