@@ -7,7 +7,7 @@ import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs } from "../refresh/tool-fidelity-cli.mjs";
 import {
-  probeSet, selectCandidates, coverage, assertPartition, coverageLines, ledgerUniverses, updatePending, cleanPending, inherited, defaultIdentity, queueFor,
+  probeSet, selectCandidates, presetUnion, loadTiers, envelope, ctxNeededFor, BIG_MIN_CTX, coverage, assertPartition, coverageLines, ledgerUniverses, updatePending, cleanPending, inherited, defaultIdentity, queueFor,
   loadFidelity, saveFidelity, loadPolicy, renderFile, FILE_NAME, REAL_FILE,
 } from "../refresh/tool-fidelity.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
@@ -32,22 +32,115 @@ const POLICY = (...rows) => ({ schema: 1, models: rows.map(([s, c]) => ({ s, c }
 
 // ---------------------------------------------------------------- candidates
 
-test("candidates: the policy's ALLOWED set with a known ctx of at least 128,000, in the policy's own rank, NOT limited to 3 per provider; pins first and exempt from the filters", () => {
-  const { snap, bench } = world((i) => (i === 4 ? 64000 : i === 5 ? 0 : 200000), 8);
+const TIERS = { fa: "free", fb: "free", fp: "paid", fd: "free-deposit", fm: "management", anthropic: "subscription" };
+
+/** The mixed world of the candidates rule: free, paid, deposit and management providers, unknown and small contexts, the relay. */
+function mixed() {
+  const m = (id, ctx = 200000, over = {}) => ({ id, outModality: "chat", ctx, tools: true, pin: 0, pout: 0, badge: "FREE", ...over });
+  const rows = [
+    { provider: "anthropic", keyId: RELAY_KEY_ID, models: [m("claude-x")] },
+    { provider: "fa", keyId: "k.fa.free", models: [m("big1", 1000000), m("big2", 200000), m("mid", 130000), m("small", 100000), m("tiny", 32000), m("unk", null), m("zero", 0), m("priced", 200000, { badge: "PAID", pin: 5, pout: 9 })] },
+    { provider: "fb", keyId: "k.fb.free", models: [m("b1", 300000), m("b2", null)] },
+    { provider: "fp", keyId: "k.fp.paid", models: [m("p1", 200000, { badge: "PAID", pin: 1, pout: 2 })] },
+    { provider: "fd", keyId: "k.fd.free-deposit", models: [m("d1")] },
+    { provider: "fm", keyId: "k.fm.management", models: [m("g1")] },
+    { provider: "fx", keyId: "k.fx.free", models: [m("t1")] },                    // a provider with no tier at all
+  ];
+  const ok = { s: "ok", t: 400, a: 1790699779 };
+  return { snap: { rows }, bench: { get: (k) => (/^(anthropic|fa|fb|fp|fd|fm|fx)\//.test(k) ? ok : null) } };
+}
+
+test("CANDIDATES: every probe-ok model on a FREE-tier provider, whether or not its context is known; paid, deposit, management, relay and tier-less providers are excluded with their reason", () => {
+  const { snap, bench } = mixed();
   const set = probeSet(snap, bench);
-  const policy = POLICY(["fa/m3", 200000], ["fb/b1", 1000000], ["fa/m1", 200000], ["fa/m4", 64000], ["fa/m5", 0], ["fa/m6", 200000], ["fa/m7", 128000], ["fa/m8", 200000]);
-  const c = selectCandidates({ set, policy });
-  assert.deepEqual(c.entries.map((e) => e.key), ["fa/m3", "fb/b1", "fa/m1", "fa/m6", "fa/m7", "fa/m8"], "policy order; 6 of fa's models are candidates, not 3 (and 128,000 exactly is at the floor)");
-  assert.equal(c.entries.filter((e) => e.provider === "fa").length, 5, "five fa models: far beyond the router's top 3");
+  const c = selectCandidates({ set, policy: POLICY(["fa/big1", 1000000]), tiers: TIERS });
+  assert.deepEqual(c.entries.map((e) => e.key).sort(), ["fa/big1", "fa/big2", "fa/mid", "fa/priced", "fa/small", "fa/unk", "fa/zero", "fb/b1", "fb/b2"].sort(), "unknown ctx (null and 0) is IN");
   const why = Object.fromEntries(c.excluded.map((e) => [e.key, e.reason]));
-  assert.deepEqual(why, { "fa/m4": "ctx-below-floor", "fa/m5": "ctx-unknown", "fa/m2": "outside-toggles", "fb/b2": "outside-toggles", "anthropic/claude-x": "relay-by-provenance" });
+  assert.deepEqual(why, { "fa/tiny": "ctx-too-small-for-fixture", "fp/p1": "not-free-tier (skipped for now)", "fd/d1": "not-free-tier (skipped for now)", "fm/g1": "not-free-tier (skipped for now)", "fx/t1": "not-free-tier (skipped for now)", "anthropic/claude-x": "relay-by-provenance" });
   assert.equal(c.entries.length + c.excluded.length, set.models.length + set.relay.length, "every probe-ok model and the relay is in exactly one list");
-  const pinned = selectCandidates({ set, policy, pins: ["fa/m4", "fb/b2", "fa/m1", "fa/nosuch"] });
-  assert.deepEqual(pinned.entries.map((e) => e.key).slice(0, 3), ["fa/m4", "fb/b2", "fa/m1"], "pins come first, in the order given, whatever their ctx or toggles");
-  assert.deepEqual(pinned.entries.filter((e) => e.pinned).map((e) => e.key), ["fa/m4", "fb/b2", "fa/m1"]);
-  assert.equal(pinned.entries.filter((e) => e.key === "fa/m1").length, 1, "a pin that is also allowed is listed once");
-  assert.deepEqual(pinned.pinned, ["fa/nosuch"], "a pin that is not a probe-ok model is reported, not invented");
-  assert.deepEqual(selectCandidates({ set, policy: POLICY() }).entries, [], "an empty policy: no candidates");
+  assert.ok(c.entries.every((e) => e.tier === "free"));
+  const priced = c.entries.find((e) => e.key === "fa/priced");
+  assert.deepEqual([priced.free ?? false, priced.pricedOnFree], [false, true], "a free-tier KEY does not make a LISTED price free: the model is costed at $5 / $9 so the row ceiling and the spend cap apply");
+  assert.ok(c.entries.filter((e) => e.key !== "fa/priced" && e.tier === "free").every((e) => e.free === true && !e.pricedOnFree), "a free-tier key with no listed price (or a free listing) costs nothing");
+  const lifted = selectCandidates({ set, policy: POLICY(), tiers: TIERS, includeTiers: ["paid", "free-deposit"] });
+  assert.deepEqual(lifted.entries.filter((e) => e.tier !== "free").map((e) => [e.key, e.tier, e.free]), [["fd/d1", "free-deposit", true], ["fp/p1", "paid", false]], "--include-tier lifts the exclusion; a paid model keeps its price (not free)");
+  assert.equal(lifted.excluded.find((e) => e.key === "fm/g1").reason, "not-free-tier (skipped for now)", "management stays out unless asked");
+  assert.equal(selectCandidates({ set, policy: POLICY(), tiers: TIERS, includeTiers: ["management"] }).entries.some((e) => e.key === "fm/g1"), true);
+  assert.equal(selectCandidates({ set, policy: POLICY(), tiers: {} }).entries.length, 0, "no tiers at all: nothing is assumed free");
+});
+
+test("SIZE rule: a KNOWN context too small for the 157 KB fixture is excluded (threshold from the fixture's token count with margin); the big step is skipped below 200,000", () => {
+  const need = ctxNeededFor(3);
+  assert.ok(need > 55000 && need < 62000, `about 1.5 x 39,223 tokens plus the answer budget: ${need}`);
+  assert.equal(ctxNeededFor(4) >= need, true);
+  assert.equal(BIG_MIN_CTX, 200000);
+  const { snap, bench } = mixed();
+  const set = probeSet(snap, bench);
+  const c = selectCandidates({ set, policy: POLICY(), tiers: TIERS });
+  assert.equal(c.excluded.find((e) => e.key === "fa/tiny").reason, "ctx-too-small-for-fixture", "32,000 is below the need");
+  assert.equal(c.entries.some((e) => e.key === "fa/small"), true, "100,000 is enough for the fixture");
+  const edge = world(() => need, 1), edgeBelow = world(() => need - 1, 1);
+  const tiers = { fa: "free", fb: "free" };
+  assert.equal(selectCandidates({ set: probeSet(edge.snap, edge.bench), policy: POLICY(), tiers }).entries.some((e) => e.key === "fa/m1"), true, "exactly the need is in");
+  assert.equal(selectCandidates({ set: probeSet(edgeBelow.snap, edgeBelow.bench), policy: POLICY(), tiers }).entries.some((e) => e.key === "fa/m1"), false, "one token less is out");
+});
+
+test("PRIORITY queue (an ordering, never a limit): 1 policy allowed >= 128,000 and pins, 2 preset union, 3 other >= 128,000, 4 unknown, 5 known below 128,000; the policy's rank inside a level", () => {
+  const { snap, bench } = mixed();
+  const set = probeSet(snap, bench);
+  const policy = POLICY(["fa/big2", 200000], ["fb/b1", 300000], ["fa/mid", 100000], ["fa/big1", 1000000]);
+  const presetKeys = new Set(["fa/priced", "fa/mid"]);
+  const c = selectCandidates({ set, policy, tiers: TIERS, presetKeys });
+  assert.deepEqual(c.entries.map((e) => [e.key, e.prio]), [["fa/big2", 1], ["fb/b1", 1], ["fa/big1", 1], ["fa/mid", 2], ["fa/priced", 2], ["fa/unk", 4], ["fa/zero", 4], ["fb/b2", 4], ["fa/small", 5]]);
+  assert.deepEqual(c.entries.map((e) => e.prio), [1, 1, 1, 2, 2, 4, 4, 4, 5], "priority levels never decrease down the list");
+  assert.deepEqual(c.entries.slice(0, 3).map((e) => e.key), ["fa/big2", "fb/b1", "fa/big1"], "level 1 follows the POLICY's own rank, not the probe-set order");
+  assert.equal(c.entries.find((e) => e.key === "fa/mid").prio, 2, "mid is in the policy at 100,000 (below the floor) but in the preset union");
+  assert.equal(c.entries.find((e) => e.key === "fa/small").prio, 5, "known 100,000 below the floor, in no preset: last");
+  const noPresets = selectCandidates({ set, policy, tiers: TIERS });
+  assert.equal(noPresets.entries.length, c.entries.length, "without the preset union nothing is dropped, only level 2 is empty");
+  assert.ok(!noPresets.entries.some((e) => e.prio === 2));
+  assert.equal(noPresets.entries.find((e) => e.key === "fa/priced").prio, 3, "known >= 128,000, not in the policy: level 3");
+  const pinned = selectCandidates({ set, policy, tiers: TIERS, pins: ["fp/p1", "fa/tiny", "fa/small", "fx/t1"] });
+  assert.deepEqual(pinned.entries.slice(0, 2).map((e) => e.key), ["fa/tiny", "fa/small"], "pins come first, in the order given, whatever their context");
+  assert.ok(!pinned.entries.some((e) => e.key === "fp/p1" || e.key === "fx/t1"), "but a pin does NOT get round the tier rule: a paid or unlabelled provider is not probed");
+  assert.deepEqual(pinned.excluded.filter((e) => e.key === "fp/p1" || e.key === "fx/t1").map((e) => e.reason), ["not-free-tier (skipped for now)", "not-free-tier (skipped for now)"]);
+  assert.ok(pinned.entries.slice(0, 2).every((e) => e.pinned && e.prio === 1));
+  assert.deepEqual(selectCandidates({ set, policy, tiers: TIERS, pins: ["fa/nosuch"] }).pinned, ["fa/nosuch"], "a pin that is not a probe-ok model is reported, not invented");
+});
+
+test("presetUnion: the union of every preset's allowed set, computed with the funnel; a funnel that cannot run gives no keys and says so", () => {
+  const { snap, bench } = mixed();
+  const r = presetUnion({ snap, bench, tiers: TIERS, nowMs: 1790700000000 });
+  assert.ok(r.keys instanceof Set);
+  assert.equal(r.note, "8 presets");
+  assert.ok(r.keys.has("fa/big1") && r.keys.has("fb/b1"), "free-tier models are in a preset");
+  assert.ok(!r.keys.has("fm/g1"), "an excluded tier is in no preset");
+  const bad = presetUnion({ snap, bench: { get() { throw new Error("boom"); } }, tiers: TIERS });
+  assert.equal(bad.keys, null);
+  assert.match(bad.note, /could not be computed offline \(boom\); priority level 2 is empty/);
+});
+
+test("loadTiers reads {provider: tier}, a compiled policy's `tiers`, or the vault registry array; anything else is null", () => {
+  const d = freshDir(), f = path.join(d, "t.json");
+  for (const [raw, want] of [[{ fa: "free", fp: "paid" }, { fa: "free", fp: "paid" }], [{ tiers: { fa: "free" }, models: [] }, { fa: "free" }], [[{ provider: "fa", tier: "free" }, { provider: "fp", tier: "paid" }, { nope: 1 }], { fa: "free", fp: "paid" }], [{ fa: 5 }, null], ["x", null]]) {
+    fs.writeFileSync(f, JSON.stringify(raw));
+    assert.deepEqual(loadTiers(f), want, JSON.stringify(raw));
+  }
+  fs.writeFileSync(f, "{");
+  assert.equal(loadTiers(f), null);
+  assert.equal(loadTiers(path.join(d, "absent.json")), null);
+});
+
+test("the ENVELOPE of a queue: its requests and tokens, the cap that finishes it in one run, the runs at a cap, the models that can never run", () => {
+  const e = (provider, i, tin) => ({ key: `${provider}/${i}`, provider, tin, reqs: 5 });
+  const rated = [...Array.from({ length: 10 }, (_, i) => e("a", i, 1000)), ...Array.from({ length: 3 }, (_, i) => e("b", i, 1000)), e("c", 0, 9000)];
+  const env1 = envelope(rated, 4500);
+  assert.deepEqual([env1.models, env1.providers, env1.requests, env1.tokens, env1.oneRunCap], [14, 3, 70, 22000, 10000]);
+  assert.deepEqual(env1.perProvider.map((p) => [p.provider, p.tokens]), [["a", 10000], ["c", 9000], ["b", 3000]]);
+  assert.deepEqual([env1.runs, env1.neverRuns], [3, 1], "a: 4 + 4 + 2 over 3 runs; c alone is 9000 > 4500 and never runs");
+  assert.deepEqual([envelope(rated, 10000).runs, envelope(rated, 10000).neverRuns], [1, 0], "at the one-run cap everything runs once");
+  assert.deepEqual([envelope(rated, 100).runs, envelope(rated, 100).neverRuns], [0, 14], "a cap below every model: no run, all never");
+  assert.equal(envelope([], 100).models, 0);
 });
 
 test("loadPolicy accepts a compiled policy shape and nothing else", () => {
@@ -147,7 +240,7 @@ test("the ledger universes: L1+L2 covers every listed model (relay, not probe-ok
   const { snap, bench } = world();
   snap.rows[2].models.push({ id: "has space", outModality: "chat", tools: true });
   const set = probeSet(snap, { get: (k) => (k === "fb/has space" ? { s: "ok", a: 1 } : bench.get(k)) });
-  const cand = selectCandidates({ set, policy: POLICY(["fa/m1", 200000], ["fa/m2", 200000]) });
+  const cand = selectCandidates({ set, policy: POLICY(["fa/m1", 200000], ["fa/m2", 200000]), tiers: { fa: "free", fb: "free" } });
   const u = ledgerUniverses({ set, cand });
   const why = Object.fromEntries(u.l12.filter((x) => x.excluded).map((x) => [x.key, x.excluded]));
   assert.deepEqual(why, { "anthropic/claude-x": "relay-by-provenance", "fb/dead": "not-probe-ok", "fb/has space": "invalid-id" });
@@ -217,7 +310,7 @@ test("inherited: own evidence wins; provisional, alias, same-provider and untest
 
 // ---------------------------------------------------------------- the CLI
 
-function env(models, { policy, answer } = {}) {
+function env(models, { policy, answer, tiers = { fa: "free", fb: "free" }, presetKeys = null } = {}) {
   const dir = freshDir();
   const rows = [{ provider: "anthropic", keyId: RELAY_KEY_ID, models: [{ id: "claude-x", outModality: "chat", ctx: 200000, tools: true, pin: 0, pout: 0, badge: "PLAN" }] }];
   const by = new Map();
@@ -225,7 +318,7 @@ function env(models, { policy, answer } = {}) {
   for (const [provider, ms] of by) rows.push({ provider, keyId: `k.${provider}.free`, models: ms });
   const known = new Set(models.map(([p, id]) => `${p}/${id}`)).add("anthropic/claude-x");
   const f = fakeFetch(answer ?? goodModel);
-  const deps = { snapshot: { ok: true, snap: { rows } }, bench: { get: (k) => (known.has(k) ? { s: "ok", t: 400, a: 1790699779 } : null) }, policy,
+  const deps = { snapshot: { ok: true, snap: { rows } }, bench: { get: (k) => (known.has(k) ? { s: "ok", t: 400, a: 1790699779 } : null) }, policy: policy === null ? null : { ...(policy ?? POLICY()), tiers }, presetKeys,
     outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"), gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW,
     isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1 };
   return { dir, deps, f, out: deps.outFile };
@@ -238,76 +331,111 @@ async function run(argv, deps) {
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
-const SIX = ["m1", "m2", "m3", "m4", "m5", "m6"].map((id, i) => ["fa", id, id === "m4" ? 64000 : id === "m5" ? 0 : 200000]);
+const SIX = ["m1", "m2", "m3", "m4", "m5", "m6"].map((id) => ["fa", id, id === "m4" ? 64000 : id === "m5" ? 0 : 200000]);
 const POL = POLICY(["fa/m3", 200000], ["fa/m1", 200000], ["fa/m2", 200000], ["fa/m4", 64000], ["fa/m5", 0]);
+const CAP = ["--tf-max-tokens-per-provider", "400000"];
 
-test("arguments: --candidates policy makes the default levels 1,2,3,5 (an explicit --levels wins); --allow and --policy-file need it; it is its own pass", () => {
-  const o = parseArgs(["--candidates", "policy"]);
-  assert.deepEqual([o.candidates, o.levels, o.allow, o.pendingRuns], [true, [1, 2, 3, 5], [], 3]);
+test("arguments: --candidates policy and --sample make the default levels 1 to 7 (an explicit --levels wins); the new flags are validated", () => {
+  assert.deepEqual(parseArgs(["--candidates", "policy"]).levels, [1, 2, 3, 4, 5, 6, 7]);
   assert.deepEqual(parseArgs(["--candidates", "policy", "--levels", "35"]).levels, [3, 5]);
-  assert.deepEqual(parseArgs(["--candidates", "policy", "--allow", "fa/m4,fb/b2", "--policy-file", "p.json", "--pending-runs", "5"]).allow, ["fa/m4", "fb/b2"]);
-  assert.equal(parseArgs(["--candidates", "policy", "--pending-runs", "5"]).pendingRuns, 5);
-  for (const bad of [["--candidates", "all"], ["--candidates"], ["--allow", "fa/m1"], ["--policy-file", "x"], ["--candidates", "policy", "--allow", "nomodel"], ["--candidates", "policy", "--retry-failed"], ["--candidates", "policy", "--policy-file"]]) {
-    assert.ok(parseArgs(bad).error, bad.join(" "));
-  }
+  const s = parseArgs(["--sample"]);
+  assert.deepEqual([s.sample, s.candidates, s.levels, s.seed], [60, true, [1, 2, 3, 4, 5, 6, 7], "1"], "a bare --sample is 60 models and implies the candidates");
+  assert.deepEqual([parseArgs(["--sample", "20", "--seed", "abc"]).sample, parseArgs(["--sample", "20", "--seed", "abc"]).seed], [20, "abc"]);
+  assert.equal(parseArgs(["--sample", "--live"]).sample, 60, "a following flag is not the number");
+  assert.deepEqual(parseArgs(["--candidates", "policy", "--include-tier", "paid,free-deposit"]).includeTiers, ["paid", "free-deposit"]);
+  for (const bad of [["--candidates", "policy", "--include-tier", "free"], ["--candidates", "policy", "--include-tier", "gold"], ["--candidates", "policy", "--include-tier"], ["--include-tier", "paid"], ["--key-choices-file", "c.json"],
+    ["--candidates", "policy", "--tiers-file"], ["--sample", "0"], ["--sample", "5", "--seed"], ["--candidates", "all"], ["--candidates", "policy", "--allow", "nomodel"], ["--candidates", "policy", "--retry-failed"]]) assert.ok(parseArgs(bad).error, bad.join(" "));
+  assert.equal(parseArgs(["--candidates", "policy", "--tiers-file", "t.json", "--pending-runs", "5"]).pendingRuns, 5);
+  assert.equal(parseArgs(["--tiers-file", "t.json", "--key-choices-file", "c.json"]).keyChoicesFile, "c.json", "the tier file and the owner's key choices apply to every run, not only the candidates");
 });
 
-test("DRY RUN with --candidates policy: the candidate block, the exclusions, both ledgers and the estimate; nothing is sent or written", async () => {
-  const e = env([...SIX, ["fb", "b1"]], { policy: POL });
+test("DRY RUN with --candidates policy: the candidate block with priority counts and exclusions, the ENVELOPE of the whole queue, both ledgers; nothing is sent or written", async () => {
+  const e = env([...SIX, ["fb", "b1", 20000], ["fb", "b2", 100000]], { policy: POL, presetKeys: new Set(["fa/m6"]) });
   const before = fs.readdirSync(e.dir).sort();
   const r = await run(["--candidates", "policy"], e.deps);
   assert.equal(r.code, 0, r.err);
   assert.equal(e.f.calls.length, 0);
   assert.deepEqual(fs.readdirSync(e.dir).sort(), before);
-  assert.match(r.out, /candidates \(policy\): 3 of 7 probe-ok model\(s\) can be picked by the router \(known context of at least 128,000\); in the policy's own rank, best first/);
-  assert.match(r.out, /excluded: .*outside-toggles 2.*relay-by-provenance 1.*ctx-below-floor 1.*ctx-unknown 1|excluded: .*ctx-below-floor 1/);
-  assert.match(r.out, /coverage L1\+L2 \(every listed model\): 8 model\(s\) = tested 0 \(none\) \+ pending 7 \(.*\) \+ excluded 1 \(relay-by-provenance 1\)/);
-  assert.match(r.out, /coverage L3 \(candidates and the rest of the probe set\): 8 model\(s\) = tested 0 \(none\) \+ pending 3 \(.*\) \+ excluded 5 \(/);
-  assert.match(r.out, /L3 and L4 each send/);
+  assert.match(r.out, /levels L1\+L2\+L3\+L4\+big\+L6\+L7/);
+  assert.match(r.out, /candidates \(free tier\): 7 of 8 model\(s\) in the probe set, whether or not their context is known; priority 1 policy allowed >= 128,000 or pinned 3, 2 preset union 1, 3 other >= 128,000 0, 4 unknown context 1, 5 known below 128,000 2 \(an ordering, never a limit\)/);
+  assert.match(r.out, /excluded: ctx-too-small-for-fixture 1, relay-by-provenance 1/);
+  assert.match(r.out, /big step skipped for 2 model\(s\) whose known context is below 200,000 \(never recorded as a failure\)/);
+  assert.match(r.out, /envelope, the WHOLE queue at full depth \(before any cap\): \d+ requests, ~[\d.]+[Mk] input tokens, 7 model\(s\) of 8 in the probe set on 2 provider\(s\)/);
+  assert.match(r.out, /finishing in ONE run needs --tf-max-tokens-per-provider [\d,]+ \(largest: fa [\d.]+[Mk].*\); at the cap of 150,000 it takes about \d+ run\(s\)/);
+  assert.doesNotMatch(r.out, /WARNING: .* cost more than the cap on their own/, "a fully tested model is about 150,000 tokens: it fits the default cap of 150,000 (just)");
+  assert.match(r.out, /per request \(a full-depth model sends each row once/);
+  assert.match(r.out, /wall time, an estimate: about .* to .* for this run/);
+  assert.match(r.out, /coverage L3 .*: 9 model\(s\) = tested 0 \(none\) \+ pending 7 \(.*\) \+ excluded 2 \(/);
 });
 
-test("--candidates policy needs a compiled policy: missing or not one is an error that plans nothing", async () => {
+test("--candidates policy needs the provider key tiers (the policy's `tiers`, or --tiers-file) and a compiled policy: otherwise an error that plans nothing", async () => {
+  const noTiers = env(SIX, { policy: POL, tiers: undefined });
+  noTiers.deps.policy = { ...POL };
+  const a = await run(["--candidates", "policy"], noTiers.deps);
+  assert.equal(a.code, 1);
+  assert.match(a.err, /needs the provider key tiers/);
+  const fromFile = path.join(noTiers.dir, "tiers.json");
+  fs.writeFileSync(fromFile, JSON.stringify({ fa: "free" }));
+  const b = await run(["--candidates", "policy", "--tiers-file", fromFile], noTiers.deps);
+  assert.equal(b.code, 0, b.err);
+  assert.match(b.out, /candidates \(free tier\): 6 of 6 model\(s\) in the probe set/);
   const e = env(SIX, { policy: null });
-  const r = await run(["--candidates", "policy", "--policy-file", path.join(e.dir, "nope.json")], e.deps);
-  assert.equal(r.code, 1);
-  assert.match(r.err, /needs a compiled policy .*missing or is not one/);
+  const c = await run(["--candidates", "policy", "--policy-file", path.join(e.dir, "nope.json")], e.deps);
+  assert.equal(c.code, 1);
+  assert.match(c.err, /needs a compiled policy .*missing or is not one/);
 });
 
-test("LIVE candidates: L3 and the big step in the policy's own rank; the per-provider cap stops the run, the tail is pending: cap and the next run picks it up; counts and the ledger add up", async () => {
+test("LIVE candidates: every free-tier model in PRIORITY order; the per-provider cap stops the run and the tail is pending: cap and picked up by the next; the big step is skipped below 200,000 of known context", async () => {
   const e = env(SIX, { policy: POL });
-  const args = ["--candidates", "policy", "--l3", "yes", "--tf-max-tokens-per-provider", "300000"];
+  const args = ["--candidates", "policy", "--l3", "yes", ...CAP];
   const r1 = await run(["--live", ...args], e.deps);
   assert.equal(r1.code, 0, r1.err + r1.out);
-  const order = calls(e.f).filter((c) => c.bytes > 300000).map((c) => c.body.model);
-  assert.deepEqual(order, ["fa/m3", "fa/m1"], "two models fit 300,000 input tokens (L1+L2+L3+big is about 140,000 each), in the policy's rank: m3 then m1");
+  assert.deepEqual(calls(e.f).filter((c) => c.bytes > 300000).map((c) => c.body.model), ["fa/m3", "fa/m1"], "two models of 178,000 tokens fit 400,000, in the policy's rank: m3 then m1");
   const s1 = loadFidelity(e.out);
   assert.deepEqual(Object.keys(s1.models).sort(), ["fa/m1", "fa/m3"]);
-  assert.deepEqual([s1.models["fa/m3"].lvr, s1.models["fa/m3"].big, s1.models["fa/m3"].t], ["ppp" + "n", "p", "v"], "L1, L2, L3 passed, the big step passed");
-  assert.deepEqual(s1.pending, { "fa/m2": { r: "cap", n: 1, at: NOW.toISOString() } }, "the untested tail of the CANDIDATES waits, with its reason and one run counted; non-candidates are not in this run");
-  assert.match(r1.out, /coverage L3 \(candidates and the rest of the probe set\): 7 model\(s\) = tested 2 \(v 2\) \+ pending 1 \(cap 1\) \+ excluded 4 \(/);
-  assert.match(r1.out, /coverage L1\+L2 \(every listed model\): 7 model\(s\) = tested 2 \(.*\) \+ pending 4 \(.*\) \+ excluded 1 \(relay-by-provenance 1\)/);
+  assert.deepEqual([s1.models["fa/m3"].lvr, s1.models["fa/m3"].big, s1.models["fa/m3"].t], ["pppp", "p", "v"], "L1, L2, L3, L4 and the big step all passed");
+  assert.deepEqual(Object.keys(s1.pending).sort(), ["fa/m2", "fa/m4", "fa/m5", "fa/m6"], "the whole tail waits, not just the next ones");
+  assert.ok(Object.values(s1.pending).every((p) => p.r === "cap" && p.n === 1));
+  assert.match(r1.out, /coverage L3 .*: 7 model\(s\) = tested 2 \(v 2\) \+ pending 4 \(cap 4\) \+ excluded 1 \(relay-by-provenance 1\)/);
   const r2 = await run(["--live", ...args], e.deps);
   assert.equal(r2.code, 0, r2.err + r2.out);
-  const s2 = loadFidelity(e.out);
-  assert.deepEqual(Object.keys(s2.models).sort(), ["fa/m1", "fa/m2", "fa/m3"], "the tail is covered by the next run");
-  assert.deepEqual(s2.pending, {}, "and its pending entry is gone");
-  assert.equal(calls(e.f).filter((c) => c.body.model === "fa/m3").length, 4, "m3 was asked its 4 levels once, in the first run");
-  assert.match(r2.out, /coverage L3 .*: 7 model\(s\) = tested 3 \(v 3\) \+ pending 0 \(none\) \+ excluded 4/);
+  assert.deepEqual(calls(e.f).filter((c) => c.bytes > 300000).map((c) => c.body.model).slice(2), ["fa/m2", "fa/m6"], "next in rank: m2 (policy), then m6 (other >= 128,000)");
   const r3 = await run(["--live", ...args], e.deps);
-  assert.match(r3.out, /nothing to probe/);
+  const s3 = loadFidelity(e.out);
+  assert.deepEqual(Object.keys(s3.models).sort(), ["fa/m1", "fa/m2", "fa/m3", "fa/m4", "fa/m5", "fa/m6"], "every candidate covered after three runs");
+  assert.deepEqual(s3.pending, {});
+  assert.equal(s3.models["fa/m4"].big, undefined, "m4's known context is 64,000: the big step was never asked, and nothing was recorded as failed");
+  assert.equal(calls(e.f).filter((c) => c.body.model === "fa/m4" && c.bytes > 300000).length, 0);
+  assert.equal(s3.models["fa/m5"].big, "p", "an UNKNOWN context is tested at the big step");
+  assert.match(r3.out, /coverage L3 .*= tested 6 \(v 6\) \+ pending 0 \(none\) \+ excluded 1/);
+  assert.match((await run(["--live", ...args], e.deps)).out, /nothing to probe/);
 });
 
-test("pins: --allow adds a model that is outside the toggles or below the ctx floor, first in line", async () => {
+test("--include-tier paid does NOT make the paid provider probeable by itself: it stays out of the probe set (reason `not-free-tier (skipped for now)`) and the dry run says what is still missing", async () => {
+  const e = env([["fa", "m1"], ["fp", "p1"]], { policy: POLICY(["fa/m1", 200000]), tiers: { fa: "free", fp: "paid" } });
+  e.deps.snapshot.snap.rows.find((r) => r.provider === "fp").models[0] = { id: "p1", outModality: "chat", ctx: 200000, tools: true, pin: 1, pout: 2, badge: "PAID" };
+  const base = await run(["--candidates", "policy", ...CAP], e.deps);
+  assert.match(base.out, /1 skipped for now because the provider's key tier is not free \(paid 1\); 1 in the probe set/);
+  assert.match(base.out, /candidates \(free tier\): 1 of 1 model\(s\) in the probe set/);
+  assert.match(base.out, /excluded: relay-by-provenance 1, not-free-tier \(skipped for now\) 1/);
+  assert.match(base.out, /free tier 1 model\(s\): no money; paid tier 0 model\(s\): estimate \$0\.000/);
+  const req = await run(["--candidates", "policy", "--include-tier", "paid", ...CAP], e.deps);
+  assert.match(req.out, /candidates \(free tier \+ paid\): 1 of 1 model\(s\) in the probe set/, "still one candidate");
+  assert.match(req.out, /excluded: relay-by-provenance 1, not-free-tier \(skipped for now\) 1/);
+  assert.match(req.out, /deep probes for paid stay skipped until all of these hold: an explicit --levels that lists the levels to run; --live; an explicit --max-spend/);
+  assert.equal(e.f.calls.length, 0, "dry");
+});
+
+test("pins: --allow puts a model first in line, whatever its tier or context", async () => {
   const e = env(SIX, { policy: POL });
   const r = await run(["--candidates", "policy", "--allow", "fa/m4,fa/m6"], e.deps);
-  assert.match(r.out, /candidates \(policy\): 5 of 6 probe-ok model\(s\).*2 pinned by --allow/);
-  assert.match(r.out, /excluded: .*ctx-unknown 1/, "m5 is still out: it was not pinned");
+  assert.match(r.out, /priority 1 policy allowed >= 128,000 or pinned 5,/, "m3, m1, m2 from the policy and the two pins");
 });
 
 test("the pending map records WHY: a rate-limited model is pending `rate` and counted run by run until it is tested; a stuck one is listed", async () => {
   let limited = true;
   const e = env([["fa", "m1"], ["fa", "m2"]], { policy: POLICY(["fa/m1", 200000], ["fa/m2", 200000]), answer: (c) => (limited && c.body.model === "fa/m2" ? http(429, "slow down") : goodModel(c)) });
-  const args = ["--candidates", "policy", "--l3", "yes", "--tf-max-tokens-per-provider", "300000", "--pending-runs", "2"];
+  const args = ["--candidates", "policy", "--l3", "yes", ...CAP, "--pending-runs", "2"];
   const a = await run(["--live", ...args], e.deps);
   assert.equal(loadFidelity(e.out).pending["fa/m2"].r, "rate");
   assert.equal(loadFidelity(e.out).pending["fa/m2"].n, 1);
@@ -323,7 +451,7 @@ test("the pending map records WHY: a rate-limited model is pending `rate` and co
 
 test("a model that failed once shows in the report as provisional (first-strike), never as failed", async () => {
   const e = env([["fa", "m1"]], { policy: POLICY(["fa/m1", 200000]), answer: (c) => (c.body.tool_choice ? { status: 200, body: "event: message_start\ndata: {}\n\n" + "event: message_stop\ndata: {}\n\n" } : goodModel(c)) });
-  const r = await run(["--live", "--candidates", "policy", "--l3", "yes", "--tf-max-tokens-per-provider", "300000"], e.deps);
+  const r = await run(["--live", "--candidates", "policy", "--l3", "yes", ...CAP], e.deps);
   assert.match(r.out, /failed once \(provisional, asked again, not yet x\) 1 of \d+: fa\/m1 L1/);
   assert.match(r.out, /pending 1 \(first-strike 1\)/);
   assert.doesNotMatch(r.out, /tested \d+ \([^)]*x \d/, "no x in the tested counts");

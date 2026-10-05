@@ -16,6 +16,10 @@ export const PRESETS = deepFreeze({
   "free-wide": { flags: { source: "all-providers", mode: "free", "free-scope": "providers", ctx: "any" }, plain: "free providers: every working model on a provider you labelled free (a much larger set; some of its models have a price)" },
   "free-1m": { flags: { source: "all-providers", mode: "free", "free-scope": "providers", ctx: "1m" }, plain: "free models only, and only those with a 1M context" },
 });
+// the context question (D-bk): 1 to 3 keep their meaning; the hard floors and the other soft preferences follow
+const CTX_CHOICES = [["1", "any", "any size"], ["2", "prefer-1m", "prefer 1M (smaller only when no 1M model is usable)"], ["3", "1m", "only 1M"],
+  ["4", "128k", "only models with at least 128k"], ["5", "200k", "only models with at least 200k"], ["6", "256k", "only models with at least 256k"], ["7", "512k", "only models with at least 512k"],
+  ["8", "prefer-256k", "prefer 256k or more (smaller only when none is usable)"], ["9", "prefer-512k", "prefer 512k or more (smaller only when none is usable)"]];
 const pl = (n, w) => `${Number(n).toLocaleString("en-US")} ${w}${n === 1 ? "" : "s"}`;
 const FLAG_ORDER = ["source", "mode", "free-scope", "ctx", "enforce"];
 /** The flags of a preset (or of a wizard answer set) in one fixed order: `--source all-providers --mode free ...`. */
@@ -30,6 +34,7 @@ export function presetListText(cli, counts = null) {
     const n = !c ? "" : c.error ? `   (${c.error})` : c.eligible === null ? "   (no list: every subagent follows main)"
       : `   eligible ${pl(c.eligible, "model")} on ${c.providers} of ${pl(c.providerTotal, "provider")}, usable ${c.usable.toLocaleString("en-US")} of ${c.eligible.toLocaleString("en-US")}`;
     L.push(`  ${name.padEnd(w)}  ${p.plain}${n}`, `  ${" ".repeat(w)}  = set ${flagsText(p.flags)}`);
+    if (c && c.ctx) L.push(`  ${" ".repeat(w)}  ${c.ctx}`);
   }
   L.push("eligible = passes your choices; usable = a known context of at least 128,000, so it can stand in for a subagent.");
   L.push(`preview one:  ${cli} preset <name>        save it:  ${cli} preset <name> --confirm yes  (add --live yes when it writes your real files)`);
@@ -50,9 +55,10 @@ const MAX_TRIES = 3;
  *   save(flags)      async -> exit code; the real save (the CLI passes the --live decision itself)
  *   cli              the command prefix printed in the equivalent command
  *   live             true on real paths: the equivalent command then carries `--live yes` (a real save needs it)
+ *   ctxFloorLine     async (free) => string|null: the rows-per-context-floor line for the scope the first answer chose (printed above the context question)
  *   freeNarrowCount  async () => number|null: how many models are tagged free (shown in answer 3); null leaves the number out
  */
-export async function runWizard({ isTTY, ask, out, mainOutsideFree, preview, save, cli, live = false, freeNarrowCount = async () => null }) {
+export async function runWizard({ isTTY, ask, out, mainOutsideFree, preview, save, cli, live = false, freeNarrowCount = async () => null, ctxFloorLine = async () => null }) {
   const res = { code: 0, asked: 0, confirmations: 0 };
   if (!isTTY) {
     res.code = 1;
@@ -89,8 +95,10 @@ export async function runWizard({ isTTY, ask, out, mainOutsideFree, preview, sav
     let flags;
     if (q1 === "1") flags = { ...PRESETS["follow-main"].flags };
     else {
-      const q2 = await choose("Context floor: how much room must the subagent's model have?", [["1", "any size"], ["2", "prefer 1M (smaller only when no 1M model is usable)"], ["3", "only 1M"]], "1");
-      const ctx = q2 === "2" ? "prefer-1m" : q2 === "3" ? "1m" : "any";
+      const cl = await ctxFloorLine(q1 === "3");
+      if (cl) { out(""); out(cl); }
+      const q2 = await choose("Context floor: how much room must the subagent's model have?", CTX_CHOICES.map(([k, , label]) => [k, label]), "1");
+      const ctx = CTX_CHOICES.find(([k]) => k === q2)[1];
       flags = { ...(q1 === "2" ? PRESETS.any.flags : PRESETS.free.flags), ctx };
       if (q1 === "3" && (await mainOutsideFree()) === true) {
         res.asked += 1;

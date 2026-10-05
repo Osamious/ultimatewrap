@@ -149,7 +149,7 @@ test("report: a missing snapshot and a missing status are SAID, never silently l
 // =====================================================================================================================
 // the frozen --json shape
 // =====================================================================================================================
-test("report --json yes: the schema is FROZEN (schema 1, a fixed key order at every level, ISO UTC times), pinned byte for byte on a small fixture", async () => {
+test("report --json yes: the schema is FROZEN (schema 2, a fixed key order at every level, ISO UTC times), pinned byte for byte on a small fixture", async () => {
   const s = setup();
   wr(path.join(s.state, "agents.jsonl"), [
     dec("2026-10-05T11:00:00.000Z", "agent-1", OPUS, ALPHA, { tc: 1000000 }),
@@ -159,7 +159,7 @@ test("report --json yes: the schema is FROZEN (schema 1, a fixed key order at ev
   const r = await REPORT(s, "--json", "yes");
   assert.equal(r.status, 0, r.err);
   const j = JSON.parse(r.out);
-  assert.deepEqual(Object.keys(j), ["schema", "kind", "estimateLabel", "window", "denominators", "totals", "counters", "estimate", "outcomes", "agents", "handoffs"]);
+  assert.deepEqual(Object.keys(j), ["schema", "kind", "estimateLabel", "window", "denominators", "totals", "counters", "estimate", "outcomes", "agents", "handoffs", "contextGrowth", "payload"]);
   assert.deepEqual(Object.keys(j.window), ["since", "until", "session"]);
   assert.deepEqual(Object.keys(j.denominators), ["agentLines", "decisions", "handoffs", "sessions", "unreadableLines", "filesRead", "agentsListed", "handoffsListed"]);
   assert.deepEqual(Object.keys(j.totals), ["mode", "moved", "unchanged", "noPolicyChoice", "keptButRewritten", "ranOn", "wouldUse"]);
@@ -169,7 +169,7 @@ test("report --json yes: the schema is FROZEN (schema 1, a fixed key order at ev
   assert.deepEqual(Object.keys(j.outcomes), ["requested", "available", "reason", "rowsRead", "truncated", "considered", "matched", "resolvedEqualsRan", "resolvedDiffers", "errorStatus", "unmatched", "joinWindowMs"]);
   for (const a of j.agents) { assert.deepEqual(Object.keys(a), ["t", "sid", "aid", "asked", "ran", "would", "why", "mode", "main", "tokens", "moved", "flags", "costUsd", "outcome"]); assert.match(a.t, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/); }
   for (const h of j.handoffs) assert.deepEqual(Object.keys(h), ["t", "sid", "aid", "text"]);
-  const golden = { schema: 1, kind: "report", estimateLabel: "estimate, input tokens only, snapshot prices",
+  const golden = { schema: 2, kind: "report", estimateLabel: "estimate, input tokens only, snapshot prices",
     window: { since: null, until: "2026-10-05T12:00:00.000Z", session: null },
     denominators: { agentLines: 3, decisions: 2, handoffs: 1, sessions: 1, unreadableLines: 0, filesRead: 1, agentsListed: 2, handoffsListed: 1 },
     totals: { mode: "shadow", moved: 1, unchanged: 0, noPolicyChoice: 1, keptButRewritten: 0, ranOn: [{ provider: "anthropic", n: 2 }], wouldUse: [{ provider: "fx-free-a", n: 1 }] },
@@ -180,10 +180,14 @@ test("report --json yes: the schema is FROZEN (schema 1, a fixed key order at ev
       { t: "2026-10-05T11:00:00.000Z", sid: "s1aaaaaa", aid: "agent-1", asked: OPUS, ran: OPUS, would: ALPHA, why: "not-in-set", mode: "shadow", main: MAIN, tokens: 1000000, moved: true, flags: [], costUsd: { inherit: 3, asRan: 15, policy: 0 }, outcome: null },
       { t: "2026-10-05T11:10:00.000Z", sid: "s1aaaaaa", aid: "agent-2", asked: HAIKU, ran: HAIKU, would: null, why: null, mode: "shadow", main: MAIN, tokens: 500000, moved: false, flags: [], costUsd: { inherit: 1.5, asRan: 0.5, policy: 0.5 }, outcome: null },
     ],
-    handoffs: [{ t: "2026-10-05T11:40:00.000Z", sid: "s1aaaaaa", aid: "agent-2", text: `HANDOFF ${ALPHA} -> ${BETA} (retry 2, hop 1)` }] };
+    handoffs: [{ t: "2026-10-05T11:40:00.000Z", sid: "s1aaaaaa", aid: "agent-2", text: `HANDOFF ${ALPHA} -> ${BETA} (retry 2, hop 1)` }],
+    contextGrowth: { label: "estimate", agents: 0, measurable: 0, singleRequest: 0, requests: 0, ratio: null, sizeSample: { requests: 0, over200k: 0, over1m: 0 } },
+    payload: { compiledAvailable: false, allowed: null, unknownLimit: null, gateLine: null } };
   assert.equal(r.out, JSON.stringify(golden), "byte-for-byte golden");
   assert.equal(JSON.parse(r.out).estimateLabel, rep.ESTIMATE_LABEL);
-  assert.equal(rep.REPORT_SCHEMA, 1);
+  assert.equal(rep.REPORT_SCHEMA, 2);
+  assert.deepEqual(Object.keys(j.contextGrowth), ["label", "agents", "measurable", "singleRequest", "requests", "ratio", "sizeSample"]);
+  assert.deepEqual(Object.keys(j.payload), ["compiledAvailable", "allowed", "unknownLimit", "gateLine"]);
 });
 
 test("report --json: a hostile model name and reason are made printable; the estimate label is in the text AND the JSON; `last --json` keeps its own S1d shape", async () => {
@@ -449,4 +453,54 @@ test("report: counts and the list agree for enforcing lines with no policy choic
   assert.match(r.out, /^  1 of 5 ran on a different model than asked although the policy kept it \(the old model-slot rewrite did that, not the policy; they count as unchanged\)$/m);
   const a3 = j.agents.find((a) => a.aid === "agent-3");
   assert.deepEqual([a3.asked, a3.ran, a3.moved], [HAIKU, OPUS, false]);
+});
+
+// ---- D-bl: context growth (an ESTIMATE) from the classifier log, and the honest payload-gate wording (sa-A1). Fixture files only; the real classify.jsonl is never read.
+const cls = (t, aid, tc, over = {}) => L({ t, sid: "s1aaaaaa", aid, pid8: null, cls: "sub", ag: 1, bl: 0, nt: 10, ga: 1, sysb: "s2", m: MAIN, rc: null, at: null, bb: "b1", tc, ...over });
+
+test("D-bl context growth: per subagent the largest later token count over its FIRST, as median, 90th percentile and max, with n; one-request agents have no ratio; main and aux lines never count", async () => {
+  const s = setup(); writeLog(s);
+  wr(path.join(s.state, "classify.jsonl"), [
+    cls("2026-10-05T10:00:00.000Z", "a1", 1000), cls("2026-10-05T10:01:00.000Z", "a1", 2000), cls("2026-10-05T10:02:00.000Z", "a1", 3000),          // peak 3x
+    cls("2026-10-05T10:00:10.000Z", "a2", 1000), cls("2026-10-05T10:05:00.000Z", "a2", 1500),                                                           // 1.5x
+    cls("2026-10-05T10:00:20.000Z", "a3", 2000), cls("2026-10-05T10:06:00.000Z", "a3", 10000), cls("2026-10-05T10:07:00.000Z", "a3", 4000),            // 5x (the peak, not the last)
+    cls("2026-10-05T10:00:30.000Z", "a4", 4000),                                                                                                          // one request: no ratio
+    cls("2026-10-05T10:00:40.000Z", "a5", 1000, { cls: "main" }), cls("2026-10-05T10:09:00.000Z", "a5", 90000, { cls: "main" }),                        // not a subagent
+    cls("2026-10-05T10:00:50.000Z", null, 1000), cls("2026-10-05T10:09:50.000Z", null, 9000),                                                            // no agent id: not an agent
+    cls("2026-10-05T10:00:55.000Z", "a6", null), cls("2026-10-05T10:09:55.000Z", "a6", 9000),                                                            // no token count on the first: one counted request
+  ].join("\n"));
+  const j = JSON.parse((await REPORT(s, "--json", "yes")).out);
+  assert.equal(j.schema, 2);
+  assert.deepEqual(j.contextGrowth, { label: "estimate", agents: 5, measurable: 3, singleRequest: 2, requests: 10, ratio: { median: 3, p90: 5, max: 5 }, sizeSample: { requests: 13, over200k: 0, over1m: 0 } },
+    "5 subagents with an id and a token count, 3 with 2+ counted requests: peaks 1.5, 3, 5 (nearest-rank median 3, p90 5)");
+  const t = (await REPORT(s)).out;
+  assert.match(t, /context growth \(estimate, the router's token counts from its classifier log\): of 5 subagents with a token count \(10 requests\), 3 made two or more requests; the largest later request of each was a median 3x, 90th percentile 5x, at most 5x its FIRST request \(n = 3 subagents; 2 with one counted request have no ratio\)/);
+  assert.match(t, /Nothing is changed by this/);
+});
+
+test("D-bl context growth: the window and the session filter the classifier lines; an absent log says not measurable instead of inventing a ratio", async () => {
+  const s = setup(); writeLog(s);
+  const none = JSON.parse((await REPORT(s, "--json", "yes")).out);
+  assert.deepEqual([none.contextGrowth.agents, none.contextGrowth.measurable, none.contextGrowth.ratio], [0, 0, null]);
+  assert.match((await REPORT(s)).out, /context growth \(estimate\): not measurable: of 0 subagents with a token count/);
+  wr(path.join(s.state, "classify.jsonl"), [cls("2026-10-05T09:00:00.000Z", "old", 1000), cls("2026-10-05T09:30:00.000Z", "old", 8000), cls("2026-10-05T11:00:00.000Z", "new", 1000), cls("2026-10-05T11:30:00.000Z", "new", 2000), cls("2026-10-05T11:31:00.000Z", "oth", 1000, { sid: "zzzzzzzz" }), cls("2026-10-05T11:32:00.000Z", "oth", 5000, { sid: "zzzzzzzz" })].join("\n"));
+  const all = JSON.parse((await REPORT(s, "--json", "yes")).out).contextGrowth;
+  assert.deepEqual([all.agents, all.measurable, all.ratio.max], [3, 3, 8]);
+  const w = JSON.parse((await REPORT(s, "--json", "yes", "--since", "2h")).out).contextGrowth;
+  assert.deepEqual([w.agents, w.measurable, w.ratio.max], [2, 2, 5], "--since 2h drops the 09:00 agent (its first request is outside the window)");
+  const se = JSON.parse((await REPORT(s, "--json", "yes", "--session", "s1aaaaaa")).out).contextGrowth;
+  assert.deepEqual([se.agents, se.ratio.max], [2, 8], "--session keeps only that session's lines");
+});
+
+test("sa-A1 report: the request-size buckets of the classifier log are counted over their own denominator, and the payload gate is called inert for models with no known cap", async () => {
+  const s = setup(); writeLog(s);
+  wr(path.join(s.state, "classify.jsonl"), ["b0", "b1", "b2", "b2", "b3"].map((bb, i) => cls(`2026-10-05T10:0${i}:00.000Z`, `z${i}`, 1000, { bb })).join("\n"));
+  assert.deepEqual(JSON.parse((await REPORT(s, "--json", "yes")).out).contextGrowth.sizeSample, { requests: 5, over200k: 3, over1m: 1 });
+  assert.match((await REPORT(s)).out, /request size \(the classifier log's size buckets\): 3 of 5 classified subagent requests \(60%\) were over 200 KB and 1 \(20%\) over 1 MB/);
+  // a compiled policy beside the log: the gate wording appears, with its own denominator
+  const compiled = { schema: 1, minRouter: 2, contentHash: "x", owner: { source: "all-providers", mode: "dynamic", ctx: "any" }, models: [], lists: {}, counts: { allowed: 4, payloadUnknown: 3, universe: 9 } };
+  wr(path.join(s.state, "policy.json"), compiled);
+  const j = JSON.parse((await REPORT(s, "--json", "yes")).out);
+  assert.deepEqual([j.payload.compiledAvailable, j.payload.allowed, j.payload.unknownLimit], [true, 4, 3]);
+  assert.match((await REPORT(s)).out, /payload limits: 3 of 4 eligible models have no known request-size limit, so the size check does nothing for them until a limit is measured/);
 });

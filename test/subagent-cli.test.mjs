@@ -23,8 +23,11 @@ const wr = (f, o) => fs.writeFileSync(f, typeof o === "string" ? o : JSON.string
 // ---- no-touch guard (9.1 principle): names, sizes and mtimes of what a test must never change
 function fingerprint() {
   const home = os.homedir(), out = {};
+  // sa-H: the LIVE router (and the keysync sweeps beside it) write their own logs, status files and per-session state into state/subagent while this suite runs, so those are not what a test could have
+  // touched: they are left out (names only, by the router's own file-name rules). policy.json, shadow.flag, the owner files and everything else a CLI command writes stay fingerprinted.
+  const LIVE_ROUTER_OUT = /^((agents|classify|decisions)(\.\d+)?\.jsonl|status(-[A-Za-z0-9_-]{1,64})?\.json|(main|agents)-[A-Za-z0-9_-]{1,64}\.(json|jsonl)|[^\\/]*\.tmp-[^\\/]*)$/;
   const walk = (d) => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-    for (const e of es) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else { try { const s = fs.statSync(f); out[f] = `${s.size}:${s.mtimeMs}`; } catch { /* raced */ } } } };
+    for (const e of es) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else if (LIVE_ROUTER_OUT.test(e.name) && d.endsWith(path.join(".uw", "state", "subagent"))) continue; else { try { const s = fs.statSync(f); out[f] = `${s.size}:${s.mtimeMs}`; } catch { /* raced */ } } } };
   walk(path.join(home, ".llmkeys"));
   walk(path.join(home, ".uw", "state", "subagent"));
   for (const f of ["accuracy.json", "tool-fidelity.json", "autorebuild.json"]) { try { const s = fs.statSync(path.join(home, ".uw", "state", f)); out[f] = `${s.size}:${s.mtimeMs}`; } catch { out[f] = "absent"; } }
@@ -299,7 +302,7 @@ test("show: 'policy off' with no files; with a policy it prints owner, compiled 
   assert.equal(on.status, 0, on.err);
   assert.match(on.out, /^policy: mode free \(free providers\), source all-providers, ctx any, enforcement shadow$/m);
   assert.match(on.out, /^ {2}owner file .*subagent-policy\.json: unverified=allow-warn allow=0 inject=off setAt=\d{4}-/m);
-  assert.match(on.out, /^ {2}compiled \d{4}-\S+, contentHash [0-9a-f]{12}, compiler 1, providersLive false$/m);
+  assert.match(on.out, /^ {2}compiled \d{4}-\S+, contentHash [0-9a-f]{12}, compiler 2, providersLive false$/m);
   assert.match(on.out, /free models \.+ 5 on 3 providers/); assert.match(on.out, /free providers \+ deposit \.+ 9 on 4 providers/);
   assert.match(on.out, /^7 of 7 eligible models are not tool-tested/m);
   assert.match(on.out, /^ {2}providers with no usable stand-in: fx-free-b \(1 of 2\); thin, fewer than 3 usable: none \(0 of 2\)$/m);
@@ -951,14 +954,14 @@ const keyRaw = (args, home = sentinelHome()) => {
   return { status: r.status, out: r.stdout, err: r.stderr, home };
 };
 
-test("R12: a bare `subagent-policy` and `help` print the usage text (exit 0, nothing written); the text names every flag value, --ctx any|prefer-1m|1m and --live yes", () => {
+test("R12: a bare `subagent-policy` and `help` print the usage text (exit 0, nothing written); the text names every flag value, --ctx any|128k|200k|256k|512k|1m|prefer-256k|prefer-512k|prefer-1m and --live yes", () => {
   for (const args of [["subagent-policy"], ["subagent-policy", "help"], ["subagent-policy", "--help"]]) {
     const r = keyRaw(args);
     assert.equal(r.status, 0, `${args.join(" ")}: ${r.err}`);
     assert.equal(r.out.trim(), lib.usageText, "the usage text is what is printed, through key.mjs");
     assert.equal(r.err, "");
   }
-  for (const needle of [/--ctx any\|prefer-1m\|1m/, /--live yes/, /rollback needs no flag/, /--mode dynamic\|inherit\|free/, /--enforce shadow\|enforce/, /--source same-provider\|all-providers/]) assert.match(lib.usageText, needle);
+  for (const needle of [/--ctx any\|128k\|200k\|256k\|512k\|1m\|prefer-256k\|prefer-512k\|prefer-1m/, /--live yes/, /rollback needs no flag/, /--mode dynamic\|inherit\|free/, /--enforce shadow\|enforce/, /--source same-provider\|all-providers/]) assert.match(lib.usageText, needle);
   const bad = keyRaw(["subagent-policy", "frobnicate"]);
   assert.equal(bad.status, 1); assert.match(bad.err, /^E_USAGE: unknown subcommand "frobnicate"/);
 });
@@ -1073,7 +1076,7 @@ test("S-F7: rebuild --if-stale verifies the compiled file's own contentHash: a h
   assert.equal(a.code, 0); assert.equal(b.code, 0); assert.equal(snap1, snap2);
 });
 
-test("D1: set --ctx takes any, prefer-1m and 1m; the value lands in the owner file and the compiled owner block (in the hash); prefer-1m leaves the row count unchanged and 1m filters; a bad value is a usage error that lists the three", () => {
+test("D1: set --ctx takes any, prefer-1m and 1m; the value lands in the owner file and the compiled owner block (in the hash); prefer-1m leaves the row count unchanged and 1m filters; a bad value is a usage error that lists every value", () => {
   const s = setup();
   const hashes = {}, counts = {};
   for (const ctx of ["any", "prefer-1m", "1m"]) {
@@ -1087,10 +1090,16 @@ test("D1: set --ctx takes any, prefer-1m and 1m; the value lands in the owner fi
   assert.notEqual(hashes.any, hashes["prefer-1m"], "ctx is routing content: the hash moves");
   assert.equal(counts.any, counts["prefer-1m"], "prefer-1m is an ordering and band change, never a filter");
   const bad = SET(s, "--ctx", "2m");
-  assert.equal(bad.status, 1); assert.match(bad.first, /must be one of any\|prefer-1m\|1m/);
+  assert.equal(bad.status, 1); assert.match(bad.first, /must be one of any\|128k\|200k\|256k\|512k\|1m\|prefer-256k\|prefer-512k\|prefer-1m/);
   assert.equal(SET(s, "--ctx", "prefer-1m", "--dry", "yes").status, 0);
   assert.match(SET(s, "--ctx", "prefer-1m", "--detail", "yes", "--dry", "yes").out, /ctx=prefer-1m/);
-  assert.throws(() => lib.validateOwner({ ...lib.OWNER_DEFAULTS, ctx: "2m" }), /ctx must be one of any\|prefer-1m\|1m/);
+  assert.throws(() => lib.validateOwner({ ...lib.OWNER_DEFAULTS, ctx: "2m" }), /ctx must be one of any\|128k\|200k\|256k\|512k\|1m\|prefer-256k\|prefer-512k\|prefer-1m/);
+  // D-bk: every hard floor and soft preference is accepted by the real CLI; the dry preview prints rows per floor with their denominators
+  for (const ctx of ["128k", "200k", "256k", "512k", "prefer-256k", "prefer-512k"]) {
+    const d = SET(s, "--source", "all-providers", "--mode", "dynamic", "--ctx", ctx, "--dry", "yes");
+    assert.ok(d.status === 0 || d.status === 2, `${ctx}: ${d.err}`);
+    if (d.status === 0) assert.match(d.out, /^CONTEXT FLOORS: of \d+ rows in the chosen scope, \d+ have no known ctx; known ctx >= 128k \d+, >= 200k \d+, >= 256k \d+, >= 512k \d+, >= 1M \d+; \d+ of the \d+ unknown rows pass 128k on an inferred ctx/m, `${ctx}: rows per floor with denominators in the preview`);
+  }
 });
 
 test("R13: explain describes the REAL rule: the lead rank band, its band id, the cooling and overlay demotion, and the tool-tier fallback (v, then t, never an untested u); banding off says it is the old pool, and a row of a lower band is 'never' a substitute only while banding is on", () => {
@@ -1099,9 +1108,9 @@ test("R13: explain describes the REAL rule: the lead rank band, its band id, the
   assert.equal(SET(s, "--source", "all-providers", "--mode", "dynamic").status, 0);
   const e = cli(["explain", "fx-free-a/fxa-alpha", ...s.F]);
   assert.equal(e.status, 0, e.err);
-  assert.match(e.out, /^band: \d+ \(equal tool tier, health, ctx class and price class/m);
+  assert.match(e.out, /^band: \d+ \(equal tool tier, health, ctx preference and price class/m);
   assert.match(e.out, /^fallback: a cooling model .*demoted, never removed.*LOWER tool tier only if it is tested \(v, then t\), never an untested u/m);
-  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx class, prefer-1m \(band\)=0, price class 2b \(band\)=\d, big step \(v only\)=\d, L4 \(v only\)=\d, recency \(order only\)=\d/);
+  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx preference \(band\)=0, price class 2b \(band\)=\d, first strike=0, big step \(v only\)=\d, L4 \(v only\)=\d, ttft quantile bucket=\d, ctx class=\d, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d/);
   const low = cli(["explain", "fx-free-a/fxa-big:free", ...s.F]);
   assert.match(low.out, /would be chosen as the substitute never, for any provider in the set/, "an unverified row behind a verified band: never");
   assert.equal(SET(s, "--banded", "no").status, 0);

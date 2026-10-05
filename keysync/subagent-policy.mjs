@@ -14,13 +14,14 @@ import { fileURLToPath } from "node:url";
 import { writeAtomic } from "../menu/atomic.mjs";
 import { loadSnapshot } from "../menu/snapshot.mjs";
 import { loadBench, BENCH_FILE, BENCH_OUTDATED_DAYS } from "../menu/bench-data.mjs";
+import { classifyTight } from "../refresh/bench.mjs";
 import { capBand, sizeCell } from "../menu/payload-cap.mjs";
 import { load as loadDefaultModel, DEFAULT_MODEL_FILE } from "./default-model.mjs";
 import { filterRegistry, chooseKeys } from "./keysync.mjs";
 import { CONTRACT as CC } from "../menu/cc-contract.mjs";
 import { CONTRACT as CCR, rpc, requestLogsDb, dataDir } from "../menu/ccr-client.mjs";
 import { funnel, emptyStage, FREE_TAG, SCOPE_NAMES, FREE_SCOPES, DEFAULT_MIN_SET, SUBSTITUTE_FLOOR, SUBSTITUTE_K, PREMIUM_RULE,
-  providerOf, stripOneM } from "../menu/subagent-funnel.mjs";
+  providerOf, stripOneM, CTX_VALUES, CTX_FLOORS, ctxSpec, ctxLabel, ctxClassOf, TTFT_BUCKETS, knownIssueText, payloadSampleText } from "../menu/subagent-funnel.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { isExcludedTier, freeScopeOf, RELAY_TIER } from "../menu/tiers.mjs";
 import { CLI, CODES, codeRow, KINDS } from "../menu/subagent-codes.mjs";
@@ -28,7 +29,7 @@ import { verdict, verdictLine, savedLine, fixLine, deltaText, ownerDiffers, corr
 import { runWizard, ttyAsker, PRESETS, presetListText, flagsText } from "./subagent-wizard.mjs";
 export { PRESETS };
 
-export const COMPILER_VERSION = 1;
+export const COMPILER_VERSION = 2;                  // 2: revision 11 policy-side fix round (ctx floors, inferred ctx, rank order); the stamp is outside the hash, so `rebuild --if-stale` recompiles an older file and the router (minRouter 2) reads both
 /** The oldest router that can read a file this compiler writes (router v2: `lists.prov`, `row.b`, a null `lists.all`, a verified `contentHash`, the `rollout` block). It sits OUTSIDE the hash. */
 export const MIN_ROUTER = 2;
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -40,6 +41,7 @@ export const COMPILED_MAX_BYTES = 1024 * 1024;
 export const ALLOW_MAX = 24, ALLOW_PIN_MAX = 100;                  // keeps a saved owner file under OWNER_MAX_BYTES: it must always load again
 /** The owner's one-use approval of a self-test plan (harness/g1-* is gitignored); a fixture run keeps its own under the fixture state folder. */
 export const SELFTEST_APPROVAL_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "harness", "g1-selftest-approval.json");
+export const REPROBE_LIST_MAX = 200;
 export const INJECT_MAX_BYTES = 2048;
 export const INJECT_MAX_ENTRIES = 20;
 export const INJECT_PER_PROVIDER = 3;
@@ -54,7 +56,7 @@ const AMBIENT_ENV = ["UW_SUBAGENT_POLICY_FILE", "UW_SUBAGENT_STATE_DIR", "UW_DEF
 
 export const ENUMS = Object.freeze({
   source: ["same-provider", "all-providers"], mode: ["dynamic", "inherit", "free"], "free-scope": [...FREE_SCOPES],
-  ctx: ["any", "prefer-1m", "1m"], enforce: ["shadow", "enforce"], inject: ["off", "on"], unverified: ["allow-warn", "allow-t", "pin-only"],
+  ctx: [...CTX_VALUES], enforce: ["shadow", "enforce"], inject: ["off", "on"], unverified: ["allow-warn", "allow-t", "pin-only"],
 });
 const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause", "outcomes", "plan", "approve-plan", "run"];
 export const FILE_FLAGS = Object.freeze(["policy-file", "state-dir", "providers-file", "snapshot-file", "bench-file", "observed-file",
@@ -402,7 +404,7 @@ export async function gatherInputs(p, { nowMs = Date.now(), liveProviders } = {}
   try { defaultModel = loadDefaultModel(p.defaultModelFile)?.model ?? null; } catch { defaultModel = null; }
   const tf = readToolFidelity(p.toolFidelityFile);
   return {
-    funnelInputs: { rows: snap.snap.rows, bench, nowMs, providers, tiers: tiersRes.tiers, toolFidelity: tf, aliasValues, defaultModel },
+    funnelInputs: { rows: snap.snap.rows, bench, nowMs, providers, tiers: tiersRes.tiers, toolFidelity: tf, aliasValues, defaultModel, classifyBench: (rec) => classifyTight(typeof rec?.m === "string" ? rec.m : "") },   // F6: the bench's own tight reading of a stored message (pay, auth, gone or null)
     providersLive: live, tiersRes, defaultModel, warnings,
     stamps: { snapshotBuiltAt: snap.snap.builtAt ?? null, snapshotSchema: snap.snap.schemaVersion, benchGeneratedAt: bench.generatedAt,
       observedWrittenAt: bench.overlayWrittenAt, tfAsOf: tf?.generatedAt ?? null,
@@ -413,12 +415,12 @@ export async function gatherInputs(p, { nowMs = Date.now(), liveProviders } = {}
 }
 
 // ------------------------------------------------------------------ injection text (6.4)
-const ctxText = (c) => (c >= 1000000 ? "1M" : c > 0 ? `${Math.floor(c / 1000)}k` : "ctx?");
-const speedText = (h) => ["fast", "ok", "slow"][h] ?? "?";
+const ctxText = (c, inferred = false) => (inferred ? `~${Math.floor(c / 1000)}k?` : c >= 1000000 ? "1M" : c > 0 ? `${Math.floor(c / 1000)}k` : "ctx?");
+const speedText = (h) => TTFT_BUCKETS[h] ?? "?";
 const toolsText = (t) => (t === "v" ? "verified" : t === "t" ? "small" : "UNVERIFIED");
 const capText = (pb) => (pb > 0 ? `${Math.round(pb / 1024)}k` : "unknown");
 export function injectRow(r) {
-  return `- ${r.s}  ${ctxText(r.c)}  ${r.i}  tools:${toolsText(r.t)}  ${speedText(r.h)}  cap:${capText(r.pb)}${r.al ? "  ALIAS" : ""}${r.p ? "  $$" : ""}`;
+  return `- ${r.s}  ${ctxText(r.c, !!r.ci)}  ${r.i}  tools:${toolsText(r.t)}  ${speedText(r.h)}  cap:${capText(r.pb)}${r.al ? "  ALIAS" : ""}${r.p ? "  $$" : ""}`;
 }
 function renderBlock(rows, hash, owner, scopeNote) {
   const { open, close, example } = CCR.subagentTag;
@@ -500,7 +502,10 @@ export function compile(g, owner, { now = () => new Date(), minSet, gate } = {})
     counts: { universe: res.counts.universe, allowed: res.counts.allowed, verified: res.counts.verified, small: res.counts.small, unverified: res.counts.unverified,
       premium: res.counts.premium, payloadRisk: res.counts.payloadRisk, payloadUnknown: res.counts.payloadUnknown, tfAsOf: g.stamps.tfAsOf, alias: res.counts.alias,
       freeScopes: res.counts.freeScopes, depositStrictSkipped: res.counts.depositStrictSkipped, idRejected: res.counts.idRejected,
+      nonAgent: res.counts.nonAgent, knownBad: res.counts.knownBad, ctxInferred: res.counts.ctxInferred, reprobe: res.counts.reprobe, accountStateRows: res.counts.accountStateRows, ctxStats: res.ctxStats,
       funnel: res.stages.map((s) => ({ stage: s.stage, n: s.n })) },
+    accountStateRows: res.accountRows.slice(0, REPROBE_LIST_MAX),   // outside the hash: free models whose stored message names the ACCOUNT (plan, key, balance): not dead and not waiting for a re-probe
+    reprobe: res.reprobe.slice(0, REPROBE_LIST_MAX),       // outside the hash: free-tagged rows dropped on a transient bench status of an old sample, for the re-probe and the ledger (sa-A7)
     models: res.models, lists: { ...res.lists, all: identityList(res.lists.all, res.models.length) ? null : res.lists.all },   // `all` is null when it is the identity 0..n-1 (the router then reads the rows by index)
     main: { ttlSec: MAIN_TTL_MS / 1000 }, sticky: { ttlSec: MAIN_TTL_MS / 1000, maxEntries: 256 },
     inject: { all: "", byProvider: {}, empty: "", promptNote: "" },
@@ -649,7 +654,7 @@ const CURE_CLAUSE = {
   "source": "subagents may then run on models of any provider",
   "free-scope": (s) => `the list becomes ${SCOPE_NAMES[s]}`,
   "mode": "any model, paid ones included, so cost is no longer limited to free",
-  "ctx": "drops the 1M-context floor",
+  "ctx": (c) => `drops the ${ctxLabel(c)}-context floor`,
 };
 
 /** Exit-2 refusal: the first line stays `E_EMPTY: ...; nothing written`, then WHY it is empty and runnable cures (Fix A, Fix B) with the consequence of each (R2, D-c; plan 7.2 item 5). */
@@ -669,7 +674,7 @@ function refusal(g, owner, res, main, why, fixture = false) {
     for (const s of FREE_SCOPES) if (s !== owner.freeScope) tryToggle("free-scope", { freeScope: s }, CURE_CLAUSE["free-scope"](s));
     tryToggle("mode", { mode: "dynamic" }, CURE_CLAUSE.mode);
   }
-  if (owner.ctx === "1m") tryToggle("ctx", { ctx: "any" }, CURE_CLAUSE.ctx);
+  if (ctxSpec(owner.ctx).hard > 0) tryToggle("ctx", { ctx: "any" }, CURE_CLAUSE.ctx(owner.ctx));
   const good = alts.filter((a) => a.n > 0).sort((a, b) => b.n - a.n);
   const scope = owner.mode === "free" ? ` under ${SCOPE_NAMES[owner.freeScope]}` : "";
   const subject = prov ? `${prov}'s candidates (main provider, ${main.source})` : "all candidates";
@@ -701,12 +706,24 @@ function freeSetsLine(res) {
   return `free sets: ${n(f.models?.n ?? 0)} ${f.models?.n === 1 ? "model" : "models"} tagged free; ${wide} on free-labelled providers (both of ${n(c.toolsPass)} tool-eligible models)`;
 }
 
+/** Rows per context floor (D-bk), each with its denominator, so a floor is chosen knowingly: measured contexts only; the unknown rows are in none of the floors. */
+export function ctxFloorsCompact(st) {
+  return st ? `context: of ${n(st.rows)} rows, ${n(st.unknown)} unknown; known ${Object.entries(st.ge).map(([k, v]) => `>= ${ctxLabel(k)} ${n(v)}`).join(", ")}` : null;
+}
+export function ctxFloorsLine(st, ctx = "any") {
+  if (!st) return "CONTEXT FLOORS: unavailable";
+  const ge = Object.entries(st.ge).map(([k, v]) => `>= ${ctxLabel(k)} ${n(v)}`).join(", ");
+  return `CONTEXT FLOORS: of ${n(st.rows)} rows in the chosen scope, ${n(st.unknown)} have no known ctx; known ctx ${ge}; ${n(st.inferred)} of the ${n(st.unknown)} unknown rows pass 128k on an inferred ctx (c?: a same-name sibling's context, a 128k floor-only prior, never the asked floor)${ctxSpec(ctx).hard > 0 ? `; ctx ${ctx} tests the measured ctx only, so those ${n(st.inferred)} are left out` : ""}`;
+}
+/** The honest state of the payload gate (sa-A1): a row with no known request-size limit (pb 0) is never held back for size, so the gate is inert for it until a limit is measured. */
+export const payloadGateLine = (k) => (k && k.payloadUnknown > 0 && k.allowed > 0
+  ? `payload limits: ${n(k.payloadUnknown)} of ${n(k.allowed)} eligible models have no known request-size limit, so the size check does nothing for them until a limit is measured (a tool test records one); live shadow: ${payloadSampleText()}` : null);
 /** The two headline count lines of a non-inherit report (the default `set` output keeps exactly these; `--detail yes` adds the whole funnel). */
 function allowedLines(res, minSet) {
   const c = res.counts, T = res.toggles;
   const free = T.mode === "free" ? [freeSetsLine(res)] : [];
-  return [`ALLOWED: ${n(c.allowed)} ${c.allowed === 1 ? "model" : "models"} (of ${n(c.chosenScopeN)} in the chosen scope${T.ctx === "1m" ? ", after the ctx 1m filter" : T.ctx === "prefer-1m" ? ", ctx prefer-1m: rows of at least 1M form the higher band" : ""}; verified ${c.verified}, small ${c.small}, unverified ${c.unverified})`,
-    `SUBSTITUTABLE: ${n(c.substitutable)} of ${n(c.allowed)} allowed (known ctx >= ${n(SUBSTITUTE_FLOOR)}); providers with substitutable < ${minSet ?? DEFAULT_MIN_SET}: ${Object.keys(res.substitutable).filter((p) => p !== "*" && res.substitutable[p] < (minSet ?? DEFAULT_MIN_SET)).sort().join(", ") || "(none)"}`, ...free];
+  return [`ALLOWED: ${n(c.allowed)} ${c.allowed === 1 ? "model" : "models"} (of ${n(c.chosenScopeN)} in the chosen scope${ctxSpec(T.ctx).hard > 0 ? `, after the ctx ${T.ctx} filter` : ctxSpec(T.ctx).prefer > 0 ? `, ctx ${T.ctx}: rows of at least ${ctxLabel(T.ctx.slice(7))} form the higher band` : ""}; verified ${c.verified}, small ${c.small}, unverified ${c.unverified})`,
+    `SUBSTITUTABLE: ${n(c.substitutable)} of ${n(c.allowed)} allowed (known ctx >= ${n(SUBSTITUTE_FLOOR)}${c.ctxInferred ? `; ${n(c.ctxInferred)} of the ${n(c.allowed)} pass the floor on an inferred ctx` : ""}); providers with substitutable < ${minSet ?? DEFAULT_MIN_SET}: ${Object.keys(res.substitutable).filter((p) => p !== "*" && res.substitutable[p] < (minSet ?? DEFAULT_MIN_SET)).sort().join(", ") || "(none)"}`, ctxFloorsLine(res.ctxStats, T.ctx), ...free];
 }
 
 export function formatReport({ owner, res, g, header, dry, minSet }) {
@@ -717,9 +734,13 @@ export function formatReport({ owner, res, g, header, dry, minSet }) {
   L.push(`  ${dots("chat-capable, not pool row")} ${n(c.chatCapable)} of ${n(c.universe)} routes`);
   L.push(`  ${dots("in live Providers")} ${n(c.inProviders)} selectors (from ${n(c.routesInProviders)} routes)`);
   L.push(`  ${dots("id-rejected (cr-m3)")} ${n(c.idRejected)} of ${n(c.chatCapable)} chat-capable routes`);
+  if (c.nonAgent) L.push(`  ${dots("non-agent ids")} ${n(c.nonAgent)} of ${n(c.chatCapable)} chat-capable routes (safety, guard, embed, rerank, ocr, lora, moderation or under 4B in the id; never candidates, never lend a ctx)`);
   if (c.oneMSpellingOnly) L.push(`  ${dots("only a [1m] spelling listed")} ${n(c.oneMSpellingOnly)} of ${n(c.chatCapable)} chat-capable routes (no wire id can name them; dropped)`);
   L.push(`  ${dots("bench ok (any age)")} ${n(c.benchOk)} of ${n(c.inProviders)} selectors`);
   L.push(`  ${dots("tools != false")} ${n(c.toolsPass)} of ${n(c.benchOk)} selectors`);
+  if (c.knownBad) L.push(`  ${dots("known issue (seed)")} ${n(c.knownBad)} of ${n(c.benchOk)} probe-ok selectors excluded by a known issue until a real tool test says otherwise (explain names it)`);
+  if (c.accountStateRows) L.push(`  ${dots("account state")} ${n(c.accountStateRows)} of ${n(c.inProviders)} selectors: free-tagged, dropped on a transient bench status whose stored message names your account (plan, key or balance), so a re-probe will not change it: ${res.accountRows.slice(0, 12).map((x) => `${x.s} (${x.why})`).join(", ")}${res.accountRows.length > 12 ? ` and ${res.accountRows.length - 12} more` : ""}`);
+  if (c.reprobe) L.push(`  ${dots("re-probe (not dead)")} ${n(c.reprobe)} of ${n(c.inProviders)} selectors: free-tagged, dropped on a transient bench status of a sample older than 2 days: ${res.reprobe.slice(0, 12).map((x) => `${x.s} (${x.status}, ${x.ageDays} d)`).join(", ")}${res.reprobe.length > 12 ? ` and ${res.reprobe.length - 12} more` : ""}`);
   L.push("  free scopes (probe-ok selectors after the tools stage; tier from the vault registry, D-k):");
   for (const s of FREE_SCOPES) {
     const f = c.freeScopes[s];
@@ -946,6 +967,11 @@ function describeCompiled(c, age, detail = false) {
   const empties = c.emptyProviders ?? [], thin = c.thinProviders ?? [];
   return [`compiled: ${age} ago; ${fmtCount(a)} eligible ${a === 1 ? "model" : "models"} of ${fmtCount(k.universe)} snapshot routes (verified ${k.verified} of ${a}, small ${k.small ?? 0} of ${a}, unverified ${k.unverified} of ${a}, premium ${k.premium} of ${a}, alias ${k.alias ?? 0} of ${a})${c.empty ? "; EMPTY: no model is eligible" : ""}`,
     `  providers with no usable stand-in: ${lst(empties)} (${empties.length} of ${P}); thin, fewer than ${DEFAULT_MIN_SET} usable: ${lst(thin)} (${thin.length} of ${P})`,
+    ...(k.ctxStats ? [`  ${ctxFloorsLine(k.ctxStats, o.ctx)}`] : []),
+    ...(payloadGateLine(k) ? [`  ${payloadGateLine(k)}`] : []),
+    ...(k.ctxInferred ? [`  ${k.ctxInferred} of ${a} eligible models pass the 128k floor on an inferred ctx (c?, a sibling's context)`] : []),
+    ...(k.accountStateRows ? [`  ${k.accountStateRows} free-tagged models show an account state (their stored message names your plan, key or balance), not a pending re-probe${detail && Array.isArray(c.accountStateRows) ? `: ${c.accountStateRows.slice(0, 20).map((x) => `${printable(x.s, 100)} (${printable(x.why, 8)})`).join(", ")}${c.accountStateRows.length > 20 ? ` and ${c.accountStateRows.length - 20} more` : ""}` : " (--detail yes names them)"}`] : []),
+    ...(k.reprobe ? [`  ${k.reprobe} free-tagged models wait for a re-probe (dropped on a transient bench status, not dead)${detail && Array.isArray(c.reprobe) ? `: ${c.reprobe.slice(0, 20).map((x) => `${printable(x.s, 100)} (${printable(x.status, 12)})`).join(", ")}${c.reprobe.length > 20 ? ` and ${c.reprobe.length - 20} more` : ""}` : " (--detail yes names them)"}`] : []),
     ...(detail ? [`  compiled ${c.compiledAt}, contentHash ${c.contentHash}, compiler ${c.builtFrom?.compiler}, providersLive ${c.builtFrom?.providersLive}`,
       "  free-scope funnel (probe-ok selectors after the tools stage, whatever scope is chosen):",
       ...FREE_SCOPES.map((s) => { const f = c.counts.freeScopes?.[s]; return `    ${dots(SCOPE_NAMES[s], 30)} ${!f || f.unavailable ? "unavailable" : `${f.n} on ${f.providers} providers`}`; }),
@@ -1052,6 +1078,8 @@ async function cmdStatus(p, flags, io, opts = {}) {
   if (compiled) {
     const t = Date.parse(compiled.compiledAt ?? "");
     L.push(`compiled: ${Number.isFinite(t) ? `${ago(nowMs - t)} ago` : "time unknown"}, ${compiled.counts.allowed} eligible ${compiled.counts.allowed === 1 ? "model" : "models"} of ${compiled.counts.universe} snapshot routes (${compiled.counts.unverified} of ${compiled.counts.allowed} not tool-tested)`);
+    const pg = payloadGateLine(compiled.counts);
+    if (pg) L.push(pg);
   } else if (!cr.ok && cr.reason !== "missing") L.push(`compiled policy: unreadable (${cr.reason})`);
   if (status) {
     const cn = isObject(status.counters) ? status.counters : {};
@@ -1068,10 +1096,11 @@ async function cmdStatus(p, flags, io, opts = {}) {
 const LOG_FILES = ["agents.3.jsonl", "agents.2.jsonl", "agents.1.jsonl", "agents.jsonl"];       // oldest first: the current file plus three rotated generations
 const LOG_READ_MAX = 4 * 1024 * 1024;
 /** Reads the agent decision log and its rotated files; a torn or non-object line is skipped and counted, never fatal. */
-export function readAgentLog(stateDir) {
+export const CLASS_FILES = ["classify.1.jsonl", "classify.jsonl"];                                // the classifier log (one line per classified request) and its one rotated generation
+export function readAgentLog(stateDir, names = LOG_FILES) {
   const lines = [];
   let unreadable = 0, files = 0;
-  for (const name of LOG_FILES) {
+  for (const name of names) {
     let text;
     try {
       const f = path.join(stateDir, name), st = fs.statSync(f);
@@ -1313,7 +1342,7 @@ async function cmdPreset(p, flags, io, name, opts = {}) {
       for (const [k, pr] of Object.entries(PRESETS)) {
         const r = funnel({ ...g.funnelInputs, minSet: flags["min-set"] }, presetToggles(base, pr.flags));
         universe = r.counts.universe;
-        counts[k] = pr.flags.mode === "inherit" ? { eligible: null } : { eligible: r.counts.allowed, providers: providerCount(r.models), providerTotal: providerTotalOf(r), usable: r.counts.substitutable };
+        counts[k] = pr.flags.mode === "inherit" ? { eligible: null } : { eligible: r.counts.allowed, providers: providerCount(r.models), providerTotal: providerTotalOf(r), usable: r.counts.substitutable, ctx: ctxFloorsCompact(r.ctxStats) };
       }
     } catch (e) {
       if (!(e instanceof PolicyError)) throw e;
@@ -1343,6 +1372,10 @@ async function cmdWizard(p, flags, io, opts = {}) {
   try {
     const res = await runWizard({
       isTTY: tty, ask: asker.ask, out: io.out, cli: CLI, live: !p.fixture,
+      ctxFloorLine: async (free) => {
+        try { const g = await gatherInputs(p); return ctxFloorsLine(funnel({ ...g.funnelInputs, minSet: flags["min-set"] }, presetToggles(loadOwner(p.policyFile) ?? { ...OWNER_DEFAULTS }, (free ? PRESETS.free : PRESETS.any).flags)).ctxStats); }
+        catch { return null; }
+      },
       freeNarrowCount: async () => {
         try { const g = await gatherInputs(p); return funnel({ ...g.funnelInputs, minSet: flags["min-set"] }, presetToggles(loadOwner(p.policyFile) ?? { ...OWNER_DEFAULTS }, PRESETS.free.flags)).counts.freeScopes.models.n; }
         catch { return null; }
@@ -1439,9 +1472,9 @@ const FALLBACK_RULE = "fallback: a cooling model (the 2 min, 10 min, 60 min, 6 h
 const STAGE_PLAIN = (grp, owner) => {
   const st = String(grp.stage ?? "");
   if (st.startsWith("bench-")) return grp.status && grp.status !== "ok" ? `its last speed test was ${grp.status}, not ok` : "it has no speed-test record";
-  return ({ "tools-false-claim": "the catalogue says it cannot use tools", "tools-failed": "it failed the tool test", "tools-unverified": "it is not tool-tested and the unverified setting excludes untested models",
+  return ({ "tools-false-claim": "the catalogue says it cannot use tools", "tools-failed": "it failed the tool test", "known-bad": `${grp.knownIssue ? knownIssueText(grp.knownIssue) : "known issue"}, and no real tool test has overridden it`, "tools-unverified": "it is not tool-tested and the unverified setting excludes untested models",
     "excluded-tier": `its key tier (${grp.tier}) is an excluded tier`, "scope": owner.mode === "free" ? `it is outside ${SCOPE_NAMES[owner.freeScope]}` : "it is outside the chosen scope",
-    "ctx": "it has less than 1M of context and the context floor is 1m" })[st] ?? `it stopped at ${st}`;
+    "ctx": `it has less than ${ctxLabel(owner.ctx)} of known context and the context floor is ${owner.ctx}` })[st] ?? `it stopped at ${st}`;
 };
 
 async function cmdExplain(p, flags, io, target) {
@@ -1474,9 +1507,12 @@ async function cmdExplain(p, flags, io, target) {
   L.push(`tools claim: ${grp.toolsAny ? "not false" : "false"} (catalogue, untrusted); tool tier: ${grp.toolTier ?? "n/a"}${grp.toolBasis ? ` (${grp.toolBasis})` : ""}${tf ? ", tool-fidelity record present" : ", no tool-fidelity record"}`);
   L.push(`key tier: ${grp.tier ?? "none"} (source: vault registry; key id ${(g.tiersRes.keyIds && Object.hasOwn(g.tiersRes.keyIds, grp.provider) ? g.tiersRes.keyIds[grp.provider] : undefined) ?? grp.keyId ?? "?"})`);
   L.push(`ALIAS: ${grp.alias ? `yes (pool rule ${POOL_ALIAS_RE} matched; never above tier u)` : "no"}; free tag: ${grp.tag ? `yes (${FREE_TAG})` : "no"}`);
-  L.push(`price: ${res.models.find((r) => r.s === grp.selector)?.i ?? (grp.pin == null && grp.pout == null ? "$?" : `$${grp.pin}/$${grp.pout}`)}; free verdict: ${grp.pin === 0 && grp.pout === 0 ? "price 0" : "not price 0"}; premium: ${grp.premium ? `yes (${PREMIUM_RULE.families.join("/")} family or output >= $${PREMIUM_RULE.outUsdPerM}/M)` : "no"}${grp.pricedButBadged ? "; PRICED_BUT_BADGED" : ""}`);
-  L.push(`ctx: ${grp.c > 0 ? n(grp.c) : "unknown"} (${grp.tag1m ? "[1m] sibling" : grp.c > 0 ? "catalogue" : "unknown"}${grp.n ? "; n:1 listing-only, needs the context-1m beta header" : ""}); substitutable: ${grp.c >= SUBSTITUTE_FLOOR ? "yes" : "no (needs a known context of at least 128,000)"}`);
-  L.push(`payload cap: ${grp.limit > 0 ? `${sizeCell(grp.limit)} (band ${capBand(grp.limit)})` : "unknown"}`);
+  L.push(`price: ${res.models.find((r) => r.s === grp.selector)?.i ?? (grp.pin == null && grp.pout == null ? "$?" : `$${grp.pin}/$${grp.pout}`)}; free verdict: ${grp.pin === 0 && grp.pout === 0 ? "price 0 (free on a free-labelled provider, like a free-tagged row)" : "not price 0"}; premium: ${grp.premium ? `yes (${PREMIUM_RULE.families.join("/")} family or output >= $${PREMIUM_RULE.outUsdPerM}/M)` : "no"}${grp.pricedButBadged ? "; PRICED_BUT_BADGED" : ""}`);
+  if (grp.knownIssue) L.push(`${knownIssueText(grp.knownIssue)}${grp.knownIssue.kind === "cap" ? ` (a size cap of about ${sizeCell(grp.knownIssue.capBelow)}, never an x)` : ""}; used only until a real tool-fidelity record exists`);
+  if (grp.accountState) L.push(`account state: its bench status is ${grp.status} but the stored message names your account (${grp.accountState}); a re-probe will not change it, so it is not listed as waiting`);
+  if (grp.reprobe) L.push(`re-probe: its bench status is ${grp.status} on a sample older than 2 days; a transient status is not proof it cannot work, so it waits for a re-probe`);
+  L.push(`ctx: ${grp.c > 0 ? n(grp.c) : "unknown"} (${grp.ci ? "INFERRED (c?) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k" : grp.tag1m ? "[1m] sibling" : grp.c > 0 ? "catalogue" : "unknown"}${grp.n ? "; n:1 listing-only, needs the context-1m beta header" : ""}); substitutable: ${grp.c >= SUBSTITUTE_FLOOR ? "yes" : "no (needs a known context of at least 128,000)"}`);
+  L.push(`payload cap: ${grp.limit > 0 ? `${sizeCell(grp.limit)} (band ${capBand(grp.limit)}; source ${grp.limitSource ?? "?"})` : "unknown (the size check does nothing for it until a limit is measured)"}`);
   if (grp.in) {
     for (const s of FREE_SCOPES) {
       const why = grp.in[s] ? "PASS" : freeScopeOf(grp.tier) === null ? `FAIL (tier ${grp.tier} is in no free scope)`
@@ -1489,10 +1525,10 @@ async function cmdExplain(p, flags, io, target) {
   L.push(`toggles: source=${owner.source} mode=${owner.mode} ctx=${owner.ctx}: ${grp.stage === "in-set" ? "IN the allowed set" : `NOT in the allowed set (stopped at ${grp.stage})`}`);
   const idx = res.models.findIndex((r) => r.s === grp.selector);
   if (idx >= 0) {
-    const labels = ["tool tier (band)", "health: latest status ok (band)", "ctx class, prefer-1m (band)", "price class 2b (band)", "big step (v only)", "L4 (v only)", "recency (order only)", "price 2b", "-ctx", "ttft bucket", "alias"];
+    const labels = ["tool tier (band)", "health: latest status ok (band)", "ctx preference (band)", "price class 2b (band)", "first strike", "big step (v only)", "L4 (v only)", "ttft quantile bucket", "ctx class", "price 2b", "recency (order only, calendar-dependent)", "alias"];
     L.push(`rank: position ${idx + 1} of ${res.models.length} (ordered by reliability then context, NOT by quality or price); keys ${labels.map((l, i) => `${l}=${grp.rk[i]}`).join(", ")}`);
     L.push(`shortlist: ${idx < INJECT_MAX_ENTRIES ? "listed" : "beyond the 20-entry injected shortlist"}; ${substituteLine(res, grp.selector, owner.banded !== false)}`);
-    L.push(`band: ${grp.b} (equal tool tier, health, ctx class and price class; rows in one band are interchangeable for the spread)`, FALLBACK_RULE);
+    L.push(`band: ${grp.b} (equal tool tier, health, ctx preference and price class; rows in one band are interchangeable for the spread)`, FALLBACK_RULE);
   }
   for (const l of L) io.out(l);
   return 0;
@@ -1554,7 +1590,8 @@ export const usageText = [
   "  Toggle 1  source   --source same-provider|all-providers   same-provider: only main's own provider; all-providers: any provider",
   "  Toggle 2  mode     --mode dynamic|inherit|free            dynamic: any model; inherit: main's own model; free: free models only",
   "            (free)   --free-scope models|providers|providers+deposit   which models count as free (only with --mode free): models = tagged free; providers = every model on a provider you labelled free",
-  "  Toggle 3  context  --ctx any|prefer-1m|1m                 any: no floor; prefer-1m: 1M models first; 1m: only 1M",
+  "  Toggle 3  context  --ctx any|128k|200k|256k|512k|1m|prefer-256k|prefer-512k|prefer-1m",
+  "            any: no floor; 128k to 1m: only models with at least that known context; prefer-256k, prefer-512k, prefer-1m: those first, nothing excluded (set --dry yes prints rows per floor)",
   "Other switches: --banded yes|no (the substitute spread stays inside the lead rank band; default yes), --handoff-notice yes|no (after a retry-driven handoff the router adds one line to the subagent's system prompt; default yes),",
   "  --enforce shadow|enforce, --inject off|on, --allow provider/model (pin one model; repeatable), --unverified allow-warn|allow-t|pin-only.",
   "",

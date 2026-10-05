@@ -4,12 +4,12 @@
 // prices and, with `--outcomes yes`, CCR's `request_logs` through an injectable read-only seam (a fixture database in every test, never the real one). The `--json` form
 // has a FROZEN shape: `REPORT_SCHEMA` and the key order built below are pinned by a test. `last --json` keeps its own S1d shape.
 import fs from "node:fs";
-import { readAgentLog, readStatus, printable, formatHandoff, localWhen, sinceMs, tally, provOf } from "./subagent-policy.mjs";
+import { readAgentLog, readStatus, readCompiled, printable, formatHandoff, localWhen, sinceMs, tally, provOf, CLASS_FILES, payloadGateLine } from "./subagent-policy.mjs";
 import { loadSnapshot } from "../menu/snapshot.mjs";
 import { stripOneM } from "../menu/subagent-funnel.mjs";
 import { loadSqlite } from "../refresh/observe.mjs";
 
-export const REPORT_SCHEMA = 1;
+export const REPORT_SCHEMA = 2;                     // 2: contextGrowth and payload were appended (revision 11, D-bl, sa-A1)
 export const ESTIMATE_LABEL = "estimate, input tokens only, snapshot prices";
 export const JOIN_WINDOW_MS = 2000;                 // the plan's session prefix and +/- 2 s window (9.3)
 export const TEXT_ROWS = 20, JSON_ROWS = 200, HANDOFF_ROWS = 50, LOG_ROW_LIMIT = 5000;
@@ -159,8 +159,42 @@ function counterBlock(sr) {
  */
 export const sessionMatches = (given, logged) => { const g = String(given).toLowerCase(), l = String(logged).toLowerCase(); return l !== "" && (g === l || (g.length > l.length && g.startsWith(l))); };
 
+const rank = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1))];
+const r2 = (v) => Math.round(v * 100) / 100;
+/**
+ * CONTEXT GROWTH (D-bl; an ESTIMATE): per subagent, the largest token count of a LATER request divided by the token count of its FIRST request, from the classifier log (every classified
+ * request carries the router's own token count `tc`; agents.jsonl holds only the first). It lets the owner set the headroom multiple k from shadow data; nothing is applied. Population
+ * words: agents are subagents seen in the window with an agent id and a token count; only those with at least two counted requests have a ratio. Pure.
+ */
+export function contextGrowth(classLines, { sinceT = null, session = null } = {}) {
+  const by = new Map();
+  let requests = 0, bytesN = 0, over200k = 0, over1m = 0;
+  for (const o of classLines ?? []) {
+    if (!isObject(o) || o.cls !== "sub") continue;
+    const t = Date.parse(o.t);
+    if (!Number.isFinite(t) || (sinceT !== null && t < sinceT)) continue;
+    if (session !== null && session !== undefined && !sessionMatches(session, String(o.sid ?? ""))) continue;
+    if (o.bb === "b0" || o.bb === "b1" || o.bb === "b2" || o.bb === "b3") { bytesN += 1; if (o.bb === "b2" || o.bb === "b3") over200k += 1; if (o.bb === "b3") over1m += 1; }
+    const tc = num(o.tc);
+    if (tc === null || tc <= 0 || typeof o.aid !== "string" || o.aid === "") continue;
+    requests += 1;
+    const k = `${String(o.sid ?? "")}|${o.aid}`;
+    (by.get(k) ?? by.set(k, []).get(k)).push({ t, tc });
+  }
+  const peaks = [];
+  for (const arr of by.values()) {
+    if (arr.length < 2) continue;
+    arr.sort((a, b) => a.t - b.t);
+    peaks.push(Math.max(...arr.slice(1).map((x) => x.tc / arr[0].tc)));
+  }
+  peaks.sort((a, b) => a - b);
+  return { label: "estimate", agents: by.size, measurable: peaks.length, singleRequest: by.size - peaks.length, requests,
+    ratio: peaks.length ? { median: r2(rank(peaks, 0.5)), p90: r2(rank(peaks, 0.9)), max: r2(peaks[peaks.length - 1]) } : null,
+    sizeSample: { requests: bytesN, over200k, over1m } };
+}
+
 /** The whole report as one plain object (the `--json` shape, in its frozen key order). Pure given its inputs. */
-export function buildReport({ lines, unreadable, files, status, snap, nowMs, since, session, outcomes, limit = JSON_ROWS }) {
+export function buildReport({ lines, unreadable, files, status, snap, nowMs, since, session, outcomes, limit = JSON_ROWS, classLines = [], compiled = null }) {
   const sinceT = since ? nowMs - sinceMs(since) : null;
   const inWin = lines.map(reportRecord).filter((r) => (sinceT === null || Date.parse(r.t) >= sinceT) && (session === undefined || session === null || sessionMatches(session, r.sid)));
   const decisions = inWin.filter((r) => r.kind === "decision"), handoffs = inWin.filter((r) => r.kind === "handoff");
@@ -184,6 +218,8 @@ export function buildReport({ lines, unreadable, files, status, snap, nowMs, sin
     agents: listed.map((r) => ({ t: r.t, sid: r.sid, aid: r.aid, asked: r.asked, ran: r.ran, would: r.would, why: r.why, mode: r.mode, main: r.main, tokens: r.tc, moved: r.moved, flags: r.flags,
       costUsd: est.per.get(r) ?? null, outcome: out.per?.get(r) ?? null })),
     handoffs: handListed.map((r) => ({ t: r.t, sid: r.sid, aid: r.aid, text: r.handoff })),
+    contextGrowth: contextGrowth(classLines, { sinceT, session }),
+    payload: { compiledAvailable: !!compiled, allowed: compiled ? num(compiled.counts?.allowed) : null, unknownLimit: compiled ? num(compiled.counts?.payloadUnknown) : null, gateLine: compiled ? payloadGateLine(compiled.counts ?? {}) : null },
   };
 }
 
@@ -229,6 +265,11 @@ export function renderReport(r, nowMs) {
       ? `outcomes (the gateway request log, read only, joined by session, agent and a ${o.joinWindowMs / 1000} second window): matched ${o.matched} of ${o.considered} agent decisions (${o.rowsRead} log rows read${o.truncated ? `, STOPPED AT THE ${LOG_ROW_LIMIT}-ROW LIMIT: later rows were not read, so some unmatched agents may only be beyond it` : ""}); the gateway resolved the logged model on ${o.resolvedEqualsRan} of ${o.matched} matched, another model on ${o.resolvedDiffers} of ${o.matched}; ${o.errorStatus} of ${o.matched} matched returned an error status (400 or above)${o.unmatched ? `; ${o.unmatched} of ${o.considered} had no matching request (the gateway keeps only recent request rows, for a time this report does not know, so older agents can be missing)` : ""}`
       : `outcomes: unavailable (${o.reason})`);
   }
+  const cg = r.contextGrowth;
+  if (cg.measurable) L.push(`context growth (${cg.label}, the router's token counts from its classifier log): of ${plural(cg.agents, "subagent")} with a token count (${plural(cg.requests, "request")}), ${cg.measurable} made two or more requests; the largest later request of each was a median ${cg.ratio.median}x, 90th percentile ${cg.ratio.p90}x, at most ${cg.ratio.max}x its FIRST request (n = ${cg.measurable} subagents; ${cg.singleRequest} with one counted request have no ratio). Nothing is changed by this; it is the measurement for the headroom multiple.`);
+  else L.push(`context growth (${cg.label}): not measurable: of ${plural(cg.agents, "subagent")} with a token count in the classifier log, none made two or more counted requests in this window`);
+  if (cg.sizeSample.requests) L.push(`request size (the classifier log's size buckets): ${cg.sizeSample.over200k} of ${cg.sizeSample.requests} classified subagent requests (${Math.round((100 * cg.sizeSample.over200k) / cg.sizeSample.requests)}%) were over 200 KB and ${cg.sizeSample.over1m} (${Math.round((100 * cg.sizeSample.over1m) / cg.sizeSample.requests)}%) over 1 MB`);
+  if (r.payload.gateLine) L.push(r.payload.gateLine);
   L.push("note: Claude Code's transcript shows the model that was REQUESTED, not the one that served the request; this report shows what the router returned.");
   return L;
 }
@@ -239,7 +280,9 @@ export async function cmdReport(p, flags, io, opts = {}) {
   const { lines, unreadable, files } = readAgentLog(p.stateDir);
   const status = readStatus(p.statusFile);
   const snap = loadSnapshot(p.snapshotFile);
-  const report = buildReport({ lines, unreadable, files, status, snap, nowMs, since: flags.since, session: flags.session, outcomes: flags.outcomes ? { p, opts } : null });
+  const cr = readCompiled(p.compiledFile);
+  const report = buildReport({ lines, unreadable, files, status, snap, nowMs, since: flags.since, session: flags.session, outcomes: flags.outcomes ? { p, opts } : null,
+    classLines: readAgentLog(p.stateDir, CLASS_FILES).lines, compiled: cr.ok ? cr.value : null });
   if (flags.json) { io.out(JSON.stringify(report)); return 0; }
   for (const l of renderReport(report, nowMs)) io.out(l);
   return 0;

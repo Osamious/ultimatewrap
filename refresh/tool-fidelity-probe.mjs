@@ -1,66 +1,111 @@
-// The tool-fidelity ladder (issue #121): requests that ask, one at a time, whether a model really handles tools.
+// The tool-fidelity ladder (issue #121): requests that ask, one at a time, whether a model really handles tools, each as cheap as it can be.
 //
-//   L1  one FORCED tool call comes back as a well-formed tool_use with valid JSON arguments (and the required argument)
-//   L2  a tool_result round trip (assistant tool_use, user tool_result) ends in a final text answer, no 400
-//   L3  the ~157 KB synthetic fixture (refresh/tool-fidelity-fixture.mjs) is accepted and answered
-//   L4  two PARALLEL tool calls come back with STREAMED arguments, on the same fixture
-//   L5  the "big" step: a ~400 KB fixture, asked only of a model that passed L3 (kept out of the four-letter result string)
+// LEVELS (what is stored) and the REQUESTS that answer them:
+//   L1  one tool call, tool_choice AUTO as Claude Code sends it, a task that plainly requires the Edit-style call. The same call carries ARGUMENT FIDELITY (`af`: every field comes back
+//       byte for byte, the boolean a boolean, the integer an integer). Only when auto yields no call is the call FORCED (`fc`): a model that passes only when forced is class t, not clean.
+//   L2  a tool_result round trip with a ~20 KB result whose fact is at the END (`br`: the answer uses it); no 400, a final text answer.   L7: the same with an is_error result (`er`).
+//   L3  3a: a ~6 KB request with the awkward constructs, an MCP-style long tool name (`nm`) and cache_control (`cc`): a construct rejection is the schema verdict and the model never pays
+//       the 40,000 tokens. 3b: the ~157 KB fixture, which also asks two PARALLEL calls: accepted and answered is L3, parallel calls with streamed arguments is L4. 3a passing does not imply L3.
+//   L5  the "big" step: the ~400 KB fixture, asked only of a model that passed L3 (kept out of the four-letter result string).   L6 `spawn`: the Agent tool, auto choice (`sp`).
 //
-// A level has three outcomes. `p` passed and `f` failed are VERDICTS about the model. `i` is INCONCLUSIVE: the answer says something
-// about the account or the moment (a rate or tokens-per-minute limit, an empty balance, a dead key, a 5xx, a timeout, a budget spent on
-// hidden reasoning), not about tools. An inconclusive level is never recorded as a failure (a billing problem is state, not death): the
-// caller leaves the model un-recorded and it is tried again later.
+// A request has three outcomes. `p` passed and `f` failed are VERDICTS about the model. `i` is INCONCLUSIVE: the answer says something about the account or the moment (a rate or tokens-
+// per-minute limit, an empty balance, a dead key, a 5xx, a timeout, a budget spent on hidden reasoning), not about tools; the caller leaves the model un-recorded and tries again later.
 //
-// A failed verdict carries a `kind` that decides what the caller may conclude from it:
-//   size     the provider refused the request for its SIZE (413, a body naming size or context length, any refusal at the big step)
-//   schema   anything else that failed (a rejected schema, a missing tool call, a malformed answer)
+// A failed verdict carries a `kind`: `size` (the provider refused the request for its SIZE: 413, a body naming size or context length, any refusal at the big step) or `schema` (anything else).
 //
-// Every dependency is injected (fetch, clock) so the ladder runs in tests against fake streams. Nothing here reads a key or a file:
-// the caller hands in the gateway URL and key, exactly as the bench does.
+// COST DISCIPLINE. Each request has its own small max_tokens and its own timeout class; the stream is CANCELLED once the content the level needs is complete (a model that keeps talking
+// after its calls costs no more output); a thinking-only stop is asked once more with a larger budget. Deep levels (above L2) are clamped away for any provider that is not on the `free` tier:
+// that rule lives HERE, in `probeModel`, so a caller that builds its own queue is still bound by it (see `liftDeepProbes` in tool-fidelity.mjs).
+//
+// Every dependency is injected (fetch, clock) so the ladder runs in tests against fake streams. Nothing here reads a key or a file.
 
 import { createSseParser, classifyHttp, classifyTight, parseRetryAfter } from "./bench.mjs";
 import { redactClip } from "../menu/redact.mjs";
 import { CONTRACT as CCR } from "../menu/ccr-client.mjs";
-import { fixture, bigFixture, smallTools, ECHO_TOOL } from "./tool-fidelity-fixture.mjs";
+import {
+  fixture, bigFixture, constructsTools, echoTool, readTool, agentTool, smallTools, bigResult, AWKWARD, BIG_RESULT_FACT, ERROR_RESULT, CACHE_CONTROL,
+  ECHO_TOOL, EDIT_TOOL, READ_TOOL, AGENT_TOOL, LONG_TOOL, AGENT_TYPES,
+} from "./tool-fidelity-fixture.mjs";
 
-export const LEVEL_NUMBERS = Object.freeze([1, 2, 3, 4, 5]);
-export const PROBE_MAX_TOKENS = 512;       // room for a reasoning model to think and then call the tool
+export const LEVEL_NUMBERS = Object.freeze([1, 2, 3, 4, 5, 6, 7]);
+export const NOT_FREE_REASON = "not-free-tier (skipped for now)";   // the ledger reason of a model whose key tier is not free: it is not probed at any level
+export const MAX_MODEL_REQUESTS = 12;      // a HARD ceiling on the requests sent to one model in a run (every level, retry, escalation, forced fallback and cache_control re-ask); reaching it is pending: request-cap, never a verdict
+const ERROR_BODY_BYTES = 2048;             // how much of a refusal is read
+export const ESCALATED_MAX_TOKENS = 2048;  // the ONE bump for a model whose whole budget went on thinking (see probeModel)
+/** The output budget of each request: just enough for the answer it asks for. */
+export const BUDGETS = Object.freeze({ "1": 256, "1f": 256, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
+export const PROBE_MAX_TOKENS = BUDGETS["1"];          // the smallest budget; kept as the name callers print
+/** Timeout classes in ms: small requests, the 157 KB request, the 400 KB request. A timeout is inconclusive, never a verdict. */
+export const TIMEOUTS_MS = Object.freeze({ small: 15000, "157": 60000, big: 90000 });
+const CLASS_OF = Object.freeze({ "1": "small", "1f": "small", "2": "small", "2e": "small", "3a": "small", "3b": "157", "5": "big", "6": "small" });
+const LEVEL_OF = Object.freeze({ "1": 1, "1f": 1, "2": 2, "2e": 7, "3a": 3, "3b": 3, "5": 5, "6": 6 });
+const EXPECT_TOOLS = Object.freeze({ "1": 1, "1f": 1, "2": 0, "2e": 0, "3a": 1, "3b": 2, "5": 1, "6": 1 });
 const WHY_CHARS = 160;
 const STREAM_CHAR_CAP = 40000;             // a model that never stops streaming is judged on what it sent so far
+const AFTER_DONE_EVENTS = 50;              // events read after the expected calls are closed while waiting for the usage event
 // Limits on what one answer may cost us to read (a hostile or broken upstream): bytes, events and blocks.
 export const STREAM_LIMITS = Object.freeze({ bytes: 2 * 1024 * 1024, events: 20000, blocks: 64 });
 
-const PROMPTS = {
-  1: `Call the ${ECHO_TOOL} tool with the message "ping".`,
-  2: `Call the ${ECHO_TOOL} tool with the message "ping", then tell me in one short sentence what it returned.`,
-  3: `Call the ${ECHO_TOOL} tool once with the message "ok".`,
-  4: `Call the ${ECHO_TOOL} tool twice in the same turn: once with the message "a" and once with the message "b".`,
+const ASK = Object.freeze({
+  1: `Edit the file ${AWKWARD.file_path}: replace the text between <old> and </old> with the text between <new> and </new>, in every occurrence, starting from line ${AWKWARD.start_line}. Call the ${EDIT_TOOL} tool; copy both texts exactly, character for character.\n<old>${AWKWARD.old_string}</old>\n<new>${AWKWARD.new_string}</new>`,
+  2: "The report you just read is above. What is the deployment code of this release? Answer in one short sentence.",
+  "2e": "Read /ws/missing.txt and tell me its first line.",
+  "3a": `Call the ${LONG_TOOL} tool with mode "demo" and limit 3.`,
+  "3b": `Call the ${ECHO_TOOL} tool twice in the same turn: once with the message "a" and once with the message "b".`,
   5: `Call the ${ECHO_TOOL} tool once with the message "ok".`,
-};
+  6: "This repository has three independent modules: auth, billing and search. I need an investigation of each: where it is configured, what it depends on and what tests cover it. Do the three investigations in parallel by delegating them to sub-agents with the Agent tool.",
+});
 const ROUND_TRIP_ID = "toolu_fx0001";
 
-/** The request body of one level for `model`. Pure: the planner measures these bytes, the probe sends them. `toolChoice: "auto"` is the L1 retry. */
-export function buildBody(level, model, maxTokens = PROBE_MAX_TOKENS, { toolChoice = null } = {}) {
+const withCache = (tools) => { const t = structuredClone(tools); t[t.length - 1] = { ...t[t.length - 1], cache_control: { ...CACHE_CONTROL } }; return t; };
+const systemBlocks = (text, cc) => (cc ? [{ type: "text", text, cache_control: { ...CACHE_CONTROL } }] : text);
+
+/**
+ * The request body of one KIND (`1`, `1f` forced, `2`, `2e`, `3a`, `3b`, `5`, `6`) for `model`. Pure: the planner measures these bytes, the probe sends them.
+ * `noCc` leaves the cache_control markers off (a provider that rejected them is not sent them again).
+ */
+export function buildBody(kind, model, maxTokens = BUDGETS[kind], { noCc = false } = {}) {
   const base = { model, max_tokens: maxTokens, stream: true };
-  if (level === 1) return { ...base, tools: smallTools(), tool_choice: toolChoice === "auto" ? { type: "auto" } : { type: "tool", name: ECHO_TOOL }, messages: [{ role: "user", content: PROMPTS[1] }] };
-  if (level === 2) {
+  const cc = !noCc;
+  if (kind === "1" || kind === "1f") return { ...base, tools: smallTools(), ...(kind === "1f" ? { tool_choice: { type: "tool", name: EDIT_TOOL } } : { tool_choice: { type: "auto" } }), messages: [{ role: "user", content: ASK[1] }] };
+  if (kind === "2" || kind === "2e") {
+    const err = kind === "2e";
     return {
-      ...base, tools: smallTools(),
+      ...base, tools: [readTool()],
       messages: [
-        { role: "user", content: PROMPTS[2] },
-        { role: "assistant", content: [{ type: "tool_use", id: ROUND_TRIP_ID, name: ECHO_TOOL, input: { message: "ping" } }] },
-        { role: "user", content: [{ type: "tool_result", tool_use_id: ROUND_TRIP_ID, content: "ping" }] },
+        { role: "user", content: err ? ASK["2e"] : "Read /ws/report.txt and tell me the deployment code of the release it describes." },
+        { role: "assistant", content: [{ type: "tool_use", id: ROUND_TRIP_ID, name: READ_TOOL, input: { file_path: err ? "/ws/missing.txt" : "/ws/report.txt" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: ROUND_TRIP_ID, content: err ? ERROR_RESULT : bigResult(), ...(err ? { is_error: true } : {}) }, ...(err ? [] : [{ type: "text", text: ASK[2] }])] },
       ],
     };
   }
-  const fx = level === 5 ? bigFixture() : fixture();
-  return { ...base, system: fx.system, tools: fx.tools, messages: [{ role: "user", content: PROMPTS[level] }] };
+  if (kind === "3a") { const t = constructsTools(); if (!cc) delete t[t.length - 1].cache_control; return { ...base, system: systemBlocks("You are a coding assistant. Use the tools you are given.", cc), tools: t, messages: [{ role: "user", content: ASK["3a"] }] }; }
+  if (kind === "6") return { ...base, tools: [agentTool()], tool_choice: { type: "auto" }, messages: [{ role: "user", content: ASK[6] }] };
+  const fx = kind === "5" ? bigFixture() : fixture();
+  return { ...base, system: systemBlocks(fx.system, cc), tools: cc ? withCache(fx.tools) : fx.tools, messages: [{ role: "user", content: ASK[kind === "5" ? 5 : "3b"] }] };
 }
 
-/** Bytes and an input-token estimate (bytes / 4, the figure the plan uses) for one level's request. */
-export function levelSize(level, maxTokens = PROBE_MAX_TOKENS) {
-  const bytes = Buffer.byteLength(JSON.stringify(buildBody(level, "provider/model", maxTokens)));
-  return { bytes, inTokens: Math.ceil(bytes / 4) };
+const sizeCache = new Map();
+/** Bytes and an input-token estimate (bytes / 4, the figure the plan uses) of ONE request kind. */
+export function kindSize(kind) {
+  if (!sizeCache.has(kind)) { const bytes = Buffer.byteLength(JSON.stringify(buildBody(kind, "provider/model"))); sizeCache.set(kind, { bytes, inTokens: Math.ceil(bytes / 4) }); }
+  return sizeCache.get(kind);
+}
+/** The request kinds a todo list sends, in order: L3 is 3a then 3b (3b also answers L4); L4 alone is 3b; L7 is the error-result request. */
+export const kindsOf = (todo) => {
+  const t = new Set(todo), out = [];
+  if (t.has(1)) out.push("1");
+  if (t.has(2)) out.push("2");
+  if (t.has(7)) out.push("2e");
+  if (t.has(3)) out.push("3a", "3b"); else if (t.has(4)) out.push("3b");
+  if (t.has(5)) out.push("5");
+  if (t.has(6)) out.push("6");
+  return out;
+};
+/** Bytes and input tokens of one LEVEL as the plan counts them (L4 rides in the L3 request: no cost of its own unless it is asked alone; `withLevel3` says L3 is in the same todo). */
+export function levelSize(level, { withLevel3 = true } = {}) {
+  const kinds = level === 3 ? ["3a", "3b"] : level === 4 ? (withLevel3 ? [] : ["3b"]) : kindsOf([level]);
+  return kinds.reduce((a, k) => ({ bytes: a.bytes + kindSize(k).bytes, inTokens: a.inTokens + kindSize(k).inTokens, requests: a.requests + 1 }), { bytes: 0, inTokens: 0, requests: 0 });
 }
 
 const clip = (s) => redactClip(String(s ?? "").replace(/\s+/g, " ").trim(), WHY_CHARS);
@@ -75,21 +120,27 @@ const LIMIT_WORDS = /per[ -]minute|per[ -]second|per[ -]day|tokens? per|requests
 const SIZE_WORDS = /too (large|big|long)|entity too large|payload|request size|content[ -]length|body (is )?too|exceeds? (the )?(maximum|max|limit|size)|maximum (context|request|content|body)|context[ -]?(length|window)|input is too|prompt is too|too many tokens|reduce the (length|size)/i;
 // The provider saying the model or its route cannot take tools at all: a verdict about the model, even when it comes as a 404.
 const NOTOOLS = /no endpoints? (found )?(that )?(support|supporting)\w* (tool|function)|(does(n'?t| not)|do(n'?t| not)) support (tool|function)|(tools?|function[ -]?calling|tool[ -]use) (is |are )?(not|un)supported|unsupported.{0,20}\btools?\b|tool use is not (available|supported)|tools? (is|are) not (available|enabled)/i;
+// A 400 that names the cache_control marker, and one that names the tool NAME (its length or pattern).
+const CC_WORDS = /cache[ _-]?control/i;
+const NAME_WORDS = /(tool|function)[ _.-]?name|name.{0,40}(too long|exceed|max(imum)? length|must (match|be)|pattern|invalid|does not match)|tools\.\d+\.name|\^\[a-zA-Z0-9_-\]/i;
 
-/** The streamed answer of one tool_use block: the joined partial_json, or the object the start event carried. */
+/** The streamed arguments of one tool_use block: the joined partial_json, or the object the start event carried. */
 function argsOf(block) {
   const raw = block.json === "" ? JSON.stringify(block.start ?? {}) : block.json;
   try { const v = JSON.parse(raw); return v && typeof v === "object" && !Array.isArray(v) ? { ok: true, value: v } : { ok: false }; }
   catch { return { ok: false }; }
 }
 
-/** Reads the whole answer stream into `{blocks, streamError, stopped, events, stopReason, overflow}`. Never throws on a malformed event. */
-async function readStream(res, { signal } = {}) {
+/**
+ * Reads the answer stream into `{blocks, streamError, stopped, events, stopReason, overflow, inTok, outTok}`. Never throws on a malformed event. With `expect` (the number of
+ * tool_use blocks the level needs) it STOPS reading, and cancels the stream, once that many are closed and the usage event has been seen (or a few more events have passed).
+ */
+async function readStream(res, { signal, expect = 0 } = {}) {
   const reader = res.body?.getReader?.();
   if (!reader) return { noBody: true, blocks: [], streamError: null, stopped: false };
   const dec = new TextDecoder(), parser = createSseParser();
-  const blocks = new Map();
-  let streamError = null, stopped = false, chars = 0, events = 0, stopReason = null, bytes = 0, overflow = false;
+  const blocks = new Map(), closed = new Set();
+  let streamError = null, stopped = false, chars = 0, events = 0, stopReason = null, bytes = 0, overflow = false, inTok = null, outTok = null, sawUsage = false, after = 0, early = false;
   const block = (index) => {
     let b = blocks.get(index);
     if (!b && blocks.size < STREAM_LIMITS.blocks) { b = { type: null, name: null, id: null, start: null, json: "", text: "" }; blocks.set(index, b); }
@@ -106,7 +157,8 @@ async function readStream(res, { signal } = {}) {
         events += 1;
         if (events > STREAM_LIMITS.events) { overflow = true; break scan; }
         const d = ev.data;
-        if (ev.type === "content_block_start" && Number.isInteger(d?.index)) {
+        if (ev.type === "message_start") { const n = d?.message?.usage?.input_tokens; if (Number.isFinite(n)) inTok = n; }
+        else if (ev.type === "content_block_start" && Number.isInteger(d?.index)) {
           const b = block(d.index);
           if (!b) { overflow = true; break scan; }
           const c = d.content_block ?? {};
@@ -118,10 +170,18 @@ async function readStream(res, { signal } = {}) {
           if (dl.type === "input_json_delta") { b.json += dl.partial_json ?? ""; b.type ??= "tool_use"; chars += (dl.partial_json ?? "").length; }
           else if (dl.type === "text_delta") { b.text += dl.text ?? ""; b.type ??= "text"; chars += (dl.text ?? "").length; }
           else if (dl.type === "thinking_delta") { b.type ??= "thinking"; chars += (dl.thinking ?? "").length; }
-        } else if (ev.type === "message_delta") { if (typeof d?.delta?.stop_reason === "string") stopReason = d.delta.stop_reason; }
-        else if (ev.type === "error") streamError = d?.error?.message ?? "stream error";
+        } else if (ev.type === "content_block_stop" && Number.isInteger(d?.index)) closed.add(d.index);
+        else if (ev.type === "message_delta") {
+          if (typeof d?.delta?.stop_reason === "string") stopReason = d.delta.stop_reason;
+          const n = d?.usage?.output_tokens; if (Number.isFinite(n)) outTok = n;
+          sawUsage = true;
+        } else if (ev.type === "error") streamError = d?.error?.message ?? "stream error";
         else if (ev.type === "message_stop") { stopped = true; break scan; }
         if (chars > STREAM_CHAR_CAP) break scan;
+        // the needed content is complete: every expected call is closed and the usage has been seen (or enough events have passed without it): stop paying for output
+        if (expect > 0 && [...blocks].filter(([i, b]) => b.type === "tool_use" && closed.has(i)).length >= expect) {
+          if (sawUsage || ++after > AFTER_DONE_EVENTS) { early = true; break scan; }
+        }
       }
     }
   } finally {
@@ -129,19 +189,21 @@ async function readStream(res, { signal } = {}) {
     try { await Promise.race([Promise.resolve(reader.cancel()), new Promise((r) => { t = setTimeout(r, 500); })]); } catch { /* closed */ }
     clearTimeout(t);
   }
-  return { blocks: [...blocks.values()], streamError, stopped, events, stopReason, overflow };
+  return { blocks: [...blocks.values()], streamError, stopped, events, stopReason, overflow, inTok, outTok, early };
 }
 
 const toolBlocks = (r) => r.blocks.filter((b) => b.type === "tool_use");
 const textOf = (r) => r.blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
 
-/** Judges the stream of one level. Pure over `readStream`'s result. */
-export function judge(level, r) {
+/** Argument fidelity of the Edit-style call: every field byte for byte, the boolean a boolean, the integer an integer. */
+const afOf = (v) => (Object.keys(AWKWARD).every((k) => v[k] === AWKWARD[k]) ? "p" : "f");
+
+/** Judges the stream of one request KIND. Pure over `readStream`'s result. */
+export function judge(kind, r) {
   if (r.noBody) return inconclusive("error", "HTTP 200 with no response body");
   if (r.overflow) return fail("the answer stream passed the size limits (too many bytes, events or blocks)");
   const tools = toolBlocks(r);
-  // CONTENT means text or a tool call: a thinking block is not content. An answer that spent its budget on thinking and ended on
-  // max_tokens says nothing about tools, at any level (the bench records the same case as `empty`).
+  // CONTENT means text or a tool call: a thinking block is not content. An answer that spent its budget on thinking and ended on max_tokens says nothing about tools, at any level.
   const usable = tools.length > 0 || !!textOf(r);
   if (r.streamError && !usable) {
     const tight = classifyTight(r.streamError);
@@ -150,39 +212,83 @@ export function judge(level, r) {
     return fail(`stream error before any content: ${r.streamError}`);
   }
   if (!r.events) return inconclusive("error", "HTTP 200 with no stream events");
-  if (!usable && r.stopReason === "max_tokens") return inconclusive("empty", "output budget spent before any text or tool call (stop_reason max_tokens); raise --max-tokens");
+  if (!usable && r.stopReason === "max_tokens") return inconclusive("empty", "output budget spent before any text or tool call (stop_reason max_tokens)");
   const bad = tools.find((b) => !argsOf(b).ok);
-  if (level === 1 || level === 4) {
-    const want = level === 1 ? 1 : 2;
-    if (!tools.length) return fail(textOf(r) ? "answered in text instead of calling the tool" : "no tool call in the answer");
+  if (kind === "1" || kind === "1f") {
+    if (!tools.length) return fail(textOf(r) ? "answered in text instead of calling the tool" : "no tool call in the answer", { nocall: true });
     if (bad) return fail("tool call arguments are not valid JSON");
-    if (tools.some((b) => b.name !== ECHO_TOOL)) return fail("tool call names a tool that was not offered");
-    if (tools.some((b) => typeof argsOf(b).value.message !== "string")) return fail("a tool call lacks the required argument `message`");
-    if (level === 4 && tools.length < want) return fail(`one tool call instead of ${want} parallel calls`);
-    if (level === 4 && new Set(tools.map((b) => b.id ?? b)).size < want) return fail("parallel tool calls share one id");
-    if (level === 4 && tools.some((b) => b.json === "")) return fail("the tool call arguments were not streamed (no argument deltas)");
-    return pass();
+    const call = tools.find((b) => b.name === EDIT_TOOL);
+    if (!call) return fail("tool call names a tool that was not offered");
+    const v = argsOf(call).value;
+    if (typeof v.file_path !== "string") return fail("a tool call lacks the required argument `file_path`");
+    return pass({ af: afOf(v) });
   }
-  if (level === 2) {
+  if (kind === "2") {
     if (r.streamError) return fail(`stream error: ${r.streamError}`);
-    if (!textOf(r)) return fail(tools.length ? "called the tool again instead of answering" : "no final answer after the tool result");
+    const text = textOf(r);
+    if (!text) return fail(tools.length ? "called the tool again instead of answering" : "no final answer after the tool result");
+    return pass({ br: text.includes(BIG_RESULT_FACT) ? "p" : "f" });
+  }
+  if (kind === "2e") {
+    if (r.streamError && !tools.length && !textOf(r)) return fail(`stream error: ${r.streamError}`);
+    return textOf(r) || tools.length ? pass() : fail("empty answer after an error result");
+  }
+  if (kind === "6") {
+    if (!tools.length) return fail(textOf(r) ? "answered in text instead of delegating" : "no tool call in the answer");
+    if (bad) return fail("tool call arguments are not valid JSON");
+    const call = tools.find((b) => b.name === AGENT_TOOL);
+    if (!call) return fail("tool call names a tool that was not offered");
+    const v = argsOf(call).value;
+    if (typeof v.prompt !== "string" || v.prompt.trim().length < 10) return fail("the Agent call has no usable prompt");
+    if (!AGENT_TYPES.includes(v.subagent_type)) return fail("the Agent call names a subagent_type that was not offered");
+    if (typeof v.description !== "string") return fail("the Agent call lacks a description");
     return pass();
   }
-  // L3 and L5: the big request was accepted and answered with something well formed
+  if (kind === "3a") {
+    if (bad) return fail("tool call arguments are not valid JSON");
+    if (r.streamError && !usable) return fail(`stream error: ${r.streamError}`);
+    const named = tools.map((b) => b.name);
+    // the name round trip: the long MCP-style name comes back exactly (`nm`), or a call came back under a different name; no call at all says nothing about names
+    const nm = named.includes(LONG_TOOL) ? "p" : named.length ? "f" : undefined;
+    return usable ? pass({ nm }) : fail("empty answer to the constructs request");
+  }
+  // 3b and 5: the large request was accepted and answered with something well formed; 3b also carries the parallel-call level (L4)
   if (bad) return fail("tool call arguments are not valid JSON");
   if (!usable) return fail("empty answer to the large request");
   if (r.streamError) return fail(`stream error: ${r.streamError}`);
-  return pass();
+  if (kind === "5") return pass();
+  const echoes = tools.filter((b) => b.name === ECHO_TOOL);
+  const par = echoes.length >= 2 && new Set(echoes.map((b) => b.id ?? b)).size >= 2 && echoes.every((b) => b.json !== "" && typeof argsOf(b).value.message === "string");
+  return pass({ l4: par ? "p" : "f", ...(par ? {} : { l4why: echoes.length < 2 ? `${echoes.length} tool call instead of 2 parallel calls` : echoes.length >= 2 && echoes.some((b) => b.json === "") ? "the tool call arguments were not streamed (no argument deltas)" : "parallel tool calls share one id or lack the argument" }) });
 }
 
-/** One request and its judgement; `body` is the request text. Resolves `{v, ...}` or `{aborted: true}`; never rejects. */
-async function send(level, body, { fetchImpl, url, key, timeoutMs, signal }) {
+/** The text of a refusal, at most `limit` bytes of it: the body is read in chunks and cancelled when enough has come, so a hostile or huge error page costs nothing. */
+async function readBounded(res, limit) {
+  try {
+    const reader = res.body?.getReader?.();
+    if (!reader) return String(await res.text()).slice(0, limit);
+    const dec = new TextDecoder();
+    let text = "", bytes = 0;
+    while (bytes < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength; text += dec.decode(value, { stream: true });
+    }
+    try { await Promise.race([Promise.resolve(reader.cancel()), new Promise((r) => setTimeout(r, 200).unref?.())]); } catch { /* closed */ }
+    return text.slice(0, limit);
+  } catch { return ""; }                                                                         // an unreadable body
+}
+
+/** One request and its judgement; `body` is the request text. Resolves `{v, ..., bytes, ms, inTok, outTok}` or `{aborted: true}`; never rejects. */
+async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, now = () => performance.now() }) {
   const bytes = Buffer.byteLength(body);
+  const t0 = now();
   const ac = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; ac.abort(); }, timeoutMs);
   const onAbort = () => ac.abort();
   if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener("abort", onAbort, { once: true }); }
+  const tele = (extra = {}) => ({ bytes, ms: Math.round(now() - t0), ...extra });
   try {
     const res = await fetchImpl(url, {
       method: "POST",
@@ -190,16 +296,16 @@ async function send(level, body, { fetchImpl, url, key, timeoutMs, signal }) {
       body, signal: ac.signal,
     });
     if (!res.ok) {
-      let text = "";
-      try { text = (await res.text()).slice(0, 2048); } catch { /* unreadable body */ }
+      const text = await readBounded(res, ERROR_BODY_BYTES);
       const ra = parseRetryAfter(res.headers?.get?.("retry-after"));
-      return { ...httpVerdict(level, res.status, text, ra), http: res.status, bytes, body: text };
+      return { ...httpVerdict(kind, res.status, text, ra), http: res.status, body: text, ...tele() };
     }
-    return { ...judge(level, await readStream(res, { signal: ac.signal })), bytes };
+    const rs = await readStream(res, { signal: ac.signal, expect: EXPECT_TOOLS[kind] });
+    return { ...judge(kind, rs), ...tele({ inTok: rs.inTok, outTok: rs.outTok, early: rs.early }) };
   } catch (e) {
-    if (timedOut) return { ...inconclusive("timeout", `no complete answer within ${timeoutMs} ms`), bytes };
+    if (timedOut) return { ...inconclusive("timeout", `no complete answer within ${timeoutMs} ms`), ...tele() };
     if (signal?.aborted) return { aborted: true };
-    return { ...inconclusive("error", e?.message ?? e), bytes };
+    return { ...inconclusive("error", e?.message ?? e), ...tele() };
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener?.("abort", onAbort);
@@ -207,12 +313,12 @@ async function send(level, body, { fetchImpl, url, key, timeoutMs, signal }) {
 }
 
 /**
- * What an HTTP refusal means. A 400, 413 or 422 on a tool-bearing request is the model or its provider refusing the request itself: a
- * verdict, unless the sentence is about the ACCOUNT (an empty balance, a dead key: `classifyTight`, the anchors that cannot be fooled by
- * an echoed tool name) or about a LIMIT of the moment (tokens per minute, rate: a 413 can say that too). A route that says it has no
- * tool support is a verdict even as a 404. Everything else (401, 402, 403, 404, 429, 5xx) is read by `classifyHttp` and is inconclusive.
+ * What an HTTP refusal means. A 400, 413 or 422 on a tool-bearing request is the model or its provider refusing the request itself: a verdict, unless the sentence is about the ACCOUNT
+ * (`classifyTight`) or a LIMIT of the moment (tokens per minute, rate: a 413 can say that too). A route that says it has no tool support is a verdict even as a 404. A 400 that names
+ * cache_control is flagged (`ccFail`) so the caller can ask again without it and still learn the level; one that names the tool name is a verdict flagged `nmFail`. Everything else
+ * (401, 402, 403, 404, 429, 5xx) is read by `classifyHttp` and is inconclusive.
  */
-function httpVerdict(level, status, text, ra) {
+function httpVerdict(kind, status, text, ra) {
   const extra = ra !== null && ra !== undefined ? { ra } : {};
   const why = `HTTP ${status}: ${text}`;
   const clientErr = status === 400 || status === 413 || status === 422;
@@ -221,49 +327,159 @@ function httpVerdict(level, status, text, ra) {
     const tight = classifyTight(text);
     if (tight) return inconclusive(tight, why, extra);
     if (LIMIT_WORDS.test(text)) return inconclusive("rate", why, extra);
-    const size = status === 413 || SIZE_WORDS.test(text) || level === 5;      // a refusal only at the big step, after the 157 KB step was accepted, is about size
-    return fail(why, { kind: size ? "size" : "schema" });
+    if (CC_WORDS.test(text) && (kind === "3a" || kind === "3b" || kind === "5")) return fail(why, { kind: "schema", ccFail: true });
+    const size = status === 413 || SIZE_WORDS.test(text) || kind === "5";       // a refusal only at the big step, after the 157 KB step was accepted, is about size
+    return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}) });
   }
   return inconclusive(classifyHttp(status, text), why, extra);
 }
 
 /**
- * One level against one model. Resolves `{v, why?, kind?, s?, ra?, http?, bytes, reqs}` or `{aborted: true}`; never rejects.
- * `v`: `p` passed, `f` failed (a verdict), `i` inconclusive (`s` says why: auth, pay, rate, gone, error, timeout or empty).
- * L1 forces a tool; a 400 that names `tool_choice` is retried ONCE with the choice left to the model before any verdict (`reqs` counts both).
+ * One request kind against one model. Resolves `{v, why?, kind?, s?, ra?, http?, bytes, ms, reqs, ...fields}` or `{aborted: true}`; never rejects. `noCc` (state) keeps the markers off.
+ * L1 is asked with the choice left to the model; only when that yields NO call is it asked FORCED (`forced: true` on the result, with the forced answer), and a forced request the
+ * backend rejects for tool_choice leaves the auto verdict standing.
  */
-export async function runLevel(level, { fetchImpl = fetch, url, key, model, maxTokens = PROBE_MAX_TOKENS, timeoutMs = 240000, signal = null } = {}) {
-  const conn = { fetchImpl, url, key, timeoutMs, signal };
-  const first = await send(level, JSON.stringify(buildBody(level, model, maxTokens)), conn);
+export async function runKind(kind, { fetchImpl = fetch, url, key, model, maxTokens, timeoutMs, timeouts = TIMEOUTS_MS, signal = null, noCc = false } = {}) {
+  const conn = { fetchImpl, url, key, signal };
+  const budget = maxTokens ?? BUDGETS[kind];
+  const limit = timeoutMs ?? timeouts[CLASS_OF[kind]];
+  const go = (k) => send(k, JSON.stringify(buildBody(k, model, budget, { noCc })), { ...conn, timeoutMs: limit });
+  const first = await go(kind);
   if (first.aborted) return first;
-  if (level === 1 && first.http && (first.http === 400 || first.http === 422) && /tool_choice/i.test(first.body ?? "")) {
-    const second = await send(level, JSON.stringify(buildBody(level, model, maxTokens, { toolChoice: "auto" })), conn);
-    if (second.aborted) return second;
-    return { ...second, reqs: 2, retriedAuto: true };
+  if (kind === "1" && first.v === "f" && first.nocall) {
+    const forced = await go("1f");
+    if (forced.aborted) return forced;
+    if (forced.v === "i") return { ...forced, reqs: 2 };
+    if (forced.http === 400 && /tool_choice/i.test(forced.body ?? "")) return { ...first, reqs: 2, forcedRejected: true };       // the backend does not take a forced choice: the auto answer stands
+    return { ...forced, reqs: 2, forced: true, fc: forced.v === "p" ? "p" : "f", ms: first.ms + forced.ms };
   }
   return { ...first, reqs: 1 };
 }
 
+// ------------------------------------------------------------------ the engine
+
 /**
- * The levels asked for one model, in order. `done` (mutated) holds the verdicts already reached for it, so a retry after an
- * inconclusive level repeats only that level. L3 and L4 need L1 and L2 passed, and L5 needs L3 passed (`prior` is the stored per-level
- * string, `nnnn` for none): a model that cannot call a tool is not sent 40,000 tokens. Resolves
- *   `{aborted: true}`
- *   `{inconclusive: {s, why, ra?}, requests}`        nothing is recorded; the model is tried again later
- *   `{done, requests, bytes}`                        every asked level has a verdict; `done` maps level -> {v, why?, kind?, bytes?}
+ * The deep-probe rule, in one place: levels above L2 are sent only for a provider whose key tier is `free`, or whose tier an explicit, validated lift names (`lift` is the
+ * frozen capability `liftDeepProbes` hands out; nothing else, no string, no flag, no environment variable, is accepted). An unknown tier is NOT free.
  */
-export async function probeModel({ levels, prior = "nnnn", done = {}, ...conn }) {
+export const LIFTS = new WeakSet();
+export const deepAllowed = (tier, lift = null) => tier === "free" || (!!lift && LIFTS.has(lift) && Array.isArray(lift.tiers) && lift.tiers.includes(tier));
+
+/**
+ * The levels asked for one model, in order. `done` (mutated) holds the verdicts already reached for it, so a retry after an inconclusive request repeats only that one. L3 and L4
+ * need L1 and L2 passed, L5 needs L3 passed, L6 and L7 need L1 and L2 passed (`prior` is the stored per-level string, `nnnn` for none; `flags` the stored record, for the markers).
+ * A model whose key tier is not `free` (and is not lifted: `deepAllowed(tier, lift)`) is not probed AT ALL, at any level including L1 and L2: every asked level is recorded
+ * `{v: "n", why: NOT_FREE_REASON, clamped: true}`, zero requests are sent and the result is `{done, requests: 0, clamped: [every level], tele}`. A lifted tier may get any level that was asked.
+ * `order: "big-first"` with a known `ctx` of at least 200,000 asks the big step before L3: a pass implies L3 (recorded `implied`, the 157 KB requests are skipped); a failure then
+ * runs L3 to locate the cause. Resolves
+ *   `{aborted: true}`
+ *   `{inconclusive: {s, why, ra?, reason?, escalated?}, requests, tele}`   nothing is recorded; the model is tried again later
+ *   `{done, requests, escalated?, tele, clamped}`                         every asked level has a verdict; `done` maps level -> {v, why?, kind?, bytes?, ...fields}
+ * THINKING-ONLY ESCALATION. An answer that was only thinking and stopped at max_tokens is inconclusive. The first time it happens for a model in this run, the SAME request is asked
+ * again once with `ESCALATED_MAX_TOKENS` (and the model's later requests use it: `state`, kept by the caller across the engine's retries, holds `{maxTokens, escalated, noCc}`).
+ * Still empty after the bump: inconclusive `empty` with `reason: "reasoning-budget"`, never a failure.
+ */
+export async function probeModel({ levels, prior = "nnnn", flags = null, done = {}, state = {}, tier = null, lift = null, order = "l3-first", ctx = 0, tele = [], ...conn }) {
   let requests = 0;
-  const passed = (n) => (done[n]?.v ?? (prior[n - 1] === "p" ? "p" : "n")) === "p";
-  for (const level of [...levels].sort((a, b) => a - b)) {
-    if (done[level]) continue;
-    if ((level === 3 || level === 4) && !(passed(1) && passed(2))) { done[level] = { v: "n", why: "not run: L1 and L2 did not both pass" }; continue; }
-    if (level === 5 && !passed(3)) { done[level] = { v: "n", why: "not run: L3 did not pass" }; continue; }
-    const r = await runLevel(level, conn);
-    if (r.aborted) return { aborted: true };
-    requests += r.reqs ?? 1;
-    if (r.v === "i") return { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}) }, requests };
-    done[level] = { v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...(level >= 3 ? { bytes: r.bytes } : {}) };
+  const deep = deepAllowed(tier, lift);
+  const want = [...new Set(levels)].sort((a, b) => a - b);
+  const clamped = [];
+  if (!deep) {                                                                                       // the owner's rule, enforced here so no entry point can get round it
+    for (const l of want) { if (!done[l]) done[l] = { v: "n", why: NOT_FREE_REASON, clamped: true }; clamped.push(l); }
+    return { done, requests: 0, tele, clamped };
   }
-  return { done, requests };
+  const passed = (n) => (done[n]?.v ?? (prior[n - 1] === "p" ? "p" : "n")) === "p";
+  const kindBudget = (k) => Math.max(conn.maxTokens ?? BUDGETS[k], state.maxTokens ?? 0);
+  if (flags?.cc === "f") state.noCc = true;
+  const CAPPED = { v: "i", s: "error", why: `the request ceiling of ${MAX_MODEL_REQUESTS} for one model was reached`, capped: true };
+  const spent = (r) => { requests += r.reqs ?? 1; state.requests = (state.requests ?? 0) + (r.reqs ?? 1); };
+  const ask = async (kind) => {
+    if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
+    const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc };
+    let r = await runKind(kind, opts);
+    if (r.aborted) return r;
+    spent(r);
+    const teleOf = (x, max) => ({ kind, level: LEVEL_OF[kind], bytes: x.bytes ?? 0, ms: x.ms ?? 0, inTok: x.inTok ?? null, outTok: x.outTok ?? null, v: x.v, s: x.s, early: !!x.early, reqs: x.reqs ?? 1, max });
+    if (r.v === "i" && r.s === "empty" && !state.escalated && kindBudget(kind) < ESCALATED_MAX_TOKENS) {
+      if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
+      state.escalated = true; state.maxTokens = ESCALATED_MAX_TOKENS;
+      tele.push(teleOf(r, opts.maxTokens));                                       // the thinking-only request was sent and its output spent: it is accounted for too
+      r = await runKind(kind, { ...conn, maxTokens: ESCALATED_MAX_TOKENS, noCc: !!state.noCc });
+      if (r.aborted) return r;
+      spent(r);
+    }
+    tele.push(teleOf(r, state.escalated ? ESCALATED_MAX_TOKENS : opts.maxTokens));
+    // a 400 that names cache_control: note it, stop sending the markers to this model and ask the same request again so the level is still learned
+    if (r.ccFail && !opts.noCc) { state.noCc = true; state.ccFail = true; const again = await ask(kind); return again.aborted || again.v === "i" ? again : { ...again, cc: "f" }; }
+    return r;
+  };
+  const stop = (r) => (r.capped
+    ? { inconclusive: { s: "error", reason: "request-cap", why: r.why }, requests, tele }
+    : r.v === "i" && r.s === "empty"
+    ? { inconclusive: { s: "empty", reason: "reasoning-budget", why: r.why, ...(state.escalated ? { escalated: true } : {}) }, requests, tele }
+    : { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}) }, requests, tele });
+
+  const bigFirst = order === "big-first" && ctx >= 200000 && want.includes(5) && deep;
+  const row = (r, extra = {}) => ({ v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...extra });
+  // L3: 3a (constructs), then 3b (157 KB, which also answers L4). 3a's verdict is kept in `state` so a retry after an inconclusive 3b does not ask it again.
+  const doL3 = async () => {
+    if (!state.l3a) {
+      const a = await ask("3a");
+      if (a.aborted) return a;
+      if (a.v === "i") return stop(a);
+      state.l3a = { v: a.v, why: a.why, kind: a.kind, nm: a.nmFail ? "f" : a.nm, cc: state.ccFail ? "f" : a.cc ?? (state.noCc ? undefined : "p") };
+    }
+    const { nm, cc } = state.l3a, marks = { ...(nm ? { nm } : {}), ...(cc ? { cc } : {}) };
+    if (state.l3a.v === "f") { done[3] = { v: "f", why: `[3a] ${state.l3a.why}`, kind: state.l3a.kind, ...marks }; return null; }
+    const b = await ask("3b");
+    if (b.aborted) return b;
+    if (b.v === "i") return stop(b);
+    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), bytes: b.bytes, ...marks };
+    if (b.v === "p" && b.l4) done[4] = { v: b.l4, ...(b.l4why ? { why: b.l4why } : {}), bytes: b.bytes };
+    return null;
+  };
+  const doBig = async () => {
+    const r = await ask("5");
+    if (r.aborted) return r;
+    if (r.v === "i") return stop(r);
+    done[5] = row(r, { bytes: r.bytes, ...(r.cc ? { cc: r.cc } : {}) });
+    return null;
+  };
+
+  for (const level of want) {
+    if (done[level]) continue;
+    const pair = passed(1) && passed(2);
+    const notRun = (why) => { done[level] = { v: "n", why }; };
+    if (level === 1 || level === 2) {
+      const r = await ask(level === 1 ? "1" : "2");
+      if (r.aborted) return r;
+      if (r.v === "i") return stop(r);
+      done[level] = row(r, level === 1 ? { ...(r.af ? { af: r.af } : {}), ...(r.fc ? { fc: r.fc } : {}) } : { ...(r.br ? { br: r.br } : {}) });
+    } else if (level === 3) {
+      if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
+      if (bigFirst && !done[5]) {
+        const x = await doBig(); if (x) return x;
+        if (done[5]?.v === "p") { done[3] = { v: "p", implied: "big", bytes: done[5].bytes, ...(done[5].cc ? { cc: done[5].cc } : {}) }; continue; }     // a pass at 400 KB implies the 157 KB step
+      }
+      const x = await doL3(); if (x) return x;
+    } else if (level === 4) {
+      if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
+      if (!passed(3)) { notRun("not run: L3 did not pass"); continue; }
+      const b = await ask("3b");                                                                    // L3 passed earlier (or by the big step): only the 157 KB request answers L4
+      if (b.aborted) return b;
+      if (b.v === "i") return stop(b);
+      done[4] = b.v === "p" ? { v: b.l4 ?? "f", ...(b.l4why ? { why: b.l4why } : {}), bytes: b.bytes } : { v: "n", why: "not run: the 157 KB request did not pass" };
+    } else if (level === 5) {
+      if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
+      if (!bigFirst && !passed(3)) { notRun("not run: L3 did not pass"); continue; }                // (big-first asks it ahead of L3, above, and needs no L3)
+      const x = await doBig(); if (x) return x;
+    } else if (level === 6 || level === 7) {
+      if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
+      const r = await ask(level === 6 ? "6" : "2e");
+      if (r.aborted) return r;
+      if (r.v === "i") return stop(r);
+      done[level] = row(r);
+    }
+  }
+  return { done, requests, tele, clamped, ...(state.escalated ? { escalated: true } : {}) };
 }

@@ -1,10 +1,11 @@
 // Shared helpers of the tool-fidelity tests: fake answer streams, a fake fetch, and a temp-directory guard.
 // Everything here is offline: no request leaves the process and no real state file is read or written.
+import { after } from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { classOf, lvOf } from "../../refresh/tool-fidelity.mjs";
-import { FIXTURE_ID } from "../../refresh/tool-fidelity-fixture.mjs";
+import { FIXTURE_ID, AWKWARD, BIG_RESULT_FACT } from "../../refresh/tool-fidelity-fixture.mjs";
 
 const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
 const norm = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
@@ -17,8 +18,20 @@ const norm = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
 export function freshDir(prefix = "uw-tf-") {
   const root = real(os.tmpdir()), dir = fs.mkdtempSync(path.join(root, prefix));
   checkTmpDir(dir);
+  made.add(dir);
   return dir;
 }
+// Every directory freshDir made, removed when the test file finishes (an earlier version left about 50 per run behind). Only these: a directory something else
+// made under the same prefix is never touched.
+const made = new Set();
+export const madeDirs = () => [...made];
+export function cleanupDirs() {
+  const n = made.size;
+  for (const d of made) { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* still held by a scanner: the OS temp cleaner gets it */ } }
+  made.clear();
+  return n;
+}
+after(cleanupDirs);
 export function checkTmpDir(dir, { root = real(os.tmpdir()), home = os.homedir() } = {}) {
   const target = real(dir), h = real(home);
   if (norm(h) === norm(root) || norm(h).startsWith(norm(root) + path.sep)) throw new Error(`the temp root ${root} is, or contains, the home folder: refused`);
@@ -29,16 +42,18 @@ export function checkTmpDir(dir, { root = real(os.tmpdir()), home = os.homedir()
 
 const sse = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 export const ev = {
-  start: () => sse("message_start", { type: "message_start", message: { id: "m1", role: "assistant", content: [] } }),
+  start: (inTok) => sse("message_start", { type: "message_start", message: { id: "m1", role: "assistant", content: [], ...(inTok ? { usage: { input_tokens: inTok } } : {}) } }),
   tool: (index, name, json, id = `toolu_${index}`) => sse("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id, name, input: {} } })
     + [...json.matchAll(/[\s\S]{1,7}/g)].map((m) => sse("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: m[0] } })).join("")
     + sse("content_block_stop", { type: "content_block_stop", index }),
   text: (index, text) => sse("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } })
     + sse("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text } }) + sse("content_block_stop", { type: "content_block_stop", index }),
-  stop: (reason = "end_turn") => sse("message_delta", { type: "message_delta", delta: { stop_reason: reason }, usage: { output_tokens: 5 } }) + sse("message_stop", { type: "message_stop" }),
+  stop: (reason = "end_turn", outTok = 5) => sse("message_delta", { type: "message_delta", delta: { stop_reason: reason }, usage: { output_tokens: outTok } }) + sse("message_stop", { type: "message_stop" }),
   error: (message) => sse("error", { type: "error", error: { type: "api_error", message } }),
 };
 export const stream = (...parts) => [ev.start(), ...parts].join("");
+/** A stream whose first event reports `inTok` input tokens (the usage a real provider sends). */
+export const streamWith = (inTok, ...parts) => [ev.start(inTok), ...parts].join("");
 
 /** A fetch that answers every call with `answer(call)` and records the calls: `{url, body, headers}`. */
 export function fakeFetch(answer) {
@@ -58,14 +73,27 @@ export function fakeFetch(answer) {
 export const ok = (body) => ({ status: 200, body, headers: { "content-type": "text/event-stream" } });
 export const http = (status, message, headers = {}) => ({ status, body: JSON.stringify({ error: { message } }), headers });
 
-/** The answer of a well-behaved model for the level the request is (read from the request, so one answer function serves a whole sweep). */
+/** Which request KIND a call is (read from its body): 1, 1f (forced), 2, 2e (error result), 3a (constructs), 3b (157 KB, parallel), 5 (big), 6 (spawn). */
+export function kindOf(call) {
+  const b = call.body, names = (b.tools ?? []).map((t) => t.name), last = b.messages.at(-1);
+  if (names.length === 1 && names[0] === "Agent") return "6";
+  if (names.length === 1 && names[0] === "fx_edit") return b.tool_choice?.type === "tool" ? "1f" : "1";
+  if (Array.isArray(last?.content) && last.content.some((c) => c.type === "tool_result")) return last.content.some((c) => c.is_error) ? "2e" : "2";
+  if (names.includes("mcp__plugin_demo__a_long_tool_name_for_testing_construct_x") && names.length < 10) return "3a";
+  return names.length > 100 ? "5" : "3b";
+}
+const ASKED = JSON.stringify({ file_path: AWKWARD.file_path, old_string: AWKWARD.old_string, new_string: AWKWARD.new_string, replace_all: AWKWARD.replace_all, start_line: AWKWARD.start_line });
+/** The answer of a well-behaved model for the request kind it receives (read from the request, so one answer function serves a whole sweep). */
 export function goodModel(call) {
-  const b = call.body, last = b.messages.at(-1);
-  const forced = !!b.tool_choice;
-  if (Array.isArray(last?.content) && last.content[0]?.type === "tool_result") return ok(stream(ev.text(0, "It returned ping."), ev.stop()));
-  if (forced) return ok(stream(ev.tool(0, "fx_echo", '{"message":"ping"}'), ev.stop("tool_use")));
-  if (/twice/.test(String(last.content))) return ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}', "toolu_a"), ev.tool(1, "fx_echo", '{"message":"b"}', "toolu_b"), ev.stop("tool_use")));
-  return ok(stream(ev.tool(0, "fx_echo", '{"message":"ok"}'), ev.stop("tool_use")));
+  const k = kindOf(call), b = call.body;
+  if (k === "1" || k === "1f") return ok(stream(ev.tool(0, "fx_edit", ASKED), ev.stop("tool_use")));
+  if (k === "2") return ok(stream(ev.text(0, `The deployment code is ${BIG_RESULT_FACT}.`), ev.stop()));
+  if (k === "2e") return ok(stream(ev.text(0, "The file does not exist, so I cannot read its first line."), ev.stop()));
+  if (k === "3a") return ok(stream(ev.tool(0, "mcp__plugin_demo__a_long_tool_name_for_testing_construct_x", '{"mode":"demo","limit":3}'), ev.stop("tool_use")));
+  if (k === "6") return ok(stream(ev.tool(0, "Agent", JSON.stringify({ description: "Investigate auth", prompt: "Investigate the auth module: configuration, dependencies and tests.", subagent_type: "Explore" })), ev.stop("tool_use")));
+  if (k === "5") return ok(stream(ev.tool(0, "fx_echo", '{"message":"ok"}'), ev.stop("tool_use")));
+  void b;
+  return ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}', "toolu_a"), ev.tool(1, "fx_echo", '{"message":"b"}', "toolu_b"), ev.stop("tool_use")));
 }
 
 /**

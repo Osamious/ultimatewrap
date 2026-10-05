@@ -491,13 +491,16 @@ test("synthetic shadow policy: deterministic for a fixed clock, three stub model
   const g = await pol.gatherInputs(paths, { nowMs: Date.parse("2026-10-03T00:00:00Z") });
   const owner = { ...pol.OWNER_DEFAULTS, source: "all-providers", mode: "dynamic", enforcement: "shadow", inject: "off" };
   const { compiled } = pol.compile(g, owner, { now: () => new Date("2026-10-03T00:00:00Z") });
+  // revision 11 (policy-side fix round): the compiler grew ADDITIVE keys the router never reads (a `reprobe` list, and counts for the non-agent drop, known issues, inferred ctx, re-probe and rows per ctx floor); the harness
+  // synthetic policy is a hash-pinned router INPUT and is left as it is, so the shape comparison ignores exactly these
+  const COMPILER_ONLY = { top: ["reprobe", "accountStateRows"], counts: ["nonAgent", "knownBad", "ctxInferred", "reprobe", "accountStateRows", "ctxStats"] };
   const keys = (o) => Object.keys(o).sort();
-  assert.deepEqual(keys(p).filter((k) => k !== "synthetic"), keys(compiled), "top-level keys (synthetic: true is the one documented extra)");
+  assert.deepEqual(keys(p).filter((k) => k !== "synthetic"), keys(compiled).filter((k) => !COMPILER_ONLY.top.includes(k)), "top-level keys (synthetic: true is the one documented extra; the compiler-only additive keys are ignored)");
   assert.equal(p.contentHash, pol.hashOf(p), "the router verifies contentHash, so the synthetic file carries the compiler's real hash of its own content");
   assert.equal(compiled.lists.all, null, "the real compile stores lists.all as null when it is the identity");
   assert.deepEqual(keys(p.rollout), keys(compiled.rollout), "keys of rollout");
   assert.equal(p.minRouter, compiled.minRouter);
-  for (const k of ["owner", "builtFrom", "counts", "main", "sticky", "inject", "lists"]) assert.deepEqual(keys(p[k]), keys(compiled[k]), `keys of ${k}`);
+  for (const k of ["owner", "builtFrom", "counts", "main", "sticky", "inject", "lists"]) assert.deepEqual(keys(p[k]), keys(compiled[k]).filter((x) => k !== "counts" || !COMPILER_ONLY.counts.includes(x)), `keys of ${k}`);
   assert.ok(compiled.lists.prov && typeof compiled.lists.prov === "object" && Object.keys(compiled.lists.prov).length > 0 && Object.values(compiled.lists.prov).every((l) => Array.isArray(l)), "prov is keyed by provider, as in the synthetic file");
   assert.deepEqual(keys(p.models[0]), keys(compiled.models[0]), "row keys");
   for (const [a, b] of [[p.owner, compiled.owner]]) for (const k of Object.keys(b)) assert.equal(typeof a[k], typeof b[k], `owner.${k} type`);

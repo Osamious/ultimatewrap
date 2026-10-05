@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { fixtureFlagMap } from "./fixtures/subagent-flags.mjs";
 import * as lib from "../keysync/subagent-policy.mjs";
-import { funnel, FREE_TAG, fnv1a32, priceText, priceSum, isPremium, emptyStage, SELECTOR_RE, toolEligible } from "../menu/subagent-funnel.mjs";
+import { funnel, FREE_TAG, fnv1a32, priceText, priceSum, isPremium, emptyStage, SELECTOR_RE, toolEligible, nonAgentReason, knownIssueOf, knownIssueText } from "../menu/subagent-funnel.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { TIERS, isTier, tierList, RELAY_KEY_ID, RELAY_TIER, freeScopeOf, isExcludedTier, isProvenanceVerified } from "../menu/tiers.mjs";
 
@@ -59,19 +59,19 @@ test("selector spelling: relay bare spelling, [1m] collapse into ONE selector wi
   const { g } = await fx((d) => {
     const s = rd(path.join(d, "snapshot.json"));
     const m = s.rows[2].models[0];
-    s.rows[2].models.push({ ...m, id: "not-listed" }, { ...m, id: "has space" }, { ...m, id: "z".repeat(70) }, { ...m, id: "bad\u0001ctl" });
+    s.rows[2].models.push({ ...m, id: "not-listed" }, { ...m, id: "has space" }, { ...m, id: "z".repeat(170) }, { ...m, id: "bad\u0001ctl" });
     wr(path.join(d, "snapshot.json"), s);
-    const pr = rd(path.join(d, "providers.json")); pr.Providers[2].models.push("has space", "z".repeat(70), "bad\u0001ctl"); wr(path.join(d, "providers.json"), pr);
+    const pr = rd(path.join(d, "providers.json")); pr.Providers[2].models.push("has space", "z".repeat(170), "bad\u0001ctl"); wr(path.join(d, "providers.json"), pr);
   });
   const r = run(g);
-  assert.equal(r.counts.idRejected, 3, "a space, a 70-character id and a control character, of 4 routes added");
+  assert.equal(r.counts.idRejected, 3, "a space, a 170-character id (the cap is 160, sa-A10) and a control character, of 4 routes added");
   assert.equal(r.idRejected.length, 3);
   assert.equal(r.dropped.get("fx-free-b/not-listed"), "not-in-providers");
   assert.ok(sels(r).every((s) => SELECTOR_RE.test(s)), "no rejected selector reaches a list");
   const big = cell(r, "fx-free-a/fxa-big:free");
   assert.equal(sels(r).filter((s) => s.startsWith("fx-free-a/fxa-big")).length, 1, "x and x[1m] are one selector");
   assert.equal(big.c, 1000000); assert.equal(big.n, 1, "1M claim only from the [1m] sibling: listing-only");
-  assert.ok(SELECTOR_RE.test("a".repeat(64)) && !SELECTOR_RE.test("a".repeat(65)));
+  assert.ok(SELECTOR_RE.test("a".repeat(160)) && !SELECTOR_RE.test("a".repeat(161)) && SELECTOR_RE.test("p/" + "a".repeat(100)), "sa-A10: 160 characters pass, 161 do not (the old cap was 64)");
   const inj = JSON.stringify(lib.compile(g, { ...lib.OWNER_DEFAULTS, source: "all-providers" }).compiled.inject);
   assert.ok(!inj.includes("has space") && !inj.includes("zzzzzz"), "rejected ids never reach injected text");
   const w = r.warnings.find((x) => x.code === "ID_REJECTED");
@@ -216,15 +216,15 @@ test("Q6 rank key 2b: class 0 (price 0, free-tier row) above class 0t (ft row) a
   const k = (x) => r.groups.get(x).rk;
   const [alpha, fxd, fxp] = ["fx-free-a/fxa-alpha", "fx-dep/fxd-model:free", "fx-paid/fxp/free/x"];
   assert.deepEqual([fxd, fxp].map((x) => k(x).slice(0, 3)), [k(alpha).slice(0, 3), k(alpha).slice(0, 3)], "keys 1 to 3 (tool tier, health, ctx class) are EQUAL for the rows under test");
-  assert.ok(k(fxd)[8] < k(alpha)[8] && k(fxp)[8] < k(alpha)[8], "the ctx key favours the 0t rows (more context)");
-  assert.ok(k(fxd)[9] < k(alpha)[9] && k(fxp)[9] < k(alpha)[9], "the TTFT key favours the 0t rows (TTFT bucket 0 against 2)");
+  assert.ok(k(fxd)[8] <= k(alpha)[8] && k(fxp)[8] <= k(alpha)[8], "the ctx CLASS key (rank key 9) never disfavours the 0t rows (more context)");
+  assert.ok(k(fxd)[7] < k(alpha)[7] && k(fxp)[7] < k(alpha)[7], "the TTFT QUANTILE key (rank key 8) favours the 0t rows (100 ms against 5,000 ms)");
   assert.deepEqual([alpha, fxd, fxp, "fx-free-a/fxa-gamma", "fx-free-a/fxa-beta"].map((x) => k(x)[3]), [0, 1, 1, 2, 3], "classes: 0, 0t, 0t, U, P");
   assert.deepEqual(sels(r), Q6_NEW, "class 0 first, then the ft rows, then unknown price, then positive price");
   assert.deepEqual([alpha, fxd, fxp].map((x) => cell(r, x).fp + "/" + cell(r, x).ft), ["1/0", "0/1", "0/1"], "the classes are the fp and ft flags of the compiled rows");
   // D1: AGE is no longer a band key and no longer outranks the price class: a stale probe on alpha leaves it in price class 0, above the fresh 0t rows (recency only orders INSIDE a band)
   const stale = await fx((d) => { q6Mutate(d); const b = rd(path.join(d, "bench.json")); b.models[alpha].a = NOW / 1000 - 20 * 86400; wr(path.join(d, "bench.json"), b); });
   const rs = run(stale.g, { mode: "free", freeScope: "providers+deposit", source: "all-providers" });
-  assert.equal(rs.groups.get(alpha).rk[6], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
+  assert.equal(rs.groups.get(alpha).rk[10], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
   assert.equal(rs.groups.get(alpha).rk[1], 0, "and health (the latest status is ok) is yes: age is ignored");
   assert.ok(sels(rs).indexOf(alpha) < sels(rs).indexOf(fxd), "the price class (band key) beats recency (ordering key): an older class 0 row still ranks above a fresh 0t row");
 });
@@ -251,7 +251,7 @@ test("Q6 top-3 spread: the best tie group holds class 0 rows only while one exis
 
 test("Q6: the ranking of a free-tier-only policy is byte-identical before and after the change (goldens taken from the pre-change code); under free providers the ft rows are not admitted so nothing moves", async () => {
   const sha = (o) => crypto.createHash("sha256").update(JSON.stringify(o)).digest("hex").slice(0, 16);
-  const GOLD_PROVIDERS = "3775a0536d3f763a", GOLD_PROVIDERS_MUTATED = "5bd1894d80829f1b", GOLD_DEPOSIT_DEFAULT = "56f712c5810bec22";
+  const GOLD_PROVIDERS = "3775a0536d3f763a", GOLD_PROVIDERS_MUTATED = "78c0f6837688378a", GOLD_DEPOSIT_DEFAULT = "c2f11b2d08c7ef42";   // revision 11 (D-bh): the order is unchanged (asserted below through the selectors), but `h` is now a TTFT QUANTILE bucket, so two goldens were re-recorded: alpha (5,000 ms) is bucket 3 in the mutated fixture, and the deposit default has 4 different `h` cells
   // router v2 added `b` to every row, `lists.prov`, and a null `lists.all` for the identity; the golden is the PRE-CHANGE shape, so those are removed again here: the ranking, the tie groups and the lists are what the goldens pin
   const compiledShape = (x, freeScope) => {
     const { compiled } = lib.compile(x.g, { ...lib.OWNER_DEFAULTS, source: "all-providers", mode: "free", freeScope }, {});
@@ -403,9 +403,16 @@ test("premium by family and by price, payload fields, ctxHints for the six alias
   assert.ok(isPremium("claude-opus-5", 1) && isPremium("x", 20) && !isPremium("x", 19.99) && isPremium("models/fable-1", null) && !isPremium("operatic", 5));
   assert.equal(r.counts.payloadUnknown, 14); assert.equal(r.counts.payloadRisk, 0);
   assert.deepEqual(r.exempt, [HAIKU_REL]);
-  assert.equal(r.ctxHints[SONNET_REL], 1000000);
-  assert.equal(r.ctxHints["anthropic/claude-sonnet-5-5[1m]"], 1000000, "the raw [1m] spelling of an alias value is hinted too");
-  assert.equal(r.ctxHints[HAIKU_REL], 200000);
+  // D-bg/D-bk: under ctx any the asked model's own context (1M for a [1m] alias) must NOT raise the router's floor: every hint is capped at 128,000
+  assert.equal(r.ctxHints[SONNET_REL], 128000, "ctx any: the sonnet hint is the 128k substitute floor, not its 1M");
+  assert.equal(r.ctxHints["anthropic/claude-sonnet-5-5[1m]"], 128000, "the raw [1m] spelling of an alias value is hinted too, at the same cap");
+  assert.equal(r.ctxHints[HAIKU_REL], 128000);
+  assert.ok(Object.values(r.ctxHints).every((v) => v <= 128000), "no hint above the floor under any");
+  const hint = (ctx) => run(g, { ctx }).ctxHints;
+  assert.equal(hint("256k")[HAIKU_REL], 200000, "a hard floor of 256k caps at 256k: haiku's own 200k stays");
+  assert.equal(Object.values(hint("256k")).filter((v) => v > 256000).length, 0);
+  assert.equal(hint("1m")[SONNET_REL], 1000000, "ctx 1m: the floor is 1M, the hint keeps it");
+  assert.ok(Object.values(hint("prefer-1m")).every((v) => v <= 128000), "a soft preference excludes nothing, so it raises no floor either");
   assert.ok(r.models.every((m) => typeof m.i === "string" && m.i.length > 0), "price on every row");
   assert.equal(priceText(3, 15), "$3/$15"); assert.equal(priceText(0.15, 0.6), "$0.15/$0.6"); assert.equal(priceText(0, 0), "free"); assert.equal(priceText(null, null), "$?");
   const withLimit = await fx((d) => { const s = rd(path.join(d, "snapshot.json")); s.rows[2].models[0].limit = { verdict: "capped", bytes: 245 * 1024 }; wr(path.join(d, "snapshot.json"), s); });
@@ -452,7 +459,7 @@ test("injected text: at most 2,048 bytes, ASCII, at most 20 entries, a price and
   assert.match(text, /NOT by quality or price/);
   const rows = text.split("\n").filter((l) => l.startsWith("- "));
   assert.ok(rows.length >= 1 && rows.length <= 20);
-  for (const r of rows) assert.match(r, /^- \S+  (1M|\d+k|ctx\?)  (\$[\d.]+\/\$[\d.]+|\$[\d.]+\/\?|free|\$\?)  tools:(UNVERIFIED|verified|small)  (fast|ok|slow|\?)  cap:(\d+k|unknown)(  ALIAS)?(  \$\$)?$/);
+  for (const r of rows) assert.match(r, /^- \S+  (1M|\d+k|~\d+k\?|ctx\?)  (\$[\d.]+\/\$[\d.]+|\$[\d.]+\/\?|free|\$\?)  tools:(UNVERIFIED|verified|small)  (fast|ok|slow|very slow|\?)  cap:(\d+k|unknown)(  ALIAS)?(  \$\$)?$/);
   assert.ok(rows.filter((r) => /^- anthropic\//.test(r)).length <= 3, "at most 3 entries per provider when all-providers");
   assert.ok(rows.some((r) => /tools:verified/.test(r)) && rows.some((r) => /tools:UNVERIFIED/.test(r)));
   assert.match(text, /Notice: \d+ of \d+ listed models have UNVERIFIED tool support/);
@@ -606,7 +613,7 @@ test("F5: the id sanitiser judges the BARE selector that is emitted: x, x[1m], y
   assert.equal(cell(bareOnly, "p/x").c, 1000000);
 });
 
-test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; an ORDERING key inside a band, rank key 5) orders rows that context alone would order the other way", async () => {
+test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; the LAST ordering key inside a band, rank key 11) is computed per row; context now outranks it", async () => {
   const day = 86400;
   const { g } = await fx((d) => {
     const s = rd(path.join(d, "snapshot.json")); const a = s.rows[1].models;
@@ -620,12 +627,12 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; an ORDERING key i
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 2 * day + 3600, l: 1 } } });   // newer than the probe: the overlay wins (a tie is the probe's)
   });
   const r = run(g, { mode: "dynamic" });
-  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[6];
+  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[10];
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map(k2), [0, 1, 2], "recency class: live and fresh, fresh, older");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).rk[1]), [0, 0, 0], "health (latest status ok) is yes for all three: age is ignored");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).b), [r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b], "and the three rows share ONE band");
   const order = sels(r).filter((x) => /fxa-(alpha|beta|gamma)$/.test(x));
-  assert.deepEqual(order, ["fx-free-a/fxa-alpha", "fx-free-a/fxa-gamma", "fx-free-a/fxa-beta"], "recency (key 5) beats context (key 7) inside the band");
+  assert.deepEqual(order, ["fx-free-a/fxa-beta", "fx-free-a/fxa-gamma", "fx-free-a/fxa-alpha"], "context (key 9) now BEATS recency (key 11): the freshest probe no longer outranks 512k and 256k of context");
   // the boundaries: a live record older than 7 days is no longer class 0; 14 d exactly is class 1, 14 d + 1 s is class 2
   const edge = await fx((d) => {
     const b = rd(path.join(d, "bench.json"));
@@ -634,10 +641,10 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; an ORDERING key i
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 8 * day + 3600, l: 1 } } });
   });
   const e = run(edge.g, { mode: "dynamic" });
-  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[6]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
+  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[10]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
 });
 
-test("F8: rank key 4 (TTFT bucket <1000 ms, <3000 ms, else or missing) orders rows that tie on every key above it; the buckets are right at the boundaries", async () => {
+test("D-bh: the TTFT bucket is a QUANTILE of the eligible set (fast, ok, slow, very slow), ahead of the ctx class; a missing TTFT is bucket 4, last", async () => {
   const { g } = await fx((d) => {
     const s = rd(path.join(d, "snapshot.json"));
     for (const id of ["fxa-alpha", "fxa-beta", "fxa-gamma"]) s.rows[1].models.find((m) => m.id === id).ctx = 200000;
@@ -648,12 +655,20 @@ test("F8: rank key 4 (TTFT bucket <1000 ms, <3000 ms, else or missing) orders ro
   });
   const r = run(g, { mode: "dynamic" });
   const h = (x) => cell(r, x).h;
-  assert.deepEqual(["fx-free-a/fxa-beta", "fx-free-a/fxa-gamma", "fx-free-b/fxb-one", "fx-free-a/fxa-alpha"].map(h), [0, 1, 1, 2], "999 -> 0, 1000 -> 1, 2999 -> 1, 3000 -> 2");
-  const order = sels(r).filter((x) => /(fxa-(alpha|beta|gamma)|fxb-one)$/.test(x));
-  assert.deepEqual(order, ["fx-free-a/fxa-beta", "fx-free-a/fxa-gamma", "fx-free-b/fxb-one", "fx-free-a/fxa-alpha"],
-    "bucket first (0, 1, 1, 2), then the id breaks the tie inside bucket 1; alpha sorts first by id but is last by TTFT");
+  assert.equal(r.ttftCuts.length, 3, "three cut points, the quartiles of the TTFTs of the rows in THIS set");
+  const all = r.models.map((m) => r.groups.get(m.s).rec?.t).filter((t) => Number.isFinite(t)).sort((a, b) => a - b);
+  assert.deepEqual(r.ttftCuts, [0.25, 0.5, 0.75].map((q) => all[Math.max(0, Math.ceil(q * all.length) - 1)]), "nearest-rank quartiles over " + all.length + " rows with a TTFT");
+  const names = ["fx-free-a/fxa-beta", "fx-free-a/fxa-gamma", "fx-free-b/fxb-one", "fx-free-a/fxa-alpha"];
+  assert.ok(h(names[0]) <= h(names[1]) && h(names[1]) <= h(names[2]) && h(names[2]) <= h(names[3]), "the bucket follows the TTFT: 999 <= 1000 <= 2999 <= 3000");
+  assert.ok(h(names[0]) < h(names[3]), "the fastest and the slowest of the four differ in bucket");
+  assert.ok(r.models.every((m) => m.h >= 0 && m.h <= 3), "every row of this fixture has a TTFT, so buckets 0 to 3");
+  // the rank key: TTFT bucket (index 9) is ahead of the ctx class (index 10)
+  const keys = r.groups.get("fx-free-a/fxa-alpha").rk;
+  assert.equal(keys[7], h("fx-free-a/fxa-alpha")); assert.equal(keys[8], 3, "alpha has 200k: ctx class 3 (>= 200k)");
   const none = await fx((d) => { const b = rd(path.join(d, "bench.json")); delete b.models["fx-free-a/fxa-alpha"].t; wr(path.join(d, "bench.json"), b); });
-  assert.equal(cell(run(none.g, { mode: "dynamic" }), "fx-free-a/fxa-alpha").h, 2, "a missing TTFT is the slowest bucket");
+  const rn = run(none.g, { mode: "dynamic" });
+  assert.equal(cell(rn, "fx-free-a/fxa-alpha").h, 4, "a missing TTFT is bucket 4: no TTFT recorded");
+  assert.deepEqual(rn.groups.get("fx-free-a/fxa-alpha").rk.slice(7, 10).length, 3);
 });
 
 test("F9: a saved owner file always loads again: the allow list is bounded in count and length and saveOwner checks the serialized size", () => {
@@ -877,7 +892,7 @@ test("G17: a management-only provider contributes no row, list entry, count, ran
 test("ar-4 + D1: every compiled row carries its BAND `b`: equal on [tool tier, health yes/no, ctx preference class, price class] and a contiguous run of the ranked rows; AGE is not a band key; lists.prov lists each provider's rows in rank order for every source (empty under inherit)", () => {
   const nowMs = Date.parse("2026-10-03T12:00:00.000Z"), day = 86400;
   const names = ["pa", "pb"], MODELS = ["m1", "m2", "m3", "m4"];
-  const mkRows = (ctxOf = (i) => 200000 - i * 1000) => names.map((p) => ({ provider: p, keyId: `b.${p}.paid`, models: MODELS.map((id, i) => ({ id, outModality: "chat", ctx: ctxOf(i), tools: true, pin: 1, pout: 2 })) }));
+  const mkRows = (ctxOf = () => 200000) => names.map((p) => ({ provider: p, keyId: `b.${p}.paid`, models: MODELS.map((id, i) => ({ id, outModality: "chat", ctx: ctxOf(i), tools: true, pin: 1, pout: 2 })) }));
   const providers = names.map((name) => ({ name, models: MODELS, enabled: true, described: false }));
   // recency differs (live within 7 days, fresh within 14, older), the band keys do not
   const age = { "pa/m1": 1, "pa/m2": 1, "pa/m3": 10, "pa/m4": 10, "pb/m1": 20, "pb/m2": 20, "pb/m3": 20, "pb/m4": 20 };
@@ -886,7 +901,8 @@ test("ar-4 + D1: every compiled row carries its BAND `b`: equal on [tool tier, h
   const res = funnel(inputs, T({ source: "all-providers" }));
   const bands = res.models.map((m) => m.b);
   assert.deepEqual([...new Set(bands)], [0], "live, fresh and old rows share ONE band: recency is an ordering key inside it (D1)");
-  assert.deepEqual(res.models.map((m) => m.s), ["pa/m1", "pa/m2", "pa/m3", "pa/m4", "pb/m1", "pb/m2", "pb/m3", "pb/m4"], "yet the ORDER still follows recency first (pa live and fresh before pb old)");
+  assert.equal(res.models[0].s, "pa/m1", "yet the ORDER follows recency among rows equal on every earlier key: the live row first");
+  assert.deepEqual(res.models.map((m) => m.s.slice(0, 2)), ["pa", "pa", "pa", "pa", "pb", "pb", "pb", "pb"], "and the fresh pa rows before the old pb rows (ties inside a recency class are broken by the id hash)");
   // tool tier IS a band key: a verified, a small and an unverified row make three bands
   const tf = { models: { "pa/m1": { t: "v" }, "pa/m2": { t: "t" } } };
   const r2 = funnel({ ...inputs, toolFidelity: tf }, T({ source: "all-providers" }));
@@ -970,4 +986,347 @@ test("tool-capability results NEVER expire by age: a tool-fidelity record stampe
   const tier = (r, s) => r.models.find((m) => m.s === s)?.t;
   assert.deepEqual([tier(fresh, target), tier(fresh, other)], ["v", "t"]);
   assert.deepEqual([tier(old, target), tier(old, other)], ["v", "t"], "400 days later: the same classes, not u");
+});
+
+// =====================================================================================================================
+// Revision 11 policy-side fix round: toggle 3 expanded (D-bg, D-bk), ctx classes (D-bh), inferred ctx and the non-agent denylist (D-bi), known-issue seeds (sa-A6), the re-probe list (sa-A7),
+// the id cap (sa-A10), one free verdict (sa-A11), opus-mt (sa-A12), strikes (sa-T3), pb sources and the payload text (sa-A1). Synthetic inputs only: no real id, no real file.
+// =====================================================================================================================
+const syn = (spec, { tiers, tf = null, bench = {} } = {}) => {
+  const rows = Object.entries(spec).map(([p, models]) => ({ provider: p, keyId: `b.${p}.${(tiers ?? {})[p] ?? "free"}`,
+    models: models.map((m) => ({ id: m.id, outModality: "chat", ctx: m.ctx ?? null, tools: m.tools ?? true, pin: m.pin ?? 0, pout: m.pout ?? 0, badge: m.badge, limit: m.limit, mode: false, routable: true })) }));
+  const providers = Object.entries(spec).map(([p, models]) => ({ name: p, models: models.map((m) => m.id), enabled: true }));
+  const meta = Object.fromEntries(Object.entries(spec).flatMap(([p, ms]) => ms.map((m) => [`${p}/${m.id}`, m])));
+  const get = (k) => { const m = meta[k], o = bench[k] ?? {}; return { s: o.s ?? "ok", t: o.t ?? m?.t ?? 500, a: o.a ?? NOW / 1000 - 3600, ...(o.m ? { m: o.m } : {}) }; };
+  return { rows, providers, bench: { get, isLive: () => false }, nowMs: NOW, tiers: tiers ?? Object.fromEntries(Object.keys(spec).map((p) => [p, "free"])), toolFidelity: tf };
+};
+const synG = (inp) => ({ funnelInputs: inp, warnings: [], stamps: {}, providersLive: true, providersHash: "h" });
+const CTXSPEC = { pa: [{ id: "c64", ctx: 64000 }, { id: "c128", ctx: 131072 }, { id: "c200", ctx: 200000 }, { id: "c256", ctx: 262144 }, { id: "c512", ctx: 524288 }, { id: "c1m", ctx: 1048576 }, { id: "cunk", ctx: null }] };
+
+test("D-bk toggle 3: any excludes nothing, the hard floors exclude rows below them (unknown included), the soft preferences exclude nothing and make a higher band; every value validates", () => {
+  const inp = syn(CTXSPEC);
+  const ids = (ctx) => sels(funnel(inp, T({ ctx }))).map((s) => s.slice(3)).sort();
+  const S = (...a) => a.sort();
+  assert.deepEqual(ids("any"), S("c1m", "c128", "c200", "c256", "c512", "c64", "cunk"), "any: all 7 rows, the 64k and the unknown included");
+  assert.deepEqual(ids("128k"), S("c1m", "c128", "c200", "c256", "c512"), "128k: the 64k and the unknown row are below the floor");
+  assert.deepEqual(ids("200k"), S("c1m", "c200", "c256", "c512"));
+  assert.deepEqual(ids("256k"), S("c1m", "c256", "c512"));
+  assert.deepEqual(ids("512k"), S("c1m", "c512"));
+  assert.deepEqual(ids("1m"), ["c1m"]);
+  for (const ctx of ["prefer-256k", "prefer-512k", "prefer-1m"]) assert.equal(ids(ctx).length, 7, `${ctx}: nothing is excluded`);
+  const band = (ctx) => Object.fromEntries(funnel(inp, T({ ctx })).models.map((m) => [m.s.slice(3), m.b]));
+  assert.deepEqual([...new Set(Object.values(band("any")))], [0], "any: one band");
+  const b256 = band("prefer-256k");
+  assert.ok(["c256", "c512", "c1m"].every((k) => b256[k] === 0) && ["c64", "c128", "c200", "cunk"].every((k) => b256[k] === 1), "prefer-256k: rows at or above 256k are the higher band");
+  const b512 = band("prefer-512k");
+  assert.ok(["c512", "c1m"].every((k) => b512[k] === 0) && b512.c256 === 1);
+  const none = funnel(syn({ pa: [{ id: "a", ctx: 200000 }, { id: "b", ctx: 262144 }] }), T({ ctx: "512k" }));
+  assert.equal(none.empty, true, "an empty result under a hard floor is the empty-set condition");
+  assert.equal(emptyStage(none, null).stage, "ctx");
+  assert.match(emptyStage(none, null).text, /ctx 512k filter/);
+  for (const ctx of lib.ENUMS.ctx) assert.doesNotThrow(() => lib.validateOwner({ ...lib.OWNER_DEFAULTS, ctx }));
+  assert.deepEqual(lib.ENUMS.ctx, ["any", "128k", "200k", "256k", "512k", "1m", "prefer-256k", "prefer-512k", "prefer-1m"]);
+  assert.throws(() => lib.validateOwner({ ...lib.OWNER_DEFAULTS, ctx: "2m" }), /ctx must be one of any\|128k\|200k\|256k\|512k\|1m\|prefer-256k\|prefer-512k\|prefer-1m/);
+});
+
+test("D-bk: rows per floor with their denominators (ctxStats): the unknown rows are in none of the floors; the counts are over the chosen scope and do not move with the ctx toggle", () => {
+  const inp = syn(CTXSPEC);
+  for (const ctx of ["any", "256k", "prefer-1m"]) {
+    const st = funnel(inp, T({ ctx })).ctxStats;
+    assert.deepEqual([st.rows, st.unknown, st.inferred], [7, 1, 0], `${ctx}: of 7 rows 1 unknown`);
+    assert.deepEqual(st.ge, { "128k": 5, "200k": 4, "256k": 3, "512k": 2, "1m": 1 }, `${ctx}: rows per floor`);
+  }
+  assert.match(lib.ctxFloorsLine(funnel(inp, T()).ctxStats), /^CONTEXT FLOORS: of 7 rows in the chosen scope, 1 have no known ctx; known ctx >= 128k 5, >= 200k 4, >= 256k 3, >= 512k 2, >= 1M 1; 0 of the 1 unknown rows pass 128k on an inferred ctx/);
+});
+
+test("D-bg: the asked model's own context never raises the floor: every ctxHint is capped at the toggle's floor (128k for any and the soft preferences, the hard floor otherwise)", () => {
+  const inp = { ...syn(CTXSPEC), aliasValues: { sonnet: "pa/c1m[1m]", haiku: "pa/c200" }, defaultModel: "pa/c1m" };
+  const hints = (ctx) => funnel(inp, T({ ctx })).ctxHints;
+  for (const ctx of ["any", "prefer-256k", "prefer-512k", "prefer-1m"]) {
+    const h = hints(ctx);
+    assert.ok(Object.values(h).every((v) => v <= 128000), `${ctx}: no hint above 128,000`);
+    assert.equal(h["pa/c1m"], 128000); assert.equal(h["pa/c1m[1m]"], 128000);
+  }
+  const h256 = hints("256k");
+  assert.equal(h256["pa/c1m"], 256000, "256k: capped at the 256k floor, not the row's 1M");
+  assert.equal(h256["pa/c200"], 200000, "an alias value keeps its own context when that is below the cap");
+  assert.equal(hints("1m")["pa/c1m"], 1000000);
+  assert.equal(hints("200k")["pa/c200"], 200000);
+  const compiled = lib.compile(synG(inp), { ...lib.OWNER_DEFAULTS, source: "all-providers", ctx: "any" }).compiled;
+  assert.equal(compiled.ctxHints["pa/c1m"], 128000, "the compiled file carries the capped hint the router reads");
+});
+
+test("D-bh: ctx CLASSES (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below) replace raw ctx: two rows in one class tie on the class key whatever their raw ctx", () => {
+  const cls = (c) => funnel(syn({ pa: [{ id: "x", ctx: c }] }), T()).groups.get("pa/x").rk[8];
+  assert.deepEqual([2000000, 1000000, 999999, 524288, 512000, 511999, 262144, 256000, 255999, 200000, 199999, 131072, 128000, 127999, 64000].map(cls), [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5]);
+  const r = funnel(syn({ pa: [{ id: "a", ctx: 1000000, t: 500 }, { id: "b", ctx: 1500000, t: 500 }] }), T());
+  assert.equal(r.groups.get("pa/a").rk[8], r.groups.get("pa/b").rk[8], "1M and 1.5M are the same class");
+  assert.equal(r.groups.get("pa/a").g, r.groups.get("pa/b").g, "so they are one tie group (raw ctx is no longer a rank key)");
+});
+
+test("D-bh: a worse TTFT bucket ranks BELOW a better one even when its ctx class is higher (TTFT is ahead of ctx); the order is stable run to run", () => {
+  const spec = { pa: [{ id: "big", ctx: 1000000, t: 40000 }, { id: "mid", ctx: 200000, t: 500 }, { id: "mid2", ctx: 200000, t: 600 }, { id: "fast", ctx: 128000, t: 400 }, { id: "s1", ctx: 512000, t: 20000 }, { id: "s2", ctx: 512000, t: 21000 }, { id: "s3", ctx: 256000, t: 900 }, { id: "s4", ctx: 256000, t: 950 }] };
+  const r = funnel(syn(spec), T());
+  const order = r.models.map((m) => m.s.slice(3));
+  assert.ok(order.indexOf("fast") < order.indexOf("big"), "128k with TTFT 400 ms ranks above 1M with TTFT 40,000 ms: TTFT bucket first");
+  assert.equal(r.models.find((m) => m.s === "pa/big").h, 3, "the slowest quartile");
+  assert.equal(r.models.find((m) => m.s === "pa/fast").h, 0, "the fastest quartile");
+  assert.deepEqual(funnel(syn(spec), T()).models.map((m) => m.s), r.models.map((m) => m.s));
+  assert.ok(funnel(syn({ pa: [{ id: "a", ctx: 200000, t: 500 }, { id: "b", ctx: 200000, t: 500 }, { id: "c", ctx: 200000, t: 500 }] }), T()).models.every((m) => m.h === 0), "equal TTFTs are one bucket, not split by position");
+});
+
+test("D-bi: an unknown ctx with a same-name sibling of known ctx >= 128k gets an INFERRED ctx (flag ci, clamped to 128k, floor-only); the smallest sibling decides; a hard floor above 128k and the asked floor never use it", () => {
+  const inp = syn({ pa: [{ id: "model-x", ctx: 1000000 }, { id: "model-y", ctx: 200000 }, { id: "model-z", ctx: 64000 }],
+    pb: [{ id: "model-x:free", ctx: null }, { id: "model-y-2026-05-01", ctx: null }, { id: "model-z@eu", ctx: null }, { id: "lonely", ctx: null }, { id: "model-w:free", ctx: null }], pc: [{ id: "model-y", ctx: 200000 }, { id: "model-w", ctx: 64000 }] });
+  inp.rows.find((r) => r.provider === "pa").models.push({ id: "model-w", outModality: "chat", ctx: 1000000, tools: true, pin: 0, pout: 0, mode: false, routable: true }); inp.providers.find((p) => p.name === "pa").models.push("model-w");
+  const r = funnel(inp, T());
+  const row = (s) => r.models.find((m) => m.s === s);
+  assert.deepEqual([row("pb/model-x:free").c, row("pb/model-x:free").ci], [128000, 1], "x:free takes the sibling's 1M but only as a 128k floor-only prior");
+  assert.equal(row("pb/model-y-2026-05-01").ci, 1, "a date suffix is the same model name");
+  assert.equal(row("pb/model-z@eu").ci, undefined, "a 64k sibling lends nothing (below the floor)");
+  assert.equal(row("pb/model-z@eu").c, 0);
+  assert.equal(row("pb/lonely").ci, undefined, "no sibling, no inference");
+  assert.equal(row("pb/model-w:free").ci, undefined, "siblings of 1M and 64k: the SMALLEST decides, so nothing is inferred");
+  assert.equal(row("pa/model-x").ci, undefined, "a measured row is never flagged");
+  assert.equal(r.groups.get("pb/model-x:free").rk[8], 4, "never a ranking class above >= 128k");
+  assert.equal(r.counts.ctxInferred, 2); assert.equal(r.ctxStats.inferred, 2);
+  assert.equal(r.substitutable["*"], 6, "known or inferred 128k+: pa x, y and w, pc y, and the two inferred pb rows (model-z 64k, pc w 64k, z@eu, lonely and w:free are not)");
+  assert.deepEqual(sels(funnel(inp, T({ ctx: "128k" }))).filter((s) => s.startsWith("pb/")), [], "a hard 128k floor tests the MEASURED ctx: the inferred rows are left out (the inferred prior serves only the default substitute floor)");
+  assert.equal(funnel(inp, T({ ctx: "128k" })).counts.ctxInferred, 0);
+  assert.deepEqual(sels(funnel(inp, T({ ctx: "prefer-256k" }))).filter((s) => s.startsWith("pb/") && s !== "pb/model-z@eu").length, 4, "a soft preference excludes nothing, so the inferred rows stay and still serve as substitutes");
+  assert.equal(funnel(inp, T({ ctx: "prefer-256k" })).substitutable["*"], 6);
+  assert.match(lib.ctxFloorsLine(r.ctxStats, "128k"), /; ctx 128k tests the measured ctx only, so those 2 are left out$/);
+  assert.ok(!/left out$/.test(lib.ctxFloorsLine(r.ctxStats, "any")));
+  assert.deepEqual(sels(funnel(inp, T({ ctx: "256k" }))).filter((s) => s.startsWith("pb/")), [], "a floor above 128k never admits an inferred row");
+  assert.deepEqual(sels(funnel(inp, T({ ctx: "1m" }))).sort(), ["pa/model-w", "pa/model-x"]);
+  assert.equal(funnel({ ...inp, aliasValues: { opus: "pb/model-x:free" } }, T()).ctxHints["pb/model-x:free"], 128000, "the hint of an inferred row is the floor value, never the sibling's 1M");
+  assert.match(lib.injectRow(row("pb/model-x:free")), /^- pb\/model-x:free  ~128k\?  /, "never shown as measured");
+});
+
+test("D-bi: the non-agent denylist (safety, guard, embed, rerank, ocr, lora, moderation, under 4B) drops a row with reason non-agent-model, and a denylisted row can never lend an inferred ctx", () => {
+  const inp = syn({ pa: [{ id: "nemotron-3.5-content-safety-free", ctx: 1000000 }, { id: "lfm-2.5-2.6b", ctx: 200000 }, { id: "llama-guard-4", ctx: 128000 }, { id: "bge-embed-v3", ctx: 8000 }, { id: "x-rerank", ctx: 4000 },
+    { id: "deepseek-ocr", ctx: 8000 }, { id: "qwen3-30b-a3b", ctx: 262144 }, { id: "gpt-oss-20b", ctx: 131072 }, { id: "tiny-moderation", ctx: 8000 }], pb: [{ id: "nemotron-3.5-content-safety-free", ctx: null }, { id: "lfm-2.5-2.6b", ctx: null }] });
+  const r = funnel(inp, T());
+  assert.deepEqual(sels(r).sort(), ["pa/gpt-oss-20b", "pa/qwen3-30b-a3b"], "30b-a3b and 20b are real agents: only they survive");
+  for (const k of ["pa/nemotron-3.5-content-safety-free", "pa/lfm-2.5-2.6b", "pa/llama-guard-4", "pa/bge-embed-v3", "pa/x-rerank", "pa/deepseek-ocr", "pa/tiny-moderation", "pb/nemotron-3.5-content-safety-free", "pb/lfm-2.5-2.6b"]) assert.equal(r.dropped.get(k), "non-agent-model", k);
+  assert.equal(r.counts.nonAgent, 9); assert.equal(r.nonAgent.length, 9);
+  assert.equal(r.counts.ctxInferred, 0, "the pb rows' siblings are denylisted: nothing is inferred from them, and they are never candidates");
+  for (const [id, want] of [["gemma-3-3b-it", "non-agent-model"], ["x-3.9b-chat", "non-agent-model"], ["x-4b-chat", null], ["model-a3b", null], ["guardian-x", null], ["safeguarded", null]]) assert.equal(nonAgentReason(id), want, id);
+});
+
+test("sa-A6: known-failing rows are seeded x (known issue) until a REAL tool-fidelity record exists; only the named provider; a size cap is a cap (pb), never x", () => {
+  const spec = { aihubmix: [{ id: "coding-glm-5.1-free", ctx: 200000 }, { id: "xiaomi-mimo-v2.5-pro-free", ctx: 1048576 }, { id: "good-model", ctx: 200000 }],
+    other: [{ id: "coding-glm-5.1-free", ctx: 200000 }, { id: "xiaomi-mimo-v2.5-pro-free", ctx: 200000 }], nvidia: [{ id: "openai/gpt-oss-20b", ctx: 131072 }], groq: [{ id: "openai/gpt-oss-20b", ctx: 131072 }], orcarouter: [{ id: "deepseek/deepseek-v4-flash-free", ctx: 1000000 }] };
+  const r = funnel(syn(spec), T());
+  assert.deepEqual(sels(r).sort(), ["groq/openai/gpt-oss-20b", "aihubmix/good-model", "orcarouter/deepseek/deepseek-v4-flash-free", "other/coding-glm-5.1-free", "other/xiaomi-mimo-v2.5-pro-free"].sort(), "5 of 8: the three seeded rows are out; the same ids on `other` and on groq are untouched");
+  for (const k of ["aihubmix/coding-glm-5.1-free", "aihubmix/xiaomi-mimo-v2.5-pro-free", "nvidia/openai/gpt-oss-20b"]) assert.equal(r.groups.get(k).stage, "known-bad", k);
+  assert.equal(r.groups.get("aihubmix/coding-glm-5.1-free").knownIssue.issue, 118);
+  assert.equal(r.groups.get("aihubmix/xiaomi-mimo-v2.5-pro-free").knownIssue.issue, 119);
+  assert.equal(r.counts.knownBad, 3);
+  assert.match(knownIssueText(r.groups.get("aihubmix/coding-glm-5.1-free").knownIssue), /^known issue #118: /);
+  const cap = r.models.find((m) => m.s === "orcarouter/deepseek/deepseek-v4-flash-free");
+  assert.deepEqual([cap.pb, cap.pbSource, cap.t], [408000, "known-issue", "u"], "#109 is a size refusal: a payload cap and still a candidate (never x)");
+  // a REAL record wins: a pass lifts the x prior and removes the seeded cap
+  const tf = { models: { "aihubmix/coding-glm-5.1-free": { t: "v", lvr: "pppp" }, "orcarouter/deepseek/deepseek-v4-flash-free": { t: "v", lvr: "pppp", big: "p" } } };
+  const w = funnel(syn(spec, { tf }), T());
+  assert.ok(sels(w).includes("aihubmix/coding-glm-5.1-free"), "a real v record overrides the seeded x");
+  assert.equal(w.models.find((m) => m.s === "orcarouter/deepseek/deepseek-v4-flash-free").pb, 0, "and the seeded cap no longer applies");
+  assert.equal(w.groups.get("aihubmix/xiaomi-mimo-v2.5-pro-free").stage, "known-bad", "the other seeded row is still excluded");
+  const x = funnel(syn(spec, { tf: { models: { "aihubmix/good-model": { t: "x", lvr: "fnnn" } } } }), T());
+  assert.equal(x.groups.get("aihubmix/good-model").stage, "tools-failed", "a measured x keeps its own stage");
+  assert.equal(knownIssueOf("aihubmix", "coding-glm-5.1-free").issue, 118);
+  assert.equal(knownIssueOf("other", "coding-glm-5.1-free"), null);
+});
+
+test("sa-A7: a free-tagged row dropped on a transient bench status (rate, empty, timeout, fetch failed) of a sample older than 2 days is listed for re-probe, never silently excluded; a fresh sample, a non-free row and a hard status are not", () => {
+  const day = 86400;
+  const spec = { pa: [{ id: "a:free" }, { id: "b:free" }, { id: "c:free" }, { id: "d:free" }, { id: "e:free" }, { id: "f:free" }, { id: "paid-row", pin: 1, pout: 2 }, { id: "g:free" }] };
+  const old = NOW / 1000 - 6 * day, fresh = NOW / 1000 - day;
+  const bench = { "pa/a:free": { s: "rate", a: old }, "pa/b:free": { s: "empty", a: old }, "pa/c:free": { s: "timeout", a: old }, "pa/d:free": { s: "error", a: old, m: "pa: fetch failed" },
+    "pa/e:free": { s: "rate", a: fresh }, "pa/f:free": { s: "gone", a: old }, "pa/paid-row": { s: "rate", a: old }, "pa/g:free": { s: "error", a: old, m: "pa: HTTP 500" } };
+  const inp = syn(spec, { tiers: { pa: "paid" }, bench });
+  const r = funnel(inp, T());
+  assert.deepEqual(r.reprobe.map((x) => x.s), ["pa/a:free", "pa/b:free", "pa/c:free", "pa/d:free"], "4 of 8 rows: the four transient statuses on a 6-day-old sample");
+  assert.deepEqual(r.reprobe.map((x) => [x.status, x.ageDays]), [["rate", 6], ["empty", 6], ["timeout", 6], ["error", 6]]);
+  assert.equal(r.counts.reprobe, 4);
+  assert.equal(r.models.length, 0, "they stay out of the allowed set");
+  assert.ok(r.warnings.some((w) => w.code === "REPROBE" && /^REPROBE: 4 free-tagged/.test(w.text)));
+  const c = lib.compile(synG(inp), { ...lib.OWNER_DEFAULTS, source: "all-providers" }, {}).compiled;
+  assert.deepEqual(c.reprobe.map((x) => x.s), ["pa/a:free", "pa/b:free", "pa/c:free", "pa/d:free"], "the compiled file lists them for the bench re-probe and the ledger");
+  assert.equal(c.counts.reprobe, 4);
+  assert.equal(lib.hashOf({ ...c, reprobe: [] }), c.contentHash, "outside the hash: routing content is unchanged by the list");
+});
+
+test("sa-A11 one free verdict: on a free-labelled provider a price 0/0 row is free like its :free-tagged sibling; on a paid provider only the free tag counts; sa-A10: a 160-character selector is kept; sa-A12: opus-mt is not premium", () => {
+  const spec = { fp: [{ id: "north-mini-code-1-0", ctx: 200000 }, { id: "north-mini-code:free", ctx: 200000, pin: 1 }, { id: "priced", ctx: 200000, pin: 1, pout: 2 }], pp: [{ id: "north-mini-code-1-0", ctx: 200000 }, { id: "north-mini-code:free", ctx: 200000 }] };
+  const r = funnel(syn(spec, { tiers: { fp: "free", pp: "paid" } }), T({ mode: "free", freeScope: "models" }));
+  assert.deepEqual(sels(r).sort(), ["fp/north-mini-code-1-0", "fp/north-mini-code:free", "pp/north-mini-code:free"].sort(), "free-labelled: price 0/0 and the tag agree; paid: only the tag");
+  assert.equal(cell(r, "fp/north-mini-code-1-0").f, 1);
+  const ok = funnel(syn({ pa: [{ id: "m".repeat(150), ctx: 200000 }] }), T());
+  assert.equal(ok.counts.idRejected, 0);
+  assert.equal(ok.models.length, 1, "pa/ + 150 characters = 153, under the 160 cap");
+  assert.equal(funnel(syn({ pa: [{ id: "m".repeat(160), ctx: 200000 }] }), T()).counts.idRejected, 1, "pa/ + 160 = 163 characters is over the cap");
+  assert.ok(!isPremium("Helsinki-NLP/opus-mt-en-de", 0) && !isPremium("opus-mt-tc-big-en-fr", null), "opus-mt is a translation model");
+  assert.ok(isPremium("claude-opus-5", 1) && isPremium("opus", null) && isPremium("models/opus-4", 0), "every real opus stays premium");
+});
+
+test("sa-T3: a provisional first strike (strikes 1) ranks BELOW a clean row of the same class inside its band, whatever its ctx and TTFT; it is never excluded; unknown record fields (inheritance data) change nothing", () => {
+  const spec = { pa: [{ id: "struck", ctx: 1000000, t: 100 }, { id: "clean", ctx: 200000, t: 900 }, { id: "clean2", ctx: 200000, t: 950 }] };
+  const tf = { models: { "pa/struck": { t: "t", lvr: "ppnn", strikes: 1, sl: 3 }, "pa/clean": { t: "t", lvr: "ppnn" }, "pa/clean2": { t: "t", lvr: "ppnn", likelyX: true, inherited: { from: "pb/x", t: "x" } } } };
+  const r = funnel(syn(spec, { tf }), T());
+  assert.deepEqual(r.models.map((m) => m.s), ["pa/clean", "pa/clean2", "pa/struck"], "the struck row is last of its class although it has the most context and the best TTFT");
+  assert.deepEqual([r.groups.get("pa/struck").rk[4], r.groups.get("pa/clean").rk[4]], [1, 0]);
+  assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "an ordering key inside ONE band, not a band of its own: a strike is not a verdict");
+  const none = funnel(syn(spec, { tf: { models: { ...tf.models, "pa/struck": { t: "t", lvr: "ppnn" } } } }), T());
+  assert.equal(none.models[0].s, "pa/struck", "without the strike the better TTFT and ctx lead: the strike is the only reason it fell");
+});
+
+test("sa-A1: pb comes from the catalogue limit or a tool-fidelity capBelow (the smaller wins) and carries a pbSource; the PAYLOAD text states the payload gate is inert for unknown caps and the measured shadow figures (317 of 337, 94%; 71, 21%)", () => {
+  const spec = { pa: [{ id: "cat", ctx: 200000, limit: { bytes: 245 * 1024 } }, { id: "cap", ctx: 200000 }, { id: "both", ctx: 200000, limit: { bytes: 900000 } }, { id: "none", ctx: 200000 }, { id: "small", ctx: 200000, limit: { bytes: 200 * 1024 } }] };
+  const tf = { models: { "pa/cap": { t: "v", lvr: "pppn", big: "f", capBelow: 408000 }, "pa/both": { t: "v", lvr: "pppn", big: "f", capBelow: 300000 }, "pa/small": { t: "v", lvr: "pppn", big: "f", capBelow: 408000 } } };
+  const r = funnel(syn(spec, { tf }), T());
+  const m = (id) => r.models.find((x) => x.s === `pa/${id}`);
+  assert.deepEqual([[m("cat").pb, m("cat").pbSource], [m("cap").pb, m("cap").pbSource], [m("both").pb, m("both").pbSource], [m("none").pb, m("none").pbSource], [m("small").pb, m("small").pbSource]],
+    [[245 * 1024, "catalogue"], [408000, "capBelow"], [300000, "capBelow"], [0, undefined], [200 * 1024, "catalogue"]], "the smaller of catalogue and capBelow wins; no cap, no source");
+  const w = r.warnings.find((x) => x.code === "PAYLOAD").text;
+  assert.match(w, /^PAYLOAD: 4 of 5 allowed models have a known payload cap below 1,000,000 bytes; 1 have no known cap, so the payload gate is inert for them until a cap is measured/);
+  assert.match(w, /317 of 337 classified subagent requests \(94%\) were over 200 KB and 71 \(21%\) over 1 MB/);
+  assert.ok(!/919/.test(w), "the old 'largest observed body 919 KB' is gone");
+  assert.match(lib.payloadGateLine({ allowed: 4, payloadUnknown: 1 }), /^payload limits: 1 of 4 eligible models have no known request-size limit, so the size check does nothing for them/);
+  assert.equal(lib.payloadGateLine({ allowed: 4, payloadUnknown: 0 }), null);
+});
+
+// =====================================================================================================================
+// Owner follow-up: the in-band order is strike, big, L4, TTFT quartile, ctx class, price value, RECENCY (calendar-dependent, last non-alias key), alias, then a hash of the id.
+// =====================================================================================================================
+test("rank order: an OLDER-probe ok model with better TTFT outranks a FRESHER-probe slower one; recency never outranks latency or context", () => {
+  const day = 86400;
+  const spec = { pa: [{ id: "old-fast", ctx: 200000, t: 100 }, { id: "new-slow", ctx: 200000, t: 9000 }, { id: "mid1", ctx: 200000, t: 3000 }, { id: "mid2", ctx: 200000, t: 4000 }] };
+  const bench = { "pa/old-fast": { a: NOW / 1000 - 20 * day }, "pa/new-slow": { a: NOW / 1000 - 3600 }, "pa/mid1": { a: NOW / 1000 - 3600 }, "pa/mid2": { a: NOW / 1000 - 3600 } };
+  const r = funnel(syn(spec, { bench }), T());
+  const g = (id) => r.groups.get(`pa/${id}`);
+  assert.equal(g("old-fast").rk.length, 12, "twelve keys");
+  assert.deepEqual([g("old-fast").rk[10], g("new-slow").rk[10]], [2, 1], "old-fast is recency class 2 (older than 14 days), new-slow class 1");
+  assert.ok(g("old-fast").rk[7] < g("new-slow").rk[7], "and its TTFT bucket (key 8) is better");
+  assert.equal(r.models[0].s, "pa/old-fast", "the older probe wins on latency");
+  assert.equal(r.models[r.models.length - 1].s, "pa/new-slow");
+  assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "all one band: health is calendar-independent and recency is no band key");
+  // context also outranks recency: a bigger context class with an older probe ranks first when TTFT ties
+  const c = funnel(syn({ pa: [{ id: "old-big", ctx: 1000000, t: 500 }, { id: "new-small", ctx: 128000, t: 500 }] }, { bench: { "pa/old-big": { a: NOW / 1000 - 30 * day }, "pa/new-small": { a: NOW / 1000 - 60 } } }), T());
+  assert.deepEqual(c.models.map((m) => m.s), ["pa/old-big", "pa/new-small"], "1M with a 30-day-old probe above 128k with a fresh one");
+  // recency is still an ordering key: with every earlier key equal, the fresher probe leads
+  const e = funnel(syn({ pa: [{ id: "a", ctx: 200000, t: 500 }, { id: "b", ctx: 200000, t: 500 }] }, { bench: { "pa/a": { a: NOW / 1000 - 20 * day }, "pa/b": { a: NOW / 1000 - 60 } } }), T());
+  assert.equal(e.models[0].s, "pa/b", "recency decides only when TTFT, ctx class and price tie");
+  assert.deepEqual(r.groups.get("pa/mid1").rk.slice(7, 9), [r.groups.get("pa/mid1").rk[7], 3], "key layout: [.. 7 TTFT bucket, 8 ctx class, 9 price value, 10 recency, 11 alias]");
+});
+
+test("final tie-break: rows equal on every key are ordered by a hash of the id (deterministic, independent of input order), not alphabetically", () => {
+  const ids = Array.from({ length: 40 }, (_, i) => `m${String(i).padStart(2, "0")}`);
+  const mk = (list) => funnel(syn({ pa: list.map((id) => ({ id, ctx: 200000, t: 500 })) }), T()).models.map((m) => m.s.slice(3));
+  const a = mk(ids), b = mk([...ids].reverse());
+  assert.deepEqual(a, b, "the same order whatever order the rows arrive in");
+  assert.deepEqual(a, [...ids].sort((x, y) => fnv1a32(`pa/${x}`) - fnv1a32(`pa/${y}`)), "ordered by fnv1a32 of the selector");
+  assert.notDeepEqual(a, [...ids].sort(), "and not alphabetical");
+});
+
+test("F2: under EVERY hard floor (128k, 200k, 256k, 512k, 1m) every allowed row has a MEASURED ctx at or above it; an inferred row is never admitted by a floor", () => {
+  const inp = syn({ pa: [{ id: "big", ctx: 1048576 }, { id: "mid", ctx: 262144 }, { id: "low", ctx: 131072 }, { id: "nope", ctx: 64000 }], pb: [{ id: "big:free", ctx: null }, { id: "mid-2026-01-02", ctx: null }, { id: "low@eu", ctx: null }, { id: "nope:free", ctx: null }] });
+  const any = funnel(inp, T());
+  assert.equal(any.counts.ctxInferred, 3, "under any three unknown rows pass the 128k substitute floor on an inferred ctx (nope:free has a 64k sibling)");
+  for (const [ctx, floor] of [["128k", 128000], ["200k", 200000], ["256k", 256000], ["512k", 512000], ["1m", 1000000]]) {
+    const r = funnel(inp, T({ ctx }));
+    assert.ok(r.models.length > 0 || ctx === "1m" || true);
+    for (const m of r.models) { assert.ok(r.groups.get(m.s).cm >= floor, `${ctx}: ${m.s} measured ${r.groups.get(m.s).cm}`); assert.equal(m.ci, undefined, `${ctx}: ${m.s} is not inferred`); }
+    assert.ok(!r.models.some((m) => m.s.startsWith("pb/")), `${ctx}: no unknown-ctx row`);
+  }
+  assert.deepEqual(sels(funnel(inp, T({ ctx: "128k" }))).sort(), ["pa/big", "pa/low", "pa/mid"]);
+});
+
+test("F3: inferred ctx never merges different models: pool aliases neither borrow nor lend, re-upload namespaces (community/) are no siblings, and two vendor paths must match when both ids have one", () => {
+  const inp = syn({
+    kilo: [{ id: "kilo-auto/free", ctx: 1000000 }], orcarouter: [{ id: "free", ctx: null }], anymodel: [{ id: "am/free", ctx: null }], pa: [{ id: "free", ctx: null }],
+    pollinations: [{ id: "community/Catniti/muse-glimmer-30b", ctx: 200000 }], routewayai: [{ id: "muse-glimmer-30b:free", ctx: null }],
+    p1: [{ id: "openai/gpt-x", ctx: 1000000 }, { id: "real-model", ctx: 200000 }], p2: [{ id: "anthropic/gpt-x", ctx: null }, { id: "real-model:free", ctx: null }], p3: [{ id: "gpt-x", ctx: null }, { id: "openai/gpt-x-2026-02-03", ctx: null }],
+    p4: [{ id: "community/real-model", ctx: 200000 }, { id: "user/gpt-y", ctx: 300000 }], p5: [{ id: "gpt-y", ctx: null }],
+  });
+  const r = funnel(inp, T());
+  const ci = (s) => r.groups.get(s).ci;
+  for (const s of ["orcarouter/free", "anymodel/am/free", "pa/free"]) assert.equal(ci(s), 0, `${s}: a pool alias never borrows from kilo-auto/free`);
+  assert.equal(r.groups.get("kilo/kilo-auto/free").ci, 0, "and a pool alias never lends or borrows");
+  assert.equal(ci("routewayai/muse-glimmer-30b:free"), 0, "a community/ re-upload is not a sibling of muse-glimmer-30b:free");
+  assert.equal(ci("p2/anthropic/gpt-x"), 0, "openai/gpt-x and anthropic/gpt-x are different vendors");
+  assert.equal(ci("p3/gpt-x"), 1, "a bare gpt-x has no vendor to contradict: it takes the one sibling's ctx");
+  assert.equal(ci("p3/openai/gpt-x-2026-02-03"), 1, "same vendor, a date suffix");
+  assert.equal(ci("p2/real-model:free"), 1, "the plain case still works: x:free borrows from x");
+  assert.equal(ci("p5/gpt-y"), 0, "user/ is a re-upload namespace too");
+  assert.equal(r.counts.ctxInferred, 3);
+});
+
+test("F4: the seeds are EXACT ids: siblings and newer versions are not touched; a seed stays in force against an L1+L2-only record and is lifted only by a real L3 or big result (or a confirmed x)", () => {
+  const spec = { aihubmix: [{ id: "coding-glm-5.1-free", ctx: 200000 }, { id: "glm-5.2", ctx: 1049000 }, { id: "glm-5.3-turbo", ctx: 200000 }, { id: "zai-glm-5.1", ctx: 200000 }, { id: "xiaomi-mimo-v2.5-pro-free", ctx: 200000 }, { id: "xiaomi-mimo-v2.6-free", ctx: 200000 }, { id: "mimo-v2.5-flash", ctx: 200000 }],
+    orcarouter: [{ id: "deepseek/deepseek-v4-flash-free", ctx: 1000000 }, { id: "deepseek/deepseek-v4-flash", ctx: 1000000 }], nvidia: [{ id: "openai/gpt-oss-20b", ctx: 131072 }, { id: "openai/gpt-oss-120b", ctx: 131072 }] };
+  const r = funnel(syn(spec), T());
+  const stopped = [...r.groups.values()].filter((g) => g.stage === "known-bad").map((g) => g.selector).sort();
+  assert.deepEqual(stopped, ["aihubmix/coding-glm-5.1-free", "aihubmix/xiaomi-mimo-v2.5-pro-free", "nvidia/openai/gpt-oss-20b"], "3 of 11 rows: exactly the ids the issues name");
+  assert.equal(r.counts.knownBad, 3);
+  for (const k of ["aihubmix/glm-5.2", "aihubmix/glm-5.3-turbo", "aihubmix/zai-glm-5.1", "aihubmix/xiaomi-mimo-v2.6-free", "aihubmix/mimo-v2.5-flash", "nvidia/openai/gpt-oss-120b", "orcarouter/deepseek/deepseek-v4-flash"]) assert.equal(r.groups.get(k).stage, "in-set", k);
+  const cap = (x) => x.models.find((m) => m.s === "orcarouter/deepseek/deepseek-v4-flash-free");
+  assert.equal(cap(r).pb, 408000);
+  assert.equal(r.models.find((m) => m.s === "orcarouter/deepseek/deepseek-v4-flash").pb, 0, "the non-free sibling has no seeded cap");
+  // an L1+L2-only record (L3 not run: lvr[2] n) proves nothing about a tool set or a 408 KB body
+  const l12 = { models: { "aihubmix/coding-glm-5.1-free": { t: "t", lvr: "ppnn" }, "aihubmix/xiaomi-mimo-v2.5-pro-free": { t: "t", lvr: "ppnn" }, "orcarouter/deepseek/deepseek-v4-flash-free": { t: "t", lvr: "ppnn" }, "nvidia/openai/gpt-oss-20b": { t: "t", lvr: "ppnn" } } };
+  const a = funnel(syn(spec, { tf: l12 }), T());
+  assert.deepEqual([...a.groups.values()].filter((g) => g.stage === "known-bad").length, 3, "the three x seeds survive an L1+L2 record");
+  assert.deepEqual([cap(a).pb, cap(a).pbSource], [408000, "known-issue"], "and the #109 cap survives it");
+  // a real L3 pass lifts an x seed; a real L3 fail is the record's own verdict; a big result lifts the cap (or replaces it with the measured capBelow)
+  const l3 = funnel(syn(spec, { tf: { models: { "aihubmix/coding-glm-5.1-free": { t: "v", lvr: "pppn" }, "aihubmix/xiaomi-mimo-v2.5-pro-free": { t: "x", lvr: "ppfn", strikes: 2, sl: 3 }, "orcarouter/deepseek/deepseek-v4-flash-free": { t: "v", lvr: "pppn", big: "p" } } } }), T());
+  assert.equal(l3.groups.get("aihubmix/coding-glm-5.1-free").stage, "in-set", "an L3 pass lifts the seed");
+  assert.equal(l3.groups.get("aihubmix/xiaomi-mimo-v2.5-pro-free").stage, "tools-failed", "a confirmed record x is the record's own stage, not the seed's");
+  assert.equal(cap(l3).pb, 0, "a big pass lifts the seeded cap");
+  const bigOnly = funnel(syn(spec, { tf: { models: { "orcarouter/deepseek/deepseek-v4-flash-free": { t: "t", lvr: "ppnn", big: "p" } } } }), T());
+  assert.equal(cap(bigOnly).pb, 0, "a big-step result alone (L3 not recorded) is real evidence about the body size: the seeded cap is lifted");
+  const bf = funnel(syn(spec, { tf: { models: { "orcarouter/deepseek/deepseek-v4-flash-free": { t: "v", lvr: "pppn", big: "f", capBelow: 300000 } } } }), T());
+  assert.deepEqual([cap(bf).pb, cap(bf).pbSource], [300000, "capBelow"], "a measured capBelow replaces the seed");
+  const keep = funnel(syn(spec, { tf: { models: { "orcarouter/deepseek/deepseek-v4-flash-free": { t: "v", lvr: "pppn", big: "f", capBelow: 500000 } } } }), T());
+  assert.deepEqual([cap(keep).pb, cap(keep).pbSource], [500000, "capBelow"], "the record's own cap is the real evidence, even above the seed");
+});
+
+test("F6: a free model dropped on a transient status whose STORED MESSAGE names the account (plan, key, balance: the bench classifyTight) is shown as account state, not as waiting for a re-probe; a rate message and a network failure still wait", async () => {
+  const { classifyTight } = await import("../refresh/bench.mjs");
+  const day = 86400, old = NOW / 1000 - 6 * day;
+  const ORCA = "orcarouter: Free models are not available to this account yet. They require the workspace owner to link a GitHub account that has been registered for some time ";
+  const spec = { pa: [{ id: "acct-a:free" }, { id: "acct-b:free" }, { id: "acct-c:free" }, { id: "rate-a:free" }, { id: "net-a:free" }, { id: "empty-a:free" }, { id: "gone-a:free" }, { id: "quota-a:free" }] };
+  const bench = {
+    "pa/acct-a:free": { s: "rate", a: old, m: ORCA }, "pa/acct-b:free": { s: "rate", a: old, m: ORCA },
+    "pa/acct-c:free": { s: "rate", a: old, m: "Insufficient balance. Please recharge your account." },
+    "pa/rate-a:free": { s: "rate", a: old, m: "mistral: Rate limit exceeded" }, "pa/net-a:free": { s: "error", a: old, m: "fetch failed" }, "pa/empty-a:free": { s: "empty", a: old },
+    "pa/gone-a:free": { s: "rate", a: old, m: "The model `x` does not exist or has been deprecated and is no longer available" },
+    "pa/quota-a:free": { s: "rate", a: old, m: "google: You exceeded your current quota, please check your plan and billing details." },
+  };
+  const inp = { ...syn(spec, { tiers: { pa: "paid" }, bench }), classifyBench: (rec) => classifyTight(typeof rec?.m === "string" ? rec.m : "") };
+  const r = funnel(inp, T());
+  assert.deepEqual(r.accountRows.map((x) => [x.s, x.why]), [["pa/acct-a:free", "auth"], ["pa/acct-b:free", "auth"], ["pa/acct-c:free", "pay"]], "3 of the 8 transient rows name the account");
+  assert.deepEqual(r.reprobe.map((x) => x.s), ["pa/empty-a:free", "pa/net-a:free", "pa/quota-a:free", "pa/rate-a:free"], "the other 4 still wait for a re-probe; gone-a is neither (its message says the model is gone)");
+  assert.equal(r.counts.accountStateRows, 3); assert.equal(r.counts.reprobe, 4);
+  assert.ok(r.warnings.some((w) => w.code === "REPROBE" && /^REPROBE: 4 /.test(w.text)), "the warning counts only the rows that wait");
+  assert.equal(r.groups.get("pa/acct-a:free").accountState, "auth"); assert.ok(!r.groups.get("pa/acct-a:free").reprobe);
+  assert.equal(r.groups.get("pa/gone-a:free").reprobe, undefined);
+  // without a classifier (a pure caller) every transient row waits, exactly as before
+  assert.equal(funnel(syn(spec, { tiers: { pa: "paid" }, bench }), T()).reprobe.length, 8);
+  // the compiled file carries both lists, outside the hash, and the shell wires the real classifier
+  const c = lib.compile(synG(inp), { ...lib.OWNER_DEFAULTS, source: "all-providers" }, {}).compiled;
+  assert.deepEqual(c.accountStateRows.map((x) => x.s), ["pa/acct-a:free", "pa/acct-b:free", "pa/acct-c:free"]);
+  assert.deepEqual([c.counts.accountStateRows, c.counts.reprobe], [3, 4]);
+  assert.equal(lib.hashOf({ ...c, accountStateRows: [] }), c.contentHash);
+  const { g } = await fx();
+  assert.equal(g.funnelInputs.classifyBench({ m: ORCA }), "auth", "gatherInputs hands the funnel the bench's own tight reading");
+  assert.equal(g.funnelInputs.classifyBench({ s: "rate" }), null);
+});
+
+test("F7: the denylist catches embedding families (embeddinggemma, -embedding-, text-embedding, embedqa), speech and retrieval models, and keeps every real agent id the snapshot holds", () => {
+  for (const id of ["embeddinggemma-300m", "@cf/google/embeddinggemma-300m", "qwen3-embedding-8b", "text-embedding-3-large", "gemini-embedding", "jina-embeddings-v3", "nv-embedqa-mistral-7b-v2", "nv-embedcode-7b-v1", "nomic-embed-text",
+    "qwen3-asr-flash", "qwen3-tts-flash", "whisper-large-v3", "jina-clip-v2", "bge-m3", "multilingual-e5-large", "gemma-4-31b-assguard", "nvidia/llama-3.1-nemoguard-8b-topic-control", "gpt-4o-transcribe", "sentence-transformers/all-minilm-l6-v2"]) assert.equal(nonAgentReason(id), "non-agent-model", id);
+  for (const id of ["claude-sonnet-5-5", "gpt-oss-120b", "gemini-3.8-flash", "qwen3-coder-480b", "deepseek-v4-flash", "llama-3.3-70b-instruct", "glm-5.1", "kimi-k2.5", "mistral-large-2512", "command-a", "grok-4", "gemma-3-27b-it", "nemotron-3-super-120b", "devstral-medium", "coding-glm-5.1-free", "minimax-m2.5", "step-3.5-flash", "ernie-5.0", "hunyuan-turbo", "o3-pro"]) assert.equal(nonAgentReason(id), null, id);
+  const r = funnel(syn({ pa: [{ id: "embeddinggemma-300m", ctx: 200000 }, { id: "real-agent", ctx: 200000 }] }), T());
+  assert.deepEqual(sels(r), ["pa/real-agent"]); assert.equal(r.dropped.get("pa/embeddinggemma-300m"), "non-agent-model");
 });

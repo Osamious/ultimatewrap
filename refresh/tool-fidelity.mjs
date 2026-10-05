@@ -26,6 +26,14 @@
 //             PROVISIONAL: lvr keeps what it was (nnnn for a model never tested), strikes is 1, and the model stays queued for one retry.
 //             The second failure at the same level CONFIRMS it (strikes 2, the `f` is written). A confirmed L1/L2 failure is class x; a
 //             confirmed L3 failure that is not about size is class x too. A pass clears both fields.
+//   fc        p: L1 passed ONLY when the call was forced (auto yielded none): class t at best, not clean.  f: forced failed too.  Absent: auto passed.
+//   af        argument fidelity of the L1 call: every field byte for byte, the boolean a boolean, the integer an integer (p / f)
+//   br        the answer after the ~20 KB tool_result used the fact at the END of it (p / f), from L2.   er  the is_error tool_result case answered, not empty (p / f), L7
+//   nm        an MCP-style ~60-character tool name came back exactly (p / f), from the L3 constructs request (3a)
+//   cc        the cache_control markers Claude Code sends were accepted (p) or rejected by name (f); a model that rejected them is not sent them again
+//   sp        the Agent (spawn) tool: a valid call with a prompt and a recognised subagent_type (p / f), L6. Two strikes like L1-L3 (sl 6); never lowers the class
+//   d3        what decided L3: a (failed at the 3a constructs request), b (failed at the 157 KB request), i (passed by implication: the big step passed first)
+// L4 (parallel calls) is answered by the same 157 KB request as L3. None of these fields is part of lvr, and none changes the class except fc (class t at best).
 // Compiler reads `t`, `alias`, `capBelow`, `big` and `lvr[3]` (L4): inside class v a model ranks big p, then big not run, then big f, and
 // then L4 p, not run, f. The picker cell grammar still comes from lvr; a confirmed L3 failure that is not about size shows `x`.
 
@@ -36,10 +44,11 @@ import { writeAtomic } from "../menu/atomic.mjs";
 import { redactClip } from "../menu/redact.mjs";
 import { benchKey } from "../menu/bench-data.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
-import { RELAY_KEY_ID } from "../menu/tiers.mjs";
-import { SUBSTITUTE_FLOOR } from "../menu/subagent-funnel.mjs";
+import { RELAY_KEY_ID, isTier } from "../menu/tiers.mjs";
+import { SUBSTITUTE_FLOOR, funnel } from "../menu/subagent-funnel.mjs";
 import { isFree, UNPRICED_PER_M } from "./bench.mjs";
-import { levelSize, PROBE_MAX_TOKENS } from "./tool-fidelity-probe.mjs";
+import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON } from "./tool-fidelity-probe.mjs";
+export { NOT_FREE_REASON };
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 
 export const FILE_NAME = "tool-fidelity.json";
@@ -54,7 +63,8 @@ export const BIG_LEVEL = 5;                          // the ~400 KB step, a leve
 
 const LVR_RE = /^[pfn]{4}$/;
 const FX_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl"]);
+const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3"]);
+const PF_FIELDS = ["fc", "af", "nm", "cc", "br", "er", "sp"];            // the one-letter p / f markers, in the order they are written
 const WHY_CHARS = 160;
 const BAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -75,7 +85,7 @@ export function classOf(r) {
   const lvr = o.lvr;
   if (lvr[0] === "n") return "u";
   const k = contiguous(lvr);
-  if (k >= 3) return "v";
+  if (k >= 3) return o.fc === "p" ? "t" : "v";               // a model that took the tool call only when it was FORCED is not clean: t at best
   if (k === 2) return lvr[2] === "f" && o.strikes >= 2 && o.sl === 3 && !o.capBelow ? "x" : "t";
   return "x";
 }
@@ -103,7 +113,7 @@ export const capBelowFor = (bytes) => Math.max(10000, Math.floor((bytes - 1) / 1
 export function cleanFidelity(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   for (const k of Object.keys(raw)) if (!FIELDS.has(k)) return null;
-  const { lvr, lv, t, ok, why, at, fx, maxBytes, alias, big, capBelow, strikes, sl } = raw;
+  const { lvr, lv, t, ok, why, at, fx, maxBytes, alias, big, capBelow, strikes, sl, d3 } = raw;
   if (typeof lvr !== "string" || !LVR_RE.test(lvr)) return null;
   if (typeof at !== "string" || at.length > 40 || !Number.isFinite(Date.parse(at))) return null;
   if (typeof fx !== "string" || !FX_RE.test(fx)) return null;
@@ -113,12 +123,15 @@ export function cleanFidelity(raw) {
   if (big !== undefined && !/^[pfn]$/.test(big)) return null;
   if (capBelow !== undefined && !(Number.isInteger(capBelow) && capBelow >= 1 && capBelow <= 4_000_000)) return null;
   if ((strikes === undefined) !== (sl === undefined)) return null;
-  if (strikes !== undefined && !((strikes === 1 || strikes === 2) && Number.isInteger(sl) && sl >= 1 && sl <= 3)) return null;
-  const d = classOf({ lvr, strikes, sl, capBelow });
+  if (strikes !== undefined && !((strikes === 1 || strikes === 2) && [1, 2, 3, 6].includes(sl))) return null;
+  for (const k of PF_FIELDS) if (raw[k] !== undefined && !/^[pf]$/.test(raw[k])) return null;
+  if (d3 !== undefined && !/^[abi]$/.test(d3)) return null;
+  const d = classOf({ lvr, strikes, sl, capBelow, fc: raw.fc });
   if (lv !== lvOf(lvr) || t !== d || ok !== (d === "v" || d === "t")) return null;
   const w = why ? redactClip(why, WHY_CHARS) : "";
   return { lv, lvr, t, ok, ...(w ? { why: w } : {}), at, fx, maxBytes, ...(alias ? { alias: true } : {}),
-           ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}) };
+           ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
+           ...Object.fromEntries(PF_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(d3 ? { d3 } : {}) };
 }
 
 /** A key this file may hold: `provider/id`, no whitespace, at most 200 characters, never a prototype name. */
@@ -154,7 +167,7 @@ export function loadFidelity(file = REAL_FILE) {
 /**
  * The PENDING map: for a model that was in a run's queue and ended it still untested, why, and in how many runs in a row. It is bookkeeping for the
  * coverage ledger (a model that waits for many runs is starving), not a result: it is dropped as soon as the model has one. `r` is a short reason code
- * (rate, pay, auth, timeout, error, gone, empty, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
+ * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
  */
 export const PENDING_MAX = 5000;
 export function cleanPending(raw) {
@@ -244,22 +257,25 @@ export function saveFidelity(file, models, { live = false, now = new Date(), kee
 // ------------------------------------------------------------------ building and merging a record
 
 /**
- * The record after a probe, or null when no level actually ran (nothing to record). `done` maps a level (1-4, and 5 for the big step) to
- * `{v: "p"|"f"|"n", why?, kind?: "size"|"schema", bytes?}`; `n` means asked but not run. Levels that ran replace their character of
- * lvr; the rest keep the prior result. TWO STRIKES: a failure at L1, L2 or L3 (L3 only when it is not about size) is provisional the
- * first time (see the header); a size refusal at L3 or at the big step lowers `capBelow` instead of failing the model.
+ * The record after a probe, or null when no level actually ran (nothing to record). `done` maps a level (1-4, 5 for the big step, 6 for spawn, 7 for the error-result case) to
+ * `{v: "p"|"f"|"n", why?, kind?: "size"|"schema", bytes?, ...markers}`; `n` means asked but not run. Levels that ran replace their character of lvr; the rest keep the prior
+ * result. The one-letter markers (af, fc, br, er, nm, cc, sp, d3) come from the levels that carry them. TWO STRIKES: a failure at L1, L2 or L3 (L3 only when it is not about size)
+ * is provisional the first time (see the header), and a provisional probe keeps EVERYTHING it learned out of the record; a failed spawn is struck the same way (sl 6) but never
+ * lowers the class; a size refusal at L3 or at the big step lowers `capBelow` instead of failing the model.
  */
 export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE_ID, alias = false } = {}) {
   const verdict = (l) => done[l]?.v === "p" || done[l]?.v === "f";
   const l3Passed = done[3]?.v ? done[3].v === "p" : prior?.lvr?.[2] === "p";
-  const ran = (l) => verdict(l) && (l !== BIG_LEVEL || l3Passed);          // the big step means something only behind an L3 pass
-  if (![1, 2, 3, 4, BIG_LEVEL].some(ran)) return null;
+  const pairOk = (done[1]?.v ?? prior?.lvr?.[0]) === "p" && (done[2]?.v ?? prior?.lvr?.[1]) === "p";
+  // the big step means something only behind an L3 pass (or an L3 implied by it); spawn and the error result only behind a passed L1+L2
+  const ran = (l) => verdict(l) && (l !== BIG_LEVEL || l3Passed) && ((l !== 6 && l !== 7) || pairOk);
+  if (![1, 2, 3, 4, BIG_LEVEL, 6, 7].some(ran)) return null;
   const base = prior?.lvr ?? "nnnn";
   const next = base.split("");
   for (let l = 1; l <= 4; l++) if (done[l]?.v) next[l - 1] = done[l].v;
   const strikeable = (l) => done[l]?.v === "f" && !(l === 3 && done[l].kind === "size");
   const F = [1, 2, 3].find(strikeable) ?? 0;
-  let lvr = next.join(""), strikes, sl;
+  let lvr = next.join(""), strikes, sl, provisional = false;
   if (F) {
     const confirmed = !!prior && (prior.strikes === 2 || (prior.strikes === 1 && prior.sl === F));
     if (confirmed) { strikes = 2; sl = F; }
@@ -267,9 +283,25 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
       // first strike: the earlier result stands. Only levels above the failed one (and above the L1+L2 pair) keep what they learned.
       const keepBase = base.split("");
       for (let l = Math.max(F, 2) + 1; l <= 4; l++) if (done[l]?.v) keepBase[l - 1] = done[l].v;
-      lvr = keepBase.join(""); strikes = 1; sl = F;
+      lvr = keepBase.join(""); strikes = 1; sl = F; provisional = true;
     }
   } else if (prior?.strikes === 1 && !ran(prior.sl)) { strikes = 1; sl = prior.sl; }       // this probe did not look at the struck level: the strike waits
+
+  // the markers: a provisional probe changes none of them
+  const keep = { ...Object.fromEntries(PF_FIELDS.map((k) => [k, prior?.[k]])), d3: prior?.d3 };
+  const m = { ...keep };
+  if (!provisional) {
+    if (ran(1)) { m.af = done[1].af; m.fc = done[1].fc; }
+    if (ran(2)) m.br = done[2].br;
+    if (ran(7)) m.er = done[7].v;
+    for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc; }
+    if (ran(3)) m.d3 = done[3].v === "f" ? (String(done[3].why ?? "").startsWith("[3a]") ? "a" : "b") : done[3].implied ? "i" : undefined;
+    if (ran(6)) {
+      if (done[6].v === "p") m.sp = "p";
+      else if (prior?.strikes === 1 && prior.sl === 6) { m.sp = "f"; strikes = 2; sl = 6; }
+      else if (!strikes) { strikes = 1; sl = 6; }                               // the strike slot is free: the first spawn failure is only provisional
+    }
+  }
 
   let capBelow = prior?.capBelow;
   for (const l of [3, BIG_LEVEL]) if (ran(l) && done[l].v === "f" && done[l].kind === "size") capBelow = Math.min(capBelow ?? Infinity, capBelowFor(done[l].bytes ?? 0));
@@ -277,9 +309,9 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
   if (capBelow && passedBytes > capBelow) capBelow = undefined;           // a pass beyond the recorded refusal contradicts it
   let big = prior?.big;
   if (ran(BIG_LEVEL)) big = done[BIG_LEVEL].v;
-  if (lvr[2] !== "p") big = undefined;                                    // the big step is only meaningful after an L3 pass
+  if (lvr[2] !== "p") { big = undefined; if (m.d3 === "i") m.d3 = undefined; }     // the big step is only meaningful after an L3 pass
 
-  const t = classOf({ lvr, strikes, sl, capBelow });
+  const t = classOf({ lvr, strikes, sl, capBelow, fc: m.fc });
   // the reason shown: the failed level of this probe's strike, else the first failed level of the record (this probe's words, or the stored ones)
   let why = "";
   if (F) why = `L${F}: ${done[F].why ?? ""}`;
@@ -293,6 +325,7 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     maxBytes: Math.max(prior?.maxBytes ?? 0, passedBytes),
     ...(alias ? { alias: true } : {}),
     ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
+    ...Object.fromEntries(PF_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])), ...(m.d3 ? { d3: m.d3 } : {}),
   };
 }
 
@@ -319,8 +352,9 @@ export function requeueL3Failures(store, provider) {
     const keepStrike = r.strikes && r.sl !== 3;
     const f = lvr.indexOf("f");
     const next = { lv: lvOf(lvr), lvr, at: r.at, fx: r.fx, maxBytes: r.maxBytes, ...(r.alias ? { alias: true } : {}), ...(keepStrike ? { strikes: r.strikes, sl: r.sl } : {}),
+                   ...Object.fromEntries(PF_FIELDS.filter((k) => r[k] !== undefined).map((k) => [k, r[k]])),
                    ...(f >= 0 && r.why?.startsWith(`L${f + 1}:`) ? { why: r.why } : {}) };
-    next.t = classOf({ lvr, strikes: next.strikes, sl: next.sl });
+    next.t = classOf({ lvr, strikes: next.strikes, sl: next.sl, fc: next.fc });
     next.ok = next.t === "v" || next.t === "t";
     changed[k] = cleanFidelity(next);
   }
@@ -373,7 +407,8 @@ export function fidelityCounts(set, store, fixtureId = FIXTURE_ID) {
   const has = (m) => !!store[m.key] && store[m.key].lvr[0] !== "n";
   const withRecord = set.models.filter(has).length;
   const current = set.models.filter((m) => has(m) && store[m.key].fx === fixtureId).length;
-  return { probeOk: n + set.relay.length, relay: set.relay.length, probeSet: n, withRecord, withRecordCurrent: current,
+  const notFree = set.notFree?.length ?? 0;
+  return { probeOk: n + notFree + set.relay.length, relay: set.relay.length, notFree, byTier: set.byTier ?? null, probeSet: n, withRecord, withRecordCurrent: current,
            outdated: withRecord - current, pending: set.models.filter((m) => isProvisional(store[m.key])).length,
            toolsFalse: set.models.filter((m) => m.toolsFalse).length, toolsFalseWithRecord: set.models.filter((m) => m.toolsFalse && has(m)).length,
            ctxUnknown: set.models.filter((m) => !(m.ctx > 0)).length, badId: set.badId ?? 0, queued: n - withRecord };
@@ -383,12 +418,14 @@ export function fidelityCounts(set, store, fixtureId = FIXTURE_ID) {
 export const failedLevels = (rec) => [...[1, 2].filter((l) => rec.lvr[l - 1] !== "p"), ...(rec.lvr[2] === "f" ? [3] : [])];
 
 /**
- * Which levels each model still needs. Without `force` a model is asked only for what it has NO result for, so a model with a record is never
- * re-probed at a level it already answered, and a record against an outdated fixture is NOT queued again (its `*` is a recommendation, not an
- * expiry). L1 and L2 are one pass: a record that ran anything answered both, except a model with ONE strike, which is asked the struck level
- * again. L3 and L4 are asked only of a model that passed L1 and L2 (or, for a model never tested, together with them), while their character is
- * `n`; the big step only of a model that passed L3 and has no big result. `force` asks every requested level again (still never past a failure
- * the ladder would stop at). `retryFailed` asks again ONLY the models of class x, and only the levels that failed: a record that passed is never touched.
+ * Which levels each model still needs. Without `force` a model is asked only for what it has NO result for, so a model with a record is never re-probed at a level it already
+ * answered (a model with L1+L2 done and L3 pending is sent L3 only), and a record against an outdated fixture is NOT queued again (its `*` is a recommendation, not an expiry). L1
+ * and L2 are one pass: a record that ran anything answered both, except a model with ONE strike, which is asked the struck level again. L3 is the 3a constructs request and the 157 KB
+ * request, which also answers L4: both are asked only of a model that passed L1 and L2 (or, for a model never tested, together with them), while their character is `n`; L4 alone only
+ * after an L3 pass. The big step only of a model that passed L3 (or in the same run as the L3 being asked) and has no big result. L6 (spawn) and L7 (the error result) only of a model
+ * that passed L1 and L2 and has no result for them, spawn also when it carries one strike. `force` asks every requested level again (still never past a failure the ladder would stop
+ * at). `retryFailed` asks again ONLY the models of class x, and only the levels that failed: a record that passed is never touched. Deep levels of a provider that is not free are
+ * clamped later, by `clampDeep` and by the engine itself.
  */
 export function queueFor(set, store, levels = DEFAULT_LEVELS, { force = false, retryFailed = false } = {}) {
   const out = [];
@@ -408,9 +445,12 @@ export function queueFor(set, store, levels = DEFAULT_LEVELS, { force = false, r
     const todo = levels.filter((l) => {
       if (l <= 2) return force || !confirmed || (pending >= 1 && pending <= 2);
       if (l === 3) return askL3;
-      if (l === 4) return okToAsk && (force || !prior || prior.lvr[3] === "n");
+      if (l === 4) return okToAsk && (force || !prior || prior.lvr[3] === "n") && (askL3 || prior?.lvr[2] === "p");
       // the big step: after an L3 pass, or in the same run as the L3 that is being asked (the ladder stops it if L3 does not pass)
-      return askL3 || (confirmed && prior.lvr[2] === "p" && (force || prior.big === undefined));
+      if (l === 5) return askL3 || (confirmed && prior.lvr[2] === "p" && (force || prior.big === undefined));
+      if (l === 6) return pending === 6 || (okToAsk && (force || !prior || prior.sp === undefined));
+      if (l === 7) return okToAsk && (force || !prior || prior.er === undefined);
+      return false;
     });
     if (todo.length) out.push({ ...m, todo, prior });
   }
@@ -447,28 +487,71 @@ export function paidFallback(models) {
   return inn || out ? { in: inn, out } : UNPRICED_PER_M;
 }
 
+/** The request kinds that answer one LEVEL of a todo list (L4 rides in the L3 request: no cost of its own unless it is asked alone). */
+const kindsOfLevel = (l, todo) => (l === 4 ? (todo.includes(3) ? [] : ["3b"]) : kindsOf([l]));
+const BIG_LEVELS = Object.freeze({ 1: "L1 edit call (arguments)", 2: "L2 round trip (20 KB result)", 3: "L3 constructs + 157 KB (+L4 parallel)", 5: "big 400 KB", 6: "spawn (Agent)", 7: "error result" });
+/** The per-level request, byte and token table the dry run prints (a full-depth model sends every row once). */
+export function levelCosts(maxTokens = null) {
+  return [1, 2, 3, 5, 6, 7].map((l) => {
+    const kinds = kindsOfLevel(l, [l]);
+    return { level: l, label: BIG_LEVELS[l], kinds, requests: kinds.length, bytes: kinds.reduce((a, k) => a + kindSize(k).bytes, 0), inTokens: kinds.reduce((a, k) => a + kindSize(k).inTokens, 0), outTokens: kinds.reduce((a, k) => a + (maxTokens ?? BUDGETS[k]), 0) };
+  });
+}
+
 /**
- * Cost of what each entry still has to run, in requests, input tokens and dollars, BEFORE anything is sent. Input tokens come from the real
- * request bytes of each level (bytes / 4); output tokens are the probe maximum per request. `lc` is the dollar cost of each level, so a
- * probe that stops part way can be charged for the levels it did complete. `fallback` is `paidFallback(whole set)`.
+ * Cost of what each entry still has to run, in requests, input tokens and dollars, BEFORE anything is sent. Input tokens come from the real request bytes of each REQUEST (bytes / 4);
+ * output tokens are each request's own small budget (`maxTokens` overrides them all). `lc` is the dollar cost of each level, so a probe that stops part way can be charged for the
+ * levels it did complete. `fallback` is `paidFallback(whole set)`. `sizes` is the per-level table (L3 is two requests, L4 none of its own).
  */
-export function estimate(entries, { maxTokens = PROBE_MAX_TOKENS, fallback = null } = {}) {
-  const sizes = Object.fromEntries([1, 2, 3, 4, 5].map((l) => [l, levelSize(l, maxTokens)]));
+export function estimate(entries, { maxTokens = null, fallback = null } = {}) {
+  const sizes = Object.fromEntries([1, 2, 3, 4, 5, 6, 7].map((l) => { const k = kindsOfLevel(l, [l === 4 ? 3 : l]); return [l, { bytes: k.reduce((a, x) => a + kindSize(x).bytes, 0), inTokens: k.reduce((a, x) => a + kindSize(x).inTokens, 0), requests: k.length }]; }));
   const fb = fallback ?? paidFallback(entries);
   const per = new Map();
   let requests = 0, inTokens = 0, outTokens = 0, usd = 0, paidModels = 0;
   const rated = entries.map((e) => {
-    const reqs = e.todo.length, tin = e.todo.reduce((s, l) => s + sizes[l].inTokens, 0), tout = reqs * maxTokens;
+    const kinds = kindsOf(e.todo), reqs = kinds.length;
+    const tin = kinds.reduce((a, k) => a + kindSize(k).inTokens, 0), tout = kinds.reduce((a, k) => a + (maxTokens ?? BUDGETS[k]), 0);
     const price = e.free ? { in: 0, out: 0 } : { in: e.pin ?? fb.in, out: e.pout ?? fb.out };
-    const lc = Object.fromEntries(e.todo.map((l) => [l, (sizes[l].inTokens * price.in + maxTokens * price.out) / 1e6]));
+    const lc = Object.fromEntries(e.todo.map((l) => { const ks = kindsOfLevel(l, e.todo); return [l, (ks.reduce((a, k) => a + kindSize(k).inTokens, 0) * price.in + ks.reduce((a, k) => a + (maxTokens ?? BUDGETS[k]), 0) * price.out) / 1e6]; }));
     const cost = Object.values(lc).reduce((a, b) => a + b, 0);
     requests += reqs; inTokens += tin; outTokens += tout; usd += cost; if (!e.free) paidModels += 1;
     const p = per.get(e.provider) ?? { provider: e.provider, models: 0, requests: 0, inTokens: 0, usd: 0, free: 0 };
     p.models += 1; p.requests += reqs; p.inTokens += tin; p.usd += cost; if (e.free) p.free += 1;
     per.set(e.provider, p);
-    return { ...e, reqs, tin, cost, lc };
+    return { ...e, reqs, tin, tout, cost, lc, kinds, price };
   });
   return { entries: rated, requests, inTokens, outTokens, usd, paidModels, perProvider: [...per.values()].sort((a, b) => b.models - a.models || (a.provider < b.provider ? -1 : 1)), sizes };
+}
+
+/**
+ * An honest RANGE for the wall time of a queue: each request is taken to cost the provider's typical first-token time (`latencyMs`, from the bench) plus prefill at `prefillTokPerSec`
+ * (the long requests dominate), a provider serves `perProvider` requests at once (one when the request is 100 KB or more), `concurrency` run at once overall. The low figure is
+ * the typical case, the high one three times that with every provider rate-limited part of the time. It is an estimate, printed as one.
+ */
+export function wallEstimate(rated, { concurrency = 8, perProvider = 2, latencyMs = 3000, prefillTokPerSec = 8000 } = {}) {
+  const prov = new Map();
+  let total = 0;
+  for (const e of rated) {
+    for (const k of e.kinds ?? kindsOf(e.todo)) {
+      const sz = kindSize(k), big = sz.bytes >= 100000, lat = latencyMs + (sz.inTokens / prefillTokPerSec) * 1000;
+      const p = prov.get(e.provider) ?? { t: 0 };
+      p.t += lat / (big ? 1 : Math.max(1, perProvider)); prov.set(e.provider, p); total += lat;
+    }
+  }
+  const low = Math.max(0, ...[...prov.values()].map((p) => p.t), total / Math.max(1, concurrency)) / 1000;
+  return { lowSec: low, highSec: low * 3, providers: prov.size };
+}
+
+/**
+ * The expected cost per model of the two orders of the deep levels, from MEASURED pass rates: `r3` the share of L1+L2 passers that pass L3, `rb` the share of L3 passers that pass the
+ * big step. l3-first sends 3a and 3b to everyone and the big step to the L3 passers; big-first sends the big step first (a pass implies L3, so those skip 3a and 3b) and 3a, 3b
+ * to the rest. A big pass is taken to be r3 * rb of the passers. Tokens, input only.
+ */
+export function orderCosts({ r3, rb }) {
+  const c3 = kindSize("3a").inTokens + kindSize("3b").inTokens, cb = kindSize("5").inTokens;
+  if (!(r3 >= 0 && r3 <= 1 && rb >= 0 && rb <= 1)) return null;
+  const pBig = r3 * rb;
+  return { l3First: c3 + r3 * cb, bigFirst: cb + (1 - pBig) * c3, pBig, c3, cb };
 }
 
 /**
@@ -487,9 +570,9 @@ export function applyProviderCap(rated, cap = DEFAULT_TOKENS_PER_PROVIDER) {
   return { kept, waiting, tooBig, needed: Math.max(0, ...rated.map((e) => e.tin)) };
 }
 
-// ------------------------------------------------------------------ candidates: the models the router could ever pick
+// ------------------------------------------------------------------ candidates: every probe-ok model on a free-tier provider, in priority order
 
-/** Reads a compiled policy file (`state/subagent/policy.json`, or a fixture of the same shape): `{models: [{s, c, ...}]}`, best first. Null when it is not one. */
+/** Reads a compiled policy file (`state/subagent/policy.json`, or a fixture of the same shape): `{models: [{s, c, ...}], tiers?: {provider: tier}}`, best first. Null when it is not one. */
 export function loadPolicy(file) {
   try {
     const raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
@@ -498,33 +581,288 @@ export function loadPolicy(file) {
 }
 export const POLICY_FILE = path.join(os.homedir(), ".uw", "state", "subagent", "policy.json");
 
+// From most to least restrictive: when a provider's rows cannot be told apart, the deepest probes go only where every candidate key allows them.
+const TIER_STRICTNESS = Object.freeze(["management", "subscription", "paid", "free-deposit", "free"]);
+
 /**
- * The models the L3 step targets: every probe-ok model the router could ever pick, which is the compiled policy's ALLOWED set (`policy.models`) with a
- * KNOWN context of at least `floor` (the substitute floor: a smaller or unknown context is never substituted), plus the owner's pins (`pins`, selectors
- * the owner allowed by hand; a pin needs no ctx and no place in the toggles, only a probe-ok model). It is NOT the top 3 of each provider: that is
- * the router's spread, not a test boundary. ORDER: the pins, then the policy's own rank, best first, so a capped run covers the likeliest picks first
- * and the untested tail waits for the next run. `set` is `probeSet(...)`. Returns `{entries, excluded}`: `entries` are probe-set entries in that order;
- * `excluded` is every other model of the L3 universe with its reason: ctx-below-floor, ctx-unknown, outside-toggles (probe-ok but not in the allowed
- * set), relay-by-provenance.
+ * One tier per provider from the vault registry's rows (`[{provider, tier, id?}]`), by the rule the policy compiler applies to the same registry (`filterRegistry`, `chooseKeys` in
+ * keysync): a management key is not a key anything is synced with, so its row is ignored when the provider has another; a provider with one key has that key's tier; a provider with
+ * several keys has the tier of the key the OWNER CHOSE (`choices`, the key-choices file: `{provider: key id}`). Only when there is no choice (the compiler's "no deliberate choice"
+ * case): keys of one tier give that tier, keys of DIFFERENT tiers give the MOST RESTRICTIVE tier (management, subscription, paid, free-deposit, free), which only ever keeps a probe
+ * away. The result never depends on the order of the rows. A row with a tier outside the vocabulary leaves its provider unlabelled (default-deny). Returns `{tiers, conflicts, detail}`:
+ * `conflicts` the providers that fell back to the most restrictive tier, `detail` one entry per provider that has more than one key (or a management key beside another):
+ * `{provider, keys, tiers, tier, how: "choice" | "same-tier" | "most-restrictive" | "management-ignored", id?}`.
  */
-export function selectCandidates({ set, policy, pins = [], floor = SUBSTITUTE_FLOOR }) {
-  const rows = new Map((policy?.models ?? []).map((m) => [m.s, m]));
-  const byKey = new Map(set.models.map((e) => [e.key, e]));
-  const pinSet = new Set(pins.map((p) => benchKey(...splitKey(p))));
-  const entries = [], taken = new Set(), excluded = [];
-  for (const p of pinSet) if (byKey.has(p) && !taken.has(p)) { entries.push({ ...byKey.get(p), pinned: true }); taken.add(p); }
-  for (const m of policy?.models ?? []) {
-    const e = byKey.get(m.s);
-    if (!e || taken.has(m.s)) continue;
-    if (Number.isFinite(m.c) && m.c >= floor) { entries.push(e); taken.add(m.s); }
+export function resolveTierRows(rows, { choices = {} } = {}) {
+  const by = new Map();
+  for (const r of rows ?? []) {
+    if (!r || typeof r.provider !== "string" || typeof r.tier !== "string") continue;
+    if (!by.has(r.provider)) by.set(r.provider, []);
+    by.get(r.provider).push({ tier: r.tier, id: typeof r.id === "string" ? r.id : null });
   }
+  const entries = [], conflicts = [], detail = [];
+  for (const [provider, all] of [...by].sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))) {
+    if (!all.every((r) => isTier(r.tier))) continue;                                              // unlabelled
+    const live = all.filter((r) => r.tier !== "management"), kept = live.length ? live : all;
+    const tiers = all.map((r) => r.tier).sort();
+    const want = Object.hasOwn(choices ?? {}, provider) ? choices[provider] : null;
+    let tier, how = null, id;
+    if (kept.length === 1) { tier = kept[0].tier; if (all.length > 1) how = "management-ignored"; }
+    else if (want !== null && kept.some((r) => r.id === want)) { tier = kept.find((r) => r.id === want).tier; how = "choice"; id = want; }
+    else {
+      const distinct = [...new Set(kept.map((r) => r.tier))];
+      tier = TIER_STRICTNESS.find((t) => distinct.includes(t));
+      how = distinct.length === 1 ? "same-tier" : "most-restrictive";
+      if (how === "most-restrictive") conflicts.push(provider);
+    }
+    if (how) detail.push({ provider, keys: all.length, tiers, tier, how, ...(id ? { id } : {}) });
+    entries.push([provider, tier]);
+  }
+  return { tiers: Object.fromEntries(entries), conflicts, detail };
+}
+
+/**
+ * Provider key tiers from a file, with where they came from: `{tiers, conflicts, detail, compiledAt, mtime, kind}`. The file is `{provider: tier}`, `{tiers: {...}}` (a compiled policy, whose
+ * `compiledAt` is reported: the compiler's own answer, key choice included) or the vault registry's array (`resolveTierRows`, with the owner's key choices from `choicesFile`, a
+ * `{provider: key id}` file). Null when it is none of them.
+ */
+export function loadTiersInfo(file, { choicesFile = null } = {}) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
+    let mtime = null;
+    try { mtime = fs.statSync(file).mtime.toISOString(); } catch { /* no stat */ }
+    let choices = {};
+    if (choicesFile) { try { const c = JSON.parse(fs.readFileSync(choicesFile, "utf8").replace(/^﻿/, "")); if (c && typeof c === "object" && !Array.isArray(c)) choices = c; } catch { return null; } }
+    let m, conflicts = [], detail = [], kind = "tiers-file";
+    if (Array.isArray(raw)) { ({ tiers: m, conflicts, detail } = resolveTierRows(raw, { choices })); kind = "registry"; }
+    else if (raw && typeof raw.tiers === "object" && raw.tiers) { m = raw.tiers; kind = "policy"; }
+    else m = raw;
+    const ok = m && typeof m === "object" && !Array.isArray(m) && Object.values(m).every((t) => typeof t === "string");
+    if (!ok) return null;
+    const stamp = typeof raw?.compiledAt === "string" && Number.isFinite(Date.parse(raw.compiledAt)) ? raw.compiledAt : null;
+    return { tiers: m, conflicts, detail, compiledAt: stamp, mtime, kind };
+  } catch { return null; }
+}
+export const loadTiers = (file) => loadTiersInfo(file)?.tiers ?? null;
+
+/** Where the tiers came from, how old they are, and which providers of the probe set they do not cover (default-deny: those get L1+L2 only). */
+export const TIERS_STALE_DAYS = 2;
+export function describeTiers({ info = null, source, tiers, providers = [], nowMs }) {
+  const stamp = info?.compiledAt ?? info?.mtime ?? null, t = stamp ? Date.parse(stamp) : NaN;
+  const ageDays = Number.isFinite(t) && Number.isFinite(nowMs) ? Math.max(0, (nowMs - t) / 864e5) : null;
+  const absent = [...new Set(providers)].filter((p) => !isTier(tiers?.[p]));
+  return { source, kind: info?.kind ?? "injected", stamp, stampIs: info?.compiledAt ? "compiled" : info?.mtime ? "file modified" : null, ageDays, stale: ageDays !== null && ageDays > TIERS_STALE_DAYS, absent, conflicts: info?.conflicts ?? [], detail: info?.detail ?? [] };
+}
+
+// What a model's KNOWN context must be before a request of a given size is worth sending. The fixture is measured in bytes / 4; real tokenisers count
+// JSON schema text at up to bytes / 3, so the margin is 1.5, plus the answer budget. The big step is about 100,000 tokens by the same count; below
+// `BIG_MIN_CTX` it is not asked (it would only prove the window is small, which the listing already says).
+export const FIXTURE_MARGIN = 1.5;
+export const BIG_MIN_CTX = 200000;
+export const ctxNeededFor = (level, maxTokens = null) => { const k = level === 5 ? "5" : "3b"; return Math.ceil(kindSize(k).inTokens * FIXTURE_MARGIN) + (maxTokens ?? BUDGETS[k]); };
+
+// Tiers that are NOT tested for now, with their ledger reason. `--include-tier` lifts one (dollar caps still apply).
+export const TIER_EXCLUSION = Object.freeze({ paid: "paid-tier", "free-deposit": "deposit-tier", management: "management-tier", subscription: "relay-by-provenance" });
+export const LIFTABLE_TIERS = Object.freeze(["paid", "free-deposit", "management"]);
+export const DEEP_TIERS = Object.freeze(["paid", "free-deposit"]);               // the only tiers a deep lift can name: management is never probed
+export const DEEP_REASON = NOT_FREE_REASON;
+
+/**
+ * The ONLY way to unlock the deep levels (everything above L2) for a tier that is not `free`: a frozen capability, handed out only when ALL of these hold, else `{ok: false, missing}`:
+ * `--include-tier paid[,free-deposit]`, an explicit `--levels` that lists a deep level, `--live`, an explicit `--max-spend`, and the per-tier cost estimate already printed. It cannot be
+ * had from an environment variable, a config file, or the incremental and onboarding entry points (they never call this). `probeModel` accepts nothing else.
+ */
+export function liftDeepProbes({ includeTiers = [], levelsExplicit = false, levels = [], live = false, maxSpendExplicit = false, printed = false } = {}) {
+  const tiers = includeTiers.filter((t) => DEEP_TIERS.includes(t));
+  const missing = [];
+  if (!tiers.length) missing.push("--include-tier paid[,free-deposit]");
+  if (!(levelsExplicit && levels.length)) missing.push("an explicit --levels that lists the levels to run");
+  if (!live) missing.push("--live");
+  if (!maxSpendExplicit) missing.push("an explicit --max-spend");
+  if (!printed) missing.push("the printed per-tier cost estimate");
+  if (missing.length) return { ok: false, missing };
+  const lift = Object.freeze({ tiers: Object.freeze([...tiers]) });
+  LIFTS.add(lift);
+  return { ok: true, lift };
+}
+
+/**
+ * Applies the free-keys-only rule to a queue: an entry whose provider tier is not `free` (and not lifted) is dropped ENTIRELY (no level, not L1 or L2 either), listed in
+ * `clamped` and counted (`byTier`, an unlabelled provider counts as `unlabelled`). Nothing is an error. The engine refuses such a model on its own; this is what the plan,
+ * the estimate and the ledger show.
+ */
+export function clampDeep(entries, { tierOf = (e) => e.tier ?? null, lift = null } = {}) {
+  const out = [], byTier = {};
+  let models = 0;
+  for (const e of entries) {
+    if (deepAllowed(tierOf(e), lift)) { out.push(e); continue; }
+    models += 1; const t = tierOf(e) ?? "unlabelled"; byTier[t] = (byTier[t] ?? 0) + 1;
+  }
+  return { entries: out, clamped: { models, byTier } };
+}
+
+/**
+ * The probe set restricted to the providers whose key tier is `free` (or a lifted tier): the owner's rule is that only free-labelled providers are probed for tools at all. The others
+ * (paid, free-deposit, management and any provider with no tier) are moved to `notFree` with their tier and counted: `byTier` counts the probe-ok models of the whole set by tier
+ * (`unlabelled` for no tier), `notFree` is what was left out. The relay keeps its own handling (`relay`). Pure.
+ */
+export function restrictToFree(set, tiers, lift = null) {
+  const byTier = {}, notFree = [], models = [];
   for (const e of set.models) {
-    if (taken.has(e.key)) continue;
-    const row = rows.get(e.key);
-    excluded.push({ key: e.key, reason: !row ? "outside-toggles" : !(row.c > 0) ? "ctx-unknown" : "ctx-below-floor" });
+    const tier = isTier(tiers?.[e.provider]) ? tiers[e.provider] : null;
+    byTier[tier ?? "unlabelled"] = (byTier[tier ?? "unlabelled"] ?? 0) + 1;
+    if (deepAllowed(tier, lift)) models.push(e); else notFree.push({ key: e.key, provider: e.provider, tier });
   }
+  return { ...set, models, notFree, byTier };
+}
+
+/**
+ * The union of every preset's allowed set, computed offline with the policy funnel over the snapshot rows: dynamic (any context, 1M only) and `free` in each
+ * of its three scopes (any context, 1M only). `inherit` allows only the main model, so it adds no list. Returns `{keys: Set|null, note}`: `keys` is null with a
+ * note when the funnel cannot be run (the priority queue then has no second level and says so).
+ */
+export function presetUnion({ snap, bench, tiers, nowMs = Date.now() }) {
+  const base = { source: "all-providers", unverified: "allow-warn", allow: [] };
+  const presets = [{ mode: "dynamic", freeScope: "providers", ctx: "any" }, { mode: "dynamic", freeScope: "providers", ctx: "1m" },
+    ...["models", "providers", "providers+deposit"].flatMap((freeScope) => ["any", "1m"].map((ctx) => ({ mode: "free", freeScope, ctx })))];
+  try {
+    const keys = new Set();
+    for (const p of presets) {
+      const res = funnel({ rows: snap?.rows ?? [], bench, nowMs, providers: null, tiers, toolFidelity: null, aliasValues: {}, defaultModel: null }, { ...base, ...p });
+      for (const m of res.models ?? []) keys.add(m.s);
+    }
+    return { keys, note: `${presets.length} presets` };
+  } catch (e) { return { keys: null, note: `the preset sets could not be computed offline (${e?.message ?? e}); priority level 2 is empty` }; }
+}
+
+/**
+ * The models the L3 step (and L4 and the big step) targets: EVERY probe-ok model on a free-tier provider, whether or not its context is known. Excluded with a
+ * ledger reason: `paid-tier`, `deposit-tier`, `management-tier`, `relay-by-provenance` (the relay and any subscription tier), `tier-unknown` (no registry tier), and
+ * `ctx-too-small-for-fixture` (a KNOWN context too small for the ~157 KB fixture, `ctxNeededFor`). `includeTiers` are the LIFTED tiers (from `liftDeepProbes`); a tier that was only
+ * `requestedTiers` stays out with the reason `deep-probes: not-free-tier`. Owner pins (`pins`) are
+ * taken whatever their tier.
+ * ORDER is a priority queue, never a limit: 1 the compiled policy's allowed set with a known context of at least `floor`, and the pins (pins first); 2 the union of
+ * every preset's allowed set (`presetKeys`); 3 the other models with a known context of at least `floor`; 4 unknown context; 5 known context below `floor`. Inside a
+ * level, the policy's own rank (then the probe-set order). `set` is `probeSet(...)`. Returns `{entries (each with prio and tier), excluded, floor, pinned}`.
+ */
+export function selectCandidates({ set, policy, tiers = {}, includeTiers = [], requestedTiers = [], pins = [], floor = SUBSTITUTE_FLOOR, presetKeys = null, maxTokens = null }) {
+  const rank = new Map((policy?.models ?? []).map((m, i) => [m.s, { i, c: m.c }]));
+  const pinList = [...new Set(pins.map((p) => benchKey(...splitKey(p))))];
+  const byKey = new Set(set.models.map((e) => e.key));
+  const allowed = new Set(["free", ...includeTiers]);
+  const need = ctxNeededFor(3, maxTokens);
+  const entries = [], excluded = [];
+  set.models.forEach((e, order) => {
+    const tier = tiers?.[e.provider];
+    const pinIdx = pinList.indexOf(e.key);
+    {                                                                                // the tier rule holds for a pin too: only free-labelled providers are probed at all
+      if (!isTier(tier) || !allowed.has(tier)) { excluded.push({ key: e.key, reason: tier === "subscription" ? TIER_EXCLUSION.subscription : NOT_FREE_REASON, tier: isTier(tier) ? tier : null }); return; }
+    }
+    if (pinIdx < 0 && e.ctx > 0 && e.ctx < need) { excluded.push({ key: e.key, reason: "ctx-too-small-for-fixture" }); return; }
+    const row = rank.get(e.key);
+    const prio = pinIdx >= 0 || (row && Number.isFinite(row.c) && row.c >= floor) ? 1 : presetKeys?.has(e.key) ? 2 : e.ctx >= floor ? 3 : e.ctx > 0 ? 5 : 4;
+    // a key of tier `free` is free of charge only where the LISTING is too (no listed price, or price 0 / a free tag). A model with a LISTED price is costed at that price, so the row ceiling
+    // and the spend cap apply to it (`pricedOnFree`); the deep-probe rule still goes by the KEY tier (`tier`), not by this.
+    const listed = !e.free && (e.pin > 0 || e.pout > 0);
+    entries.push({ ...e, ...(tier === "free" && !listed ? { free: true } : {}), ...(tier === "free" && listed ? { pricedOnFree: true } : {}), tier: isTier(tier) ? tier : null, prio, ...(pinIdx >= 0 ? { pinned: true } : {}), _o: [prio, pinIdx >= 0 ? pinIdx : Infinity, row ? row.i : Infinity, order] });
+  });
+  entries.sort((a, b) => { for (let i = 0; i < 4; i++) if (a._o[i] !== b._o[i]) return a._o[i] < b._o[i] ? -1 : 1; return 0; });
+  for (const e of entries) delete e._o;
   for (const k of set.relay) excluded.push({ key: k, reason: "relay-by-provenance" });
-  return { entries, excluded, floor, pinned: [...pinSet].filter((p) => !byKey.has(p)) };
+  return { entries, excluded, floor, pinned: pinList.filter((p) => !byKey.has(p)) };
+}
+
+// ------------------------------------------------------------------ the stratified pilot (`--sample`)
+
+const REASONING_ID = /(^|[-_/:.])(r1|o1|o3|o4|qwq|magistral|gpt-oss)([-_/:.]|$)|think|reason/i;
+/** The stratum of a model for the pilot: reasoning or plain (from the id: the snapshot has no such flag), and the context class unknown, small (under 128,000) or large. */
+export const stratumOf = (e) => `${REASONING_ID.test(e.id) ? "reasoning" : "plain"}/${e.ctx > 0 ? (e.ctx >= SUBSTITUTE_FLOOR ? "large" : "small") : "unknown"}`;
+
+function rng(seed) {                                            // mulberry32 over a 32-bit hash of the seed text: the same seed gives the same sample on every machine
+  let h = 2166136261;
+  for (const c of String(seed)) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
+  let a = h >>> 0;
+  return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+const shuffled = (list, rand) => { const a = [...list]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+/**
+ * A deterministic stratified pilot: `n` free-tier models drawn across providers (a few each, in rounds: one per provider per round, so no provider is
+ * drawn twice before every provider once) and, inside a provider, across the strata reasoning or plain by context class, taking the least-used stratum
+ * first. The same `seed` gives the same models. Returns `{entries, strata}`; `strata` carries the counts a dry run prints.
+ */
+export function drawSample({ entries, n = 60, seed = 1 }) {
+  const rand = rng(seed);
+  const pool = entries.filter((e) => e.tier === "free");
+  const by = new Map();
+  for (const e of pool) { if (!by.has(e.provider)) by.set(e.provider, new Map()); const m = by.get(e.provider); const s = stratumOf(e); if (!m.has(s)) m.set(s, []); m.get(s).push(e); }
+  for (const m of by.values()) for (const [s, l] of m) m.set(s, shuffled(l, rand));
+  const order = shuffled([...by.keys()].sort(), rand), used = new Map(order.map((p) => [p, new Map()])), overall = new Map(), out = [];
+  while (out.length < n && order.some((p) => [...by.get(p).values()].some((l) => l.length))) {
+    for (const p of order) {
+      if (out.length >= n) break;
+      const live = [...by.get(p)].filter(([, l]) => l.length);
+      if (!live.length) continue;
+      // least used inside this provider first, then least used across ALL providers (so reasoning and plain, and every context class, are drawn in proportion), then by name
+      live.sort(([a], [b]) => (used.get(p).get(a) ?? 0) - (used.get(p).get(b) ?? 0) || (overall.get(a) ?? 0) - (overall.get(b) ?? 0) || (a < b ? -1 : 1));
+      const [s, l] = live[0];
+      out.push(l.shift());
+      used.get(p).set(s, (used.get(p).get(s) ?? 0) + 1);
+      overall.set(s, (overall.get(s) ?? 0) + 1);
+    }
+  }
+  const tally = (f) => { const o = {}; for (const e of out) o[f(e)] = (o[f(e)] ?? 0) + 1; return o; };
+  return { entries: out, strata: { n: out.length, of: pool.length, providers: new Set(out.map((e) => e.provider)).size, byProvider: tally((e) => e.provider),
+    byReasoning: tally((e) => stratumOf(e).split("/")[0]), byCtx: tally((e) => stratumOf(e).split("/")[1]), byStratum: tally(stratumOf) } };
+}
+
+/**
+ * The L3 failure rate among the models that PASSED L1 and L2, overall and per provider: `tested` have an L3 result (p or f), `failed` have f, `waiting` are
+ * passers with no L3 result yet (including a first strike). `rate` is failed over tested, or null with nothing tested. For the owner's decision on promoting L3/L4.
+ */
+export function l3Rates(store, keys) {
+  const per = new Map();
+  const blank = () => ({ passers: 0, tested: 0, failed: 0, waiting: 0 });
+  const all = blank();
+  for (const k of keys) {
+    const r = store[k];
+    if (!r || !r.lvr.startsWith("pp")) continue;
+    const prov = k.slice(0, k.indexOf("/"));
+    const p = per.get(prov) ?? blank();
+    per.set(prov, p);
+    for (const t of [p, all]) {
+      t.passers += 1;
+      if (r.lvr[2] === "p" || r.lvr[2] === "f") { t.tested += 1; if (r.lvr[2] === "f") t.failed += 1; } else t.waiting += 1;
+    }
+  }
+  const fin = (t) => ({ ...t, rate: t.tested ? t.failed / t.tested : null });
+  return { overall: fin(all), perProvider: Object.fromEntries([...per].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => [k, fin(v)])) };
+}
+
+// ------------------------------------------------------------------ the envelope: what the whole queue costs, and how many runs it takes
+
+/**
+ * What finishing a queue would cost at full depth, before any cap: its requests and input tokens, the cap per provider that would finish it in ONE run
+ * (`oneRunCap`: the largest provider total), the per-provider totals, and how many runs it takes at `cap` (every model assumed to complete; a model that
+ * alone costs more than the cap never runs: `neverRuns`). `rated` is `estimate(...).entries`.
+ */
+export function envelope(rated, cap = DEFAULT_TOKENS_PER_PROVIDER) {
+  const per = new Map();
+  let requests = 0, tokens = 0;
+  for (const e of rated) {
+    const p = per.get(e.provider) ?? { provider: e.provider, models: 0, requests: 0, tokens: 0 };
+    p.models += 1; p.requests += e.reqs; p.tokens += e.tin; per.set(e.provider, p);
+    requests += e.reqs; tokens += e.tin;
+  }
+  let runs = 0, rest = rated, neverRuns = 0;
+  while (rest.length && runs < 100000) {
+    const { kept, waiting, tooBig } = applyProviderCap(rest, cap);
+    neverRuns += tooBig.length;
+    if (!kept.length) { neverRuns += waiting.length; break; }
+    runs += 1; rest = waiting;
+  }
+  const perProvider = [...per.values()].sort((a, b) => b.tokens - a.tokens || (a.provider < b.provider ? -1 : 1));
+  return { models: rated.length, providers: per.size, requests, tokens, perProvider, oneRunCap: perProvider[0]?.tokens ?? 0, runs, neverRuns, cap };
 }
 
 // ------------------------------------------------------------------ the coverage ledger
@@ -561,8 +899,9 @@ export function assertPartition(universe, { tested, pending, excluded }) {
  * `provisional` models that failed once (a first strike is never reported as a failure), `stuck` models pending in `stuckRuns` or more runs in a row, and
  * `outdated` tested models whose record is against an older fixture (a `*`: re-sweep recommended, never automatic).
  */
-export function coverage(universe, store, { level = "l12", pending = {}, plan = {}, fixtureId = FIXTURE_ID, stuckRuns = 3, listCap = 10 } = {}) {
+export function coverage(universe, store, { level = "l12", pending = {}, plan = {}, fixtureId = FIXTURE_ID, stuckRuns = 3, listCap = 10, deepOk = () => true } = {}) {
   const tested = [], waiting = [], excluded = [], provisional = [], stuck = [], outdated = [];
+  const optional = { l4: 0, big: 0, sp: 0, er: 0 };
   for (const u of universe) {
     if (u.excluded) { excluded.push({ key: u.key, reason: u.excluded }); continue; }
     const r = store[u.key] ?? null;
@@ -571,7 +910,14 @@ export function coverage(universe, store, { level = "l12", pending = {}, plan = 
     const done = !!r && (level === "l12" ? r.lvr[0] !== "n" : r.lvr[2] === "p" || r.lvr[2] === "f" || confirmedFail);
     if (strike) provisional.push({ key: u.key, level: strike, why: r.why ?? "" });
     if (done) {
-      tested.push({ key: u.key, tier: compiledClass(r), evidence: `${r.lvr}${r.big ? ` big ${r.big}` : ""}${r.capBelow ? ` cap<${r.capBelow}` : ""}` });
+      tested.push({ key: u.key, tier: compiledClass(r), evidence: `${r.lvr}${r.big ? ` big ${r.big}` : ""}${r.capBelow ? ` cap<${r.capBelow}` : ""}${PF_FIELDS.filter((k) => r[k]).map((k) => ` ${k} ${r[k]}`).join("")}` });
+      // OPTIONAL levels do not block `tested`: they are counted while they have not run (only where deep probes are allowed, and only behind an L3 pass or a passed pair)
+      if (r.t !== "x" && r.lvr.startsWith("pp") && deepOk(u.key)) {
+        if (r.lvr[2] === "p" && r.lvr[3] === "n") optional.l4 += 1;
+        if (r.lvr[2] === "p" && r.big === undefined) optional.big += 1;
+        if (r.sp === undefined) optional.sp += 1;
+        if (r.er === undefined) optional.er += 1;
+      }
       if (r.fx !== fixtureId) outdated.push({ key: u.key, fx: r.fx });
       continue;
     }
@@ -586,7 +932,7 @@ export function coverage(universe, store, { level = "l12", pending = {}, plan = 
     level, total: universe.length, tested, pending: waiting, excluded,
     counts: { total: universe.length, tested: tested.length, pending: waiting.length, excluded: excluded.length,
               byTier: tally(tested, (e) => e.tier), byPending: tally(waiting, (e) => e.reason), byExcluded: tally(excluded, (e) => e.reason) },
-    provisional: cap(provisional), stuck: cap(stuck), outdated: cap(outdated),
+    provisional: cap(provisional), stuck: cap(stuck), outdated: cap(outdated), optional,
   };
 }
 
@@ -598,14 +944,16 @@ export function coverageLines(cov, label) {
   list("failed once (provisional, asked again, not yet x)", cov.provisional, (e) => `${e.key} L${e.level}`);
   list("pending too long", cov.stuck, (e) => `${e.key} ${e.reason} x${e.runs}`);
   list("against an older fixture (*, re-sweep recommended)", cov.outdated, (e) => `${e.key} ${e.fx}`);
+  const opt = Object.entries(cov.optional ?? {}).filter(([, n]) => n > 0).map(([k, n]) => `${k === "l4" ? "L4" : k === "sp" ? "spawn" : k === "er" ? "error-result" : k} ${n}`);
+  if (opt.length) L.push(`  optional levels not run yet among the ${c.tested} tested (they do not block being tested): ${opt.join(", ")}`);
   return L;
 }
 
 /** The two universes of the ledger: every listed model for L1+L2 (the not probe-ok, the invalid ids and the relay are excluded with their reason), and the L3 candidates with theirs. */
 export function ledgerUniverses({ set, cand = null }) {
-  const l12 = [...set.models.map((e) => ({ key: e.key })), ...set.relay.map((k) => ({ key: k, excluded: "relay-by-provenance" })),
+  const l12 = [...set.models.map((e) => ({ key: e.key })), ...(set.notFree ?? []).map((e) => ({ key: e.key, excluded: NOT_FREE_REASON })), ...set.relay.map((k) => ({ key: k, excluded: "relay-by-provenance" })),
     ...(set.notOkKeys ?? []).map((k) => ({ key: k, excluded: "not-probe-ok" })), ...(set.badKeys ?? []).map((k) => ({ key: k, excluded: "invalid-id" }))];
-  const l3 = cand ? [...cand.entries.map((e) => ({ key: e.key })), ...cand.excluded.map((e) => ({ key: e.key, excluded: e.reason }))] : null;
+  const l3 = cand ? [...cand.entries.map((e) => ({ key: e.key })), ...cand.excluded.map((e) => ({ key: e.key, excluded: e.reason })), ...(set.notFree ?? []).map((e) => ({ key: e.key, excluded: NOT_FREE_REASON }))] : null;
   return { l12, l3 };
 }
 
@@ -623,6 +971,28 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, now =
     const code = String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
     out[e.key] = { r: code, n: Math.min(9999, (out[e.key]?.n ?? 0) + 1), at: now.toISOString() };
   }
+  return out;
+}
+
+// ------------------------------------------------------------------ the one-line summary of a record
+
+/**
+ * Everything one record says, flat and ready to print or rank on: the class, the four-letter result, and each marker as `p` (passed), `f` (failed) or `n` (not run) so a caller never
+ * has to know which are stored where; `notes` lists the things a bare class hides (forced-only, L3 implied by the big step, where L3 failed, a size cap, a pending strike).
+ * `text` is the compact form: `pppp big+ sp+ af+ nm+ cc+ br+ er+` (+ passed, - failed, ? not run). Pure; the funnel may read `sp` and `af` from it later.
+ */
+export function summaryOf(rec) {
+  if (!rec) return null;
+  const m = (v) => (v === "p" || v === "f" ? v : "n");
+  const out = { class: rec.t, lvr: rec.lvr, l4: m(rec.lvr[3] === "n" ? undefined : rec.lvr[3]), big: m(rec.big), sp: m(rec.sp), af: m(rec.af), nm: m(rec.nm), cc: m(rec.cc), br: m(rec.br), er: m(rec.er), fc: m(rec.fc), d3: rec.d3 ?? null, capBelow: rec.capBelow ?? 0, notes: [] };
+  if (rec.fc === "p") out.notes.push("passed only when the tool call was forced: class t at best");
+  if (rec.d3 === "i") out.notes.push("L3 passed by implication (the big step passed first)");
+  if (rec.d3 === "a") out.notes.push("L3 failed at the constructs request (3a), before the 157 KB request");
+  if (rec.d3 === "b") out.notes.push("L3 failed at the 157 KB request (3b)");
+  if (rec.capBelow) out.notes.push(`refuses requests of about ${rec.capBelow} bytes and more`);
+  if (rec.strikes === 1) out.notes.push(`failed once at L${rec.sl}: asked again`);
+  const sym = (v) => (v === "p" ? "+" : v === "f" ? "-" : "?");
+  out.text = `${rec.lvr} big${sym(out.big)} sp${sym(out.sp)} af${sym(out.af)} nm${sym(out.nm)} cc${sym(out.cc)} br${sym(out.br)} er${sym(out.er)}`;
   return out;
 }
 

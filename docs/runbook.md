@@ -248,7 +248,23 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
 - **The three toggles.** Toggle 1 *source* (`--source same-provider|all-providers`: only main's
   own provider, or any provider). Toggle 2 *mode* (`--mode dynamic|inherit|free`: any model,
   main's own model, or free models only; with `free`, `--free-scope models|providers|providers+deposit`
-  says which models count as free). Toggle 3 *context* (`--ctx any|prefer-1m|1m`). Also
+  says which models count as free). Toggle 3 *context* (`--ctx any|128k|200k|256k|512k|1m|prefer-256k|prefer-512k|prefer-1m`: `any`
+  excludes nothing; `128k` to `1m` are hard floors that leave out every model with less known
+  context, unknown included; the `prefer-` values put models at or above that context first and
+  leave out nothing; the context the asked model has never raises the floor above the one you chose;
+  `set --dry yes`, `show`, `preset` and the wizard print how many rows pass each floor, each over
+  its own denominator, so you can pick one knowingly). A model whose context is unknown can pass
+  the 128k stand-in floor on the context of a same-name sibling (shown `c?`, never used for a higher
+  floor); safety, guard, embed, rerank, OCR, LoRA, moderation and under-4B models are never
+  candidates. A model that failed once in a tool test ranks below a clean one of its class. Inside
+  a rank band models are then ordered by the tool-test steps (big request, then L4), speed
+  quartile (of the rows in your set), context class (1M, 512k, 256k, 200k, 128k), price, and only
+  then by how recently the model was probed (live within 7 days, probe within 14 days, older: this
+  depends on the calendar, so it only breaks ties and never outranks speed or context); a hash of
+  the model id breaks the last ties, so no provider is favoured by its name. Models with a known tool failure (a filed issue) stay
+  out until a real tool test says otherwise; free models dropped on a rate-limit, timeout, empty or
+  network status of an old test are listed as waiting for a re-probe, not treated as dead
+  (`show --detail yes` names them). Also
   `--banded yes|no`, `--handoff-notice yes|no`, `--enforce shadow|enforce`, `--inject off|on`
   and `--allow provider/model`. The presets: `follow-main` (mode inherit), `any` (dynamic, all
   providers), `free` (free, all providers, free scope models: only models tagged free), `free-wide`
@@ -329,7 +345,12 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   answered with an error status; the gateway keeps only recent request rows (how long is not
   specified here; the observer notes in section 6 report roughly 1.5 hours on one machine, issue
   #134, not a guarantee), so older agents show as "no matching request". An unreadable log or snapshot is said in the report, never left out.
-  `--json yes` prints one JSON object whose shape is frozen (`schema` 1, a fixed key order, pinned
+  The report also prints "context growth", an estimate from the router's classifier log: for each
+  subagent, its largest later request divided by its first request, as a median, 90th percentile and
+  maximum over the n subagents with two or more counted requests; it measures the headroom a model
+  needs and changes nothing. `report` and `status` also say how many eligible models have no known
+  request-size limit, so the size check does nothing for them until a tool test records one.
+  `--json yes` prints one JSON object whose shape is frozen (`schema` 2, a fixed key order, pinned
   by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves
   helper calls alone, on a real headless Claude Code inside the isolated sandbox. `selftest --plan
@@ -1418,15 +1439,38 @@ requests per model through the gateway, the same way the bench does, with the re
 
 | Level | What the request asks | Passes when |
 |---|---|---|
-| L1 | one forced tool call | a well-formed `tool_use` with valid JSON arguments and the required argument comes back (a 400 that names `tool_choice` is retried once with the choice left to the model) |
-| L2 | a `tool_result` round trip | a final text answer comes back and the gateway returns no 400 |
-| L3 | the large synthetic fixture (about 157 KB, about 40,000 input tokens, awkward schema constructs included) | the request is accepted and answered |
-| L4 | two parallel tool calls, same fixture | two `tool_use` blocks with their own ids and valid, streamed arguments |
-| big | the same kind of fixture at about 400 KB (about 100,000 input tokens) | accepted and answered; asked only of a model that passed L3 |
+| L1 | one tool call, the choice left to the model (`tool_choice` auto), with awkward arguments (multi-line string, quotes, backslashes, unicode, an astral character, a nested JSON string, a boolean, an integer) | a well-formed `tool_use` whose arguments come back intact (argument fidelity, `af`). If auto yields no call, the same request is asked once with the call forced (`fc`): a model that only calls when forced is class `t` at best |
+| L2 | a `tool_result` round trip; the result is about 20 KB and the fact the answer needs is at its END (`br`) | a final text answer that uses the fact, and no 400 |
+| L3 | two requests: **3a** the constructs (a 58-character MCP-style tool name `nm`, a deep schema, `cache_control` on a tool `cc`; about 5 KB), then **3b** the large fixture (about 157 KB, about 40,000 input tokens, 44 tools) | 3a passes first; 3b is sent only after that. L3 passes when both are accepted and answered. A 3a pass alone is not an L3 pass |
+| L4 | two parallel tool calls, asked inside the 3b request | two `tool_use` blocks with their own ids and valid, streamed arguments |
+| big (5) | a fixture of about 400 KB (about 100,000 input tokens), `cache_control` on it | accepted and answered; a pass implies L3 (marked implied) |
+| L6 spawn | the `Agent` tool: `subagent_type` and a prompt | a well-formed call (`sp`); sent only after L1 and L2 passed; two strikes; a failure never lowers the class |
+| L7 error | a separate small request whose `tool_result` is `is_error` | the model reports the error and goes on (`er`) |
 
-L1 and L2 always run together. L3 and L4 are sent only to a model that passed L1 and L2, and only when you ask for them (`--levels 34`);
-the big step only to a model that passed L3 (`--levels 5`). A thinking block is not an answer: a reply that only thought and ran out of
-output budget says nothing about tools and is tried again later.
+L1 and L2 always run together. L3 and L4 are sent only to a model that passed L1 and L2 and only when you ask for them (`--levels 34`);
+the big step only to a model that passed L3 (`--levels 5`; `--order big-first` below). A thinking block is not an answer: a reply that
+only thought and ran out of output budget says nothing about tools and is tried again later.
+
+A provider that refuses `cache_control` with a 400 that names it is recorded `cc: f` (the model is not failed) and the request is asked
+again without it. A 400 that names the tool name is recorded `nm: f`.
+
+**Free keys only (owner rule).** Only providers whose key tier is `free` are probed for tools AT ALL, at ANY level, L1 and L2 included. Providers
+whose tier is `paid`, `free-deposit`, `management` or unknown are skipped entirely for now: they are not in the probe set, they get no request,
+no record and no pending entry, and the ledger lists them as `excluded: not-free-tier (skipped for now)`, counted per tier (never an error).
+The relay and any subscription tier stay `relay-by-provenance`. The rule is default-deny: an unlabelled provider, or a run with no tier data at
+all (no compiled policy, no `--tiers-file`), probes nothing. It is enforced in three layers so no entry point can get round it (candidates,
+`--sample`, `--only`, `--limit`, incremental, resume, `--retry-failed`, onboarding): the probe set is restricted to free-labelled providers
+when the plan is made (`restrictToFree`), the queue is filtered again (`clampDeep`), and the engine (`probeModel`) itself sends zero
+requests for a model whose tier is not free. A named model of a non-free provider is therefore not a way round it (`--only pb/b1` matches no
+probe-ok model; `--allow` pins follow the same rule). The dry run reports the probe-ok models by key tier, how many were skipped, and the probe
+set size.
+
+**Lifting the rule (the same lift for every level).** It can be lifted only when ALL of these hold at once: `--include-tier paid` (or
+`free-deposit`) names the tier, `--levels` is given explicitly, `--live` is given, the run printed the per-tier cost estimate, and
+`--max-spend` is given explicitly (the dollar caps are in force). A lifted tier is probed at exactly the levels listed, L1 and L2 included:
+lifting L1+L2 for the paid tier is the same lift as lifting the deep levels. Drop any one condition and the tier stays out of the probe set;
+the dry run prints what is still missing. Management is never probed, lifted or not. No environment variable, config file, incremental run or
+onboarding entry point lifts it.
 
 **What is stored (one record per `provider/id`, every field).**
 
@@ -1440,7 +1484,9 @@ output budget says nothing about tools and is tried again later.
 | `alias` | a pool alias such as `auto`: it keeps its digit but compiles no higher than `u`, because the model behind that id can change |
 | `big` | `p` or `f` for the 400 KB step; absent means not run. Not part of `lvr` |
 | `capBelow` | bytes: the provider REFUSED a request of about this size or larger (an observed upper bound). The compiler lowers the model's payload cap `pb` to it, so big requests skip the model and small subagents may still use it. Written only for a refusal about SIZE (413, a body naming size or context length, any refusal at the big step), never for a rate or tokens-per-minute limit |
-| `strikes`, `sl` | two strikes (below): the first failure at level `sl` (1 to 3) is provisional |
+| `strikes`, `sl` | two strikes (below): the first failure at level `sl` (1, 2, 3 or 6) is provisional |
+| `fc`, `af`, `nm`, `cc`, `br`, `er`, `sp` | one-letter `p` (passed) or `f` (failed) markers for the extra checks: `fc` L1 needed a forced call, `af` argument fidelity, `nm` long MCP name, `cc` cache_control accepted, `br` the fact at the end of the 20 KB result, `er` the error result, `sp` spawn. Kept OUT of `lvr`. They never change `lv`, `t`, `ok` except `fc`, which caps class `v` to `t`. `summaryOf(record)` in `refresh/tool-fidelity.mjs` turns a record into one printable line |
+| `d3` | which part of L3 failed: `a` (the constructs), `b` (the 157 KB request), `i` (inconclusive) |
 
 **Two strikes.** A first failure at L1, L2, or L3 for a reason that is not size does not make a model `x`. The record keeps what it was
 (a model never tested stays untested, a model that passed keeps its class), remembers the strike, and the next ordinary run asks that
@@ -1453,21 +1499,78 @@ model gets no record and stays queued. A route that says it has no tool support 
 big step passed, then one that has not run it, then one that failed it; then the same for L4 (rank keys 4 and 5 of the explain output).
 `capBelow` lowers `pb`. Nothing else changes, and class `t` and `u` rows are not reordered by these keys.
 
-**Candidates: which models get the large requests.** L1 and L2 go to every probe-ok model with no result (the ordinary run). L3, and the
-400 KB step for the models that pass L3, go to every model the router could ever pick, not to the top 3 of each provider (that is the
-router's spread, not a test boundary). `--candidates policy` builds that set from the compiled policy (`state/subagent/policy.json`, or
-`--policy-file` for a fixture): its ALLOWED set with a known context of at least 128,000 (the substitute floor), plus the models you pin
-with `--allow provider/model,...` (pins come first and need neither the context nor a place in the toggles, only a probe-ok model). They
-are tested in the policy's own rank, best first; the per-provider token cap and the spend cap stop the run, and the untested tail stays
-queued for the next run (`pending: cap`). A candidate with no L1+L2 result is asked those first, in the same run. The default levels of
-this mode are 1, 2, 3 and 5 (`--levels` overrides). The dry run prints how many candidates there are and why the others are out
-(`ctx-below-floor`, `ctx-unknown`, `outside-toggles`, `relay-by-provenance`).
+**Candidates: which models get the large requests.** L1 and L2 go to every probe-ok model of a free-labelled provider with no result (the ordinary run). L3, L4 and
+the 400 KB step (for the models that pass L3) go, with `--candidates policy`, to EVERY probe-ok model on a FREE-tier provider (and only there: see the hard rule), whether or
+not its context length is known. The tier is the provider's key tier: the compiled policy's `tiers` map (`state/subagent/policy.json`, or
+`--policy-file` for a fixture) or `--tiers-file` (a `{provider: tier}` file, a policy, or the vault registry). Not tested for now, each
+with its ledger reason: `not-free-tier (skipped for now)` (paid, free-deposit, management and unlabelled providers: see the owner rule above) and
+`relay-by-provenance` (the relay and any subscription tier). `--include-tier paid[,free-deposit]` lifts an exclusion later (all five conditions); a
+lifted paid model is charged as listed and the bench's row ceiling and spend cap apply. A model with a LISTED price on a FREE-labelled provider is
+probed too (the provider's label governs, not the model's price) and is costed at that price under the same caps. Pins (`--allow provider/model,...`)
+follow the tier rule like everything else: they bypass only the context-size exclusion.
+
+*Size rules, so results stay meaningful.* A model whose KNOWN context is too small for the 157 KB fixture (about 39,000 tokens times 1.5
+for tokeniser differences, plus the answer budget: about 59,000) is out with `ctx-too-small-for-fixture`. The 400 KB step is skipped, and
+never recorded as a failure, when the known context is below 200,000 tokens (the dry run counts those). An unknown context is tested: a
+context-length refusal at the big step is a size cap, not a failure.
+
+*Order is a priority queue, never a limit.* Level 1: the compiled policy's allowed set with a known context of at least 128,000, plus
+the pins (pins first). Level 2: the union of every preset's allowed set (dynamic and free in each scope, any context and 1M only, computed
+offline with the policy funnel; if that cannot be computed the dry run says so and level 2 is empty). Level 3: other models with a known
+context of at least 128,000. Level 4: unknown context. Level 5: known context below 128,000. Inside a level, the policy's own rank. The
+per-provider token cap and the spend cap stop a run; the rest stays `pending: cap` and the next run picks it up. A candidate with no
+L1+L2 result is asked those first, in the same run. The default levels of this mode are 1 to 7 (`--levels` overrides; on a key that is not free the engine clamps to 1 and 2, see the hard rule).
+
+*The envelope.* The dry run prints the cost of the WHOLE queue at full depth before any cap (requests and input tokens, over how many of
+the probe-ok models and providers), the per-provider cap that would finish it in one run (the largest provider's total), how many runs it
+takes at the cap in force, and the smallest cap at which every model can run at all (a model that alone costs more than the cap never
+runs under it: a full-depth model is about 147,000 input tokens, so the default cap of 150,000 just fits one; pass
+`--tf-max-tokens-per-provider` to run more per provider). It also prints the cost of each request kind, the per-tier totals, the wall-time
+estimate (a range, from provider latency and the in-flight rule below) and how many runs the whole queue takes at the default caps.
+
+*The pilot.* `--sample [N]` (default 60; `--seed S`, default 1) draws a deterministic stratified pilot from the free-tier candidates: a
+few per provider, in rounds so no provider is drawn twice before every provider once, mixing reasoning and plain models (judged from the
+id: the snapshot has no such flag) and the context classes unknown, small (under 128,000) and large. It runs every level (L1 to L7; L4 rides in the 157 KB request), and the big step
+for the models that pass; it never samples the big step. The dry run prints the strata counts and the estimate (about 40,000 tokens per model for L1+L2+L3,
+the big step on top for passers); the report prints the L3 failure rate among the models that passed L1+L2, overall and per provider, so
+the decision on promoting L3 and L4 to every model can be made on data.
 
 ```bash
-node refresh/tool-fidelity-cli.mjs --candidates policy                                  # dry: the plan and both ledgers
-node refresh/tool-fidelity-cli.mjs --candidates policy --l3 yes --live --tf-max-tokens-per-provider 600000
-node refresh/tool-fidelity-cli.mjs --candidates policy --allow groq/some-model --l3 yes --live --tf-max-tokens-per-provider 600000
+node refresh/tool-fidelity-cli.mjs --candidates policy                                  # dry: the plan, the envelope and both ledgers
+node refresh/tool-fidelity-cli.mjs --sample                                              # dry: the 60-model pilot
+node refresh/tool-fidelity-cli.mjs --sample 60 --l3 yes --live --tf-max-tokens-per-provider 400000
+node refresh/tool-fidelity-cli.mjs --candidates policy --l3 yes --live --tf-max-tokens-per-provider 400000
+node refresh/tool-fidelity-cli.mjs --candidates policy --allow groq/some-model --l3 yes --live --tf-max-tokens-per-provider 400000
+node refresh/tool-fidelity-cli.mjs --candidates policy --include-tier paid                # dry: what the paid tier would add and cost
 ```
+
+**Safety limits and accounting (security round).**
+
+- *Request ceiling.* No model is sent more than 12 requests in one run, counted together across every level, retry, the forced fallback, the thinking-only escalation and the `cache_control` re-ask. Reaching it ends the model as `pending: request-cap` (never a verdict, never an error). The `cache_control` re-ask happens once, and only when the failing request actually carried the marker; a model recorded `cc f` starts with the markers off.
+- *Free key, listed price.* A free-tier KEY does not make a LISTED price free. A model with a listed price (price above 0 and no free tag) is costed at it, so `--max-row-cost` (default $0.10) and `--max-spend` apply: one over the ceiling is `pending: priced-over-row-cap` (counted, never an error) and `--max-row-cost` raises it. The deep-probe rule still goes by the key tier. The dry run prints how many free-keyed models carry a listed price, the dollars at full depth, and how many are over the ceiling. A free-keyed model with no listed price, or a free listing, costs nothing. The provider's label governs whether a model is probed; the model's price only governs what it costs.
+- *Which tier a provider has.* The same effective tier the policy compiler uses for the chosen key. The compiled policy's `tiers` map is the compiler's own answer (the default source). A `--tiers-file` holding the vault registry (an array of rows with `id`) is resolved the way the compiler resolves it: a management key is ignored when the provider has another; one key gives its tier; several keys give the tier of the key the OWNER CHOSE (`--key-choices-file`, a `{provider: key id}` file, the compiler's key-choices). Only where no choice resolves it (none recorded, or one that names no usable key) keys of one tier give that tier and keys of DIFFERENT tiers give the MOST RESTRICTIVE tier (management, subscription, paid, free-deposit, free); the provider is then listed as a fallback. The result never depends on the row order. A tier outside the vocabulary leaves the provider unlabelled (default-deny). The dry run shows, per provider with several keys, which key and tier was chosen and why, and lists the providers that fell back.
+- *Tier source and age.* The dry run and the report print where the tiers came from (the policy file or the tiers file), when it was compiled (or last modified) and how old that is, how many providers of the probe set the map does not cover (they count as not free), and a WARNING when the map is older than 2 days or covers too little.
+- *The lift preview.* `--include-tier` prints, in every run (dry too), what lifting would cost per tier as if `--live` were given. The lift counts that line as shown only when it is in the printed plan; without it the paid tier stays clamped.
+- *Spend.* Charged per request that was billed, from the usage the answer reported (the estimate when it did not): a part-finished level, an all-thinking answer and the larger-budget request asked after it count; a rate limit, a dead key or a server error cost nothing.
+- *Error bodies.* A refusal body is read in chunks and cancelled after 2 KB.
+- *File size cap.* When the state file passes its size cap the oldest records (models that left the catalogue first) are dropped; the report says how many and why.
+- *The side file.* When the final save fails the records go to `state/tool-fidelity.unsaved.json`. `node refresh/tool-fidelity-cli.mjs --merge-unsaved` counts what it holds (dry); with `--live` it takes the records the state file lacks or has older, saves under the lock and only then deletes the side file.
+
+**Scheduler and cost rules (every one measured, none lowers what is learned).**
+
+- *Small output budgets.* Each request kind asks for few tokens: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step and spawn. A reply cut by the budget is asked again once with 2048 (see below).
+- *Stream cut.* The stream is cancelled once every expected `tool_use` block is closed and the usage was seen; the dry run counts these as `cut early`.
+- *Timeouts.* 15 s for small requests, 60 s for the 157 KB request, 90 s for the 400 KB request (`--timeout-small`, `--timeout-157`, `--timeout-big`, in ms). A timeout is inconclusive, never a failure, and is counted.
+- *In flight.* One request at a time per provider for requests of 100 KB or more, otherwise two; eight in all. A 429 is retried after the `Retry-After` time (at most 60 s); three 429s in a row pause that provider for the rest of the run (pending `rate`).
+- *Canary.* The first request to each provider decides: an auth, payment or gone answer sends nothing more to that provider in this run (pending with that reason).
+- *No repeats.* A confirmed level is never sent again (the dry run and the ledger count it as done).
+- *Order.* `--order l3-first` (default) runs the 3a/3b pair and then the big step. `--order big-first` sends the big step first to a model with a known context of at least 200,000: a pass implies L3 (recorded `implied`), a failure then runs L3. The pilot report prints the expected cost of each order from the rates it measured.
+- *Telemetry.* The run prints, per request kind and per provider, actual input and output tokens and seconds against the estimate, the total wall time and a calibration line. It is printed, never stored.
+
+**Thinking-only answers.** A reply that only thought and stopped at `max_tokens` is inconclusive. The first time it happens for a model
+in a run, the same request is asked again once with 2048 tokens instead of its small budget (and that model's later levels use 2048). A pass after the
+bump is a normal verdict; the report counts the escalated models. Still empty after the bump, the model is `pending: reasoning-budget`,
+never failed.
 
 **Coverage ledger.** Every model of a step ends in exactly one terminal state, and the dry run and the end-of-run report print the counts
 with their denominators (`coverage L1+L2 ...` over every listed model, `coverage L3 ...` over the probe-ok models split into candidates
@@ -1482,8 +1585,12 @@ and excluded):
 `coverage()` in `refresh/tool-fidelity.mjs` builds the ledger and `assertPartition()` throws if a model is in no state, in two, or twice:
 a model dropped by a bug is a loud failure, never a smaller denominator. Three capped lists follow the counts: models that failed once
 (provisional, never reported as failed), models pending for `--pending-runs` runs in a row (default 3), and tested models whose record
-is against an older fixture (`*`, a re-sweep is recommended and never automatic). The run counts live in an optional `pending` object in
-`state/tool-fidelity.json` (`{ "provider/id": { r: reason, n: runs, at } }`); an entry goes away when the model gets a result.
+is against an older fixture (`*`, a re-sweep is recommended and never automatic). The run counts live in an optional top-level `pending` object in
+`state/tool-fidelity.json`: `"pending": { "provider/id": { "r": "rate", "n": 3, "at": "2026-10-05T10:00:00.000Z" } }`. `r` is a short code (`rate`, `pay`,
+`auth`, `timeout`, `error`, `gone`, `empty`, `reasoning-budget`, `request-cap`, `priced-over-row-cap`, `cap`, `spend`, `row-cost`, `not-run`; lower case, digits and hyphens, at most 24 characters), `n` the
+number of runs in a row (1 to 9999) in which the model was in the queue and ended untested, `at` the last of them. It is bookkeeping, not a result: an entry goes away
+when the model gets a result or waits on its second strike, entries of models that left the probe set are dropped, at most 5,000 are kept, it is counted in the
+file's size cap, and the ledger ignores the entry of a model that is tested.
 
 **Inheritance marks (data only; nothing reads them yet).** `inherited(key, store, catalog)` says what the records of OTHER providers imply
 for a model that has no result of its own, so a planner can decide how to show it. A pass never propagates as a pass.

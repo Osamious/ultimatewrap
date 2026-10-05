@@ -13,9 +13,11 @@ import {
   contiguous, outOfOrder, lvOf, classOf, compiledClass, cellOf, cleanFidelity, loadFidelity, saveFidelity, capRecords, renderFile, buildRecord, mergeRecord,
   probeSet, fidelityCounts, queueFor, failedLevels, selectOnly, limitEntries, estimate, paidFallback, applyProviderCap, flipDiff, requeueL3Failures, rankInV, payloadCapOf,
   capBelowFor, isProvisional, keyOk, REAL_FILE, FILE_NAME, KIND, MAX_FILE_BYTES, MAX_READ_BYTES,
+  summaryOf, liftDeepProbes, clampDeep, restrictToFree, coverage, coverageLines, orderCosts, wallEstimate, levelCosts,
 } from "../refresh/tool-fidelity.mjs";
 import { FIXTURE_ID } from "../refresh/tool-fidelity-fixture.mjs";
-import { funnel } from "../menu/subagent-funnel.mjs";
+import { kindsOf } from "../refresh/tool-fidelity-probe.mjs";
+import { funnel, fnv1a32 } from "../menu/subagent-funnel.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 import { loadBench } from "../menu/bench-data.mjs";
 import { compact, createLogWriter } from "../refresh/bench-store.mjs";
@@ -537,27 +539,34 @@ test("--only and --limit narrow like the bench: provider or provider/model; limi
 
 // ---------------------------------------------------------------- estimates and caps
 
-test("estimate: L1+L2 is 2 requests per model; L3 and L4 about 40,000 input tokens each, the big step about 100,000; free costs nothing; paid is priced in AND out", () => {
+test("estimate: L1+L2 is 2 requests per model (~5.5k tokens: the 20 KB result is in L2); L3 is two requests (3a + 3b, ~41k) and L4 rides in them; the big step is ~100k; free costs nothing; paid is priced in AND out", () => {
   const { snap, bench } = world();
   const set = probeSet(snap, bench);
   const q = queueFor(set, {});
   const e = estimate(q, { maxTokens: 512 });
   assert.equal(e.requests, 14, "2 requests x 7 models");
-  assert.ok(e.inTokens > 7 * 200 && e.inTokens < 7 * 400, `small requests: ${e.inTokens}`);
+  assert.ok(e.inTokens > 7 * 5000 && e.inTokens < 7 * 6200, `L1 (~320 tokens) + L2 (~5,200 with the 20 KB result): ${e.inTokens}`);
   assert.equal(e.paidModels, 3);
   const b1 = e.entries.find((x) => x.key === "pb/b1"), a1 = e.entries.find((x) => x.key === "fa/a1");
   assert.equal(a1.cost, 0);
-  assert.ok(Math.abs(b1.cost - ((b1.tin * 1 + 2 * 512 * 4) / 1e6)) < 1e-12, "input tokens x input price + output tokens x output price");
+  assert.ok(Math.abs(b1.cost - ((b1.tin * 1 + 2 * 512 * 4) / 1e6)) < 1e-12, "input tokens x input price + output tokens x output price (a maxTokens override applies to every request)");
   assert.ok(Math.abs(Object.values(b1.lc).reduce((a, b) => a + b, 0) - b1.cost) < 1e-12 && Object.keys(b1.lc).join() === "1,2", "the cost of each level is available, so a probe that stops part way can be charged for the levels it completed");
   const b3 = e.entries.find((x) => x.key === "pb/b3");
   assert.ok(Math.abs(b3.cost - ((b3.tin * 2 + 2 * 512 * 8) / 1e6)) < 1e-12, "an unpriced paid row is charged the HIGHEST listed paid price (2 in, 8 out here)");
   const done = Object.fromEntries(set.models.map((m) => [m.key, rec("ppnn")]));
-  const big = estimate(queueFor(set, done, [3, 4]), { maxTokens: 512 });
-  assert.equal(big.requests, 14);
-  assert.ok(big.inTokens > 14 * 37000 && big.inTokens < 14 * 42000, `L3 and L4: ${big.inTokens}`);
-  const bigStep = estimate(queueFor(set, Object.fromEntries(set.models.map((m) => [m.key, rec("pppn")])), [5]), { maxTokens: 512 });
+  const l3 = estimate(queueFor(set, done, [3, 4]), { fallback: null });
+  assert.equal(l3.requests, 14, "L3 is two requests per model, and L4 (parallel calls) rides in the 157 KB one: it adds none");
+  assert.ok(l3.inTokens > 7 * 40000 && l3.inTokens < 7 * 43000, `3a + 3b: ${l3.inTokens}`);
+  assert.ok(Object.values(l3.entries[0].lc).every((x) => x >= 0) && l3.entries[0].lc[4] === 0, "L4 has no cost of its own beside L3");
+  const only4 = estimate(queueFor(set, Object.fromEntries(set.models.map((m) => [m.key, rec("pppn")])), [4]));
+  assert.equal(only4.requests, 7, "L4 alone (L3 already passed) is one 157 KB request");
+  const bigStep = estimate(queueFor(set, Object.fromEntries(set.models.map((m) => [m.key, rec("pppn")])), [5]));
   assert.equal(bigStep.requests, 7);
   assert.ok(bigStep.sizes[5].inTokens > 95000 && bigStep.sizes[5].inTokens < 105000, `the big step: ${bigStep.sizes[5].inTokens}`);
+  const full = estimate([{ key: "fa/z", provider: "fa", id: "z", free: true, todo: [1, 2, 3, 4, 5, 6, 7] }]);
+  assert.ok(full.inTokens > 140000 && full.inTokens < 156000, `a fully tested model is about 150,000 input tokens: ${full.inTokens}`);
+  assert.equal(full.entries[0].reqs, 7, "L1, L2, 3a, 3b, big, spawn, error result");
+  assert.deepEqual(full.entries[0].kinds, ["1", "2", "2e", "3a", "3b", "5", "6"]);
 });
 
 test("the unpriced-row price is the highest listed paid price of the WHOLE probe set, so a narrowed run is charged like a full one", () => {
@@ -603,7 +612,7 @@ function compiled(records, rows, { unverified = "allow-warn", toolsOverride } = 
   const providers = names.map((name) => ({ name, enabled: true, models: rows.filter((r) => r.provider === name).flatMap((r) => r.models.map((m) => m.id)) }));
   const tiers = Object.fromEntries(names.map((n) => [n, n === "anthropic" ? "subscription" : "free"]));
   const bench = { get: () => ({ s: "ok", a: 1790699779, t: 400 }), isLive: () => false };
-  return funnel({ rows, bench, nowMs: 1790700000000, providers, tiers, toolFidelity: toolsOverride ?? { models } }, { source: "all-providers", mode: "dynamic", freeScope: "providers", ctx: "any", unverified, allow: [] });
+  return funnel({ rows, bench, nowMs: 1790700000000, providers, tiers, toolFidelity: toolsOverride !== undefined ? toolsOverride : { models } }, { source: "all-providers", mode: "dynamic", freeScope: "providers", ctx: "any", unverified, allow: [] });
 }
 const m = (id, over = {}) => ({ id, outModality: "chat", ctx: 200000, tools: true, pin: 0, pout: 0, badge: "FREE", ...over });
 
@@ -692,9 +701,16 @@ test("RANK inside v: big passed, then big not run, then big failed; then L4 the 
 
 test("with no tool-fidelity data the funnel's order and rank keys are as before (the new keys are constant 0 outside class v)", () => {
   const rows = [{ provider: "fa", keyId: "k.fa.free", models: [m("a"), m("b"), m("c")] }];
+  // a DIFFERENTIAL: no records, an absent fidelity file (null) and an empty one give the same order, rank keys and bands; and that order is the funnel own deterministic tie-break order
+  // (rows equal on every key are ordered by fnv1a32 of the selector, then the selector), so the new tool-fidelity keys add nothing outside class v
   const r = compiled({}, rows);
-  assert.deepEqual(r.models.map((x) => x.s), ["fa/a", "fa/b", "fa/c"]);
+  const absent = compiled({}, rows, { toolsOverride: null }), empty = compiled({}, rows, { toolsOverride: { models: {} } });
+  const sig = (x) => JSON.stringify({ s: x.models.map((y) => y.s), b: x.models.map((y) => y.b), g: x.models.map((y) => y.g), k: x.models.map((y) => x.groups.get(y.s).rk) });
+  assert.equal(sig(absent), sig(r), "an absent file is the same as no records");
+  assert.equal(sig(empty), sig(r), "an empty file is the same as no records");
+  assert.deepEqual(r.models.map((x) => x.s), ["fa/a", "fa/b", "fa/c"].sort((p, q) => fnv1a32(p) - fnv1a32(q) || (p < q ? -1 : 1)), "the order is the id-hash order of rows equal on every key");
   assert.deepEqual(r.models.map((x) => x.b), [0, 0, 0]);
+  for (const x of r.models) assert.deepEqual(r.groups.get(x.s).rk.slice(4, 7), [0, 0, 0], "strike, big step and L4 are constant 0 without tool-fidelity data");
 });
 
 test("flipDiff: the removed-model diff of tightening `unverified` names the models, the emptied providers and the count; it applies nothing", () => {
@@ -723,4 +739,191 @@ test("the plan's id series do not appear in any user-visible string of the libra
     const strings = [...src.replace(/^\s*\/\/.*$/gm, "").matchAll(/`([^`]*)`|"([^"\\]*)"/g)].map((x) => x[1] ?? x[2]).join("\n");
     assert.ok(!/\b(D-a[a-z]|QB-\d+|CQ\d|G[1-7]\b|cr-M\d|R[1-7]\b)/.test(strings), f);
   }
+});
+
+const U = (...keys) => keys.map((k) => ({ key: k }));
+
+// ---------------------------------------------------------------- the markers (fc, af, br, er, nm, cc, sp, d3), the deep-probe lift, the summary
+
+test("markers are kept OUT of lvr and never change the class, except `fc` p (L1 passed only when forced): class t at best", () => {
+  const all = run(null, { 1: { v: "p", af: "p" }, 2: { v: "p", br: "p" }, 3: { v: "p", nm: "p", cc: "p", bytes: 156800 }, 4: { v: "p", bytes: 156800 }, 5: { v: "p", bytes: 399700, cc: "p" }, 6: P, 7: P });
+  assert.deepEqual([all.lvr, all.t, all.af, all.br, all.nm, all.cc, all.er, all.sp, all.big], ["pppp", "v", "p", "p", "p", "p", "p", "p", "p"]);
+  assert.deepEqual(cleanFidelity(all), all);
+  const bad = run(null, { 1: { v: "p", af: "f" }, 2: { v: "p", br: "f" }, 3: { v: "p", nm: "f", cc: "f", bytes: 1 }, 6: F("no"), 7: F("no") });
+  assert.equal(bad.t, "v", "af, br, nm, cc and er failing do not lower the class");
+  assert.deepEqual([bad.af, bad.br, bad.nm, bad.cc, bad.er], ["f", "f", "f", "f", "f"]);
+  const forced = run(null, { 1: { v: "p", fc: "p", af: "p" }, 2: P, 3: { v: "p", bytes: 156800 } });
+  assert.deepEqual([forced.lvr, forced.t, forced.fc, forced.ok], ["pppn", "t", "p", true], "passed only when forced: t, not v");
+  assert.equal(classOf({ lvr: "pppp", fc: "p" }), "t");
+  assert.equal(classOf({ lvr: "ppnn", fc: "p" }), "t");
+  assert.equal(classOf({ lvr: "pppn", fc: "f" }), "v", "fc f is the L1 failure itself, not a cap on a pass");
+  const clean = run(forced, { 1: { v: "p", af: "p" } }, { now: at(1000) });
+  assert.deepEqual([clean.fc, clean.t], [undefined, "v"], "auto passes on a later probe: the forced-only mark clears and the class is clean");
+  assert.equal(cleanFidelity({ ...forced, t: "v" }), null, "the cleaner derives the cap too");
+  for (const k of ["fc", "af", "nm", "cc", "br", "er", "sp"]) { assert.equal(cleanFidelity({ ...all, [k]: "x" }), null, k); assert.equal(cleanFidelity({ ...all, [k]: "n" }), null, `${k}: absent means not run, never stored as n`); }
+  assert.equal(cleanFidelity({ ...all, d3: "z" }), null);
+  assert.ok(cleanFidelity({ ...all, d3: "i" }));
+});
+
+test("d3 says what decided L3: a (failed at 3a), b (failed at 3b), i (implied by the big step); a pass clears it", () => {
+  const a = run(rec("ppnn"), { 3: { v: "f", why: "[3a] HTTP 400: anyOf", kind: "schema", nm: "p", cc: "p" } });
+  assert.deepEqual([a.d3, a.strikes, a.sl, a.lvr], [undefined, 1, 3, "ppnn"], "first strike: provisional, nothing learned is kept");
+  const a2 = run(a, { 3: { v: "f", why: "[3a] HTTP 400: anyOf", kind: "schema", nm: "p", cc: "p" } }, { now: at(1000) });
+  assert.deepEqual([a2.d3, a2.t, a2.strikes, a2.nm, a2.cc, a2.why], ["a", "x", 2, "p", "p", "L3: [3a] HTTP 400: anyOf"]);
+  const b = run(rec("ppnn"), { 3: { v: "f", why: "[3b] HTTP 413", kind: "size", bytes: 156800 } });
+  assert.deepEqual([b.d3, b.capBelow, b.t], ["b", 150000, "t"]);
+  const imp = run(rec("ppnn"), { 3: { v: "p", implied: "big", bytes: 399700, cc: "p" }, 5: { v: "p", bytes: 399700 } });
+  assert.deepEqual([imp.lvr, imp.d3, imp.big, imp.t], ["pppn", "i", "p", "v"]);
+  const pass = run(imp, { 3: { v: "p", bytes: 156800 } }, { now: at(1000) });
+  assert.equal(pass.d3, undefined);
+  assert.deepEqual(cleanFidelity(imp), imp);
+});
+
+test("SPAWN (sl 6): a first failure is provisional (the record keeps what it was, class unchanged), the second confirms `sp` f, a pass clears the strike; it never lowers the class and never blocks another strike", () => {
+  const base = rec("pppp");
+  const first = run(base, { 6: F("no usable prompt") });
+  assert.deepEqual([first.strikes, first.sl, first.sp, first.t], [1, 6, undefined, "v"]);
+  assert.equal(isProvisional(first), true);
+  assert.deepEqual(cleanFidelity(first), first);
+  const second = run(first, { 6: F("no usable prompt") }, { now: at(1000) });
+  assert.deepEqual([second.strikes, second.sl, second.sp, second.t], [2, 6, "f", "v"], "confirmed: sp f, class still v");
+  const pass = run(first, { 6: P }, { now: at(1000) });
+  assert.deepEqual([pass.sp, pass.strikes], ["p", undefined]);
+  const busy = run(rec("ppnn", { strikes: 1, sl: 3 }), { 6: F("x") });
+  assert.deepEqual([busy.strikes, busy.sl, busy.sp], [1, 3, undefined], "the strike slot is taken by the L3 strike: the spawn failure is dropped, not recorded");
+  const classStrike = run(base, { 3: F("[3a] anyOf", "schema"), 6: F("x") });
+  assert.deepEqual([classStrike.strikes, classStrike.sl, classStrike.sp], [1, 3, undefined], "a class-level strike in the same probe wins the slot");
+  assert.equal(run(null, { 6: P }), null, "spawn alone is a result (it ran), but a model with no L1+L2 result is never asked it (queue)");
+});
+
+test("a provisional class-level strike keeps EVERY marker as it was: nothing learned in a probe that is not confirmed is written", () => {
+  const prior = rec("pppn", { af: "p", br: "p", nm: "p", cc: "p", er: "p" });
+  const prov = run(prior, { 1: { v: "f", why: "no call", af: undefined, fc: "f" }, 2: { v: "p", br: "f" } });
+  assert.deepEqual([prov.strikes, prov.sl, prov.af, prov.br, prov.fc, prov.lvr], [1, 1, "p", "p", undefined, "pppn"]);
+});
+
+test("er and br: the error-result answer and the end-of-result fact are plain markers from their own requests", () => {
+  const r = run(rec("ppnn"), { 7: P });
+  assert.equal(r.er, "p");
+  assert.equal(run(rec("ppnn"), { 7: F("empty") }).er, "f", "a failed error-result case is recorded at once: it is not a class level, so no strike");
+  assert.equal(run(rec("ppnn", { er: "p" }), { 2: { v: "p", br: "f" } }, { now: at(1000) }).br, "f");
+});
+
+test("summaryOf: the class, the four letters and every marker as p / f / n, with the notes a bare class hides; the text is compact", () => {
+  const r = rec("pppp", { big: "p", sp: "p", af: "f", nm: "p", cc: "p", br: "p", er: "p", fc: "p", d3: "i", capBelow: 390000 });
+  const s = summaryOf(r);
+  assert.deepEqual([s.class, s.lvr, s.l4, s.big, s.sp, s.af, s.nm, s.cc, s.br, s.er, s.fc, s.d3], ["t", "pppp", "p", "p", "p", "f", "p", "p", "p", "p", "p", "i"]);
+  assert.equal(s.text, "pppp big+ sp+ af- nm+ cc+ br+ er+");
+  assert.ok(s.notes.some((n) => /only when the tool call was forced/.test(n)) && s.notes.some((n) => /implication/.test(n)) && s.notes.some((n) => /390000/.test(n)));
+  const bare = summaryOf(rec("ppnn"));
+  assert.deepEqual([bare.l4, bare.big, bare.sp, bare.af, bare.fc, bare.notes], ["n", "n", "n", "n", "n", []]);
+  assert.equal(bare.text, "ppnn big? sp? af? nm? cc? br? er?");
+  assert.equal(summaryOf(rec("nnnn", { strikes: 1, sl: 6 })).notes[0], "failed once at L6: asked again");
+  assert.equal(summaryOf(null), null);
+  assert.deepEqual(summaryOf(rec("ppfn", { d3: "a" })).notes, ["L3 failed at the constructs request (3a), before the 157 KB request"]);
+});
+
+test("queueFor, the new levels: spawn (6) and the error result (7) only of models that passed L1+L2 and have no result; a struck spawn is asked again; L4 alone only behind an L3 pass; nothing is re-sent", () => {
+  const set = { models: [{ key: "fa/a", provider: "fa", id: "a", free: true }] };
+  const all = [1, 2, 3, 4, 5, 6, 7];
+  assert.deepEqual(queueFor(set, {}, all).map((e) => e.todo), [[1, 2, 3, 4, 5, 6, 7]], "a fresh model: everything, in one run");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("ppnn") }, all).map((e) => e.todo), [[3, 4, 5, 6, 7]], "L1+L2 done: only what is missing");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("pppp", { big: "p", sp: "p", er: "p" }) }, all), [], "everything has a result: nothing is sent");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("pppn", { big: "p", sp: "p", er: "p" }) }, all).map((e) => e.todo), [[4]], "L4 alone, behind a passed L3");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("ppfn", { capBelow: 150000, sp: "p", er: "p" }) }, all), [], "L3 failed (size): L4 and the big step are not asked");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("pppp", { big: "p", er: "p", strikes: 1, sl: 6 }) }, all).map((e) => e.todo), [[6]], "the spawn that failed once is asked again");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("ffnn", { strikes: 2, sl: 1 }) }, all), [], "a confirmed failure: nothing deep, nothing re-sent");
+  assert.deepEqual(queueFor(set, {}, [6, 7]), [], "spawn and the error result for a model with no L1+L2 result are not asked");
+  assert.deepEqual(queueFor(set, { "fa/a": rec("ppnn") }, [6, 7]).map((e) => e.todo), [[6, 7]]);
+  assert.deepEqual(queueFor(set, { "fa/a": rec("pppp", { sp: "p" }) }, [6], { force: true }).map((e) => e.todo), [[6]], "--force asks again");
+  assert.deepEqual(queueFor(set, {}, [4]), [], "L4 alone with no L3 result: nothing");
+});
+
+test("liftDeepProbes needs ALL of: --include-tier, an explicit --levels, --live, an explicit --max-spend and the printed estimate; each missing one is named", () => {
+  const good = { includeTiers: ["paid"], levelsExplicit: true, levels: [1, 2, 3], live: true, maxSpendExplicit: true, printed: true };
+  assert.equal(liftDeepProbes(good).ok, true);
+  const gaps = { includeTiers: [[], "--include-tier"], levelsExplicit: [false, "explicit --levels"], levels: [[], "explicit --levels"], live: [false, "--live"], maxSpendExplicit: [false, "--max-spend"], printed: [false, "printed per-tier cost"] };
+  for (const [k, [bad, word]] of Object.entries(gaps)) {
+    const r = liftDeepProbes({ ...good, [k]: bad });
+    assert.equal(r.ok, false, k);
+    assert.ok(r.missing.some((m) => m.includes(word)), `${k}: ${r.missing.join("; ")}`);
+    assert.equal(r.lift, undefined, "no capability is handed out");
+  }
+  assert.equal(liftDeepProbes({}).ok, false);
+  assert.deepEqual(liftDeepProbes({}).missing.length, 5);
+  assert.deepEqual(liftDeepProbes({ ...good, includeTiers: ["management"] }).ok, false, "management can never be lifted");
+  assert.deepEqual(liftDeepProbes({ ...good, includeTiers: ["paid", "management", "free-deposit"] }).lift.tiers, ["paid", "free-deposit"]);
+});
+
+test("clampDeep drops EVERY level of a model that is not on a free tier (or lifted), counts them by tier (an unlabelled provider as `unlabelled`), and keeps the rest", () => {
+  const e = (key, tier, todo) => ({ key, provider: key.split("/")[0], tier, todo });
+  const q = [e("a/1", "free", [1, 2, 3, 5]), e("b/1", "paid", [1, 2, 3, 5]), e("c/1", undefined, [1, 2, 6]), e("d/1", "free-deposit", [3]), e("f/1", "management", [1])];
+  const c = clampDeep(q);
+  assert.deepEqual(c.entries.map((x) => [x.key, x.todo]), [["a/1", [1, 2, 3, 5]]], "nothing is left of the others, not even L1 or L2");
+  assert.deepEqual(c.clamped, { models: 4, byTier: { paid: 1, unlabelled: 1, "free-deposit": 1, management: 1 } });
+  const lifted = liftDeepProbes({ includeTiers: ["paid"], levelsExplicit: true, levels: [1, 2, 3], live: true, maxSpendExplicit: true, printed: true }).lift;
+  assert.deepEqual(clampDeep(q, { lift: lifted }).entries.map((x) => [x.key, x.todo]).filter(([k]) => k === "b/1"), [["b/1", [1, 2, 3, 5]]], "a lifted tier keeps every level it was asked; the others do not");
+  assert.equal(clampDeep(q, { lift: lifted }).clamped.byTier.paid, undefined);
+});
+
+test("restrictToFree: only providers whose key tier is free (or a lifted tier) stay in the probe set; the rest are listed with their tier and counted by tier, unlabelled included", () => {
+  const set = { models: [{ key: "a/1", provider: "a" }, { key: "a/2", provider: "a" }, { key: "b/1", provider: "b" }, { key: "c/1", provider: "c" }, { key: "d/1", provider: "d" }, { key: "e/1", provider: "e" }], relay: ["r/1"] };
+  const tiers = { a: "free", b: "paid", c: "free-deposit", d: "management" };
+  const r = restrictToFree(set, tiers);
+  assert.deepEqual(r.models.map((m) => m.key), ["a/1", "a/2"]);
+  assert.deepEqual(r.notFree.map((m) => [m.key, m.tier]), [["b/1", "paid"], ["c/1", "free-deposit"], ["d/1", "management"], ["e/1", null]]);
+  assert.deepEqual(r.byTier, { free: 2, paid: 1, "free-deposit": 1, management: 1, unlabelled: 1 });
+  assert.deepEqual(r.relay, ["r/1"], "the relay keeps its own handling");
+  assert.equal(restrictToFree(set, null).models.length, 0, "no tier data: nothing counts as free");
+  const lifted = liftDeepProbes({ includeTiers: ["paid"], levelsExplicit: true, levels: [1], live: true, maxSpendExplicit: true, printed: true }).lift;
+  assert.deepEqual(restrictToFree(set, tiers, lifted).models.map((m) => m.key), ["a/1", "a/2", "b/1"], "a lifted tier is in; management never is");
+  assert.equal(restrictToFree({ ...set, models: [{ key: "x/1", provider: "__proto__" }] }, tiers).models.length, 0, "a hostile provider name is just unlabelled");
+});
+
+test("coverage: OPTIONAL levels do not block `tested` but are counted while they have not run (only where deep probes are allowed); the evidence names the markers", () => {
+  const store = { "p/a": rec("pppp", { big: "p", sp: "p", er: "p", af: "p" }), "p/b": rec("pppn"), "p/c": rec("ppnn"), "p/d": rec("ppnn"), "p/x": rec("ffnn", { strikes: 2, sl: 1 }) };
+  const cov = coverage(U("p/a", "p/b", "p/c", "p/d", "p/x", "p/new"), store, { level: "l3", deepOk: (k) => k !== "p/d" });
+  assert.equal(cov.counts.tested, 3, "a, b and the confirmed failure x; p/c and p/d have L1+L2 but no L3 yet: pending, not tested, for the L3 ledger");
+  const t = Object.fromEntries(cov.tested.map((x) => [x.key, x.evidence]));
+  assert.equal(t["p/a"], "pppp big p af p er p sp p");
+  const l12 = coverage(U("p/a", "p/b", "p/c", "p/d", "p/x", "p/new"), store, { level: "l12", deepOk: (k) => k !== "p/d" });
+  assert.equal(l12.counts.tested, 5, "L1+L2 is the required level there: tested whatever the optional ones say");
+  assert.deepEqual(l12.optional, { l4: 1, big: 1, sp: 2, er: 2 }, "b: l4 big sp er; c: sp er (its L3 has not run, so no big); d is not deep-allowed: not counted; x failed: not counted; a is complete");
+  assert.match(coverageLines(l12, "L1+L2").join("\n"), /optional levels not run yet among the 5 tested \(they do not block being tested\): L4 1, big 1, spawn 2, error-result 2/);
+  assert.equal(coverage(U("p/a"), store, { level: "l12" }).optional.sp, 0);
+});
+
+test("orderCosts: expected input tokens per passer of l3-first and big-first from MEASURED rates; wallEstimate: a range, longer when requests are big or providers few; levelCosts: the per-level table", () => {
+  const oc = orderCosts({ r3: 0.9, rb: 0.8 });
+  assert.ok(Math.abs(oc.l3First - (oc.c3 + 0.9 * oc.cb)) < 1e-9 && Math.abs(oc.bigFirst - (oc.cb + (1 - 0.72) * oc.c3)) < 1e-9);
+  assert.ok(oc.bigFirst < oc.l3First, "most models pass both: big-first saves the 3a and 3b requests of every big passer");
+  assert.ok(orderCosts({ r3: 0.2, rb: 0.5 }).bigFirst > orderCosts({ r3: 0.2, rb: 0.5 }).l3First, "few pass L3: l3-first stops at L3 and never pays the 100k");
+  assert.equal(orderCosts({ r3: 0, rb: 0 }).l3First, orderCosts({ r3: 0, rb: 0 }).c3, "nobody passes L3: l3-first costs just 3a + 3b");
+  assert.equal(orderCosts({ r3: 2, rb: 0.5 }), null, "an impossible rate is refused");
+  const rated = (n, prov, todo) => Array.from({ length: n }, (_, i) => ({ key: `${prov}/${i}`, provider: prov, todo, kinds: kindsOf(todo) }));
+  const small = wallEstimate(rated(10, "a", [1, 2]), { concurrency: 8, perProvider: 2, latencyMs: 2000 });
+  const deep = wallEstimate(rated(10, "a", [1, 2, 3, 5]), { concurrency: 8, perProvider: 2, latencyMs: 2000 });
+  assert.ok(deep.lowSec > small.lowSec * 5, `big requests dominate: ${small.lowSec} -> ${deep.lowSec}`);
+  assert.equal(deep.highSec, deep.lowSec * 3);
+  const wide = wallEstimate([...rated(5, "a", [1, 2]), ...rated(5, "b", [1, 2]), ...rated(5, "c", [1, 2]), ...rated(5, "d", [1, 2])], { concurrency: 8, perProvider: 2, latencyMs: 2000 });
+  const narrow = wallEstimate(rated(20, "a", [1, 2]), { concurrency: 8, perProvider: 2, latencyMs: 2000 });
+  assert.ok(narrow.lowSec > wide.lowSec, "the same requests on one provider take longer than spread over four");
+  const lc = levelCosts();
+  assert.deepEqual(lc.map((x) => [x.level, x.requests]), [[1, 1], [2, 1], [3, 2], [5, 1], [6, 1], [7, 1]]);
+  assert.ok(lc.find((x) => x.level === 3).inTokens > 40000 && lc.find((x) => x.level === 5).inTokens > 95000 && lc.find((x) => x.level === 1).inTokens < 400);
+  assert.ok(lc.reduce((a, x) => a + x.inTokens, 0) > 140000 && lc.reduce((a, x) => a + x.inTokens, 0) < 156000, "a fully tested model: about 150,000");
+  assert.equal(levelCosts(100).find((x) => x.level === 1).outTokens, 100, "a --max-tokens override applies");
+});
+
+test("requeueL3Failures keeps the markers (af, br, er, sp, nm, cc, fc) of the record it resets", () => {
+  const store = { "fa/m": rec("ppfn", { capBelow: 150000, af: "p", br: "p", er: "p", sp: "p", nm: "p", cc: "p", d3: "b" }) };
+  const out = requeueL3Failures(store, "fa")["fa/m"];
+  assert.deepEqual([out.lvr, out.af, out.br, out.er, out.sp, out.nm, out.cc, out.capBelow, out.d3], ["ppnn", "p", "p", "p", "p", "p", "p", undefined, undefined]);
+});
+
+test("wallEstimate: with the default concurrency the whole run is bounded by 8 requests in flight, not by the slowest provider alone", () => {
+  const rated = Array.from({ length: 20 }, (_, i) => ({ key: `p${i}/m`, provider: `p${i}`, todo: [1, 2], kinds: kindsOf([1, 2]) }));
+  const one = wallEstimate(rated.slice(0, 1), { perProvider: 2, latencyMs: 2000 });
+  const all = wallEstimate(rated, { perProvider: 2, latencyMs: 2000 });
+  assert.ok(all.lowSec > one.lowSec * 4, `20 providers through 8 slots take about 2.5 times one provider's two requests per slot-pair: ${one.lowSec} -> ${all.lowSec}`);
 });

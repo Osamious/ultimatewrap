@@ -6,7 +6,7 @@ import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
-import { freshDir, fakeFetch, ev, stream, ok, http, goodModel, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { freshDir, fakeFetch, ev, stream, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, parseLevels, plan, printPlan, liveRefusal, runIncremental } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, saveFidelity, buildRecord, probeSet, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
@@ -35,7 +35,7 @@ function env(extra = {}) {
   fs.writeFileSync(benchFile, JSON.stringify({ schema: 1, models: { "fa/a1": { s: "ok", a: 1 } } }));
   const f = fakeFetch(extra.answer ?? goodModel);
   const deps = { ...w, outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"), gateway: { base: "http://gw.test", key: "k" }, fetch: f,
-    now: () => NOW, isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1, ...extra.deps };
+    now: () => NOW, isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1, tiers: { fa: "free", pb: "free" }, ...extra.deps };
   return { dir, deps, f, benchFile, out: deps.outFile, ...w };
 }
 async function run(argv, deps) {
@@ -48,13 +48,15 @@ async function run(argv, deps) {
 const probeCalls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
 const listing = (d) => fs.readdirSync(d).sort();
 
-test("arguments: levels parse as digits 1-5 once each (5 is the big step); caps are positive numbers; --l3 needs `yes`; an empty --only is refused", () => {
+test("arguments: levels parse as digits 1-7 once each (5 is the big step, 6 spawn, 7 the error result); caps are positive numbers; --l3 needs `yes`; an empty --only is refused", () => {
   assert.deepEqual(parseLevels("12"), [1, 2]);
   assert.deepEqual(parseLevels("4,3"), [3, 4]);
   assert.deepEqual(parseLevels("1+2+3+4"), [1, 2, 3, 4]);
   assert.deepEqual(parseLevels("5"), [5]);
   assert.deepEqual(parseLevels("354"), [3, 4, 5]);
-  for (const bad of ["", "6", "0", "112", "ab", "1 6"]) assert.equal(parseLevels(bad), null, JSON.stringify(bad));
+  assert.deepEqual(parseLevels("6"), [6]);
+  assert.deepEqual(parseLevels("7531"), [1, 3, 5, 7]);
+  for (const bad of ["", "8", "0", "112", "ab", "1 8"]) assert.equal(parseLevels(bad), null, JSON.stringify(bad));
   const o = parseArgs([]);
   assert.deepEqual([o.live, o.levels, o.tfMaxTokens, o.maxSpend, o.maxRowCost, o.force, o.l3], [false, [1, 2], 150000, 5, 0.1, false, false]);
   assert.ok(parseArgs(["--levels", "9"]).error);
@@ -80,7 +82,7 @@ test("DRY RUN (the default): prints the counts with denominators and the estimat
   assert.deepEqual(listing(e.dir), before, "no file or lock was created");
   assert.equal(sha(e.benchFile), hb);
   assert.match(r.out, /DRY RUN, nothing is sent/);
-  assert.match(r.out, /models: 8 probe-ok; 1 Anthropic relay model\(s\) not probed \(provenance: known good\); 7 in the probe set/);
+  assert.match(r.out, /models: 8 probe-ok; 1 Anthropic relay model\(s\) not probed \(provenance: known good\); 0 skipped for now because the provider's key tier is not free; 7 in the probe set \(free-labelled providers only\)/);
   assert.match(r.out, /with a record: 0 of 7; with a record against the current fixture: 0 of 7/);
   assert.match(r.out, /tools:false in the probe set: 1 of 7 .*probed like the rest/);
   assert.match(r.out, /context length unknown: 0 of 7 model\(s\) in the probe set/);
@@ -91,15 +93,21 @@ test("DRY RUN (the default): prints the counts with denominators and the estimat
   assert.ok(!/\b(D-a[a-z]|QB-\d+|CQ\d|G[1-7]\b)/.test(r.out), "plan ids are not user-visible");
 });
 
-test("DRY RUN with levels 3 and 4 prints the large-request estimate BEFORE anything is spent, and says what a live run needs", async () => {
-  const e = env();
+test("DRY RUN with levels 3 and 4 prints the per-request cost BEFORE anything is spent, leaves the paid-key provider out of the probe set altogether and says what a live run needs", async () => {
+  const e = env({ deps: { tiers: { fa: "free", pb: "paid" } } });
   saveFidelity(e.out, Object.fromEntries(probeSet(e.snapshot.snap, e.bench).models.map((m) => [m.key, buildRecord(null, { 1: { v: "p" }, 2: { v: "p" } }, { now: NOW })])), { now: NOW });
   const r = await run(["--levels", "34"], e.deps);
   assert.equal(r.code, 0);
-  assert.match(r.out, /requests 4 /, "the default per-provider cap of 150,000 input tokens fits 2 models of 2 large requests each, per provider");
-  assert.match(r.out, /whole queue, before the cap: 14 requests, ~5\d\dk input tokens/);
-  assert.match(r.out, /L3 and L4 each send ~15\d KB \(~39k input tokens\) per request/);
-  assert.match(r.out, /needs --l3 yes and --only/);
+  assert.match(r.out, /4 model\(s\) queued of 4/, "only the four free-tier models: the paid provider's three are not in the probe set at all");
+  assert.match(r.out, /3 skipped for now because the provider's key tier is not free \(paid 3\); 4 in the probe set/);
+  assert.match(r.out, /probe-ok models by key tier \(relay apart\): free 4, paid 3/);
+  assert.match(r.out, /requests 6 /, "the default per-provider cap of 150,000 input tokens fits 3 models of 2 requests (3a + 3b) each");
+  assert.match(r.out, /whole queue, before the cap: 8 requests, ~1\d\dk input tokens/);
+  assert.match(r.out, /L3 constructs \+ 157 KB \(\+L4 parallel\) 2 req ~4\dk in/);
+  assert.match(r.out, /output budgets: .*3b 256/);
+  assert.match(r.out, /timeouts: small 15 s, 157 KB 60 s, 400 KB 90 s/);
+  assert.match(r.out, /per tier this run: free 3 model\(s\)/);
+  assert.match(r.out, /needs --l3 yes and --only|deep levels need --l3 yes and --only/);
   assert.equal(e.f.calls.length, 0);
 });
 
@@ -107,10 +115,10 @@ test("the dry run's counts follow the store: with a record, against the CURRENT 
   const e = env();
   saveFidelity(e.out, { "fa/a1": record("ppnn"), "fa/a2": record("ffnn", { strikes: 2, sl: 1 }), "pb/b1": record("ppnn", { fx: "cc-tools-0" }) }, { now: NOW });
   const h = sha(e.out);
-  const r = await run(["--tf-max-tokens-per-provider", "600"], e.deps);
+  const r = await run(["--tf-max-tokens-per-provider", "12000"], e.deps);
   assert.match(r.out, /with a record: 3 of 7; with a record against the current fixture: 2 of 7; against an older fixture: 1 \(a recommendation to re-sweep, not queued\)/);
   assert.match(r.out, /4 model\(s\) queued of 7/);
-  assert.match(r.out, /3 fit the per-provider cap of 600 input tokens, 1 wait for the next run|\d fit the per-provider cap of 600/);
+  assert.match(r.out, /\d fit the per-provider cap of 12,000 input tokens/);
   assert.equal(sha(e.out), h, "the dry run did not touch the store");
 });
 
@@ -154,7 +162,7 @@ test("--live L1+L2: every probe-ok model gets a record, the relay does not, noth
   const s = loadFidelity(e.out);
   assert.equal(s.ok, true);
   assert.deepEqual(Object.keys(s.models).sort(), ["fa/a1", "fa/a2", "fa/a3", "fa/auto", "pb/b1", "pb/b2", "pb/b3"]);
-  for (const rec of Object.values(s.models)) assert.deepEqual([rec.lvr, rec.t, rec.ok, rec.fx], ["ppnn", "t", true, "cc-tools-1"]);
+  for (const rec of Object.values(s.models)) assert.deepEqual([rec.lvr, rec.t, rec.ok, rec.fx], ["ppnn", "t", true, "cc-tools-2"]);
   assert.equal(s.models["fa/auto"].alias, true, "a pool alias is marked");
   assert.equal(s.models["fa/a3"].t, "t", "the tools:false model passed and is recorded as it behaved");
   assert.equal(s.generatedAt, NOW.toISOString());
@@ -193,7 +201,7 @@ test("a record against an OUTDATED fixture is NOT re-queued by a run (its `*` is
   const f = await run(["--live", "--force", "--only", "fa/a1"], e.deps);
   assert.equal(f.code, 0, f.err);
   assert.equal(probeCalls(e.f).length, 2);
-  assert.equal(loadFidelity(e.out).models["fa/a1"].fx, "cc-tools-1", "re-swept: now against the current fixture");
+  assert.equal(loadFidelity(e.out).models["fa/a1"].fx, "cc-tools-2", "re-swept: now against the current fixture");
   assert.equal(loadFidelity(e.out).models["fa/a2"].fx, "cc-tools-0", "the others keep their older record");
 });
 
@@ -209,7 +217,7 @@ test("a model with a record is never re-probed by the incremental pass, whatever
 test("TWO STRIKES end to end: a first failure is provisional and asked again by the next run, the second CONFIRMS it as x; an account or rate failure is never recorded", async () => {
   const e = env({ answer: (c) => {
     const m = c.body.model;
-    if (m === "fa/a2") return c.body.tool_choice ? ok(stream(ev.text(0, "nope"), ev.stop())) : goodModel(c);
+    if (m === "fa/a2") return kindOf(c) === "1" || kindOf(c) === "1f" ? ok(stream(ev.text(0, "nope"), ev.stop())) : goodModel(c);
     if (m === "pb/b1") return http(402, "payment required");
     if (m === "pb/b2") return http(429, "slow down");
     return goodModel(c);
@@ -220,15 +228,18 @@ test("TWO STRIKES end to end: a first failure is provisional and asked again by 
   assert.match(s["fa/a2"].why, /^L1: answered in text/);
   assert.equal(s["pb/b1"], undefined, "402 is the account's state, not a verdict about the model");
   assert.equal(s["pb/b2"], undefined, "429 neither");
-  assert.ok(s["pb/b3"] && s["fa/a1"]);
+  assert.ok(s["fa/a1"]);
+  assert.equal(s["pb/b3"], undefined, "pb's canary (its first answer) was a 402: the rest of the provider is left alone, with ZERO further requests");
+  assert.equal(probeCalls(e.f).filter((c) => c.body.model.startsWith("pb/")).length, 1, "one request to pb in the whole run");
+  assert.match(r.out, /left alone for the rest of this run, their models stay pending: pb \(canary: pay\)/);
   assert.match(r.out, /failed once, asked again next run 1/);
   assert.match(r.out, /not recorded \(they stay queued; a refusal about the account is not a verdict on the model\): .*\b(pay|rate) \d/);
-  assert.match(r.out, /still queued 3\b/, "a2 (one strike), b1 and b2");
+  assert.match(r.out, /still queued 4\b/, "a2 (one strike) and the three pb models");
   const second = await run(["--live", "--only", "fa"], e.deps);
   assert.equal(second.code, 0, second.err);
   s = loadFidelity(e.out).models;
   assert.deepEqual([s["fa/a2"].lvr, s["fa/a2"].t, s["fa/a2"].ok, s["fa/a2"].strikes], ["fpnn", "x", false, 2], "second strike at the same level: confirmed");
-  assert.deepEqual(probeCalls(e.f).filter((c) => c.body.model === "fa/a2").length, 4, "a2: 2 requests per run, 2 runs");
+  assert.deepEqual(probeCalls(e.f).filter((c) => c.body.model === "fa/a2").length, 6, "a2: L1, the forced L1 and L2 per run, 2 runs");
   e.f.calls.length = 0;
   const third = await run(["--live", "--only", "fa"], e.deps);
   assert.match(third.out, /nothing to probe/, "a confirmed failure is not asked again by an ordinary run");
@@ -248,34 +259,44 @@ test("FREE TIER FIRST: every free-model request is sent before any paid-model re
 
 test("the per-provider token cap: a provider stops at the cap, the rest wait for the next run, and the next run continues where it stopped", async () => {
   const e = env();
-  const r = await run(["--live", "--tf-max-tokens-per-provider", "600"], e.deps);
+  const r = await run(["--live", "--tf-max-tokens-per-provider", "12000"], e.deps);
   assert.equal(r.code, 0, r.err);
   const first = Object.keys(loadFidelity(e.out).models).sort();
-  assert.deepEqual(first, ["fa/a1", "fa/a2", "pb/b1", "pb/b2"], "2 models (574 tokens) per provider fit 600; the next one of each does not");
-  assert.match(r.out, /3 model\(s\) waited for the per-provider cap of 600 input tokens: run again to continue/);
-  const r2 = await run(["--live", "--tf-max-tokens-per-provider", "600"], e.deps);
+  assert.deepEqual(first, ["fa/a1", "fa/a2", "pb/b1", "pb/b2"], "2 models (about 5,500 tokens each: L1 and L2 with the 20 KB result) per provider fit 12,000; the next one of each does not");
+  assert.match(r.out, /3 model\(s\) waited for the per-provider cap of 12,000 input tokens: run again to continue/);
+  const r2 = await run(["--live", "--tf-max-tokens-per-provider", "12000"], e.deps);
   assert.equal(r2.code, 0, r2.err);
   assert.deepEqual(Object.keys(loadFidelity(e.out).models).sort(), ["fa/a1", "fa/a2", "fa/a3", "fa/auto", "pb/b1", "pb/b2", "pb/b3"], "covered over two runs");
   assert.equal(probeCalls(e.f).length, 14, "no model was asked twice across the runs");
 });
 
-test("L3 and L4 on named models: --l3 yes --only; L4 passing with L3 failing writes lvr ppfp and the file compiles it as `t`", async () => {
-  const e = env({ answer: (c) => (c.bytes > 150000 && !/twice/.test(String(c.body.messages[0].content)) ? http(413, "request entity too large") : goodModel(c)) });
+test("L3 on a named FREE-tier model: --l3 yes --only; a size refusal at the 157 KB request writes lvr ppfn, class t, a payload cap and d3 b; L1 and L2 are not asked again", async () => {
+  const e = env({ answer: (c) => (c.bytes > 150000 ? http(413, "request entity too large") : goodModel(c)) });
   const first = await run(["--live"], e.deps);
   assert.equal(first.code, 0);
   e.f.calls.length = 0;
   const r = await run(["--live", "--levels", "34", "--l3", "yes", "--only", "fa/a1"], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
   const calls = probeCalls(e.f);
-  assert.deepEqual(calls.map((c) => c.body.model), ["fa/a1", "fa/a1"]);
-  assert.ok(calls.every((c) => c.bytes > 150000), "both are the large fixture; L1 and L2 were not asked again");
+  assert.deepEqual(calls.map((c) => [c.body.model, c.bytes > 100000 ? "3b" : "3a"]), [["fa/a1", "3a"], ["fa/a1", "3b"]], "the constructs request, then the 157 KB one; L4 rides in the latter");
   const rec = loadFidelity(e.out).models["fa/a1"];
-  assert.equal(rec.lvr, "ppfp");
-  assert.equal(rec.t, "t", "compiles as t");
-  assert.equal(rec.lv, 1);
-  assert.match(rec.why, /^L3: HTTP 413/);
-  assert.ok(rec.maxBytes > 150000);
+  assert.deepEqual([rec.lvr, rec.t, rec.lv, rec.capBelow, rec.d3, rec.nm, rec.cc], ["ppfn", "t", 1, 150000, "b", "p", "p"]);
+  assert.match(rec.why, /^L3: \[3b\] HTTP 413/);
   assert.equal(loadFidelity(e.out).models["fa/a2"].lvr, "ppnn", "the other models are untouched");
+});
+
+test("a construct rejection at 3a is the schema verdict: two strikes make it x, and the 157 KB request is NEVER sent", async () => {
+  const e = env({ answer: (c) => (c.bytes > 3000 && c.bytes < 12000 ? http(400, "tools.0.input_schema: unsupported keyword anyOf") : goodModel(c)) });
+  await run(["--live"], e.deps);
+  e.f.calls.length = 0;
+  const args = ["--live", "--levels", "34", "--l3", "yes", "--only", "fa/a1"];
+  await run(args, e.deps);
+  assert.deepEqual([loadFidelity(e.out).models["fa/a1"].strikes, loadFidelity(e.out).models["fa/a1"].lvr], [1, "ppnn"]);
+  await run(args, e.deps);
+  const rec = loadFidelity(e.out).models["fa/a1"];
+  assert.deepEqual([rec.lvr, rec.t, rec.strikes, rec.d3], ["ppfn", "x", 2, "a"]);
+  assert.ok(probeCalls(e.f).every((c) => c.bytes < 12000), "no 157 KB request in either run");
+  assert.equal(probeCalls(e.f).length, 2);
 });
 
 test("L3 and L4 are not sent to a model that failed L1 or L2 (it costs no 40,000 tokens), even when named", async () => {
@@ -336,23 +357,29 @@ test("an interrupted run keeps what finished: records written so far are saved a
 test("runIncremental: the function a scheduler can call: the queue is the probe-ok models with no record, inside the per-provider cap", () => {
   const { snapshot, bench } = world();
   const store = { "fa/a1": record("ppnn"), "pb/b1": record("ffnn", { strikes: 2, sl: 1, fx: "cc-tools-0" }) };
-  const r = runIncremental({ snap: snapshot.snap, bench, store });
+  const tiers = { fa: "free", pb: "free" };
+  assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store }).queue, [], "default-deny: with no tier data nothing is probed");
+  assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store, tiers: { fa: "free", pb: "paid" } }).queue.map((e) => e.key).sort(), ["fa/a2", "fa/a3", "fa/auto"], "a paid-key provider is not probed at all, not even L1+L2");
+  const r = runIncremental({ snap: snapshot.snap, bench, store, tiers });
   assert.deepEqual(r.queue.map((e) => e.key).sort(), ["fa/a2", "fa/a3", "fa/auto", "pb/b2", "pb/b3"]);
   assert.equal(r.counts.withRecord, 2);
   assert.deepEqual(r.queue.map((e) => e.todo.join()), r.queue.map(() => "1,2"));
-  const capped = runIncremental({ snap: snapshot.snap, bench, store, tfMaxTokens: 400 });
-  assert.equal(capped.queue.length, 2, "one model per provider fits 400 tokens");
+  const capped = runIncremental({ snap: snapshot.snap, bench, store, tiers, tfMaxTokens: 6000 });
+  assert.equal(capped.queue.length, 2, "one model per provider fits 6,000 tokens (a model is about 5,500)");
   assert.equal(capped.waiting.length, 3);
-  assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store: Object.fromEntries(probeSet(snapshot.snap, bench).models.map((m) => [m.key, store["fa/a1"]])) }).queue, []);
+  assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store: Object.fromEntries(probeSet(snapshot.snap, bench).models.map((m) => [m.key, store["fa/a1"]])), tiers }).queue, []);
 });
 
 test("plan, printPlan and liveRefusal are pure over their inputs", () => {
   const { snapshot, bench } = world();
   const o = parseArgs(["--levels", "34"]);
   const have = Object.fromEntries(probeSet(snapshot.snap, bench).models.map((m) => [m.key, record("ppnn")]));
-  const p = plan({ snap: snapshot.snap, bench, store: have, o });
+  const tiers = { fa: "free", pb: "free" };
+  const p = plan({ snap: snapshot.snap, bench, store: have, o, tiers });
   assert.equal(p.queued.length, 7);
-  assert.equal(plan({ snap: snapshot.snap, bench, store: {}, o }).queued.length, 0, "no L3 or L4 for a model with no L1+L2 result yet");
+  assert.equal(plan({ snap: snapshot.snap, bench, store: have, o }).queued.length, 0, "default-deny: with no tier data nothing deep is queued");
+  assert.equal(plan({ snap: snapshot.snap, bench, store: have, o, tiers: { fa: "free", pb: "paid" } }).queued.length, 4, "a paid-key provider is not in the probe set");
+  assert.equal(plan({ snap: snapshot.snap, bench, store: {}, o, tiers }).queued.length, 0, "no L3 or L4 for a model with no L1+L2 result yet");
   const text = printPlan(p, o);
   assert.match(text, /levels L3\+L4/);
   assert.match(liveRefusal(o, p), /--l3 yes/);

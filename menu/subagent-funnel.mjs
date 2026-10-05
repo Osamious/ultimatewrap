@@ -14,10 +14,60 @@ import { RELAY_KEY_ID, RELAY_TIER, freeScopeOf, isExcludedTier, isProvenanceVeri
 /** The free tag (I9): the token `free` delimited by `:`, `/`, `_`, `.`, `-` or an edge. Tested on the BARE id. */
 export const FREE_TAG = /(^|[:/_.-])free($|[:/_.-])/i;
 /** Provider-supplied ids are UNTRUSTED (cr-m3): a selector that fails this never reaches a list or injected text. */
-export const SELECTOR_RE = /^[A-Za-z0-9_./:@+~-]{1,64}$/;
+export const SELECTOR_MAX = 160;                               // sa-A10: 13 of 6,080 routes were rejected at the old 64-character cap; 160 is the router's own log-selector cap
+export const SELECTOR_RE = new RegExp(`^[A-Za-z0-9_./:@+~-]{1,${SELECTOR_MAX}}$`);
 export const SUBSTITUTE_FLOOR = 128000;
 export const ONE_M = 1000000;
 export const PAYLOAD_RISK_BYTES = 1000000;
+/** Measured in the live shadow (state/subagent/classify.jsonl, 2026-10-05; never read by a test): 337 classified subagent requests, 317 over 200 KB, 71 over 1 MB (sa-A1). */
+export const PAYLOAD_SAMPLE = Object.freeze({ n: 337, over200k: 317, over1m: 71 });
+const pct = (a, b) => Math.round((100 * a) / b);
+export const payloadSampleText = () => `${PAYLOAD_SAMPLE.over200k} of ${PAYLOAD_SAMPLE.n} classified subagent requests (${pct(PAYLOAD_SAMPLE.over200k, PAYLOAD_SAMPLE.n)}%) were over 200 KB and ${PAYLOAD_SAMPLE.over1m} (${pct(PAYLOAD_SAMPLE.over1m, PAYLOAD_SAMPLE.n)}%) over 1 MB`;
+
+// ---- toggle 3, the context toggle (D-bg, D-bk). A HARD floor excludes rows below it (an empty result is the empty-set refusal); a SOFT preference makes rows at or above it a higher band and
+// excludes nothing; `any` excludes nothing. Whatever the value, the substitute floor the router derives from the compiled `ctxHints` is capped at the toggle's own floor (128k for `any` and every
+// soft preference): the asked model's own context never raises it, the router's per-request token fit check does that work.
+export const CTX_FLOORS = Object.freeze({ "128k": 128000, "200k": 200000, "256k": 256000, "512k": 512000, "1m": ONE_M });
+export const CTX_PREFERS = Object.freeze({ "prefer-256k": 256000, "prefer-512k": 512000, "prefer-1m": ONE_M });
+export const CTX_VALUES = Object.freeze(["any", ...Object.keys(CTX_FLOORS), ...Object.keys(CTX_PREFERS)]);
+export const ctxSpec = (ctx) => ({ hard: Object.hasOwn(CTX_FLOORS, ctx) ? CTX_FLOORS[ctx] : 0, prefer: Object.hasOwn(CTX_PREFERS, ctx) ? CTX_PREFERS[ctx] : 0 });
+/** The substitute floor handed to the router through `ctxHints`: the hard floor, but never below the 128k substitute floor. */
+export const hintCapOf = (ctx) => Math.max(SUBSTITUTE_FLOOR, ctxSpec(ctx).hard);
+/** In-band ctx CLASSES (D-bh, D-bk): 0 >= 1M, 1 >= 512k, 2 >= 256k, 3 >= 200k, 4 >= 128k, 5 below or unknown. */
+export const CTX_CLASS_FLOORS = Object.freeze([[ONE_M, "1M"], [512000, "512k"], [256000, "256k"], [200000, "200k"], [SUBSTITUTE_FLOOR, "128k"]]);
+export const ctxClassOf = (c) => { const i = CTX_CLASS_FLOORS.findIndex(([v]) => c >= v); return i < 0 ? CTX_CLASS_FLOORS.length : i; };
+/** The printable name of a ctx value in a sentence: 1m is 1M, 256k stays 256k. */
+export const ctxLabel = (ctx) => (ctx === "1m" ? "1M" : ctx);
+/** TTFT quantile buckets (D-bh): the cut points are computed over the eligible set, so the buckets are equal-sized whatever the provider mix. 4 = no TTFT recorded. */
+export const TTFT_BUCKETS = Object.freeze(["fast", "ok", "slow", "very slow"]);
+
+// ---- non-agent ids (D-bi): safety classifiers, guards, embedders, rerankers, OCR, LoRA adapters and tiny (under 4B) models are never candidates, so no inference can make one a substitute
+const NON_AGENT_RE = /(^|[^a-z])(safety|safeguard|(nemo|ass)?guard|embed[a-z]*|rerank|reranker|ocr|lora|moderation|transcribe|nvclip|melotts|sentence-transformers)($|[^a-z])|(^|[^a-z0-9])(asr|tts|whisper|clip|colbert|bge|e5)($|[^a-z0-9])/i;   // embed[a-z]* covers embedding, embeddings, embeddinggemma, embedqa, embedcode; asr/tts/whisper are speech, clip/colbert/bge/e5 retrieval models
+const TINY_B_RE = /(^|[-_/:@])(\d+(?:\.\d+)?)b($|[-_/:@])/ig;
+export const TINY_MODEL_B = 4;
+/** `non-agent-model` or null, from the BARE id only (untrusted text, never executed). */
+export function nonAgentReason(bare) {
+  const id = String(bare);
+  if (NON_AGENT_RE.test(id)) return "non-agent-model";
+  for (const m of id.matchAll(TINY_B_RE)) if (Number(m[2]) < TINY_MODEL_B) return "non-agent-model";
+  return null;
+}
+
+// ---- known issues (sa-A6): a seed for rows that fail on a Claude Code tool request, used ONLY until a real tool-fidelity record exists (a real record always wins), and ONLY for the named provider.
+// kind x = a tool failure prior (tier x); kind cap = a size refusal, never x (D-ba): it sets the payload cap upper bound. issue is the GitHub issue number, null when none is filed.
+export const KNOWN_ISSUES = Object.freeze([
+  { issue: 118, provider: "aihubmix", ids: ["coding-glm-5.1-free"], kind: "x", text: "aihubmix coding-glm-5.1-free answers 400 to a tool schema (the glm-5.x backend)" },
+  { issue: 119, provider: "aihubmix", ids: ["xiaomi-mimo-v2.5-pro-free"], kind: "x", text: "aihubmix xiaomi-mimo-v2.5-pro-free answers 400 to the Artifact tool schema" },
+  { issue: null, provider: "nvidia", ids: ["openai/gpt-oss-20b"], kind: "x", text: "the same model answers 400 to a tool request at groq (not filed)" },
+  { issue: 109, provider: "orcarouter", ids: ["deepseek/deepseek-v4-flash-free", "deepseek-v4-flash-free"], kind: "cap", capBelow: 408000, text: "the free tier refuses a 408 KB request" },
+].map((k) => Object.freeze({ ...k, ids: Object.freeze(k.ids) })));
+/** EXACT ids only (the provider key plus the bare id the issue names): a sibling model or a newer version is not the model the evidence is about. */
+export const knownIssueOf = (provider, bare) => KNOWN_ISSUES.find((k) => k.provider === provider && k.ids.includes(String(bare).toLowerCase())) ?? null;
+export const knownIssueText = (k) => `known issue ${k.issue === null ? "(not filed)" : `#${k.issue}`}: ${k.text}`;
+
+// ---- bench statuses that are NOT proof of non-function (sa-A7): a transient failure on an old sample is a reason to re-probe, never to exclude silently
+export const REPROBE_AGE_S = 2 * 86400;
+export const isTransientDrop = (rec) => !!rec && (rec.s === "rate" || rec.s === "timeout" || rec.s === "empty" || (rec.s === "error" && /fetch failed/i.test(String(rec.m ?? ""))));
 /** Premium (D-b, Q3): catalogue family opus or fable, or an output price at least this many USD per M tokens. */
 export const PREMIUM_RULE = Object.freeze({ families: Object.freeze(["opus", "fable"]), outUsdPerM: 20 });
 export const FREE_SCOPES = Object.freeze(["models", "providers", "providers+deposit"]);
@@ -26,6 +76,7 @@ export const DEFAULT_MIN_SET = 3;
 export const SUBSTITUTE_K = 3;
 
 const FAMILY_RE = new RegExp(`(^|[^a-z])(${PREMIUM_RULE.families.join("|")})([^a-z]|$)`, "i");
+const OPUS_MT = /(^|[^a-z])opus-mt(?=[^a-z]|$)/gi;               // sa-A12: Helsinki-NLP opus-mt is a translation model, not Claude Opus
 /** A plain object with the same OWN keys (a key named __proto__ stays an own key, JSON.stringify writes it, JSON.parse reads it back as one). */
 const own = (o) => Object.fromEntries(Object.entries(o));
 const num = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
@@ -53,7 +104,7 @@ export const priceSum = (pin, pout) => {
   const a = num(pin), b = num(pout);
   return a === null && b === null ? null : (a ?? 0) + (b ?? 0);
 };
-export const isPremium = (bareId, pout) => FAMILY_RE.test(String(bareId)) || (num(pout) !== null && num(pout) >= PREMIUM_RULE.outUsdPerM);
+export const isPremium = (bareId, pout) => FAMILY_RE.test(String(bareId).replace(OPUS_MT, "$1")) || (num(pout) !== null && num(pout) >= PREMIUM_RULE.outUsdPerM);
 
 const chatCapable = (m) => m && m.mode !== true &&
   (m.outModality === "chat" || m.outModality === "chat?" || (m.outModality == null && m.outputKind !== "nontext"));
@@ -87,7 +138,7 @@ export function toolEligible(tier, unverified, pinned) {
  * @param toggles {source, mode, freeScope, ctx, unverified, allow}
  */
 export function funnel(inputs, toggles) {
-  const { rows = [], bench, providers = null, tiers = null, toolFidelity = null, aliasValues = {}, defaultModel = null } = inputs;
+  const { rows = [], bench, providers = null, tiers = null, toolFidelity = null, aliasValues = {}, defaultModel = null, classifyBench = null } = inputs;
   const nowMs = Number.isFinite(inputs.nowMs) ? inputs.nowMs : 0;
   const minSet = Number.isInteger(inputs.minSet) && inputs.minSet >= 1 ? inputs.minSet : DEFAULT_MIN_SET;
   const T = { source: "same-provider", mode: "dynamic", freeScope: "providers", ctx: "any", unverified: "allow-warn", allow: [], ...toggles };
@@ -96,7 +147,8 @@ export function funnel(inputs, toggles) {
   const warn = (code, text) => warnings.push({ code, text });
 
   const counts = { universe: 0, chatCapable: 0, routesInProviders: 0, inProviders: 0, idRejected: 0, benchOk: 0, toolsPass: 0,
-    accountState: { pay: 0, auth: 0, rate: 0 }, unverifiedExcluded: 0, oneMSpellingOnly: 0 };
+    accountState: { pay: 0, auth: 0, rate: 0 }, unverifiedExcluded: 0, oneMSpellingOnly: 0, nonAgent: 0 };
+  const nonAgent = [];
   const idRejected = [];
   const dropped = new Map();                                    // `provider/bare` -> why a route never became a candidate
   const tierMismatch = [];
@@ -117,6 +169,7 @@ export function funnel(inputs, toggles) {
       const key = `${provider}/${bare}`;
       if (!chatCapable(m)) { dropped.set(key, "not-chat-capable"); continue; }
       counts.chatCapable += 1;
+      if (nonAgentReason(bare)) { counts.nonAgent += 1; nonAgent.push(key); dropped.set(key, "non-agent-model"); continue; }   // D-bi: judged on the bare id, before any grouping, so it can neither be a candidate nor lend an inferred ctx
       // The selector emitted is always the BARE one (Claude Code strips [1m] from the wire model), so the bare spelling is what
       // must resolve and what the sanitiser judges: a route spelled `x[1m]` whose bare `x` is listed is the same selector as `x`.
       // Only the [1m] spelling listed means no wire id can reach it: its own drop reason, never id-rejected.
@@ -133,7 +186,7 @@ export function funnel(inputs, toggles) {
       let g = groups.get(`${provider}/${bare}`);
       if (!g) {
         g = { selector: `${provider}/${bare}`, provider, bare, tier: regTier, relay, keyId: r.keyId ?? null, ctx: 0, tag1m: false, tag1mOnly: false,
-              bareCtx: 0, toolsAny: false, badgeFree: false, pin: null, pout: null, limit: 0, provenance: m.provenance ?? null, routes: 0 };
+              bareCtx: 0, toolsAny: false, badgeFree: false, pin: null, pout: null, limit: 0, limitSource: null, provenance: m.provenance ?? null, routes: 0 };
         groups.set(g.selector, g);
       }
       g.routes += 1;
@@ -144,13 +197,43 @@ export function funnel(inputs, toggles) {
       if (m.tools !== false) g.toolsAny = true;
       if (m.badge === "FREE" || m.badge === "FREE?") g.badgeFree = true;
       if (g.pin === null && g.pout === null) { g.pin = num(m.pin); g.pout = num(m.pout); }
-      g.limit = Math.max(g.limit, num(m.limit?.bytes) ?? num(r.limit?.bytes) ?? 0);
+      const lb = num(m.limit?.bytes) ?? num(r.limit?.bytes) ?? 0;
+      if (lb > g.limit) { g.limit = lb; g.limitSource = "catalogue"; }
     }
   }
   counts.inProviders = groups.size;
 
+  // ---- inferred ctx (D-bi, sa-A5): a row with NO known context takes the smallest known context of its same-name siblings (the same underlying model on any provider), but only as a
+  // FLOOR-ONLY prior, flagged `ci`: it is clamped to the 128k substitute floor, so it can never satisfy a higher floor, never reach a ctx class above >= 128k, and is never shown as measured.
+  // The smallest sibling is used so one small route vetoes it; a sibling with no known ctx lends nothing. A SIBLING is the same model: the same last id segment up to a tier suffix (:free, -free), a date or an
+  // @region, AND the same vendor path (the segments before the last) whenever both ids have one. A pool alias (auto, router, default, free: the model behind the name changes) neither borrows nor lends,
+  // and neither does a re-upload namespace (community/, user/, hf/ ...): the same file name there is not the same model.
+  const nameKey = (bare) => String(bare).split("/").pop().toLowerCase().replace(/\[1m\]$/, "").replace(/@[a-z]{2,6}$/, "").replace(/[:_-]free$/, "")
+    .replace(/[-_]?(\d{4}-\d{2}-\d{2}|\d{8})$/, "");
+  const vendorOf = (bare) => String(bare).toLowerCase().split("/").slice(0, -1).join("/");
+  const REUPLOAD = /^(community|users?|hf|huggingface|uploads?)$/i;
+  const infers = (g) => !POOL_ALIAS_RE.test(g.bare) && !String(g.bare).split("/").slice(0, -1).some((seg) => REUPLOAD.test(seg));
+  const byName = new Map();
+  for (const g of groups.values()) {
+    g.cm = Math.max(g.ctx, g.tag1m ? ONE_M : 0);                    // the measured context (catalogue or a [1m] sibling), 0 when unknown
+    g.ci = 0;
+    if (!infers(g)) continue;
+    const k = nameKey(g.bare);
+    (byName.get(k) ?? byName.set(k, []).get(k)).push(g);
+  }
+  for (const sibs of byName.values()) {
+    if (sibs.length < 2) continue;
+    for (const g of sibs) {
+      if (g.cm > 0) continue;
+      const vg = vendorOf(g.bare);
+      const known = sibs.filter((x) => x !== g && x.cm > 0 && (!vg || !vendorOf(x.bare) || vendorOf(x.bare) === vg)).map((x) => x.cm);
+      if (known.length && Math.min(...known) >= SUBSTITUTE_FLOOR) g.ci = 1;
+    }
+  }
+
   // ---- stages 3-4 per selector group
   const probeOk = [];                                           // groups that pass stages 1-4, with their tool tier
+  const reprobe = [], accountRows = [];
   let aliasProbeOk = 0;
   for (const g of groups.values()) {
     const rec = bench?.get ? bench.get(g.selector) : null;
@@ -160,17 +243,34 @@ export function funnel(inputs, toggles) {
     g.premium = isPremium(g.bare, g.pout);
     g.alias = POOL_ALIAS_RE.test(g.bare);
     g.tag = FREE_TAG.test(g.bare);
-    g.c = Math.max(g.ctx, g.tag1m ? ONE_M : 0);
+    g.c = g.cm > 0 ? g.cm : g.ci ? SUBSTITUTE_FLOOR : 0;
     g.oneM = g.c >= ONE_M;
     g.n = g.oneM && (g.relay || g.bareCtx < ONE_M) ? 1 : 0;
     const ok = g.ok;
     if (rec && (rec.s === "pay" || rec.s === "auth" || rec.s === "rate")) counts.accountState[rec.s] += 1;
-    if (!ok) { g.stage = g.stage ?? (rec ? `bench-${rec.s}` : "bench-none"); continue; }
+    if (!ok) {
+      g.stage = g.stage ?? (rec ? `bench-${rec.s}` : "bench-none");
+      // sa-A7: a free-tagged (or free-labelled-provider) row dropped on a transient status of an OLD sample is not dead, it is unknown: it waits for a re-probe and is named, never silently excluded
+      if (isTransientDrop(rec) && Number.isFinite(rec.a) && nowMs / 1000 - rec.a > REPROBE_AGE_S && (g.tag || g.badgeFree || freeScopeOf(g.tier) === "providers")) {
+        // the stored message can say the ACCOUNT is the reason (a plan, a key, an empty balance: the shell classifies it with the bench `classifyTight`): that is account state, not a model waiting for a re-probe
+        const why = typeof classifyBench === "function" ? classifyBench(rec) : null;
+        const row = { s: g.selector, status: rec.s, ageDays: Math.floor((nowMs / 1000 - rec.a) / 86400) };
+        if (why === "pay" || why === "auth") { g.accountState = why; accountRows.push({ ...row, why }); }
+        else if (why !== "gone") { g.reprobe = true; reprobe.push(row); }
+      }
+      continue;
+    }
     counts.benchOk += 1;
     if (g.alias) aliasProbeOk += 1;
     const tf = toolFidelity?.models?.[g.selector] ?? null;
     let tier, basis;
+    // A known-issue seed stays in force until a record carries a REAL result at L3 or the big step (or is a confirmed x): an L1+L2-only record never sends a tool set or a 408 KB body, so it proves nothing about either.
+    const ki = knownIssueOf(g.provider, g.bare);
+    const realResult = !!tf && (tf.t === "x" || tf.lvr?.[2] === "p" || tf.lvr?.[2] === "f" || tf.big === "p" || tf.big === "f");
+    const seed = ki && !realResult ? ki : null;
+    if (seed) g.knownIssue = seed;
     if (isProvenanceVerified(g.tier)) { tier = "v"; basis = "provenance"; }
+    else if (seed?.kind === "x") { tier = "x"; basis = "known-issue"; }
     else if (tf && ["v", "t", "x"].includes(tf.t)) { tier = g.alias && tf.t !== "x" ? "u" : tf.t; basis = "tool-fidelity"; }
     else if (g.toolsAny) { tier = "u"; basis = "unprobed"; }
     else { g.stage = "tools-false-claim"; continue; }
@@ -181,9 +281,12 @@ export function funnel(inputs, toggles) {
       g.tfBig = tf.big === "p" || tf.big === "f" ? tf.big : "n";
       g.tfL4 = typeof tf.lvr === "string" && (tf.lvr[3] === "p" || tf.lvr[3] === "f") ? tf.lvr[3] : "n";
       const cap = Number.isInteger(tf.capBelow) && tf.capBelow > 0 ? tf.capBelow : 0;
-      if (cap) g.limit = g.limit > 0 ? Math.min(g.limit, cap) : cap;
+      if (cap && (g.limit === 0 || cap < g.limit)) { g.limit = cap; g.limitSource = "capBelow"; }
     }
-    if (!toolEligible(tier, T.unverified, allow.has(g.selector))) { counts.unverifiedExcluded += 1; g.stage = tier === "x" ? "tools-failed" : "tools-unverified"; continue; }
+    if (seed?.kind === "cap" && basis !== "provenance" && (g.limit === 0 || seed.capBelow < g.limit)) { g.limit = seed.capBelow; g.limitSource = "known-issue"; }
+    // sa-T3: a provisional first strike (refresh/tool-fidelity.mjs: strikes 1) is read from ANY record, class or not; it ranks below a clean row of the same class and never excludes
+    g.tfStrike = tf && tf.strikes === 1 ? 1 : 0;
+    if (!toolEligible(tier, T.unverified, allow.has(g.selector))) { counts.unverifiedExcluded += 1; g.stage = tier === "x" ? (basis === "known-issue" ? "known-bad" : "tools-failed") : "tools-unverified"; continue; }
     counts.toolsPass += 1;
     g.stage = "tools-pass";
     probeOk.push(g);
@@ -207,7 +310,9 @@ export function funnel(inputs, toggles) {
     const zero = priceSum(g.pin, g.pout) === 0;
     g.in = { models: false, providers: false, "providers+deposit": false };
     if (!noScope) {
-      g.in.models = freeTier(t) ? (g.badgeFree || g.tag) : g.tag;
+      // ONE free verdict for the `free models` scope (sa-A11): on a free-labelled provider a row is free when it carries the free tag, the FREE badge or a listed price of exactly 0 for both input and
+      // output (a `price: free` row and its `:free` sibling then agree); on a paid or deposit provider only the free tag counts (the strict rule, a price of 0 is not a promise there).
+      g.in.models = freeTier(t) ? (g.badgeFree || g.tag || (num(g.pin) === 0 && num(g.pout) === 0)) : g.tag;
       g.in.providers = tiers !== null && freeTier(t);
       g.in["providers+deposit"] = tiers !== null && (freeTier(t) || (strictTier(t) && g.tag));
     }
@@ -236,6 +341,7 @@ export function funnel(inputs, toggles) {
   // An EXCLUDED tier (management, menu/tiers.mjs) is never admitted under any mode or scope (plan revision 7 item 8): no row, no list, no count.
   const excludedTier = (g) => isExcludedTier(g.tier);
   const inScope = (g) => !excludedTier(g) && (T.mode !== "free" ? true : g.in?.[T.freeScope] === true);
+  const ctxHard = ctxSpec(T.ctx).hard, ctxPrefer = ctxSpec(T.ctx).prefer;
   const set = [];
   const perProvider = Object.create(null);                      // keyed by a provider name, which may be __proto__ or constructor: no prototype, so the key is always an own one
   const pp = (p) => (perProvider[p] ??= { benchOk: 0, tools: 0, scope: 0, ctx: 0, sub: 0 });
@@ -245,7 +351,7 @@ export function funnel(inputs, toggles) {
     p.tools += 1;
     if (!inScope(g)) { g.stage = excludedTier(g) ? "excluded-tier" : "scope"; continue; }
     p.scope += 1;
-    if (T.ctx === "1m" && !g.oneM) { g.stage = "ctx"; continue; }
+    if (ctxHard > 0 && !(g.cm >= ctxHard)) { g.stage = "ctx"; continue; }               // a hard floor tests the MEASURED ctx (cm): an unknown ctx is below it, and an inferred ctx (a floor-only prior for the default 128k substitute floor) is never counted, whatever the floor
     p.ctx += 1;
     g.stage = "in-set";
     if (g.c >= SUBSTITUTE_FLOOR) p.sub += 1;
@@ -255,16 +361,23 @@ export function funnel(inputs, toggles) {
   for (const p of Object.values(perProvider)) { totals.scope += p.scope; totals.ctx += p.ctx; totals.sub += p.sub; }
 
   // ---- rank (5.3, revised by owner decision D1): the BAND keys come first, in this order: 1 tool tier, 2 HEALTH (the model's latest status is probe-ok: yes or no, AGE IGNORED, so the
-  // band never depends on the calendar), 3 context preference class (only under ctx prefer-1m: rows of at least 1M first), 4 price class (free providers under mode free). Then, INSIDE a
-  // band only, the ordering keys: 5 recency class (live within 7 days, probe within 14 days, older: a pure ordering key), 6 price value, 7 ctx desc, 8 TTFT, 9 non-alias first; then the id.
+  // band never depends on the calendar), 3 context preference class (only under a soft ctx preference prefer-256k, prefer-512k or prefer-1m: rows at or above it first), 4 price class (free
+  // providers under mode free). Then, INSIDE a band only, the ordering keys: 5 strike (a provisional first tool-fidelity strike after a clean row, sa-T3), 6 big step and 7 L4 (class v only),
+  // 8 TTFT QUANTILE bucket (D-bh), 9 ctx CLASS (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below or unknown; an inferred ctx is at most the 128k class), 10 price value, 11 RECENCY class (live within
+  // 7 days, probe within 14 days, older: CALENDAR-DEPENDENT, so it is an ordering key only and the last one before alias: it never outranks latency or context), 12 non-alias first; then a hash of the id (FNV-1a), then the id.
   const price2b = T.mode === "free" && T.freeScope !== "models";
+  // TTFT QUANTILE buckets over the eligible set (D-bh): fast / ok / slow / very slow are the quartiles of the TTFTs of the rows in THIS set (nearest rank), so the buckets are equal-sized whatever the data
+  // (the old fixed 1 s / 3 s cuts put 97.5% of the rows in one bucket); 4 = no TTFT recorded.
+  const ttfts = set.map((g) => num(g.rec?.t)).filter((v) => v !== null).sort((a, b) => a - b);
+  const ttftCuts = [0.25, 0.5, 0.75].map((q) => (ttfts.length ? ttfts[Math.max(0, Math.ceil(q * ttfts.length) - 1)] : null));
+  const ttftBucket = (t) => (t === null ? 4 : t <= ttftCuts[0] ? 0 : t <= ttftCuts[1] ? 1 : t <= ttftCuts[2] ? 2 : 3);
   const keyOf = (g) => {
     const rec = g.rec;
     const ageS = nowMs / 1000 - (rec?.a ?? 0);
     const live = !!(bench?.isLive && bench.isLive(g.selector));
     const recency = live && ageS <= 7 * 86400 ? 0 : ageS <= 14 * 86400 ? 1 : 2;       // ordering inside a band only: with more than 3 rows in a band it still makes the choice of the top 3 calendar dependent
     const healthOk = rec && rec.s === "ok" ? 0 : 1;                                    // the latest bench status merged with the observer overlay (bench.get): admitted rows are ok, so this is constant in a set; it is a band key for the day a non-ok row is admitted
-    const ctxClass = T.ctx === "prefer-1m" && !(g.c >= ONE_M) ? 1 : 0;
+    const ctxPref = ctxPrefer > 0 && !(g.c >= ctxPrefer) ? 1 : 0;                     // soft preference (D-bk): rows at or above it are a higher band; nothing is excluded
     // classes (plan 5.3, revision 8 item 2, owner ruling Q6): 0 price 0 on a free-tier row, 0t strict-free-tag row on a paid or deposit provider, U unknown price, P positive price
     let pc = 0, pv = 0;
     if (price2b) {
@@ -274,17 +387,18 @@ export function funnel(inputs, toggles) {
         pv = p === null ? 0 : p;
       } else pc = 1;
     }
-    const ttft = num(rec?.t);
-    const h = ttft === null ? 2 : ttft < 1000 ? 0 : ttft < 3000 ? 1 : 2;
+    const h = ttftBucket(num(rec?.t));
     g.h = h;
     // inside class v (never elsewhere): big step passed, then not run, then failed; then L4 the same way. Constant 0 outside v, so no other row moves.
     const inV = g.toolTier === "v" && g.toolBasis === "tool-fidelity";
     const pnf = { p: 0, n: 1, f: 2 };
-    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxClass, pc, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, recency, pv, -g.c, h, g.alias ? 1 : 0];
+    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxPref, pc, g.tfStrike ? 1 : 0, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, h, ctxClassOf(g.c), pv, recency, g.alias ? 1 : 0];
   };
   for (const g of set) g.rk = keyOf(g);
   const cmpKeys = (a, b) => { for (let i = 0; i < a.rk.length; i++) if (a.rk[i] !== b.rk[i]) return a.rk[i] - b.rk[i]; return 0; };
-  set.sort((a, b) => cmpKeys(a, b) || (a.selector < b.selector ? -1 : a.selector > b.selector ? 1 : 0));
+  // the final tie-break is a hash of the selector (FNV-1a, the funnel own hash), then the selector itself so it stays total: deterministic, but not biased toward early-alphabet providers in the top K
+  const tieOf = (g) => (g.tie ??= fnv1a32(g.selector));
+  set.sort((a, b) => cmpKeys(a, b) || tieOf(a) - tieOf(b) || (a.selector < b.selector ? -1 : a.selector > b.selector ? 1 : 0));
   let gi = -1;
   set.forEach((g, i) => { if (i === 0 || cmpKeys(set[i - 1], g) !== 0) gi += 1; g.g = gi; });
   // BAND (router v2, ar-4; D1): rows equal on the first four rank keys [tool tier, health yes/no, context preference class, price class]; constant over every later key (recency,
@@ -301,6 +415,8 @@ export function funnel(inputs, toggles) {
     s: g.selector, c: g.c, f: g.in.models ? 1 : 0, t: g.toolTier, h: g.h, m: g.oneM ? 1 : 0, n: g.n,
     i: priceText(g.pin, g.pout), p: g.premium ? 1 : 0, pb: g.limit, al: g.alias ? 1 : 0,
     fp: fx && freeTier(tierOf(g)) ? 1 : 0, ft: fx && strictTier(tierOf(g)) && g.tag ? 1 : 0, g: g.g, b: g.b,
+    ...(g.ci ? { ci: 1 } : {}),                                  // c? : the context is INFERRED from a sibling, a floor-only 128k prior, never measured
+    ...(g.limit > 0 && g.limitSource ? { pbSource: g.limitSource } : {}),   // where pb came from: catalogue | capBelow (a tool-fidelity size refusal) | known-issue
   }));
   const inherit = T.mode === "inherit";
   const lists = { all: [], byProvider: Object.create(null), prov: Object.create(null) };
@@ -335,6 +451,11 @@ export function funnel(inputs, toggles) {
     if (row.fp && (priceSum(set[i].pin, set[i].pout) ?? 0) > 0) credit += 1;
   });
   const chosenScope = probeOk.filter(inScope);
+  // rows per context floor over the chosen scope, BEFORE the ctx toggle (the counts the `set` preview, `show` and the picker print so a floor is chosen knowingly): measured contexts only; the unknown rows are in none
+  // of the floors, and `inferred` of them pass 128k on a sibling's context (a floor-only prior)
+  const ctxStats = { rows: chosenScope.length, unknown: chosenScope.filter((g) => g.cm === 0).length, inferred: chosenScope.filter((g) => g.ci).length,
+    ge: Object.fromEntries(Object.entries(CTX_FLOORS).map(([k, v]) => [k, chosenScope.filter((g) => g.cm >= v).length])) };
+  counts.ctxInferred = models.filter((r) => r.ci).length;
 
   // ---- hints for the router
   const exempt = [];
@@ -343,15 +464,18 @@ export function funnel(inputs, toggles) {
     if (typeof v === "string" && v) { const b = stripOneM(v); if (!exempt.includes(b)) exempt.push(b); }
   }
   const ctxHints = Object.create(null);                         // keyed by a settings alias value or a selector: own keys only
+  // The router takes the substitute floor from these values (max(ctxHints[asked], 128000)). D-bg/D-bk: whatever the asked model's own context is (a [1m] alias says 1M), the value is CAPPED at the toggle's
+  // floor (128k under `any` and every soft preference, the hard floor otherwise), so the asked model never raises the floor above what the owner chose; the per-request token fit does the rest.
+  const hintCap = hintCapOf(T.ctx);
   const hintFor = (raw) => {
     if (typeof raw !== "string" || !raw) return;
     const b = stripOneM(raw), g = groups.get(b);
-    const c = Math.max(g?.c ?? 0, raw !== b ? ONE_M : 0);
+    const c = Math.min(Math.max(g?.c ?? 0, raw !== b ? ONE_M : 0), hintCap);
     if (c > 0) { ctxHints[b] = c; if (raw !== b) ctxHints[raw] = c; }
   };
   for (const k of ["opus", "sonnet", "haiku", "fable", "model", "smallFast"]) hintFor(aliasValues[k]);
   hintFor(defaultModel);
-  for (const row of models) ctxHints[row.s] = row.c;
+  for (const row of models) ctxHints[row.s] = Math.min(row.c, hintCap);
 
   // ---- warnings
   const likelyMain = defaultModel ? stripOneM(defaultModel) : null;
@@ -368,7 +492,8 @@ export function funnel(inputs, toggles) {
     const nu = tierCount.u;
     if (nu > 0) warn("UNVERIFIED", `UNVERIFIED: ${nu} of ${models.length} allowed models have unverified tool support (D-f)`);
     if (premium > 0) warn("PREMIUM", `PREMIUM: ${premium} of ${models.length} allowed models are Opus- or Fable-priced (price shown per row; no cap, D-b)`);
-    if (models.length > 0) warn("PAYLOAD", `PAYLOAD: ${payloadRisk} of ${models.length} allowed models have a known payload cap below ${PAYLOAD_RISK_BYTES.toLocaleString("en-US")} bytes (largest observed subagent body 919 KB); ${payloadUnknown} have no known cap`);
+    if (models.length > 0) warn("PAYLOAD", `PAYLOAD: ${payloadRisk} of ${models.length} allowed models have a known payload cap below ${PAYLOAD_RISK_BYTES.toLocaleString("en-US")} bytes; ${payloadUnknown} have no known cap, so the payload gate is inert for them until a cap is measured (live shadow: ${payloadSampleText()})`);
+    if (reprobe.length > 0) warn("REPROBE", `REPROBE: ${reprobe.length} free-tagged or free-provider models were dropped on a transient bench status (rate, empty, timeout, fetch failed) of a sample older than 2 days: not dead, waiting for a re-probe (listed by show --detail)`);
     if (oneMListing > 0) warn("ONE_M_LISTING", `1M basis listing-only for ${oneMListing} of ${models.length} allowed rows (n:1)`);
     if (alias > 0) warn("ALIAS", `ALIAS: ${alias} of ${models.length} allowed rows are pool aliases, flagged ALIAS, never above tier u`);
     const frag = [];
@@ -404,9 +529,10 @@ export function funnel(inputs, toggles) {
     counts: { ...counts, allowed: models.length, verified: tierCount.v, small: tierCount.t, unverified: tierCount.u, premium, payloadRisk, payloadUnknown,
       alias, aliasProbeOk, oneMListing, creditPositive: credit, pricedButBadged,
       depositStrictSkipped: { ...skipped }, freeScopes, substitutable: substitutable["*"],
-      chosenScopeN: chosenScope.length, chosenScopeCtx1m: chosenScope.filter((g) => g.oneM).length },
+      chosenScopeN: chosenScope.length, chosenScopeCtx1m: chosenScope.filter((g) => g.oneM).length, reprobe: reprobe.length, accountStateRows: accountRows.length,
+      knownBad: [...groups.values()].filter((g) => g.stage === "known-bad").length },
     totals, perProvider: own(perProvider), models, lists: { all: lists.all, byProvider: own(lists.byProvider), prov: own(lists.prov) }, substitutable: own(substitutable), emptyProviders, thinProviders, exempt, ctxHints: own(ctxHints), warnings, idRejected, tierMismatch,
-    skippedIds, groups, dropped,
+    skippedIds, groups, dropped, ctxStats, ttftCuts, nonAgent, reprobe: reprobe.sort((a, b) => (a.s < b.s ? -1 : 1)), accountRows: accountRows.sort((a, b) => (a.s < b.s ? -1 : 1)),
     stages: [
       { stage: "chat-capable", n: counts.chatCapable, of: counts.universe, unit: "routes" },
       { stage: "in-providers", n: counts.inProviders, of: counts.chatCapable, unit: "selectors (routes after the [1m] collapse)" },
@@ -420,7 +546,7 @@ export function funnel(inputs, toggles) {
 export function emptyStage(result, provider = null) {
   const c = provider === null ? result.totals : (Object.hasOwn(result.perProvider, provider) ? result.perProvider[provider] : { benchOk: 0, tools: 0, scope: 0, ctx: 0, sub: 0 });
   const seq = [["tools", "the tools stage", c.benchOk], ["scope", `the ${result.toggles.mode === "free" ? SCOPE_NAMES[result.toggles.freeScope] : "scope"} filter`, c.tools],
-    ["ctx", "the ctx 1m filter", c.scope], ["sub", "the substitute floor (known context of at least 128,000)", c.ctx]];
+    ["ctx", `the ctx ${result.toggles.ctx} filter`, c.scope], ["sub", "the substitute floor (known context of at least 128,000)", c.ctx]];
   const after = [c.tools, c.scope, c.ctx, c.sub];
   for (let i = 0; i < seq.length; i++) if (after[i] === 0) return { stage: seq[i][0], text: seq[i][1], before: seq[i][2] };
   return null;

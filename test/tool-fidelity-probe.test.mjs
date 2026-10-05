@@ -1,37 +1,81 @@
-// The tool-fidelity ladder against fake streams: every level, every failure mode, offline.
+// The tool-fidelity requests against fake streams: every request kind, every verdict and every failure mode, offline.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
-import { ev, stream, fakeFetch, ok, http, goodModel } from "./fixtures/tool-fidelity-helpers.mjs";
-import { runLevel, probeModel, buildBody, levelSize, judge } from "../refresh/tool-fidelity-probe.mjs";
+import { ev, stream, fakeFetch, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
+import { runKind, buildBody, kindSize, levelSize, kindsOf, judge, BUDGETS, TIMEOUTS_MS } from "../refresh/tool-fidelity-probe.mjs";
+import { AWKWARD, BIG_RESULT_FACT, LONG_TOOL, ERROR_RESULT } from "../refresh/tool-fidelity-fixture.mjs";
 
 guardRealState(after, assert);
-const conn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", timeoutMs: 5000, ...extra });
-const lvl = async (n, answer, extra) => { const f = fakeFetch(answer); const r = await runLevel(n, conn(f, extra)); return { r, f }; };
+const conn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", ...extra });
+const kind = async (k, answer, extra) => { const f = fakeFetch(answer); const r = await runKind(k, conn(f, extra)); return { r, f }; };
+const edit = (over = {}) => JSON.stringify({ file_path: AWKWARD.file_path, old_string: AWKWARD.old_string, new_string: AWKWARD.new_string, replace_all: AWKWARD.replace_all, start_line: AWKWARD.start_line, ...over });
+const callEdit = (json = edit()) => ok(stream(ev.tool(0, "fx_edit", json), ev.stop("tool_use")));
 
-test("request shapes: L1 forces the one tool, L2 is a tool_result round trip with a matching id, L3 and L4 send the large fixture", () => {
-  const b1 = buildBody(1, "p/m");
-  assert.deepEqual(b1.tool_choice, { type: "tool", name: "fx_echo" });
+test("request shapes: L1 leaves the choice to the model, 1f forces it, L2 carries a ~20 KB result with the fact at the END, 2e an is_error result, 3a is small, 3b ~157 KB, 5 ~400 KB, 6 offers the Agent tool", () => {
+  const b1 = buildBody("1", "p/m");
+  assert.deepEqual(b1.tool_choice, { type: "auto" });
   assert.equal(b1.tools.length, 1);
   assert.equal(b1.stream, true);
-  const b2 = buildBody(2, "p/m");
+  assert.ok(b1.messages[0].content.includes(AWKWARD.file_path) && b1.messages[0].content.includes(AWKWARD.old_string) && b1.messages[0].content.includes(AWKWARD.new_string), "the task carries the awkward texts it must copy");
+  assert.deepEqual(buildBody("1f", "p/m").tool_choice, { type: "tool", name: "fx_edit" });
+  const b2 = buildBody("2", "p/m");
   const [u, a, r] = b2.messages;
-  assert.equal(u.role, "user"); assert.equal(a.role, "assistant"); assert.equal(r.role, "user");
   assert.equal(a.content[0].type, "tool_use");
-  assert.equal(r.content[0].type, "tool_result");
   assert.equal(r.content[0].tool_use_id, a.content[0].id, "the tool_result answers the assistant's tool_use id");
-  assert.equal(b2.tool_choice, undefined, "the round trip does not force a call: the model must be free to answer");
-  for (const n of [3, 4]) {
-    const { bytes, inTokens } = levelSize(n);
-    assert.ok(bytes > 150000 && bytes < 165000, `L${n} is about 157 KB, got ${bytes}`);
-    assert.ok(inTokens > 37000 && inTokens < 42000, `L${n} is about 40,000 input tokens, got ${inTokens}`);
-    assert.ok(buildBody(n, "p/m").system.length >= 8000, "a roughly 9 KB system prompt rides with the tools");
-  }
-  assert.ok(levelSize(1).bytes < 2000 && levelSize(2).bytes < 2000, "L1 and L2 are small requests");
+  assert.ok(r.content[0].content.length > 19000 && r.content[0].content.length < 22000, "about 20 KB");
+  assert.ok(r.content[0].content.trimEnd().endsWith(`${BIG_RESULT_FACT}.`), "the fact is on the LAST line");
+  assert.ok(!r.content[0].content.slice(0, -200).includes(BIG_RESULT_FACT), "and nowhere before it");
+  assert.equal(b2.tool_choice, undefined, "the round trip does not force a call");
+  const b7 = buildBody("2e", "p/m");
+  assert.equal(b7.messages[2].content[0].is_error, true);
+  assert.equal(b7.messages[2].content[0].content, ERROR_RESULT);
+  assert.ok(kindSize("1").bytes < 3000 && kindSize("2e").bytes < 3000 && kindSize("6").bytes < 3000, "the cheap requests are small");
+  assert.ok(kindSize("3a").bytes > 4000 && kindSize("3a").bytes < 12000, `3a is about 6-9 KB: ${kindSize("3a").bytes}`);
+  assert.ok(kindSize("3b").bytes > 150000 && kindSize("3b").bytes < 165000, `3b: ${kindSize("3b").bytes}`);
+  assert.ok(kindSize("3b").inTokens > 37000 && kindSize("3b").inTokens < 42000);
+  assert.ok(kindSize("5").bytes > 390000 && kindSize("5").bytes < 410000);
+  const b6 = buildBody("6", "p/m");
+  assert.deepEqual([b6.tools.length, b6.tools[0].name, b6.tool_choice], [1, "Agent", { type: "auto" }]);
+  assert.deepEqual(b6.tools[0].input_schema.properties.subagent_type.enum.slice(0, 2), ["general-purpose", "Explore"]);
+  assert.ok(/three independent/.test(b6.messages[0].content) && /Agent tool/.test(b6.messages[0].content), "the task plainly warrants delegating");
 });
 
-test("every level is sent through the gateway URL with the probe client tag and stream:true", async () => {
-  const { f } = await lvl(1, goodModel);
+test("cache_control rides on the system block and the LAST tool of 3a, 3b and the big step, exactly as the real client sends it; `noCc` leaves it off", () => {
+  for (const k of ["3a", "3b", "5"]) {
+    const b = buildBody(k, "p/m");
+    assert.deepEqual(b.system[0].cache_control, { type: "ephemeral" }, `${k}: system block`);
+    assert.deepEqual(b.tools.at(-1).cache_control, { type: "ephemeral" }, `${k}: last tool`);
+    assert.equal(b.tools.slice(0, -1).some((t) => t.cache_control), false, `${k}: only the last tool`);
+    const off = buildBody(k, "p/m", undefined, { noCc: true });
+    assert.equal(typeof off.system, "string");
+    assert.equal(JSON.stringify(off).includes("cache_control"), false, `${k}: no marker at all without cc`);
+  }
+  assert.ok(buildBody("3a", "p/m").tools.some((t) => t.name === LONG_TOOL), "3a offers the MCP-style long name");
+  assert.ok(LONG_TOOL.length >= 55 && LONG_TOOL.length <= 64 && /^mcp__[a-z_]+$/.test(LONG_TOOL));
+  assert.ok(buildBody("3b", "p/m").tools.some((t) => t.name === LONG_TOOL), "and so does the 157 KB set");
+});
+
+test("budgets and timeouts are small and pinned: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step and spawn; 15 s, 60 s and 90 s by request class", () => {
+  assert.deepEqual({ ...BUDGETS }, { "1": 256, "1f": 256, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
+  assert.deepEqual({ ...TIMEOUTS_MS }, { small: 15000, "157": 60000, big: 90000 });
+  for (const k of Object.keys(BUDGETS)) assert.equal(buildBody(k, "p/m").max_tokens, BUDGETS[k], k);
+  assert.equal(buildBody("1", "p/m", 999).max_tokens, 999, "an explicit budget wins");
+});
+
+test("which requests a todo sends: L3 is 3a then 3b, L4 alone is 3b, L4 beside L3 is nothing extra; the level sizes follow", () => {
+  assert.deepEqual(kindsOf([1, 2]), ["1", "2"]);
+  assert.deepEqual(kindsOf([3, 4]), ["3a", "3b"]);
+  assert.deepEqual(kindsOf([4]), ["3b"]);
+  assert.deepEqual(kindsOf([1, 2, 3, 4, 5, 6, 7]), ["1", "2", "2e", "3a", "3b", "5", "6"]);
+  assert.equal(levelSize(4).requests, 0);
+  assert.equal(levelSize(4, { withLevel3: false }).requests, 1);
+  assert.equal(levelSize(3).requests, 2);
+  assert.equal(levelSize(3).bytes, kindSize("3a").bytes + kindSize("3b").bytes);
+});
+
+test("every request goes to the gateway URL with the probe client tag and stream:true", async () => {
+  const { f } = await kind("1", goodModel);
   const c = f.calls[0];
   assert.equal(c.url, "http://gw.test/v1/messages");
   assert.equal(c.body.model, "p/m");
@@ -40,170 +84,210 @@ test("every level is sent through the gateway URL with the probe client tag and 
   assert.equal(c.body.stream, true);
 });
 
-test("L1: a forced tool call with valid JSON arguments passes", async () => {
-  const { r } = await lvl(1, () => ok(stream(ev.tool(0, "fx_echo", '{"message":"ping"}'), ev.stop("tool_use"))));
-  assert.equal(r.v, "p");
+test("L1: a tool call with the choice left AUTO passes, with argument fidelity `af` p when every field comes back byte for byte (multi-line, quotes, backslashes, unicode, JSON in a string, boolean, integer)", async () => {
+  const { r, f } = await kind("1", () => callEdit());
+  assert.deepEqual([r.v, r.af, r.reqs, r.forced], ["p", "p", 1, undefined]);
+  assert.equal(f.calls.length, 1, "a pass under auto sends no forced request");
+  assert.equal(kindOf(f.calls[0]), "1");
 });
 
-test("L1 failure modes: text instead of a call, no content, invalid JSON, a tool that was not offered", async () => {
-  const text = await lvl(1, () => ok(stream(ev.text(0, "ping"), ev.stop())));
-  assert.deepEqual([text.r.v, text.r.why], ["f", "answered in text instead of calling the tool"]);
-  const none = await lvl(1, () => ok(stream(ev.stop())));
-  assert.deepEqual([none.r.v, none.r.why], ["f", "no tool call in the answer"]);
-  const bad = await lvl(1, () => ok(stream(ev.tool(0, "fx_echo", '{"message":"pi'), ev.stop("tool_use"))));
+test("argument fidelity `af`: any change in any field fails `af` but NOT L1 (the call itself was well formed)", async () => {
+  const mutations = {
+    "a backslash lost": { old_string: AWKWARD.old_string.replace(String.fromCharCode(92) + " and a literal", " and a literal") }, "unicode mangled": { new_string: AWKWARD.new_string.replace("🚀", "?") },
+    "newline turned into space": { old_string: AWKWARD.old_string.replace("\n\t", " \t") }, "JSON string re-escaped": { new_string: JSON.stringify(JSON.parse(AWKWARD.new_string.split("\n")[0])) + "\n" + AWKWARD.new_string.split("\n")[1] },
+    "boolean sent as a string": { replace_all: "true" }, "integer sent as a string": { start_line: "12" }, "integer sent as a float": { start_line: 12.5 }, "path altered": { file_path: AWKWARD.file_path.toLowerCase() },
+    "trailing space": { old_string: `${AWKWARD.old_string} ` },
+  };
+  for (const [name, over] of Object.entries(mutations)) {
+    const { r } = await kind("1", () => callEdit(edit(over)));
+    assert.deepEqual([r.v, r.af], ["p", "f"], name);
+  }
+  const exact = await kind("1", () => callEdit(edit({ replace_all: true, start_line: 12 })));
+  assert.equal(exact.r.af, "p");
+});
+
+test("L1 failure modes: text instead of a call, no content, invalid JSON, a tool that was not offered, the required argument missing", async () => {
+  const text = await kind("1", () => ok(stream(ev.text(0, "done"), ev.stop())), { });
+  assert.deepEqual([text.r.v, text.r.nocall], ["f", true]);
+  const bad = await kind("1", () => callEdit('{"file_path":"x'));
   assert.deepEqual([bad.r.v, bad.r.why], ["f", "tool call arguments are not valid JSON"]);
-  const arr = await lvl(1, () => ok(stream(ev.tool(0, "fx_echo", '["x"]'), ev.stop("tool_use"))));
-  assert.equal(arr.r.v, "f", "arguments must be a JSON object");
-  const other = await lvl(1, () => ok(stream(ev.tool(0, "rm_rf", '{"message":"x"}'), ev.stop("tool_use"))));
+  assert.equal((await kind("1", () => callEdit('["x"]'))).r.v, "f", "arguments must be a JSON object");
+  const other = await kind("1", () => ok(stream(ev.tool(0, "rm_rf", "{}"), ev.stop("tool_use"))));
   assert.deepEqual([other.r.v, other.r.why], ["f", "tool call names a tool that was not offered"]);
+  const miss = await kind("1", () => callEdit('{"old_string":"a","new_string":"b"}'));
+  assert.deepEqual([miss.r.v, miss.r.why], ["f", "a tool call lacks the required argument `file_path`"]);
+});
+
+test("FORCED fallback: only when auto yields NO call. A model that calls when forced is `fc` p (clean L1 pass but class t at best), one that fails forced too is `fc` f; a backend that rejects a forced choice leaves the auto verdict", async () => {
+  const seen = [];
+  const f = fakeFetch((c) => { seen.push(kindOf(c)); return kindOf(c) === "1f" ? callEdit() : ok(stream(ev.text(0, "I would edit the file."), ev.stop())); });
+  const r = await runKind("1", conn(f));
+  assert.deepEqual(seen, ["1", "1f"]);
+  assert.deepEqual([r.v, r.fc, r.forced, r.reqs, r.af], ["p", "p", true, 2, "p"]);
+  const both = await runKind("1", conn(fakeFetch(() => ok(stream(ev.text(0, "no"), ev.stop())))));
+  assert.deepEqual([both.v, both.fc, both.reqs], ["f", "f", 2]);
+  const refused = await runKind("1", conn(fakeFetch((c) => (kindOf(c) === "1f" ? http(400, "tool_choice is not supported by this model") : ok(stream(ev.text(0, "no"), ev.stop()))))));
+  assert.deepEqual([refused.v, refused.fc, refused.forcedRejected, refused.reqs], ["f", undefined, true, 2], "the backend does not take a forced choice: the auto verdict stands, no fc");
+  const hardFail = await kind("1", () => http(400, "schema rejected"));
+  assert.equal(hardFail.f.calls.length, 1, "an HTTP verdict is not a 'no call': nothing is forced");
+  const inc = await runKind("1", conn(fakeFetch((c) => (kindOf(c) === "1f" ? http(429, "slow") : ok(stream(ev.text(0, "no"), ev.stop()))))));
+  assert.deepEqual([inc.v, inc.s], ["i", "rate"], "an inconclusive forced answer is inconclusive");
 });
 
 test("HTTP 400, 413 and 422 on a tool-bearing request are verdicts: failed, with the reason redacted and clipped", async () => {
   for (const status of [400, 413, 422]) {
-    const { r } = await lvl(1, () => http(status, `schema rejected ${"y".repeat(500)}`));
+    const { r } = await kind("3b", () => http(status, `schema rejected ${"y".repeat(500)}`));
     assert.equal(r.v, "f", `HTTP ${status}`);
     assert.equal(r.http, status);
     assert.ok(r.why.length <= 160, "clipped");
   }
   const fake = ["sk", "abcdefghijklmnopqrstuvwxyz0123456789"].join("-");           // built at run time: no key-shaped literal in the source
-  const leaky = await lvl(1, () => http(400, `bad request for key ${fake}`));
+  const leaky = await kind("1", () => http(400, `bad request for key ${fake}`));
   assert.ok(!leaky.r.why.includes(fake.slice(0, 12)), "a key-shaped string in the provider's sentence is masked");
 });
 
 test("account and moment failures are INCONCLUSIVE, never a failed verdict: 429 rate, 402 pay, 401 auth, 404 gone, 500 error", async () => {
   const cases = [[429, "slow down", "rate"], [402, "payment required", "pay"], [401, "bad key", "auth"], [404, "not found", "gone"], [500, "oops", "error"], [503, "unavailable", "error"]];
   for (const [status, msg, s] of cases) {
-    const { r } = await lvl(1, () => http(status, msg));
+    const { r } = await kind("1", () => http(status, msg));
     assert.deepEqual([r.v, r.s], ["i", s], `HTTP ${status}`);
   }
-  const ra = await lvl(1, () => http(429, "slow down", { "retry-after": "7" }));
+  const ra = await kind("1", () => http(429, "slow down", { "retry-after": "7" }));
   assert.equal(ra.r.ra, 7000, "Retry-After is carried for the engine's backoff");
-  const quota = await lvl(1, () => http(400, "insufficient balance, please top up"));
+  const quota = await kind("1", () => http(400, "insufficient balance, please top up"));
   assert.deepEqual([quota.r.v, quota.r.s], ["i", "pay"], "a 400 that says the account is empty is the account's state, not the model's");
 });
 
-test("stream error events: an account/overload sentence is inconclusive; an unexplained one before any content is a failure", async () => {
-  const over = await lvl(1, () => ok(stream(ev.error("Overloaded, try again"))));
-  assert.deepEqual([over.r.v, over.r.s], ["i", "error"]);
-  const bad = await lvl(1, () => ok(stream(ev.error("unsupported schema keyword anyOf"))));
-  assert.equal(bad.r.v, "f");
-  const none = await lvl(1, () => ok(""));
-  assert.deepEqual([none.r.v, none.r.s], ["i", "error"], "a 200 with no stream events says nothing about tools");
+test("stream error events: an account/overload sentence is inconclusive; an unexplained one before any content is a failure; a 200 with no events says nothing", async () => {
+  assert.deepEqual(Object.values((({ r }) => ({ v: r.v, s: r.s }))(await kind("1", () => ok(stream(ev.error("Overloaded, try again")))))), ["i", "error"]);
+  assert.equal((await kind("1", () => ok(stream(ev.error("unsupported schema keyword anyOf"))))).r.v, "f");
+  const none = await kind("1", () => ok(""));
+  assert.deepEqual([none.r.v, none.r.s], ["i", "error"]);
 });
 
-test("a budget spent on hidden reasoning (max_tokens, no content) is inconclusive, never a failed tool call", async () => {
-  const { r } = await lvl(1, () => ok(stream(ev.stop("max_tokens"))));
-  assert.deepEqual([r.v, r.s], ["i", "empty"]);
+test("a budget spent on hidden reasoning (max_tokens, no content) is inconclusive `empty`, never a failed call, at every kind", async () => {
+  for (const k of ["1", "2", "2e", "3a", "3b", "5", "6"]) {
+    const { r } = await kind(k, () => ok(stream(ev.stop("max_tokens"))));
+    assert.deepEqual([r.v, r.s], ["i", "empty"], k);
+  }
 });
 
-test("a hung request is inconclusive `timeout`; an abort from the caller is reported as aborted, not as a result", async () => {
-  const f = async (url, init) => new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("aborted"))));
-  const t = await runLevel(1, conn(f, { timeoutMs: 30 }));
-  assert.deepEqual([t.v, t.s], ["i", "timeout"]);
+test("TIMEOUTS are per request class and inconclusive: small 15 s, 157 KB 60 s, 400 KB 90 s by default; a hung request is `timeout`, a caller's abort is not a result", async () => {
+  const hang = async (url, init) => new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("aborted"))));
+  const t0 = Date.now();
+  const small = await runKind("1", conn(hang, { timeouts: { small: 30, "157": 5000, big: 5000 } }));
+  assert.deepEqual([small.v, small.s], ["i", "timeout"]);
+  assert.ok(Date.now() - t0 < 1500, "the SMALL class timeout applied, not the long ones");
+  const t1 = Date.now();
+  const mid = await runKind("3b", conn(hang, { timeouts: { small: 5000, "157": 40, big: 5000 } }));
+  const big = await runKind("5", conn(hang, { timeouts: { small: 5000, "157": 5000, big: 50 } }));
+  assert.deepEqual([mid.s, big.s], ["timeout", "timeout"]);
+  assert.ok(Date.now() - t1 < 2000, "each request kind used its own class");
   const ac = new AbortController();
-  const p = runLevel(1, conn(f, { signal: ac.signal, timeoutMs: 5000 }));
+  const p = runKind("1", conn(hang, { signal: ac.signal }));
   ac.abort();
   assert.deepEqual(await p, { aborted: true });
-  const net = await runLevel(1, conn(async () => { throw new Error("socket hang up"); }));
+  const net = await runKind("1", conn(async () => { throw new Error("socket hang up"); }));
   assert.deepEqual([net.v, net.s], ["i", "error"]);
 });
 
-test("L2: a final text answer passes; calling the tool again, no answer, and an error all fail", async () => {
-  const good = await lvl(2, () => ok(stream(ev.text(0, "It returned ping."), ev.stop())));
-  assert.equal(good.r.v, "p");
-  const again = await lvl(2, () => ok(stream(ev.tool(0, "fx_echo", '{"message":"ping"}'), ev.stop("tool_use"))));
+test("L2: a final text answer passes; `br` is p when the answer uses the fact from the END of the 20 KB result and f when it does not; calling the tool again, no answer and a 400 fail", async () => {
+  const good = await kind("2", goodModel);
+  assert.deepEqual([good.r.v, good.r.br], ["p", "p"]);
+  const wrong = await kind("2", () => ok(stream(ev.text(0, "The code is AB-0001."), ev.stop())));
+  assert.deepEqual([wrong.r.v, wrong.r.br], ["p", "f"], "an answer, but not from the end of the result: L2 holds, `br` fails");
+  const again = await kind("2", () => ok(stream(ev.tool(0, "fx_read", '{"file_path":"/ws/report.txt"}'), ev.stop("tool_use"))));
   assert.deepEqual([again.r.v, again.r.why], ["f", "called the tool again instead of answering"]);
-  const empty = await lvl(2, () => ok(stream(ev.stop())));
-  assert.deepEqual([empty.r.v, empty.r.why], ["f", "no final answer after the tool result"]);
-  const rejected = await lvl(2, () => http(400, "messages.2: tool_result blocks are not supported"));
-  assert.equal(rejected.r.v, "f", "a 400 on the round trip is exactly what L2 exists to catch");
-  const midErr = await lvl(2, () => ok(stream(ev.text(0, "It returned"), ev.error("upstream decode failed"))));
-  assert.equal(midErr.r.v, "f");
+  assert.deepEqual([(await kind("2", () => ok(stream(ev.stop())))).r.why], ["no final answer after the tool result"]);
+  assert.equal((await kind("2", () => http(400, "messages.2: tool_result blocks are not supported"))).r.v, "f", "a 400 on the round trip is exactly what L2 exists to catch");
+  assert.equal((await kind("2", () => ok(stream(ev.text(0, `code ${BIG_RESULT_FACT}`), ev.error("upstream decode failed"))))).r.v, "f");
 });
 
-test("L3: the large request is accepted and answered (text or a call); the size sent is reported; a refusal at that size fails", async () => {
-  const asText = await lvl(3, () => ok(stream(ev.text(0, "ok"), ev.stop())));
-  assert.equal(asText.r.v, "p");
-  assert.ok(asText.r.bytes > 150000 && asText.r.bytes < 165000, `bytes sent: ${asText.r.bytes}`);
-  const asTool = await lvl(3, goodModel);
-  assert.equal(asTool.r.v, "p");
-  const tooBig = await lvl(3, () => http(413, "request entity too large"));
-  assert.deepEqual([tooBig.r.v, tooBig.r.http], ["f", 413]);
-  const empty = await lvl(3, () => ok(stream(ev.stop())));
-  assert.deepEqual([empty.r.v, empty.r.why], ["f", "empty answer to the large request"]);
-  const badArgs = await lvl(3, () => ok(stream(ev.tool(0, "fx_read_0", '{"path":'), ev.stop("tool_use"))));
-  assert.equal(badArgs.r.v, "f");
+test("L7 the error result: an answer (text) or a retry (a new call) passes `er`; an EMPTY answer fails; a 400 fails", async () => {
+  assert.equal((await kind("2e", goodModel)).r.v, "p");
+  assert.equal((await kind("2e", () => ok(stream(ev.tool(0, "fx_read", '{"file_path":"/ws/other.txt"}'), ev.stop("tool_use"))))).r.v, "p", "retrying with another call is a reaction");
+  const empty = await kind("2e", () => ok(stream(ev.text(0, "  "), ev.stop())));
+  assert.deepEqual([empty.r.v, empty.r.why], ["f", "empty answer after an error result"]);
+  assert.equal((await kind("2e", () => http(400, "tool_result is_error is not supported"))).r.v, "f");
 });
 
-test("L4: two parallel calls with streamed arguments pass; one call, a shared id, or broken arguments fail", async () => {
-  const two = await lvl(4, goodModel);
-  assert.equal(two.r.v, "p");
-  assert.ok(two.f.calls[0].bytes > 150000, "L4 rides on the large fixture");
-  const one = await lvl(4, () => ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}'), ev.stop("tool_use"))));
-  assert.deepEqual([one.r.v, one.r.why], ["f", "one tool call instead of 2 parallel calls"]);
-  const same = await lvl(4, () => ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}', "same"), ev.tool(1, "fx_echo", '{"message":"b"}', "same"), ev.stop("tool_use"))));
-  assert.deepEqual([same.r.v, same.r.why], ["f", "parallel tool calls share one id"]);
-  const cut = await lvl(4, () => ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}', "x"), ev.tool(1, "fx_echo", '{"message":"b', "y"), ev.stop("tool_use"))));
-  assert.equal(cut.r.v, "f", "the second call's arguments were cut off");
+test("3a (the constructs request): an answer passes; the long MCP-style name coming back exactly is `nm` p, a different name `nm` f, no call at all says nothing; a construct rejection is the schema verdict", async () => {
+  const good = await kind("3a", goodModel);
+  assert.deepEqual([good.r.v, good.r.nm], ["p", "p"]);
+  const mangled = await kind("3a", () => ok(stream(ev.tool(0, LONG_TOOL.slice(0, 40), '{"mode":"demo"}'), ev.stop("tool_use"))));
+  assert.deepEqual([mangled.r.v, mangled.r.nm], ["p", "f"]);
+  const text = await kind("3a", () => ok(stream(ev.text(0, "I would call it."), ev.stop())));
+  assert.deepEqual([text.r.v, text.r.nm], ["p", undefined]);
+  const construct = await kind("3a", () => http(400, "tools.0.input_schema: unsupported keyword anyOf"));
+  assert.deepEqual([construct.r.v, construct.r.kind], ["f", "schema"], "3a is small: a refusal here is never about size");
+  const big = await kind("3a", () => http(400, "request payload too large"));
+  assert.equal(big.r.kind, "schema");
+  const name = await kind("3a", () => http(400, "tools.0.name: String should match pattern '^[a-zA-Z0-9_-]{1,64}$'"));
+  assert.deepEqual([name.r.v, name.r.nmFail, name.r.kind], ["f", true, "schema"], "a 400 naming the tool name is a verdict, flagged for `nm`");
+  assert.equal((await kind("3a", () => ok(stream(ev.stop())))).r.v, "f");
 });
 
-test("argument deltas arrive split across many events and chunks and are reassembled", async () => {
-  const body = stream(ev.tool(0, "fx_echo", JSON.stringify({ message: "x".repeat(300) })), ev.stop("tool_use"));
-  const chunks = body.match(/[\s\S]{1,13}/g);
-  const f = async () => new Response(new ReadableStream({ start(c) { for (const k of chunks) c.enqueue(new TextEncoder().encode(k)); c.close(); } }), { status: 200 });
-  assert.equal((await runLevel(1, conn(f))).v, "p");
+test("a 400 that names cache_control is flagged `ccFail` (a verdict the caller can act on) at 3a, 3b and the big step only", async () => {
+  for (const k of ["3a", "3b", "5"]) {
+    const { r } = await kind(k, () => http(400, "system.0.cache_control: Extra inputs are not permitted"));
+    assert.deepEqual([r.v, r.ccFail, r.kind], ["f", true, "schema"], k);
+  }
+  const l1 = await kind("1", () => http(400, "cache_control is not permitted"));
+  assert.equal(l1.r.ccFail, undefined, "L1 sends no marker");
+  const idle = await kind("3b", () => http(400, "tools.7.input_schema: unsupported keyword anyOf"));
+  assert.equal(idle.r.ccFail, undefined);
+});
+
+test("3b (the 157 KB request): accepted and answered passes L3 and ALSO answers L4 (two parallel calls with streamed arguments); the size sent is reported; a refusal at that size fails", async () => {
+  const good = await kind("3b", goodModel);
+  assert.deepEqual([good.r.v, good.r.l4], ["p", "p"]);
+  assert.ok(good.r.bytes > 150000 && good.r.bytes < 165000, `bytes sent: ${good.r.bytes}`);
+  const one = await kind("3b", () => ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}'), ev.stop("tool_use"))));
+  assert.deepEqual([one.r.v, one.r.l4, one.r.l4why], ["p", "f", "1 tool call instead of 2 parallel calls"], "L3 holds, L4 fails: no strike, no class change");
+  const same = await kind("3b", () => ok(stream(ev.tool(0, "fx_echo", '{"message":"a"}', "same"), ev.tool(1, "fx_echo", '{"message":"b"}', "same"), ev.stop("tool_use"))));
+  assert.equal(same.r.l4, "f");
+  const whole = (i, id, input) => `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: i, content_block: { type: "tool_use", id, name: "fx_echo", input } })}\n\nevent: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: i })}\n\n`;
+  const notStreamed = await kind("3b", () => ok(stream(whole(0, "a", { message: "a" }), whole(1, "b", { message: "b" }), ev.stop("tool_use"))));
+  assert.deepEqual([notStreamed.r.l4, notStreamed.r.l4why], ["f", "the tool call arguments were not streamed (no argument deltas)"]);
+  const asText = await kind("3b", () => ok(stream(ev.text(0, "ok"), ev.stop())));
+  assert.deepEqual([asText.r.v, asText.r.l4], ["p", "f"], "an answer in text is accepted (L3) but is not parallel calls");
+  const tooBig = await kind("3b", () => http(413, "request entity too large"));
+  assert.deepEqual([tooBig.r.v, tooBig.r.kind, tooBig.r.http], ["f", "size", 413]);
+  assert.deepEqual([(await kind("3b", () => ok(stream(ev.stop())))).r.why], ["empty answer to the large request"]);
+  assert.equal((await kind("3b", () => ok(stream(ev.tool(0, "fx_echo", '{"message":'), ev.stop("tool_use"))))).r.v, "f");
+});
+
+test("the big step (5): accepted and answered passes; any 400 there is about SIZE (after 157 KB was accepted); a rate or tokens-per-minute limit is never a verdict", async () => {
+  assert.equal((await kind("5", goodModel)).r.v, "p");
+  const big = await kind("5", () => http(400, "bad request"));
+  assert.deepEqual([big.r.v, big.r.kind], ["f", "size"]);
+  for (const [status, msg] of [[413, "Request too large for model on tokens per minute (TPM): Limit 6000, Requested 40000"], [400, "Rate limit reached: 30 requests per minute"], [422, "quota exceeded, try again in 20s"]]) {
+    const { r } = await kind("5", () => http(status, msg));
+    assert.deepEqual([r.v, r.s], ["i", "rate"], `${status}: ${msg}`);
+  }
+});
+
+test("spawn (6): a valid Agent call with a prompt and a recognised subagent_type passes; text, another tool, bad JSON, a short prompt, an unknown type and a missing description fail", async () => {
+  assert.equal((await kind("6", goodModel)).r.v, "p");
+  const call = (o) => ok(stream(ev.tool(0, "Agent", JSON.stringify({ description: "Investigate", prompt: "Investigate the module thoroughly", subagent_type: "Explore", ...o })), ev.stop("tool_use")));
+  assert.deepEqual([(await kind("6", () => ok(stream(ev.text(0, "I will look."), ev.stop())))).r.why], ["answered in text instead of delegating"]);
+  assert.equal((await kind("6", () => ok(stream(ev.tool(0, "fx_edit", "{}"), ev.stop("tool_use"))))).r.why, "tool call names a tool that was not offered");
+  assert.equal((await kind("6", () => ok(stream(ev.tool(0, "Agent", '{"prompt":'), ev.stop("tool_use"))))).r.why, "tool call arguments are not valid JSON");
+  assert.equal((await kind("6", () => call({ prompt: "hi" }))).r.why, "the Agent call has no usable prompt");
+  assert.equal((await kind("6", () => call({ prompt: "" }))).r.v, "f");
+  assert.equal((await kind("6", () => call({ subagent_type: "wizard" }))).r.why, "the Agent call names a subagent_type that was not offered");
+  assert.equal((await kind("6", () => call({ description: undefined }))).r.why, "the Agent call lacks a description");
+  assert.equal((await kind("6", () => call({ subagent_type: "code-reviewer" }))).r.v, "p", "any of the offered types");
+});
+
+test("a THINKING block is not content: thinking, then a stop on max_tokens with no text or tool call, is inconclusive; thinking then a call is judged on the call", async () => {
+  const sse = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  const think = (i, t) => sse("content_block_start", { type: "content_block_start", index: i, content_block: { type: "thinking", thinking: "" } }) + sse("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: t } }) + sse("content_block_stop", { type: "content_block_stop", index: i });
+  assert.deepEqual([(await kind("1", () => ok(stream(think(0, "hmm"), ev.stop("max_tokens"))))).r.s], ["empty"]);
+  assert.equal((await kind("1", () => ok(stream(think(0, "hmm"), ev.tool(1, "fx_edit", edit()), ev.stop("tool_use"))))).r.v, "p");
+  assert.equal((await kind("1", () => ok(stream(think(0, "hmm"), ev.stop("end_turn"))))).r.v, "f", "thinking and a normal stop with no call is a real miss");
 });
 
 test("judge is pure over a parsed stream: a no-body response is inconclusive", () => {
-  assert.equal(judge(1, { noBody: true, blocks: [] }).v, "i");
-});
-
-test("probeModel: asks only the requested levels, in order, and returns the verdicts with the size L3 sent", async () => {
-  const f = fakeFetch(goodModel);
-  const r = await probeModel({ levels: [1, 2, 3, 4], ...conn(f) });
-  assert.deepEqual(Object.fromEntries(Object.entries(r.done).map(([k, v]) => [k, v.v])), { 1: "p", 2: "p", 3: "p", 4: "p" });
-  assert.equal(r.requests, 4);
-  assert.ok(r.done[3].bytes > 150000 && r.done[4].bytes > 150000, "the size each large level sent is carried");
-  const f2 = fakeFetch(goodModel);
-  const r2 = await probeModel({ levels: [1, 2], ...conn(f2) });
-  assert.equal(r2.requests, 2);
-  assert.equal(r2.done[3], undefined, "L3 did not run: no size is claimed");
-});
-
-test("probeModel: a model that failed L1 or L2 is NOT sent the 157 KB levels (zero requests, level recorded as not run)", async () => {
-  const f = fakeFetch((c) => (c.body.tool_choice ? ok(stream(ev.text(0, "no"), ev.stop())) : goodModel(c)));
-  const r = await probeModel({ levels: [1, 2, 3, 4], ...conn(f) });
-  assert.equal(r.requests, 2, "L1 and L2 only");
-  assert.deepEqual([r.done[1].v, r.done[2].v, r.done[3].v, r.done[4].v], ["f", "p", "n", "n"]);
-  assert.ok(f.calls.every((c) => c.bytes < 2000), "no large request was sent");
-  // the same through a stored prior: lazy L3 on a model whose record says L1 and L2 did not both pass
-  const f2 = fakeFetch(goodModel);
-  const r2 = await probeModel({ levels: [3, 4], prior: "pfnn", ...conn(f2) });
-  assert.equal(r2.requests, 0);
-  assert.deepEqual([r2.done[3].v, r2.done[4].v], ["n", "n"]);
-  // and lazy L3 and L4 on a model whose record says pp: both run, L1 and L2 are not asked again
-  const f3 = fakeFetch(goodModel);
-  const r3 = await probeModel({ levels: [3, 4], prior: "ppnn", ...conn(f3) });
-  assert.equal(r3.requests, 2);
-  assert.ok(f3.calls.every((c) => c.bytes > 150000));
-});
-
-test("probeModel: an inconclusive level returns no verdicts at all (nothing to record); a retry repeats only that level", async () => {
-  let n = 0;
-  const f = fakeFetch((c) => (c.body.messages.length === 3 && ++n === 1 ? http(429, "slow down") : goodModel(c)));
-  const done = {};
-  const first = await probeModel({ levels: [1, 2], done, ...conn(f) });
-  assert.equal(first.inconclusive.s, "rate");
-  assert.equal(first.done, undefined, "no result object to record");
-  assert.equal(done[1].v, "p", "L1 had a verdict and keeps it");
-  assert.equal(done[2], undefined);
-  const second = await probeModel({ levels: [1, 2], done, ...conn(f) });
-  assert.equal(second.requests, 1, "only L2 is asked again");
-  assert.deepEqual([second.done[1].v, second.done[2].v], ["p", "p"]);
-});
-
-test("probeModel: an abort drops the model without a verdict", async () => {
-  const ac = new AbortController();
-  const f = async (url, init) => { ac.abort(); throw new Error("aborted"); };
-  assert.deepEqual(await probeModel({ levels: [1, 2], ...conn(f, { signal: ac.signal }) }), { aborted: true });
+  assert.equal(judge("1", { noBody: true, blocks: [] }).v, "i");
 });

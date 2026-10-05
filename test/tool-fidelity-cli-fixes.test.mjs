@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
-import { freshDir, fakeFetch, ok, http, goodModel, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { freshDir, fakeFetch, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, plan, parseArgs } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, saveFidelity, cleanFidelity, FILE_NAME, REAL_FILE, KIND } from "../refresh/tool-fidelity.mjs";
 import { funnel } from "../menu/subagent-funnel.mjs";
@@ -27,7 +27,8 @@ function env(models, extra = {}) {
   const f = fakeFetch(extra.answer ?? goodModel);
   const deps = { snapshot: { ok: true, snap: { rows } }, bench: { get: (k) => (models.some(([p, id]) => `${p}/${id}` === k) ? { s: "ok", t: 400, a: 1790699779 } : null) },
     outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"), gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW, isAlive: () => false, findRunning: () => [],
-    sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1, ...extra.deps };
+    sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1,
+    tiers: Object.fromEntries(rows.map((r) => [r.provider, "free"])), ...extra.deps };
   return { dir, deps, f, out: deps.outFile, rows };
 }
 async function run(argv, deps) {
@@ -52,11 +53,11 @@ test("--retry-failed asks again ONLY models of class x, only at the levels that 
   const r = await run(["--live", "--retry-failed", "--l3", "yes", "--only", "fa"], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
   const by = {};
-  for (const c of calls(e.f)) (by[c.body.model] ??= []).push(c.bytes > 100000 ? "L3" : c.body.messages.length === 3 ? "L2" : "L1");
-  assert.deepEqual(by, { "fa/a1": ["L1", "L2"], "fa/a2": ["L3"], "fa/auto": ["L2"] }, "a3 passed and is not asked anything; L1 of `auto` passed and is not asked again");
+  for (const c of calls(e.f)) (by[c.body.model] ??= []).push(kindOf(c));
+  assert.deepEqual(by, { "fa/a1": ["1", "2"], "fa/a2": ["3a", "3b"], "fa/auto": ["2"] }, "a3 passed and is not asked anything; L1 of `auto` passed and is not asked again");
   const s = loadFidelity(e.out).models;
   assert.deepEqual([s["fa/a1"].lvr, s["fa/a1"].t, s["fa/a1"].strikes], ["ppnn", "t", undefined], "retried and passed: the strike is gone");
-  assert.deepEqual([s["fa/a2"].lvr, s["fa/a2"].t], ["pppn", "v"]);
+  assert.deepEqual([s["fa/a2"].lvr, s["fa/a2"].t], ["pppp", "v"], "the retried L3 request also answers L4");
   assert.deepEqual([s["fa/auto"].lvr, s["fa/auto"].t], ["ppnn", "t"]);
   assert.deepEqual(s["fa/a3"], before, "untouched");
   const dry = await run(["--retry-failed"], e.deps);
@@ -83,9 +84,10 @@ test("the store is RELOADED after the lock: results another run wrote while this
 test("a failed periodic save never stops the run and loses nothing: the records stay in memory and the next save carries them", async () => {
   const many = Array.from({ length: 30 }, (_, i) => ["fa", `m${i}`]);
   const e = env(many);
+  const CAPALL = ["--tf-max-tokens-per-provider", "1000000"];
   let n = 0;
   e.deps.saveImpl = (...a) => { n += 1; if (n === 1) throw new Error("disk hiccup"); return saveFidelity(...a); };
-  const r = await run(["--live"], e.deps);
+  const r = await run(["--live", ...CAPALL], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
   assert.match(r.err, /warning: could not save \(disk hiccup\)/);
   assert.equal(Object.keys(loadFidelity(e.out).models).length, 30, "all 30 are in the file");
@@ -113,14 +115,15 @@ test("the FINAL save is retried; when it still fails the records go to a side fi
 });
 
 test("SPEND counts the levels a probe COMPLETED even when a later level errors: L1 done then L2 rate-limited is still charged", async () => {
-  const e = env([["pb", "b1", { pin: 1000, pout: 1000 }], ["pb", "b2", { pin: 1000, pout: 1000 }], ["pb", "b3", { pin: 1000, pout: 1000 }]],
+  const e = env([["pb", "b1", { pin: 100, pout: 100 }], ["pb", "b2", { pin: 100, pout: 100 }], ["pb", "b3", { pin: 100, pout: 100 }]],
     { answer: (c) => (c.body.messages.length === 3 ? http(429, "slow down") : goodModel(c)) });
   const r = await run(["--live", "--max-spend", "5", "--max-row-cost", "5"], e.deps);
   assert.equal(r.code, 3, "no model answered ok in this run (every L2 was rate limited): the bench's own exit code for that");
   const m = r.out.match(/est\. spend \$([\d.]+) of the \$5\.00 cap/);
   assert.ok(m, r.out);
-  // each model completed L1 (about 116 input + 512 output tokens at $1000 per million) and then hit the rate limit at L2, on every attempt
-  assert.ok(Number(m[1]) > 1.8 && Number(m[1]) < 2.0, `3 completed L1 levels charged once each: ${m[1]}`);
+  // each model completed L1 and then hit the rate limit at L2, on every attempt; with pb's first answers rate limited the provider is paused after three
+  assert.ok(Number(m[1]) > 0.05 && Number(m[1]) < 0.2, `completed L1 levels (about 318 in + 256 out tokens at $100 per million, about $0.057 each) are charged once each, though L2 never finished: ${m[1]}`);
+  assert.match(r.out, /left alone for the rest of this run, their models stay pending: pb \(rate-limited\)/, "three rate limits in a row pause the provider");
   assert.deepEqual(Object.keys(loadFidelity(e.out).models), [], "and nothing was recorded for them");
 });
 
@@ -128,10 +131,10 @@ test("a run narrowed with --only charges an unpriced paid model the highest list
   const e = env([["pb", "priced", { pin: 50, pout: 100 }], ["pb", "unpriced", { pin: 1, pout: 1 }], ["fa", "free1"]]);
   e.deps.snapshot.snap.rows[0].models.find((m) => m.id === "unpriced").pin = null;
   e.deps.snapshot.snap.rows[0].models.find((m) => m.id === "unpriced").pout = null;
-  const price = (only) => plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, o: { ...parseArgs([]), only } }).run.entries.find((x) => x.key === "pb/unpriced");
+  const price = (only) => plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, tiers: e.deps.tiers, o: { ...parseArgs([]), only } }).run.entries.find((x) => x.key === "pb/unpriced");
   const narrow = price(["pb/unpriced"]), whole = price(null);
   assert.ok(narrow.cost > 0 && Math.abs(narrow.cost - whole.cost) < 1e-12, "the same price narrowed or not");
-  assert.ok(Math.abs(narrow.cost - ((narrow.tin * 50 + narrow.reqs * 512 * 100) / 1e6)) < 1e-12, "the highest listed (50 in, 100 out), not the documented default");
+  assert.ok(Math.abs(narrow.cost - ((narrow.tin * 50 + narrow.tout * 100) / 1e6)) < 1e-12, "the highest listed (50 in, 100 out), not the documented default");
 });
 
 test("provider names and ids are sanitised in everything printed: an escape sequence in a provider name never reaches the terminal", async () => {
@@ -149,14 +152,14 @@ test("a cap below ONE model's cost says what cap is needed: a warning in the dry
   const e = env(FREE4);
   const dry = await run(["--tf-max-tokens-per-provider", "100"], e.deps);
   assert.equal(dry.code, 0);
-  assert.match(dry.out, /WARNING: 4 queued model\(s\) cost more than the cap on their own and will never run under it: raise --tf-max-tokens-per-provider to at least 287/);
+  assert.match(dry.out, /WARNING: 4 queued model\(s\) cost more than the cap on their own and will never run under it: raise --tf-max-tokens-per-provider to at least 5,5\d\d/);
   const live = await run(["--live", "--tf-max-tokens-per-provider", "100"], e.deps);
   assert.equal(live.code, 2);
-  assert.match(live.err, /--tf-max-tokens-per-provider 100 is below the cost of one model for these levels: nothing would run\. Use at least 287/);
+  assert.match(live.err, /--tf-max-tokens-per-provider 100 is below the cost of one model for these levels: nothing would run\. Use at least 5,5\d\d/);
   assert.equal(e.f.calls.length, 0);
-  const some = await run(["--live", "--tf-max-tokens-per-provider", "300"], e.deps);
+  const some = await run(["--live", "--tf-max-tokens-per-provider", "6000"], e.deps);
   assert.equal(some.code, 0, some.err);
-  assert.equal(Object.keys(loadFidelity(e.out).models).length, 1, "300 tokens fits one model of 287 per provider");
+  assert.equal(Object.keys(loadFidelity(e.out).models).length, 1, "6,000 tokens fits one model of about 5,550 per provider");
 });
 
 test("the BIG step: needs --l3 yes and a named provider; asked only of models that passed L3; a pass is `big: p`, a refusal is `big: f` with a size cap, a rate limit records nothing", async () => {
@@ -169,7 +172,7 @@ test("the BIG step: needs --l3 yes and a named provider; asked only of models th
   saveAll(e, { "fa/a1": record("pppn"), "fa/a2": record("pppn"), "fa/a3": record("pppn"), "fa/a4": record("ppnn") });
   const dry = await run(["--levels", "5"], e.deps);
   assert.match(dry.out, /levels big/);
-  assert.match(dry.out, /the big step ~39\d KB \(~10\dk\)|the big step ~39\d KB \(~9\dk\)/);
+  assert.match(dry.out, /big 400 KB 1 req ~100k in, up to 512 out/);
   assert.match(dry.out, /3 model\(s\) queued of 4/, "a4 did not pass L3: not queued");
   assert.equal((await run(["--live", "--levels", "5"], e.deps)).code, 2);
   assert.equal((await run(["--live", "--levels", "5", "--l3", "yes"], e.deps)).code, 2, "and a named provider or a cap");
@@ -209,20 +212,20 @@ test("context length unknown is its own count in the report: 1 of the probe set,
   assert.match(live.out, /context length unknown 2 of 3\b/);
 });
 
-test("TWO STRIKES at L3 end to end: a schema refusal is provisional the first time (class stays t), the second makes it x and it leaves every compiled list", async () => {
-  const e = env([["fa", "a1"], ["fa", "a2"]], { answer: (c) => (c.bytes > 100000 && /once/.test(String(c.body.messages[0].content)) && !/twice/.test(String(c.body.messages[0].content)) ? http(400, "tools[3].input_schema: unsupported keyword anyOf") : goodModel(c)) });
+test("TWO STRIKES at L3 end to end: a schema refusal of the 157 KB request is provisional the first time (class stays t), the second makes it x and it leaves every compiled list", async () => {
+  const e = env([["fa", "a1"], ["fa", "a2"]], { answer: (c) => (kindOf(c) === "3b" ? http(400, "tools[3].input_schema: unsupported keyword anyOf") : goodModel(c)) });
   saveAll(e, { "fa/a1": record("ppnn"), "fa/a2": record("ppnn") });
   const args = ["--live", "--levels", "34", "--l3", "yes", "--only", "fa", "--tf-max-tokens-per-provider", "200000"];
   const first = await run(args, e.deps);
   assert.equal(first.code, 0, first.err + first.out);
   let s = loadFidelity(e.out).models;
-  assert.deepEqual([s["fa/a1"].lvr, s["fa/a1"].t, s["fa/a1"].strikes, s["fa/a1"].sl], ["ppnp", "t", 1, 3], "provisional: still t, L4 kept");
+  assert.deepEqual([s["fa/a1"].lvr, s["fa/a1"].t, s["fa/a1"].strikes, s["fa/a1"].sl], ["ppnn", "t", 1, 3], "provisional: still t");
   const nCalls = calls(e.f).length;
   const second = await run(args, e.deps);
   assert.equal(second.code, 0, second.err + second.out);
-  assert.equal(calls(e.f).length - nCalls, 2, "only the struck level (L3) is asked again, for each of the two models");
+  assert.equal(calls(e.f).length - nCalls, 4, "only the struck level (L3: 3a and 3b) is asked again, for each of the two models");
   s = loadFidelity(e.out).models;
-  assert.deepEqual([s["fa/a1"].lvr, s["fa/a1"].t, s["fa/a1"].strikes, s["fa/a1"].ok], ["ppfp", "x", 2, false]);
+  assert.deepEqual([s["fa/a1"].lvr, s["fa/a1"].t, s["fa/a1"].strikes, s["fa/a1"].ok, s["fa/a1"].d3], ["ppfn", "x", 2, false, "b"]);
   assert.ok(cleanFidelity(s["fa/a1"]));
   const third = await run(args, e.deps);
   assert.match(third.out, /nothing to probe/);

@@ -27,7 +27,7 @@ const OLD = execFileSync("git", ["show", "6edfdee:spike/uw-router.cjs"], { cwd: 
 const V29 = JSON.parse(fs.readFileSync(path.join(REPO, "test", "fixtures", "router-slot-v29-ids.json"), "utf8")).ids;
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
 const liveDir = path.dirname(LIVE_ROUTER);
-const realSnapshot = () => ({ router: sha(fs.readFileSync(LIVE_ROUTER)), slot: sha(fs.readFileSync(path.join(liveDir, "slot.json"))), names: fs.readdirSync(liveDir).sort().join("|") });
+const realSnapshot = () => ({ router: sha(fs.readFileSync(LIVE_ROUTER)), slot: sha(fs.readFileSync(path.join(liveDir, "slot.json"))), names: fs.readdirSync(liveDir).filter((n) => !/\.bak-pre-subpolicy-/.test(n)).sort().join("|") });   // sa-H: a live deploy leaves .bak-pre-subpolicy-* copies beside the router; they are the deploy's, not a test's
 const before = realSnapshot();
 
 const made = [];
@@ -632,5 +632,5 @@ test("differential vs git 6edfdee (variants): whitespace, case and prefix varian
 
 test("no part of this file touched the real spike/ (hashes and the directory listing are unchanged)", () => {
   assert.deepEqual(realSnapshot(), before);
-  assert.ok(!realSnapshot().names.includes(".bak-pre-subpolicy") && !/\.tmp-/.test(realSnapshot().names));
+  assert.ok(!/\.tmp-/.test(realSnapshot().names), "no temp file of a test is left in spike/ (a live deploy's own .bak-pre-subpolicy-* copies are ignored)");
 });

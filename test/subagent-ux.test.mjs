@@ -275,9 +275,9 @@ test("show: verdict first, the last-change delta when an undo generation exists,
   assert.match(r.out, /HELPER CALLS: free governs subagents with tools/);
   assert.doesNotMatch(r.out, INTERNAL_ID); assert.doesNotMatch(r.out, /\(D-[a-z]\)/);
   // U5: the technical fields are behind --detail yes, and show and status print `policy:` in the SAME format
-  assert.doesNotMatch(r.out, /providersLive|contentHash|compiler 1|inject off/, "no internal field in the default view");
+  assert.doesNotMatch(r.out, /providersLive|contentHash|compiler 2|inject off/, "no internal field in the default view");
   const det = await SHOW(s, "--detail", "yes");
-  for (const needle of [/providersLive false/, /contentHash [0-9a-f]{12}/, /compiler 1/, /inject off/]) assert.match(det.out, needle);
+  for (const needle of [/providersLive false/, /contentHash [0-9a-f]{12}/, /compiler 2/, /inject off/]) assert.match(det.out, needle);
   const pol = (x) => /^policy: (.*)$/m.exec(x)[1];
   assert.equal(pol(r.out), "mode free (free providers), source all-providers, ctx any, enforcement shadow");
   assert.equal(pol(r.out), pol((await STATUS(s)).out), "show and status say the same policy line");
@@ -477,7 +477,7 @@ test("preset: on REAL paths a confirmed preset needs --live yes (nothing written
 // =====================================================================================================================
 test("help: the owner's toggle map (toggle 1 source, toggle 2 mode with the free scope, toggle 3 ctx, the other switches) and every command, no internal id", () => {
   const h = lib.usageText;
-  for (const needle of [/Toggle 1 +source +--source same-provider\|all-providers/, /Toggle 2 +mode +--mode dynamic\|inherit\|free/, /--free-scope models\|providers\|providers\+deposit/, /Toggle 3 +context +--ctx any\|prefer-1m\|1m/,
+  for (const needle of [/Toggle 1 +source +--source same-provider\|all-providers/, /Toggle 2 +mode +--mode dynamic\|inherit\|free/, /--free-scope models\|providers\|providers\+deposit/, /Toggle 3 +context +--ctx any\|128k\|200k\|256k\|512k\|1m\|prefer-256k\|prefer-512k\|prefer-1m/,
     /--banded yes\|no/, /--handoff-notice yes\|no/, /--enforce shadow\|enforce/, /--inject off\|on/, /--allow provider\/model/, /--live yes/, /rollback needs no flag/]) assert.match(h, needle);
   for (const c of [...lib.COMMANDS, "help"]) assert.ok(new RegExp(`(^|\\s)${c}( |$|\\|)`, "m").test(h), `the help names ${c}`);
   assert.doesNotMatch(h, INTERNAL_ID);
@@ -543,7 +543,7 @@ test("explain what-if: --source/--mode/--free-scope/--ctx answer 'would model X 
   const free = await E("fx-free-a/fxa-alpha", "--source", "all-providers", "--mode", "free", "--free-scope", "models");
   assert.match(free.lines[1], /^ANSWER: fx-free-a\/fxa-alpha (WOULD|would NOT) be allowed under mode free \(free models\)/);
   const ctx = await E("fx-free-a/fxa-alpha", "--source", "all-providers", "--mode", "dynamic", "--ctx", "1m");
-  assert.match(ctx.lines[1], /^ANSWER: fx-free-a\/fxa-alpha would NOT be allowed under mode dynamic, source all-providers, ctx 1m: it has less than 1M of context and the context floor is 1m/);
+  assert.match(ctx.lines[1], /^ANSWER: fx-free-a\/fxa-alpha would NOT be allowed under mode dynamic, source all-providers, ctx 1m: it has less than 1M of known context and the context floor is 1m/);
   const inh = await E("fx-paid/fxp-plain", "--mode", "inherit");
   assert.match(inh.lines[1], /^ANSWER: under mode inherit every non-exempt subagent runs on main's own model, so fx-paid\/fxp-plain is used exactly when main itself runs on it \(what-if: nothing was saved\)$/);
   const plain = await E("fx-paid/fxp-plain");
@@ -1103,7 +1103,7 @@ test("code table (F14, F15): EVERY fix command of EVERY row parses through the r
     if (r.degrades) assert.doesNotMatch(r.fix, /--dry yes|preset( \w[\w-]*)?$/, `${r.code}: a degrading code's fix is a repair, not a preview`);
   }
   assert.ok(parsed >= 50, `parsed ${parsed} subagent-policy fix commands`);
-  assert.equal(CODES.length, 129, "the table holds 129 rows");
+  assert.equal(CODES.length, 130, "the table holds 130 rows");
   // the rows the review named
   assert.equal(codeRow("FREE_PROMISE_BREAK").fix, `${CLI} show --detail yes`);
   assert.equal(codeRow("UNKNOWN_MAIN").fix, `${CLI} status`); assert.match(codeRow("UNKNOWN_MAIN").fixNote, /start a request in the main session first/);
@@ -1195,4 +1195,111 @@ test("runbook 5b (F19): every documented example runs in a fixture with the MINI
   assert.match(flat, /`\$F` given to `last`, `pause`, `rollback`, `clear` or `why` is refused as E_USAGE/);
   assert.match(flat, /preset free-wide/);
   assert.match(flat, /--lift-pause yes/); assert.match(flat, /`wizard`/);
+});
+
+// =====================================================================================================================
+// 14. revision 11, policy-side fix round: the context toggle everywhere (preview, show, preset, wizard, explain), inferred ctx, known issues, re-probe, payload wording
+// =====================================================================================================================
+const FLOORS_LINE = /^CONTEXT FLOORS: of \d+ rows in the chosen scope, \d+ have no known ctx; known ctx >= 128k \d+, >= 200k \d+, >= 256k \d+, >= 512k \d+, >= 1M \d+; \d+ of the \d+ unknown rows pass 128k on an inferred ctx/m;
+
+test("the `set --dry yes` preview prints rows per context floor with their denominators; --detail adds them to the funnel too; the numbers do not move with the ctx value (they describe the scope, not the choice)", async () => {
+  const s = setup();
+  const a = await SET(s, ...DYN, "--ctx", "any", "--dry", "yes");
+  assert.equal(a.status, 0, a.err);
+  assert.match(a.out, FLOORS_LINE);
+  const floors = (r) => r.out.split("\n").find((l) => l.startsWith("CONTEXT FLOORS"));
+  const b = await SET(s, ...DYN, "--ctx", "prefer-256k", "--dry", "yes");
+  assert.equal(floors(b), floors(a), "same scope, same rows per floor");
+  assert.match(b.out, /ALLOWED: \d+ models? \(of \d+ in the chosen scope, ctx prefer-256k: rows of at least 256k form the higher band;/);
+  const c = await SET(s, ...DYN, "--ctx", "128k", "--dry", "yes");
+  assert.match(c.out, /after the ctx 128k filter/);
+  assert.match((await SET(s, ...DYN, "--ctx", "prefer-1m", "--dry", "yes")).out, /ctx prefer-1m: rows of at least 1M form the higher band/);
+  const d = await SET(s, ...DYN, "--ctx", "any", "--dry", "yes", "--detail", "yes");
+  assert.match(d.out, FLOORS_LINE);
+  assert.ok(!INTERNAL_ID.test(a.out), "no plan id in the default preview");
+});
+
+test("`preset` with no name lists one context line per preset (rows per floor with denominators), and `preset free-1m` (a preset that mentions 1m) still previews", async () => {
+  const s = setup();
+  const r = await run(["preset", ...s.F]);
+  assert.equal(r.status, 0, r.err);
+  assert.equal(r.out.split("\n").filter((l) => /^\s+context: of \d+ rows, \d+ unknown; known >= 128k \d+, >= 200k \d+, >= 256k \d+, >= 512k \d+, >= 1M \d+$/.test(l)).length, 4, "a context line under each of the 4 presets that have a list");
+  const p = await run(["preset", "free-1m", ...s.F]);
+  assert.ok(p.status === 0 || p.status === 2, p.err);
+  assert.match(p.out, /--ctx 1m/);
+});
+
+test("`show` prints the compiled rows per context floor and, with --detail, names the free models waiting for a re-probe; the payload gate is called inert when pb is unknown", async () => {
+  const s = setup();
+  const r = await SET(s, ...DYN);
+  assert.equal(r.status, 0, r.err);
+  const sh = await SHOW(s);
+  assert.match(sh.out, /^  CONTEXT FLOORS: of \d+ rows in the chosen scope/m);
+  assert.match(sh.out, /^  payload limits: \d+ of \d+ eligible models have no known request-size limit, so the size check does nothing for them until a limit is measured \(a tool test records one\); live shadow: 317 of 337 classified subagent requests \(94%\) were over 200 KB and 71 \(21%\) over 1 MB/m);
+  const c = rd(s.compiled);
+  const wt = { ...c, counts: { ...c.counts, reprobe: 2 }, reprobe: [{ s: "pa/a:free", status: "rate", ageDays: 6 }, { s: "pa/b:free", status: "timeout", ageDays: 5 }] };
+  wr(s.compiled, wt);
+  assert.match((await SHOW(s)).out, /2 free-tagged models wait for a re-probe \(dropped on a transient bench status, not dead\) \(--detail yes names them\)/);
+  assert.match((await SHOW(s, "--detail", "yes")).out, /wait for a re-probe .*: pa\/a:free \(rate\), pa\/b:free \(timeout\)/);
+  wr(s.compiled, { ...wt, counts: { ...wt.counts, accountStateRows: 1 }, accountStateRows: [{ s: "pa/orca:free", status: "rate", ageDays: 6, why: "auth" }] });
+  assert.match((await SHOW(s)).out, /1 free-tagged models show an account state \(their stored message names your plan, key or balance\), not a pending re-probe \(--detail yes names them\)/);
+  assert.match((await SHOW(s, "--detail", "yes")).out, /show an account state .*: pa\/orca:free \(auth\)/);
+  const st = await STATUS(s);
+  assert.match(st.out, /^payload limits: /m, "status says it too");
+});
+
+test("explain: an INFERRED ctx is named as such, a seeded known issue is named with its number, a payload cap names its source, the ctx floor in the verdict text follows the toggle", async () => {
+  const s = setup();
+  const sn = rd(s.m["snapshot-file"]);
+  const pa = sn.rows.find((r) => r.provider === "fx-free-a"), pb = sn.rows.find((r) => r.provider === "fx-free-b");
+  const tpl = pa.models[0];
+  pa.models.push({ ...tpl, id: "sib-model", ctx: 500000 });
+  pb.models.push({ ...tpl, id: "sib-model:free", ctx: null });
+  wr(s.m["snapshot-file"], sn);
+  const pr = rd(s.m["providers-file"]);
+  pr.Providers.find((p) => p.name === "fx-free-a").models.push("sib-model"); pr.Providers.find((p) => p.name === "fx-free-b").models.push("sib-model:free");
+  wr(s.m["providers-file"], pr);
+  const bn = rd(s.m["bench-file"]);
+  bn.models["fx-free-a/sib-model"] = { ...bn.models["fx-free-a/fxa-alpha"] }; bn.models["fx-free-b/sib-model:free"] = { ...bn.models["fx-free-a/fxa-alpha"] };
+  wr(s.m["bench-file"], bn);
+  const e = await run(["explain", "fx-free-b/sib-model:free", ...s.F]);
+  assert.equal(e.status, 0, e.err);
+  assert.match(e.out, /^ctx: 128,000 \(INFERRED \(c\?\) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k\)/m);
+  const e256 = await run(["explain", "fx-free-b/sib-model:free", "--ctx", "256k", ...s.F]);
+  assert.match(e256.out, /would NOT be allowed under mode dynamic, source all-providers, ctx 256k: it has less than 256k of known context and the context floor is 256k/);
+  assert.match(e.out, /^rank: position \d+ of \d+.*first strike=0, big step \(v only\)=\d, L4 \(v only\)=\d, ttft quantile bucket=\d, ctx class=4, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d/m);
+});
+
+test("wizard: the context question offers the hard floors and the soft preferences, prints the rows per floor above it, and answer 2 and 3 keep their old meaning (prefer-1m, 1m)", async () => {
+  const outs = [], asked = [];
+  const answers = ["2", "6", "y"];
+  const res = await runWizard({ isTTY: true, ask: async (p) => { asked.push(p); return answers.shift() ?? ""; }, out: (l) => outs.push(l), cli: "CLI", mainOutsideFree: async () => false,
+    preview: async () => 0, save: async (f) => { outs.push(`SAVE ${flagsText(f)}`); return 0; }, ctxFloorLine: async (free) => `FLOORS(${free})` });
+  assert.equal(res.code, 0);
+  const text = outs.join("\n");
+  assert.match(text, /FLOORS\(false\)/);
+  for (const w of ["only 1M", "only models with at least 128k", "at least 200k", "at least 256k", "at least 512k", "prefer 256k or more", "prefer 512k or more", "prefer 1M"]) assert.ok(text.includes(w), w);
+  assert.match(text, /SAVE .*--ctx 256k/, "answer 6 is the 256k floor");
+  const old = ["3", "2", "y"], o2 = [];
+  const r2 = await runWizard({ isTTY: true, ask: async () => old.shift() ?? "", out: (l) => o2.push(l), cli: "CLI", mainOutsideFree: async () => false, preview: async () => 0, save: async (f) => { o2.push(`SAVE ${flagsText(f)}`); return 0; } });
+  assert.equal(r2.code, 0);
+  assert.match(o2.join("\n"), /SAVE .*--ctx prefer-1m/, "answer 2 still means prefer-1m");
+});
+
+test("F1: a policy compiled by an OLDER compiler (stamp 1) is rebuilt by `rebuild --if-stale yes` and the next call is up to date; the stamp is outside the hash and minRouter is unchanged, so the router reads both", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const c = rd(s.compiled);
+  assert.equal(c.builtFrom.compiler, lib.COMPILER_VERSION); assert.equal(lib.COMPILER_VERSION, 2);
+  assert.equal((await run(["rebuild", "--if-stale", "yes", ...s.F])).out, "up to date: nothing to rebuild", "a current file is not rebuilt");
+  const old = { ...c, builtFrom: { ...c.builtFrom, compiler: 1 } };
+  wr(s.compiled, old);
+  assert.equal(lib.hashOf(old), old.contentHash, "the compiler stamp is not routing content: the old file still verifies");
+  const r = await run(["rebuild", "--if-stale", "yes", ...s.F]);
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.out, /^rebuilt /m, "the old stamp is stale");
+  const fresh = rd(s.compiled);
+  assert.equal(fresh.builtFrom.compiler, 2);
+  assert.deepEqual([fresh.minRouter, fresh.contentHash], [old.minRouter, old.contentHash], "minRouter and the hash are unchanged: only the stamp moved");
+  assert.equal((await run(["rebuild", "--if-stale", "yes", ...s.F])).out, "up to date: nothing to rebuild");
 });
