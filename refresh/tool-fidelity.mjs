@@ -48,7 +48,7 @@ import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { RELAY_KEY_ID, isTier } from "../menu/tiers.mjs";
 import { SUBSTITUTE_FLOOR, funnel } from "../menu/subagent-funnel.mjs";
 import { isFree, UNPRICED_PER_M } from "./bench.mjs";
-import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute } from "./tool-fidelity-probe.mjs";
+import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText } from "./tool-fidelity-probe.mjs";
 export { NOT_FREE_REASON };
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 
@@ -64,8 +64,9 @@ export const BIG_LEVEL = 5;                          // the ~400 KB step, a leve
 
 const LVR_RE = /^[pfn]{4}$/;
 const FX_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w"]);
+const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "xw"]);
 const NOTE_FIELDS = ["afw", "l4w"];                                      // short reasons of non-blocking marker failures (printable ASCII, at most 60 characters): what differed, never a verdict
+export const GATEWAY_WHY = GATEWAY_WORDS;                                  // the reason text of a failure caused by the gateway's own request translation
 const noteOk = (x) => typeof x === "string" && /^[ -~]{1,60}$/.test(x);
 const PF_FIELDS = ["fc", "af", "nm", "cc", "br", "er", "sp"];            // the one-letter p / f markers, in the order they are written
 const WHY_CHARS = 160;
@@ -130,13 +131,14 @@ export function cleanFidelity(raw) {
   for (const k of PF_FIELDS) if (raw[k] !== undefined && !/^[pf]$/.test(raw[k])) return null;
   if (d3 !== undefined && !/^[abi]$/.test(d3)) return null;
   for (const k of NOTE_FIELDS) if (raw[k] !== undefined && !noteOk(raw[k])) return null;
+  if (raw.xw !== undefined && raw.xw !== "gateway") return null;
   const d = classOf({ lvr, strikes, sl, capBelow, fc: raw.fc });
   if (lv !== lvOf(lvr) || t !== d || ok !== (d === "v" || d === "t")) return null;
   const w = why ? redactClip(why, WHY_CHARS) : "";
   return { lv, lvr, t, ok, ...(w ? { why: w } : {}), at, fx, maxBytes, ...(alias ? { alias: true } : {}),
            ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
            ...Object.fromEntries(PF_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(d3 ? { d3 } : {}),
-           ...Object.fromEntries(NOTE_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])) };
+           ...Object.fromEntries(NOTE_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(raw.xw ? { xw: raw.xw } : {}) };
 }
 
 /** A key this file may hold: `provider/id`, no whitespace, at most 200 characters, never a prototype name. */
@@ -172,7 +174,7 @@ export function loadFidelity(file = REAL_FILE) {
 /**
  * The PENDING map: for a model that was in a run's queue and ended it still untested, why, and in how many runs in a row. It is bookkeeping for the
  * coverage ledger (a model that waits for many runs is starving), not a result: it is dropped as soon as the model has one. `r` is a short reason code
- * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, route-shape, upstream-400, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
+ * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, route-shape, upstream-unavailable, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
  */
 export const PENDING_MAX = 5000;
 export function cleanPending(raw) {
@@ -324,6 +326,8 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
   else if (lvr.includes("f")) { const f = lvr.indexOf("f") + 1; why = done[f]?.why ? `L${f}: ${done[f].why}` : prior?.lvr?.[f - 1] === "f" ? prior.why ?? "" : ""; }
   else if (big === "f" && done[BIG_LEVEL]?.why) why = `L5: ${done[BIG_LEVEL].why}`;
   const hadBig = prior && (prior.lvr[2] !== "n" || prior.lvr[3] !== "n");
+  // a failure caused by the gateway's own request translation stays x (a subagent would fail through this gateway) but is tagged: it is fixable there, it is not a limit of the model
+  const xw = lvr.includes("f") && ((F && done[F]?.gw) || GATEWAY_WHY.test(why)) ? "gateway" : undefined;
   return {
     lv: lvOf(lvr), lvr, t, ok: t === "v" || t === "t",
     ...(why ? { why: redactClip(why, WHY_CHARS) } : {}),
@@ -333,6 +337,7 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
     ...Object.fromEntries(PF_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])), ...(m.d3 ? { d3: m.d3 } : {}),
     ...Object.fromEntries(NOTE_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])),
+    ...(xw ? { xw } : {}),
   };
 }
 
@@ -1015,6 +1020,85 @@ export function migrateStrikes(store) {
     out[key] = { ...rest, t, ok: t === "v" || t === "t" };
   }
   return { store: out, cleared };
+}
+
+// ------------------------------------------------------------------ gateway-compat insights and the transient migration
+
+/** The records that fail because of the gateway's request translation: `[{provider, n, hint}]` by provider (the provider's own words, cut), most first. */
+export function gatewayInsights(store) {
+  const by = new Map();
+  for (const [key, r] of Object.entries(store ?? {})) {
+    if (!r || r.xw !== "gateway") continue;
+    const p = key.slice(0, key.indexOf("/"));
+    const x = by.get(p) ?? { provider: p, n: 0, hint: "" };
+    x.n += 1;
+    if (!x.hint) x.hint = redactClip(String(r.why ?? "").replace(/^L\d: (\[3[ab]\] )?HTTP \d+: /, "").replace(/^\{"error":\{"message":"/, ""), 110);
+    by.set(p, x);
+  }
+  return [...by.values()].sort((a, b) => b.n - a.n || (a.provider < b.provider ? -1 : 1));
+}
+
+/** The shape of an availability or unnamed refusal, for the migration's counts. */
+export function transientShape(msg) {
+  const m = String(msg ?? "");
+  if (/temporar(il)?y[ -]?(un)?available/i.test(m)) return "temporarily unavailable";
+  if (/try another model/i.test(m)) return "try another model";
+  if (/upstream (request |provider |service )?(failed|error)/i.test(m)) return "upstream request failed";
+  if (/upstream (provider )?rejected/i.test(m)) return "upstream rejected";
+  if (/service (is )?(temporarily )?unavailable|currently unavailable|bad gateway|gateway time-?out/i.test(m)) return "service unavailable";
+  if (/internal (server )?error/i.test(m)) return "internal error";
+  if (/overload|at capacity/i.test(m)) return "overloaded";
+  if (/please (re)?try|\bretry\b/i.test(m)) return "please retry";
+  return null;
+}
+const REFUSAL_WHY = /^L([123467]): (?:\[3[ab]\] )?HTTP (4\d\d): ([\s\S]*)$/;
+const NAMED_FOR_MIGRATION = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
+/** Why a stored reason is an availability (or an unnamed 400) and not a verdict about the model, or null: `{level, shape}`. */
+export function transientReason(why) {
+  const m = typeof why === "string" ? REFUSAL_WHY.exec(why) : null;
+  if (!m) return null;
+  const msg = extractMsg(m[3]);
+  if (isAvailabilityText(m[3])) return { level: Number(m[1]), shape: transientShape(msg) ?? "availability" };
+  if (m[2] === "400" && m[1] !== "5" && !NAMED_FOR_MIGRATION.test(msg)) return { level: Number(m[1]), shape: transientShape(msg) ?? "unnamed 400" };
+  return null;
+}
+const extractMsg = (body) => { let t = String(body ?? ""); try { const j = JSON.parse(t); const c = j?.error?.message ?? j?.message ?? (typeof j?.error === "string" ? j.error : null); if (typeof c === "string") t = c; } catch { /* as is */ } return t.replace(/\s+/g, " ").trim(); };
+/**
+ * Clears the records whose reason is an availability or unnamed 400 (never a verdict; an `x` or a strike that those texts produced) and tags the gateway-translation failures with `xw: gateway`.
+ * The failed level is reset to untested; a record with nothing else known is removed (asked again from scratch). Also clears `af`/`afw` whose reason came from the old content design (`afReset`). Pure: `{store, cleared: [{key, kind, shape, level, removed}], tagged: [key], afReset: [key]}`.
+ */
+export const STALE_AFW = /^(file_path: (newline|backslash)|replace_all: missing|start_line: missing)/;
+export function migrateTransient(store) {
+  const out = {}, cleared = [], tagged = [], afReset = [];
+  for (const [key, rec] of Object.entries(store ?? {})) {
+    if (!rec) { out[key] = rec; continue; }
+    const tr = rec.lvr?.includes("f") || rec.strikes !== undefined ? transientReason(rec.why) : null;
+    if (tr) {
+      const kind = rec.strikes === 1 ? "strike" : "failed";
+      const chars = rec.lvr.split("");
+      const reset = (i) => { for (let j = i; j < 4; j += 1) if (chars[j] !== "n") chars[j] = "n"; };
+      if (tr.level <= 2) reset(0);                                  // L1 and L2 are one pass: a reset of either asks both again
+      else if (tr.level === 3) reset(2);
+      const lvr = chars.join("");
+      const { strikes, sl, why, ...rest } = rec;
+      const base = { ...rest, lvr, lv: lvOf(lvr) };
+      delete base.xw;
+      if (tr.level === 6) delete base.sp;
+      if (tr.level <= 3) { delete base.big; delete base.d3; delete base.capBelow; delete base.l4w; }
+      if (tr.level <= 2) for (const k of ["af", "afw", "fc", "br", "er", "nm", "cc", "sp"]) delete base[k];
+      const keepsNothing = lvr === "nnnn" && base.sp === undefined && ["af", "nm", "cc", "br", "er", "fc"].every((k) => base[k] === undefined);
+      cleared.push({ key, kind, shape: tr.shape, level: tr.level, removed: keepsNothing });
+      if (keepsNothing) continue;
+      const t = classOf({ lvr, capBelow: base.capBelow, fc: base.fc });
+      out[key] = { ...base, t, ok: t === "v" || t === "t" };
+      continue;
+    }
+    if (rec.lvr?.includes("f") && rec.xw !== "gateway" && GATEWAY_WHY.test(rec.why ?? "")) { out[key] = { ...rec, xw: "gateway" }; tagged.push(key); continue; }
+    // argument-fidelity reasons that came from the old content design (a path with an escape look-alike, an optional parameter left out) say nothing: the result is cleared, to be asked again
+    if (rec.af === "f" && STALE_AFW.test(rec.afw ?? "")) { const { af, afw, ...rest } = rec; out[key] = rest; afReset.push(key); continue; }
+    out[key] = rec;
+  }
+  return { store: out, cleared, tagged, afReset };
 }
 
 // ------------------------------------------------------------------ the one-line summary of a record

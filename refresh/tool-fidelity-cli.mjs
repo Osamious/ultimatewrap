@@ -52,7 +52,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, migrateStrikes, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -95,6 +95,8 @@ export function parseArgs(argv) {
     else if (a === "--retry-failed") o.retryFailed = true;
     else if (a === "--merge-unsaved") o.mergeUnsaved = true;
     else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
+    else if (a === "--reset-transient") o.resetTransient = true;
+    else if (a === "--only-gateway") o.onlyGateway = true;
     else if (a === "--l3") { if (argv[++i] !== "yes") return { error: "--l3 needs the word yes (it allows the 157 KB level 3 and level 4 requests and the 400 KB big step)" }; o.l3 = true; }
     else if (a === "--levels") {
       const l = parseLevels(argv[++i]);
@@ -143,6 +145,7 @@ export function parseArgs(argv) {
   if (!o.candidates && (o.allow.length || o.includeTiers.length)) return { error: "--allow and --include-tier go with --candidates policy" };
   if (o.keyChoicesFile && !o.tiersFile) return { error: "--key-choices-file goes with --tiers-file (the vault registry): a compiled policy already holds the compiler's key choice" };
   if (o.candidates && !o.levelsExplicit) o.levels = [1, 2, 3, 4, 5, 6, 7];   // L1+L2 for the ones with no result, then L3 (with L4 inside it), the big step, spawn and the error result
+  if (o.onlyGateway && !o.retryFailed) return { error: "--only-gateway goes with --retry-failed: it asks again only the models whose failure was the gateway's request translation (xw gateway)" };
   if (o.retryFailed && o.force) return { error: "--retry-failed and --force contradict each other (retry-failed asks again only the failed levels of failed models)" };
   for (const [lo, hi, name] of [["timeoutSmall", "timeoutMaxSmall", "small"], ["timeout157", "timeoutMax157", "157"], ["timeoutBig", "timeoutMaxBig", "big"]]) {
     if (o[lo] > o[hi]) return { error: `the ${name} timeout floor (${o[lo]} s) is above its cap (${o[hi]} s): raise --timeout-max-${name} or lower --timeout-${name}` };
@@ -178,6 +181,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
     bigSkipped += 1;
     return { ...e, todo: e.todo.filter((l) => l !== 5) };
   }).filter((e) => e.todo.length);
+  if (o.onlyGateway) { const keep = asked.filter((e) => e.prior?.xw === "gateway"); asked.length = 0; asked.push(...keep); }
   const tierOf = (e) => e.tier ?? tiers?.[e.provider] ?? null;
   const tiered = asked.map((e) => ({ ...e, tier: tierOf(e) }));
   const cl = clampDeep(tiered, { lift: liftCap });
@@ -214,7 +218,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const smalls = kept.map((e) => timeoutsFor(bench?.get?.(e.key), { small: floorS, "157": o.timeout157 * 1000, big: o.timeoutBig * 1000 }, { small: capS, "157": o.timeoutMax157 * 1000, big: o.timeoutMaxBig * 1000 }).small).sort((a, b) => a - b);
   const timeoutStats = smalls.length ? `${Math.round(smalls[0] / 1000)} s at the least, ${Math.round(smalls[Math.floor(smalls.length / 2)] / 1000)} s median, ${Math.round(smalls.at(-1) / 1000)} s at the most` : null;
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
-  return { timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
+  return { gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
 /** Where the provider tiers came from, how old they are and which providers they do not cover (printed in the plan and in the report). */
@@ -304,6 +308,46 @@ async function resetAwkward(o, outFile, deps) {
   finally { got.release(); }
 }
 
+/**
+ * `--reset-transient`: clears the records an AVAILABILITY or unnamed 400 produced ("The selected model is temporarily unavailable. Try another model.", "Upstream request failed.", ...: never a verdict
+ * about tools) and tags the failures caused by the gateway's request translation (`xw: gateway`, they stay x). Dry by default (counts per shape and provider); `--live` applies it under the lock, atomically.
+ */
+async function resetTransient(o, outFile, deps) {
+  const cur = loadFidelity(outFile);
+  if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was changed`); return 1; }
+  const m1 = migrateTransient(cur.models);
+  const tally = (list, f) => { const x = {}; for (const c of list) x[f(c)] = (x[f(c)] ?? 0) + 1; return Object.entries(x).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none"; };
+  console.log(`tool-fidelity: ${num(m1.cleared.length)} of ${num(Object.keys(cur.models).length)} record(s) came from an availability or unnamed refusal, never a verdict about tools: ${tally(m1.cleared, (c) => (c.kind === "strike" ? "first strikes" : "confirmed failures"))}; shapes: ${tally(m1.cleared, (c) => c.shape)}; ${num(m1.cleared.filter((c) => c.removed).length)} would be removed (asked again from scratch), ${num(m1.cleared.filter((c) => !c.removed).length)} keep their other results`);
+  const prov = {};
+  for (const c of m1.cleared) { const p = c.key.slice(0, c.key.indexOf("/")); prov[p] = (prov[p] ?? 0) + 1; }
+  const top = Object.entries(prov).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${show(k, 18)} ${num(n)}`).join(", ");
+  if (top) console.log(`  by provider: ${top}`);
+  console.log(`  failures caused by the gateway's request translation: ${num(m1.tagged.length)} would be tagged xw gateway (they stay x)`);
+  console.log(`  argument-fidelity failures that came from the old test content (a path with an escape look-alike, an optional parameter left out): ${num(m1.afReset.length)} would be cleared (ask again with --force --levels 1 --only provider/model)`);
+  if (!o.live) { console.log("nothing was written. Re-run with --reset-transient --live to apply it."); return 0; }
+  if (!m1.cleared.length && !m1.tagged.length && !m1.afReset.length) { console.log("tool-fidelity: nothing to change"); return 0; }
+  const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
+  if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  try {
+    const fresh = loadFidelity(outFile);
+    if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
+    const m = migrateTransient(fresh.models);
+    const pending = { ...(fresh.pending ?? {}) };
+    for (const c of m.cleared) delete pending[c.key];
+    (deps.saveImpl ?? saveFidelity)(outFile, m.store, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending });
+    console.log(`tool-fidelity: ${num(m.cleared.length)} record(s) cleared, ${num(m.tagged.length)} tagged xw gateway and ${num(m.afReset.length)} argument-fidelity result(s) cleared in ${path.basename(outFile)}; the next run asks the cleared ones again`);
+    return 0;
+  } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
+  finally { got.release(); }
+}
+
+/** The insights block: the failures caused by the gateway's own request translation (fixable there), by provider, with the provider's words. */
+export function gatewayLines(g) {
+  if (!g.length) return [];
+  return [`  failing because of the gateway's request translation (fixable there, not limits of the models; they stay x for routing; \`--retry-failed --only-gateway\` asks them again after a fix): ${num(g.reduce((a, x) => a + x.n, 0))} record(s)`,
+    ...g.slice(0, 10).map((x) => `    ${x.provider}: ${x.n} -- ${x.hint}`)];
+}
+
 /** The text of the dry run. */
 export function printPlan(p, o) {
   const c = p.counts, L = [];
@@ -344,6 +388,7 @@ export function printPlan(p, o) {
   const free = p.run.entries.filter((e) => e.free).length, paid = p.run.paidModels;
   L.push(`  free tier ${num(free)} model(s): no money; paid tier ${num(paid)} model(s): estimate ${usd(p.run.usd)} (input and output priced, cap ${usd(o.maxSpend)}, row ceiling ${usd(o.maxRowCost)}; an unlisted price is charged at the highest listed paid price of the whole probe set)`);
   L.push(...tierLines(p));
+  L.push(...gatewayLines(p.gateway ?? []));
   if (!p.tierInfo) L.push("  no provider tier data (no compiled policy and no --tiers-file): no provider counts as free, so nothing is probed (default-deny)");
   if (p.pricedOnFree?.entries.length) L.push(`  free-tier keys with a LISTED price: ${num(p.pricedOnFree.entries.length)} of ${num(p.queued.length)} queued model(s) are costed at the listed price, not as free: ${usd(p.pricedOnFree.usd)} at full depth (input and output priced); ${num(p.overRowAll)} of them are over the ${usd(o.maxRowCost)} row ceiling at the levels asked (${num(p.overRow)} of those within this run's cap) and stay pending: ${PRICED_OVER_ROW} (raise --max-row-cost to probe them)`);
   if (p.cand && p.envelope.models) {
@@ -428,7 +473,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     const sx = r.inconclusive?.s;
     if (sx === "rate") { if (++ps.rateStreak >= RATE_PAUSE_AFTER) ps.paused = true; } else ps.rateStreak = 0;
     if (!ps.answered) { if (sx === "auth" || sx === "pay" || sx === "gone") ps.blocked = sx; else if (!r.inconclusive) ps.answered = true; }
-    if (r.inconclusive?.reason === "route-shape" || r.inconclusive?.reason === "upstream-400") return { s: "skip", w: r.inconclusive.reason, ...(r.inconclusive.hint ? { hint: r.inconclusive.hint } : {}) };
+    if (r.inconclusive?.reason === "route-shape" || r.inconclusive?.reason === "upstream-unavailable") return { s: "skip", w: r.inconclusive.reason, ...(r.inconclusive.hint ? { hint: r.inconclusive.hint } : {}) };
     if (r.inconclusive) return { s: r.inconclusive.s, ...(r.inconclusive.escalated ? { escalated: true } : {}), ...(r.inconclusive.reason ? { reason: r.inconclusive.reason } : {}), ...(r.inconclusive.secs !== undefined ? { secs: r.inconclusive.secs } : {}), ...(r.inconclusive.ra !== undefined ? { ra: r.inconclusive.ra } : {}), ...(r.inconclusive.http ? { http: r.inconclusive.http } : {}), p: r.inconclusive.why, m: r.inconclusive.why };
     return { s: "ok", tf: { done: t.done }, ...(r.escalated ? { escalated: true } : {}) };
   };
@@ -485,6 +530,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const outFile = deps.outFile ?? REAL_FILE;
   if (o.mergeUnsaved) return mergeUnsaved(o, outFile, deps);
   if (o.resetAwkwardJson) return resetAwkward(o, outFile, deps);
+  if (o.resetTransient) return resetTransient(o, outFile, deps);
   const loaded = deps.snapshot ?? loadSnapshot();
   if (!loaded.ok) { console.error(`tool-fidelity: no usable snapshot (${loaded.reason}) -- run: node menu/snapshot.mjs --build`); return 1; }
   const stored = loadFidelity(outFile);
@@ -562,9 +608,10 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const periodic = () => { try { writeOnce(); sinceSave = 0; } catch (e) { if (!saveWarned) { saveWarned = true; console.error(`tool-fidelity: warning: could not save (${e?.message ?? e}); the records are kept and the save is retried`); } } };
   const tally = { t: 0, v: 0, x: 0, u: 0, pending: 0 }, other = {}, why = new Map(), got = new Set(), escalated = new Set(), clampedKeys = new Set(), telemetry = makeTelemetry(), prov = {};
   let recorded = 0;
-  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {};
+  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {}, unavailBy = {};
   const onResult = (r) => {
     if (r.escalated) escalated.add(r.key);
+    if (r.w === "upstream-unavailable") { const pv = r.key.slice(0, r.key.indexOf("/")); const x = (unavailBy[pv] ??= { n: 0, hint: r.hint ?? "" }); x.n += 1; }
     if (r.w === "route-shape") { const pv = r.key.slice(0, r.key.indexOf("/")); const x = (routeBy[pv] ??= { n: 0, hint: r.hint ?? "" }); x.n += 1; }
     if (r.reason === "slow") { const pv = r.key.slice(0, r.key.indexOf("/")); slowBy[pv] = (slowBy[pv] ?? 0) + 1; slowList.push({ key: r.key, secs: r.secs }); }
     if (r.s !== "ok" || !r.tf) { other[r.s] = (other[r.s] ?? 0) + 1; why.set(r.key, pendingReasonOf(r, p.kept.find((k) => k.key === r.key))); return; }
@@ -660,8 +707,11 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     console.log("  providers needing a routing fix (the route says the model must be called another way: a different endpoint or message shape; not a model failure, never a strike; pending: route-shape):");
     for (const [k, x] of Object.entries(routeBy)) console.log(show(`    ${k}: ${x.n} model(s) -- the provider said: ${x.hint}`, 260));
   }
-  const upstream = [...why].filter(([, r]) => r === "upstream-400").length;
-  if (upstream) console.log(`  pending: upstream-400 (a 400 that says nothing about the request; asked twice, not word for word the same twice; never a verdict, a later run asks again): ${num(upstream)} model(s)`);
+  if (Object.keys(unavailBy).length) {
+    console.log("  providers whose upstream was unavailable or answered nothing about the request (pending: upstream-unavailable; never a verdict, never a strike toward x; a later run asks again):");
+    for (const [k, x] of Object.entries(unavailBy).sort((p, q) => q[1].n - p[1].n).slice(0, 12)) console.log(show(`    ${k}: ${x.n} model(s) -- the provider said: ${x.hint}`, 260));
+  }
+  for (const line of gatewayLines(gatewayInsights(store))) console.log(show(line, 300));
   const attention = Object.entries(prov).filter(([, x]) => x.blocked);
   if (attention.length) {
     const WHAT = { auth: "the key was rejected", pay: "no credit or the plan does not allow it", gone: "the route or model no longer exists" };

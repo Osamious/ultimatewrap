@@ -73,7 +73,7 @@ export const agentTool = () => ({
 
 /** The Edit-style argument-fidelity case: every field must come back byte for byte, the boolean a boolean, the integer an integer. */
 export const AWKWARD = Object.freeze({
-  file_path: "C:\\Users\\demo\\notes\\todo.md",
+  file_path: "C:\\Users\\demo\\My Documents\\caf\u00e9 projects\\Report 2026.md",   // a REALISTIC path (spaces, a non-ASCII letter, Windows separators): no newline, no escape look-alike; the awkward characters belong in the strings below
   old_string: "line one\n\tindented \"quoted\" it's here\nbackslashes \\ and a literal \\n and C:\\temp\\new\n{\"key\": \"va\\\"lue\", \"n\": [1, 2.5, null]}\nunicode: caf\u00e9 \u00f1 \u65e5\u672c\u8a9e \ud83d\ude80 end",
   new_string: "{\"done\": true, \"items\": [\"a\\tb\", \"c\\\\d\"], \"note\": \"say \\\"hi\\\"\"}\nsecond line \u2713 \ud83d\ude80",
   replace_all: true,

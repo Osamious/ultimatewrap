@@ -86,31 +86,40 @@ test("end to end: a route-shape 400 is pending route-shape (no record, no strike
 
 // ---------------------------------------------------------------- (3) a 400 that says nothing about the request
 
-test("a 400 that names nothing about the request (\"Upstream provider rejected the request\") is asked ONCE more: the same words twice are the provider's answer (a verdict), anything else stays pending upstream-400", async () => {
-  const msg = "Upstream provider rejected the request";
-  const twice = fakeFetch(() => http(400, msg));
-  const d = {};
-  const r = await probeModel({ levels: [3], prior: "ppnn", done: d, ...FREE, ...conn(twice) });
-  assert.equal(twice.calls.length, 2, "asked twice");
-  assert.deepEqual([d[3].v, d[3].kind], ["f", "schema"], "identical twice: a verdict");
-  assert.equal(r.inconclusive, undefined);
-  let n = 0;
-  const differs = fakeFetch(() => http(400, ++n === 1 ? "Upstream provider rejected the request" : "Upstream gateway refused it (try later)"));
-  const r2 = await probeModel({ levels: [1, 2], done: {}, ...FREE, ...conn(differs) });
-  assert.deepEqual([r2.inconclusive.s, r2.inconclusive.reason], ["error", "upstream-400"], "different words: a one-off, pending");
-  const heals = fakeFetch((c) => (++n % 2 === 0 ? http(400, msg) : goodModel(c)));
-  n = 0;
-  const d3 = {};
-  const r3 = await probeModel({ levels: [1], done: d3, ...FREE, ...conn(heals) });
-  assert.equal(r3.inconclusive, undefined);
-  assert.equal(d3[1].v, "p", "the second attempt passed: the model is fine");
-  const ids = fakeFetch(() => http(400, `Upstream provider rejected the request (request ${["8f3a9c2e", "1d4b7a90"][0]}-aaaa)`));
-  let k = 0;
-  const f2 = fakeFetch(() => http(400, `Upstream provider rejected the request (request ${k++ ? "5c6d7e8f" : "8f3a9c2e"}-aaaa)`));
-  const d4 = {};
-  await probeModel({ levels: [3], prior: "ppnn", done: d4, ...FREE, ...conn(f2) });
-  assert.equal(d4[3].v, "f", "request ids in the text do not make two identical refusals different");
-  void ids;
+test("an AVAILABILITY sentence or a 400 that names nothing about the request is NEVER a verdict: one request, inconclusive upstream-unavailable, whatever the level and however often it repeats", async () => {
+  for (const msg of ["anymodel: The selected model is temporarily unavailable. Try another model.", "cloudflare: Upstream request failed.", "Upstream provider rejected the request", "Service unavailable, please retry", "Internal server error",
+    "The model is overloaded", "No healthy upstream", "Bad gateway", "We are at capacity right now"]) {
+    for (const k of ["1", "1a", "2", "3a", "3b", "6", "2e"]) {
+      const { r, f } = await one(k, () => http(400, msg));
+      assert.deepEqual([r.v, r.s, r.reason], ["i", "error", "upstream-unavailable"], `${k}: ${msg}`);
+      assert.equal(f.calls.length, 1, "no second request, no confirmation");
+      assert.ok(r.hint.length > 3 && r.hint.length <= 120);
+    }
+  }
+  for (const msg of ["Upstream provider rejected the request", "cloudflare: Upstream request failed."]) {
+    const f = fakeFetch(() => http(400, msg));
+    const done = {}, state = {};
+    const r = await probeModel({ levels: [3], prior: "ppnn", done, state, ...FREE, ...conn(f) });
+    assert.deepEqual([r.inconclusive.s, r.inconclusive.reason, done[3]], ["error", "upstream-unavailable", undefined], "the same words again and again never become a failure");
+    assert.equal(f.calls.length, 1);
+    const again = await probeModel({ levels: [3], prior: "ppnn", done, state, ...FREE, ...conn(f) });
+    assert.equal(again.inconclusive.reason, "upstream-unavailable");
+    assert.equal(done[3], undefined);
+  }
+});
+
+test("a sentence that names the schema, the tool or the parameters is a verdict even when it also says the request failed", async () => {
+  for (const msg of ["Upstream request failed: tools.2.input_schema is invalid", "temporarily unavailable? no: the tool_choice parameter is not supported", "internal error: unsupported keyword anyOf in the schema"]) {
+    const { r } = await one("3b", () => http(400, msg));
+    assert.equal(r.v, "f", msg);
+  }
+});
+
+test("a stream error event that says the upstream is unavailable is inconclusive too (not 'stream error before any content' as a failure)", async () => {
+  const { r } = await one("1", () => ok(stream(ev.error("The selected model is temporarily unavailable. Try another model."))));
+  assert.deepEqual([r.v, r.s, r.reason], ["i", "error", "upstream-unavailable"]);
+  const real = await one("1", () => ok(stream(ev.error("tool schema rejected by the provider"))));
+  assert.equal(real.r.v, "f", "an unexplained error that is not about availability is still a failure before any content");
 });
 
 test("a 400 that names the request's shape is a verdict at once (one request): schema, tool, parameter, format words", async () => {
@@ -123,34 +132,32 @@ test("a 400 that names the request's shape is a verdict at once (one request): s
   }
 });
 
-test("the confirmed upstream 400 is read like any other refusal: at the big step it is a SIZE cap, not a schema verdict; the confirmation counts toward the request ceiling", async () => {
+test("the big step keeps its reading: an unnamed 400 there is a SIZE refusal (a cap, never x); an availability sentence there is still not", async () => {
   const f = fakeFetch((c) => (kindOf(c) === "5" ? http(400, "bad request") : goodModel(c)));
   const d = {}, st = {};
   await probeModel({ levels: [1, 2, 3, 5], done: d, state: st, ...FREE, ...conn(f) });
   assert.deepEqual([d[5].v, d[5].kind], ["f", "size"]);
-  assert.equal(f.calls.filter((c) => kindOf(c) === "5").length, 2);
-  const g = fakeFetch(() => http(400, "Upstream provider rejected the request"));
-  const r = await probeModel({ levels: [1], done: {}, state: { requests: MAX_MODEL_REQUESTS - 1 }, ...FREE, ...conn(g) });
-  assert.equal(g.calls.length, 1, "one request left: the confirmation is not sent");
-  assert.equal(r.inconclusive.reason, "request-cap");
+  const g = fakeFetch((c) => (kindOf(c) === "5" ? http(400, "Upstream request failed.") : goodModel(c)));
+  const d2 = {};
+  const r2 = await probeModel({ levels: [1, 2, 3, 5], done: d2, ...FREE, ...conn(g) });
+  assert.equal(r2.inconclusive.reason, "upstream-unavailable");
+  assert.equal(d2[5], undefined);
 });
 
-test("end to end: an unconfirmed upstream 400 is pending upstream-400 (no record, no strike) and the report counts it; a repeated one becomes a first strike like any schema refusal", async () => {
-  let n = 0;
-  const e = cliEnv([{ provider: "fa", keyId: "k.fa.free", models: [m("a1")] }, { provider: "fb", keyId: "k.fb.free", models: [m("b1")] }], {
-    answer: (c) => (c.body.model === "fa/a1" ? http(400, ++n % 2 ? "Upstream provider rejected the request" : "Upstream gateway refused it (try later)") : goodModel(c)) });
-  const r = await run(["--live", "--per-provider", "1"], e.deps);
-  const st = loadFidelity(e.out);
-  assert.equal(st.pending["fa/a1"].r, "upstream-400");
-  assert.ok(!st.models["fa/a1"]);
-  assert.match(r.out, /pending: upstream-400 \(a 400 that says nothing about the request; asked twice, not word for word the same twice; never a verdict, a later run asks again\): 1 model\(s\)/);
-  const e2 = cliEnv([{ provider: "fa", keyId: "k.fa.free", models: [m("a1")] }], { answer: (c) => http(400, "Upstream provider rejected the request") });
-  await run(["--live"], e2.deps);
-  const rec = loadFidelity(e2.out).models["fa/a1"];
-  assert.deepEqual([rec.strikes, rec.t], [1, "u"], "the same words twice: a first strike (provisional), like any schema refusal");
+test("end to end: unavailable upstream answers are pending upstream-unavailable (no record, no strike, however many runs), and the report names the provider with the provider's words", async () => {
+  const e = cliEnv([{ provider: "fa", keyId: "k.fa.free", models: [m("a1"), m("a2")] }, { provider: "fb", keyId: "k.fb.free", models: [m("b1")] }], {
+    answer: (c) => (c.body.model.startsWith("fa/") ? http(400, "fa: The selected model is temporarily unavailable. Try another model.") : goodModel(c)) });
+  for (let i = 0; i < 3; i += 1) {
+    const r = await run(["--live", "--per-provider", "1"], e.deps);
+    const st = loadFidelity(e.out);
+    assert.deepEqual(Object.keys(st.models), ["fb/b1"], `run ${i + 1}: no record for the unavailable provider, never an x`);
+    assert.equal(st.pending["fa/a1"].r, "upstream-unavailable");
+    assert.match(r.out, /providers whose upstream was unavailable or answered nothing about the request \(pending: upstream-unavailable; never a verdict, never a strike toward x; a later run asks again\):/);
+    assert.match(r.out, /fa: 2 model\(s\) -- the provider said: fa: The selected model is temporarily unavailable/);
+  }
 });
 
-// ---------------------------------------------------------------- (4) afw and l4w, and the strictness of the argument check
+// ---------------------------------------------------------------- afw and l4w, and the strictness of the argument check
 
 const calling = (v) => () => ok(stream(ev.tool(0, EDIT_TOOL, JSON.stringify(v)), ev.stop("tool_use")));
 const mangled = (k, fn) => ({ ...AWKWARD, [k]: fn(AWKWARD[k]) });

@@ -130,7 +130,7 @@ const inconclusive = (s, why, extra = {}) => ({ v: "i", s, why: clip(why), ...ex
 const WALLET_WORDS = /(wallet|account|credit|balance)[^.]{0,40}(insufficient|too low|empty|exhausted|depleted|not enough)|(insufficient|not enough|no remaining|out of) [^.]{0,20}(credits?|balance|funds|wallet|quota)|(please |kindly )?(recharge|top[ -]?up) (your|at|to|the)|credit limit (reached|exceeded|is)|payment required|add (funds|credits)/i;
 const ROUTE_WORDS = /must be called (via|through|at|using)|should be called (via|through|at)|wrong endpoint|use (the )?\/[\w./{}-]*v\d[\w./{}-]*|unsupported protocol|not supported (on|at) this (endpoint|route|api)|(only|exclusively) (available|supported) (via|on|at|through) [^.]{0,40}(\/v\d|messages|chat\/completions)/i;
 // A 400 whose sentence names none of these says nothing about the request's shape ("Upstream provider rejected the request"): an upstream hiccup until it repeats word for word.
-const SCHEMA_WORDS = /schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
+const SCHEMA_WORDS = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
 /** The tight reading of a refusal text, plus the two shapes above: `{s, reason?, hint?}` or null. */
 function tightRead(text) {
   const t = classifyTight(text);
@@ -142,7 +142,19 @@ function tightRead(text) {
 }
 /** What the provider's own sentence in a refusal says about the ACCOUNT or the ROUTE, for records written before those readings existed: `"pay"`, `"route-shape"` or null. */
 export const accountOrRoute = (text) => { const t = tightRead(text); return t ? (t.s === "pay" ? "pay" : t.reason ?? null) : null; };
-const sameText = (a, b) => { const n = (x) => String(x ?? "").replace(/[0-9a-f-]{8,}/gi, "#").replace(/\s+/g, " ").trim(); return n(a) === n(b); };
+/**
+ * A sentence about AVAILABILITY, not about the request ("The selected model is temporarily unavailable. Try another model.", "Upstream request failed.", service unavailable, please retry, an internal error,
+ * overload, capacity): it says nothing about tools, whatever the status, so it is NEVER a verdict and never a strike toward x. Unless the same sentence names the schema or the tool choice as the problem.
+ */
+export const AVAIL_WORDS = /temporar(il)?y[ -]?(un)?available|try another model|upstream (request |provider |service )?(failed|error|rejected|unavailable)|service (is )?(temporarily )?unavailable|currently unavailable|please (re)?try|\bretry\b|internal (server )?error|overload|at capacity|bad gateway|gateway time-?out|no (healthy )?(upstream|backend)/i;
+const NAMES_REQUEST = /schema|tool[ _-]?choice|tools?\.\d|input_schema|parameter|propert|anyof|oneof|\$ref|function call|thought_signature|empty content/i;
+/** Whether a refusal text is about availability only (see AVAIL_WORDS), read on the provider's own sentence. */
+export const isAvailabilityText = (text) => { const m = extractMessage(text); return AVAIL_WORDS.test(m) && !NAMES_REQUEST.test(m); };
+/**
+ * The gateway's own translation of an Anthropic request to the provider's shape fails ("Function call is missing a thought_signature in functionCall parts", "Empty content is not allowed for
+ * assistant messages" for an assistant turn that has only a tool_use): a real failure for practical use through this gateway, but not a limit of the model. The record stays x and is tagged `xw: gateway`.
+ */
+export const GATEWAY_WORDS = /thought_signature|empty content is not allowed for assistant messages/i;
 
 const TRANSIENT_WORDS = /overload|rate.?limit|too many|try again|timed? ?out|unavailable|capacity|temporar|busy|quota/i;
 // A refusal that is about the account's allowance or the moment, never about the model, whatever the status (a 413 can say this too).
@@ -247,13 +259,16 @@ function stringDiff(want, got) {
 /**
  * Argument fidelity of the Edit-style call: every field byte for byte, the boolean a boolean, the integer an integer. Exact on purpose: a real Edit finds its `old_string` only when it is
  * byte for byte what the file holds, so a lost newline, a doubled backslash, CRLF, a different Unicode normalisation or trailing whitespace is a call that fails in use, not a test being strict.
- * Key order and fields the schema does not name do not matter. Returns `{af: "p"}` or `{af: "f", afw}`: `afw` is what differed (a few words, the first field that does).
+ * Key order, fields the schema does not name, a path written with "/" for "\\" and an optional parameter that was left out do not matter: the check means "would corrupt a real Edit". Returns `{af: "p"}` or `{af: "f", afw}`: `afw` is what differed (a few words, the first field that does).
  */
+const AF_OPTIONAL = new Set(["replace_all", "start_line"]);                            // the schema does not require them: leaving one out changes the edit's reach, it corrupts no text
+const samePath = (a, b) => typeof a === "string" && typeof b === "string" && a.replace(/\\/g, "/") === b.replace(/\\/g, "/");
 export function afCheck(v) {
   for (const k of Object.keys(AWKWARD)) {
     const want = AWKWARD[k], got = v[k];
     if (got === want) continue;
-    if (got === undefined) return { af: "f", afw: `${k}: missing` };
+    if (k === "file_path" && samePath(got, want)) continue;                                  // a path is a path: / and \\ are the same separator to every file tool
+    if (got === undefined) { if (AF_OPTIONAL.has(k)) continue; return { af: "f", afw: `${k}: missing` }; }          // an optional parameter the model left out is not a mangled argument
     if (typeof got !== typeof want) return { af: "f", afw: `${k}: ${typeof want === "number" ? "integer" : typeof want} sent as ${typeof got}` };
     return { af: "f", afw: `${k}: ${typeof want === "string" ? stringDiff(want, got) : "value changed"}` };
   }
@@ -267,6 +282,7 @@ export function judge(kind, r) {
   const tools = toolBlocks(r);
   // CONTENT means text or a tool call: a thinking block is not content. An answer that spent its budget on thinking and ended on max_tokens says nothing about tools, at any level.
   const usable = tools.length > 0 || !!textOf(r);
+  if (r.streamError && isAvailabilityText(r.streamError)) return inconclusive("error", `stream error: ${r.streamError}`, { reason: "upstream-unavailable", hint: clip(extractMessage(r.streamError)).slice(0, 120) });
   if (r.streamError && !usable) {
     const tight = tightRead(r.streamError);
     if (tight) return inconclusive(tight.s, `stream error: ${r.streamError}`, tight.reason ? { reason: tight.reason, hint: tight.hint } : {});
@@ -393,7 +409,7 @@ async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, now = 
  * cache_control is flagged (`ccFail`) so the caller can ask again without it and still learn the level; one that names the tool name is a verdict flagged `nmFail`. Everything else
  * (401, 402, 403, 404, 429, 5xx) is read by `classifyHttp` and is inconclusive.
  */
-function httpVerdict(kind, status, text, ra, confirmed = false) {
+function httpVerdict(kind, status, text, ra) {
   const extra = ra !== null && ra !== undefined ? { ra } : {};
   const why = `HTTP ${status}: ${text}`;
   const clientErr = status === 400 || status === 413 || status === 422;
@@ -402,10 +418,12 @@ function httpVerdict(kind, status, text, ra, confirmed = false) {
     const tight = tightRead(text);
     if (tight) return inconclusive(tight.s, why, { ...extra, ...(tight.reason ? { reason: tight.reason, hint: tight.hint } : {}) });
     if (LIMIT_WORDS.test(text)) return inconclusive("rate", why, extra);
-    if (!confirmed && status === 400 && !SCHEMA_WORDS.test(extractMessage(text))) return { ...inconclusive("error", why, extra), upstream400: true };
+    // availability, or a 400 that names nothing about the request: never a verdict (pending upstream-unavailable, asked again by a later run). At the big step an unnamed 400 stays a size refusal.
+    const msg400 = extractMessage(text);
+    if (isAvailabilityText(text) || (status === 400 && kind !== "5" && !SCHEMA_WORDS.test(msg400))) return inconclusive("error", why, { ...extra, reason: "upstream-unavailable", hint: clip(msg400).slice(0, 120) });
     if (CC_WORDS.test(text) && (kind === "3a" || kind === "3b" || kind === "5")) return fail(why, { kind: "schema", ccFail: true });
     const size = status === 413 || SIZE_WORDS.test(text) || kind === "5";       // a refusal only at the big step, after the 157 KB step was accepted, is about size
-    return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}) });
+    return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
   }
   return inconclusive(classifyHttp(status, text), why, extra);
 }
@@ -470,7 +488,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
   if (flags?.cc === "f") state.noCc = true;
   const CAPPED = { v: "i", s: "error", why: `the request ceiling of ${MAX_MODEL_REQUESTS} for one model was reached`, capped: true };
   const spent = (r) => { requests += r.reqs ?? 1; state.requests = (state.requests ?? 0) + (r.reqs ?? 1); };
-  const ask = async (kind, second = false) => {
+  const ask = async (kind) => {
     if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
     const base = (conn.timeouts ?? TIMEOUTS_MS)[CLASS_OF[kind]];
     const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc, timeoutMs: base * (state.tmult ?? 1) };
@@ -487,16 +505,6 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       spent(r);
     }
     tele.push(teleOf(r, state.escalated ? ESCALATED_MAX_TOKENS : opts.maxTokens));
-    // a 400 that says nothing about the request ("Upstream provider rejected the request"): asked once more; the SAME words twice are the provider's answer to this request (a verdict), anything
-    // else stays inconclusive (pending upstream-400)
-    if (r.upstream400) {
-      if (second) return r;
-      const again = await ask(kind, true);
-      if (again.aborted) return again;
-      if (!(again.upstream400 && sameText(again.body, r.body))) return again;
-      const { upstream400, ...rest } = again;                                                   // word for word the same twice: read it as any other refusal of the request (size, schema, name)
-      return { ...rest, ...httpVerdict(kind, again.http, again.body, undefined, true) };
-    }
     // a timeout: asked once more at DOUBLE the time inside this run (it counts toward the request ceiling, and the model's later requests keep the doubled time); a second timeout at the
     // doubled value ends the model for this run: on L1 as "slow" (with the seconds it was given), elsewhere as a plain timeout. Never a verdict.
     if (r.v === "i" && r.s === "timeout") {
@@ -513,10 +521,10 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     ? { inconclusive: { s: "error", reason: "request-cap", why: r.why }, requests, tele }
     : r.v === "i" && r.s === "empty"
     ? { inconclusive: { s: "empty", reason: "reasoning-budget", why: r.why, ...(state.escalated ? { escalated: true } : {}) }, requests, tele }
-    : { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}), ...(r.upstream400 ? { reason: "upstream-400" } : r.reason ? { reason: r.reason } : {}), ...(r.hint ? { hint: r.hint } : {}) }, requests, tele });
+    : { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}), ...(r.reason ? { reason: r.reason } : {}), ...(r.hint ? { hint: r.hint } : {}) }, requests, tele });
 
   const bigFirst = order === "big-first" && ctx >= 200000 && want.includes(5) && deep;
-  const row = (r, extra = {}) => ({ v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...extra });
+  const row = (r, extra = {}) => ({ v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...(r.gw ? { gw: true } : {}), ...extra });
   // L3: 3a (constructs), then 3b (157 KB, which also answers L4). 3a's verdict is kept in `state` so a retry after an inconclusive 3b does not ask it again.
   const doL3 = async () => {
     if (!state.l3a) {
