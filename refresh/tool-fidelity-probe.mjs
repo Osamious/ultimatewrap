@@ -19,7 +19,7 @@
 //
 // Every dependency is injected (fetch, clock) so the ladder runs in tests against fake streams. Nothing here reads a key or a file.
 
-import { createSseParser, classifyHttp, classifyTight, parseRetryAfter } from "./bench.mjs";
+import { createSseParser, classifyHttp, classifyTight, parseRetryAfter, extractMessage } from "./bench.mjs";
 import { redactClip } from "../menu/redact.mjs";
 import { CONTRACT as CCR } from "../menu/ccr-client.mjs";
 import {
@@ -123,6 +123,23 @@ const pass = (extra = {}) => ({ v: "p", ...extra });
 const fail = (why, extra = {}) => ({ v: "f", why: clip(why), kind: "schema", ...extra });
 const inconclusive = (s, why, extra = {}) => ({ v: "i", s, why: clip(why), ...extra });
 
+// Read on the provider's OWN sentence (never on the whole body, which can echo a tool name such as `check_balance`): the account is out of money in words the bench's reader does not know
+// ("Your wallet balance is insufficient. Recharge at ..."), or the route says the model must be called another way. Neither says anything about the model.
+const WALLET_WORDS = /(wallet|account|credit|balance)[^.]{0,40}(insufficient|too low|empty|exhausted|depleted|not enough)|(insufficient|not enough|no remaining|out of) [^.]{0,20}(credits?|balance|funds|wallet|quota)|(please |kindly )?(recharge|top[ -]?up) (your|at|to|the)|credit limit (reached|exceeded|is)|payment required|add (funds|credits)/i;
+const ROUTE_WORDS = /must be called (via|through|at|using)|should be called (via|through|at)|wrong endpoint|use (the )?\/[\w./{}-]*v\d[\w./{}-]*|unsupported protocol|not supported (on|at) this (endpoint|route|api)|(only|exclusively) (available|supported) (via|on|at|through) [^.]{0,40}(\/v\d|messages|chat\/completions)/i;
+// A 400 whose sentence names none of these says nothing about the request's shape ("Upstream provider rejected the request"): an upstream hiccup until it repeats word for word.
+const SCHEMA_WORDS = /schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
+/** The tight reading of a refusal text, plus the two shapes above: `{s, reason?, hint?}` or null. */
+function tightRead(text) {
+  const t = classifyTight(text);
+  if (t) return { s: t };
+  const msg = extractMessage(text);
+  if (WALLET_WORDS.test(msg)) return { s: "pay" };
+  if (ROUTE_WORDS.test(msg)) return { s: "error", reason: "route-shape", hint: clip(msg).slice(0, 120) };
+  return null;
+}
+const sameText = (a, b) => { const n = (x) => String(x ?? "").replace(/[0-9a-f-]{8,}/gi, "#").replace(/\s+/g, " ").trim(); return n(a) === n(b); };
+
 const TRANSIENT_WORDS = /overload|rate.?limit|too many|try again|timed? ?out|unavailable|capacity|temporar|busy|quota/i;
 // A refusal that is about the account's allowance or the moment, never about the model, whatever the status (a 413 can say this too).
 const LIMIT_WORDS = /per[ -]minute|per[ -]second|per[ -]day|tokens? per|requests? per|\btpm\b|\brpm\b|rate[ -]?limit|too many requests|quota|try again (in|later)|retry (in|after)/i;
@@ -205,8 +222,39 @@ async function readStream(res, { signal, expect = 0 } = {}) {
 const toolBlocks = (r) => r.blocks.filter((b) => b.type === "tool_use");
 const textOf = (r) => r.blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
 
-/** Argument fidelity of the Edit-style call: every field byte for byte, the boolean a boolean, the integer an integer. */
-const afOf = (v) => (Object.keys(AWKWARD).every((k) => v[k] === AWKWARD[k]) ? "p" : "f");
+const count = (str, ch) => str.split(ch).length - 1;
+/** The first difference between the string that was sent and the string that came back, in a few words (at most 60 characters in all): the kind of mangling, not the text. */
+function stringDiff(want, got) {
+  if (got.replace(/\r\n/g, "\n") === want) return "CRLF line endings";
+  if (got.trimEnd() === want.trimEnd()) return "trailing whitespace changed";
+  if (got.normalize("NFC") === want.normalize("NFC")) return "unicode normalisation (NFC/NFD)";
+  if (got.includes("\\u") && !want.includes("\\u")) return "unicode escaped as \\u";
+  if (got.replace(/\\\\/g, "\\") === want && got !== want) return "backslash doubled";
+  if (count(want, "\n") > 0 && count(got, "\n") === 0) return "newline lost";
+  if (got.replace(/\s+/g, " ") === want.replace(/\s+/g, " ")) return "whitespace collapsed";
+  if (count(want, "\n") !== count(got, "\n")) return "newline count differs";
+  if (count(got, "\\") < count(want, "\\")) return "backslash lost";
+  if (count(got, '"') !== count(want, '"')) return "quote changed";
+  if (/[\ud800-\udbff]/.test(want) && !/[\ud800-\udbff]/.test(got)) return "astral character lost";
+  let i = 0;
+  while (i < want.length && want[i] === got[i]) i += 1;
+  return `text differs at ${i}`;
+}
+/**
+ * Argument fidelity of the Edit-style call: every field byte for byte, the boolean a boolean, the integer an integer. Exact on purpose: a real Edit finds its `old_string` only when it is
+ * byte for byte what the file holds, so a lost newline, a doubled backslash, CRLF, a different Unicode normalisation or trailing whitespace is a call that fails in use, not a test being strict.
+ * Key order and fields the schema does not name do not matter. Returns `{af: "p"}` or `{af: "f", afw}`: `afw` is what differed (a few words, the first field that does).
+ */
+export function afCheck(v) {
+  for (const k of Object.keys(AWKWARD)) {
+    const want = AWKWARD[k], got = v[k];
+    if (got === want) continue;
+    if (got === undefined) return { af: "f", afw: `${k}: missing` };
+    if (typeof got !== typeof want) return { af: "f", afw: `${k}: ${typeof want === "number" ? "integer" : typeof want} sent as ${typeof got}` };
+    return { af: "f", afw: `${k}: ${typeof want === "string" ? stringDiff(want, got) : "value changed"}` };
+  }
+  return { af: "p" };
+}
 
 /** Judges the stream of one request KIND. Pure over `readStream`'s result. */
 export function judge(kind, r) {
@@ -216,8 +264,8 @@ export function judge(kind, r) {
   // CONTENT means text or a tool call: a thinking block is not content. An answer that spent its budget on thinking and ended on max_tokens says nothing about tools, at any level.
   const usable = tools.length > 0 || !!textOf(r);
   if (r.streamError && !usable) {
-    const tight = classifyTight(r.streamError);
-    if (tight) return inconclusive(tight, `stream error: ${r.streamError}`);
+    const tight = tightRead(r.streamError);
+    if (tight) return inconclusive(tight.s, `stream error: ${r.streamError}`, tight.reason ? { reason: tight.reason, hint: tight.hint } : {});
     if (TRANSIENT_WORDS.test(r.streamError)) return inconclusive("error", `stream error: ${r.streamError}`);
     return fail(`stream error before any content: ${r.streamError}`);
   }
@@ -231,7 +279,7 @@ export function judge(kind, r) {
     if (!call) return fail("tool call names a tool that was not offered");
     const v = argsOf(call).value;
     if (typeof v.file_path !== "string") return fail("a tool call lacks the required argument `file_path`");
-    return pass({ af: afOf(v) });
+    return pass(afCheck(v));
   }
   if (kind === "2") {
     if (r.streamError) return fail(`stream error: ${r.streamError}`);
@@ -269,7 +317,8 @@ export function judge(kind, r) {
   if (kind === "5") return pass();
   const echoes = tools.filter((b) => b.name === ECHO_TOOL);
   const par = echoes.length >= 2 && new Set(echoes.map((b) => b.id ?? b)).size >= 2 && echoes.every((b) => b.json !== "" && typeof argsOf(b).value.message === "string");
-  return pass({ l4: par ? "p" : "f", ...(par ? {} : { l4why: echoes.length < 2 ? `${echoes.length} tool call instead of 2 parallel calls` : echoes.length >= 2 && echoes.some((b) => b.json === "") ? "the tool call arguments were not streamed (no argument deltas)" : "parallel tool calls share one id or lack the argument" }) });
+  return pass({ l4: par ? "p" : "f", ...(par ? {} : { l4why: echoes.length < 2 ? `${echoes.length} tool call instead of 2 parallel calls` : echoes.length >= 2 && echoes.some((b) => b.json === "") ? "the tool call arguments were not streamed (no argument deltas)" : "parallel tool calls share one id or lack the argument",
+    l4w: echoes.length < 2 ? `${echoes.length} call of 2` : echoes.some((b) => b.json === "") ? "args not streamed" : "shared id or no arg" }) });
 }
 
 /** The text of a refusal, at most `limit` bytes of it: the body is read in chunks and cancelled when enough has come, so a hostile or huge error page costs nothing. */
@@ -328,15 +377,16 @@ async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, now = 
  * cache_control is flagged (`ccFail`) so the caller can ask again without it and still learn the level; one that names the tool name is a verdict flagged `nmFail`. Everything else
  * (401, 402, 403, 404, 429, 5xx) is read by `classifyHttp` and is inconclusive.
  */
-function httpVerdict(kind, status, text, ra) {
+function httpVerdict(kind, status, text, ra, confirmed = false) {
   const extra = ra !== null && ra !== undefined ? { ra } : {};
   const why = `HTTP ${status}: ${text}`;
   const clientErr = status === 400 || status === 413 || status === 422;
   if (NOTOOLS.test(text) && (clientErr || status === 404)) return fail(why, { kind: "schema" });
   if (clientErr) {
-    const tight = classifyTight(text);
-    if (tight) return inconclusive(tight, why, extra);
+    const tight = tightRead(text);
+    if (tight) return inconclusive(tight.s, why, { ...extra, ...(tight.reason ? { reason: tight.reason, hint: tight.hint } : {}) });
     if (LIMIT_WORDS.test(text)) return inconclusive("rate", why, extra);
+    if (!confirmed && status === 400 && !SCHEMA_WORDS.test(extractMessage(text))) return { ...inconclusive("error", why, extra), upstream400: true };
     if (CC_WORDS.test(text) && (kind === "3a" || kind === "3b" || kind === "5")) return fail(why, { kind: "schema", ccFail: true });
     const size = status === 413 || SIZE_WORDS.test(text) || kind === "5";       // a refusal only at the big step, after the 157 KB step was accepted, is about size
     return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}) });
@@ -403,7 +453,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
   if (flags?.cc === "f") state.noCc = true;
   const CAPPED = { v: "i", s: "error", why: `the request ceiling of ${MAX_MODEL_REQUESTS} for one model was reached`, capped: true };
   const spent = (r) => { requests += r.reqs ?? 1; state.requests = (state.requests ?? 0) + (r.reqs ?? 1); };
-  const ask = async (kind) => {
+  const ask = async (kind, second = false) => {
     if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
     const base = (conn.timeouts ?? TIMEOUTS_MS)[CLASS_OF[kind]];
     const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc, timeoutMs: base * (state.tmult ?? 1) };
@@ -420,6 +470,16 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       spent(r);
     }
     tele.push(teleOf(r, state.escalated ? ESCALATED_MAX_TOKENS : opts.maxTokens));
+    // a 400 that says nothing about the request ("Upstream provider rejected the request"): asked once more; the SAME words twice are the provider's answer to this request (a verdict), anything
+    // else stays inconclusive (pending upstream-400)
+    if (r.upstream400) {
+      if (second) return r;
+      const again = await ask(kind, true);
+      if (again.aborted) return again;
+      if (!(again.upstream400 && sameText(again.body, r.body))) return again;
+      const { upstream400, ...rest } = again;                                                   // word for word the same twice: read it as any other refusal of the request (size, schema, name)
+      return { ...rest, ...httpVerdict(kind, again.http, again.body, undefined, true) };
+    }
     // a timeout: asked once more at DOUBLE the time inside this run (it counts toward the request ceiling, and the model's later requests keep the doubled time); a second timeout at the
     // doubled value ends the model for this run: on L1 as "slow" (with the seconds it was given), elsewhere as a plain timeout. Never a verdict.
     if (r.v === "i" && r.s === "timeout") {
@@ -436,7 +496,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     ? { inconclusive: { s: "error", reason: "request-cap", why: r.why }, requests, tele }
     : r.v === "i" && r.s === "empty"
     ? { inconclusive: { s: "empty", reason: "reasoning-budget", why: r.why, ...(state.escalated ? { escalated: true } : {}) }, requests, tele }
-    : { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}) }, requests, tele });
+    : { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}), ...(r.upstream400 ? { reason: "upstream-400" } : r.reason ? { reason: r.reason } : {}), ...(r.hint ? { hint: r.hint } : {}) }, requests, tele });
 
   const bigFirst = order === "big-first" && ctx >= 200000 && want.includes(5) && deep;
   const row = (r, extra = {}) => ({ v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...extra });
@@ -454,7 +514,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     if (b.aborted) return b;
     if (b.v === "i") return stop(b);
     done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), bytes: b.bytes, ...marks };
-    if (b.v === "p" && b.l4) done[4] = { v: b.l4, ...(b.l4why ? { why: b.l4why } : {}), bytes: b.bytes };
+    if (b.v === "p" && b.l4) done[4] = { v: b.l4, ...(b.l4why ? { why: b.l4why } : {}), ...(b.l4w ? { w: b.l4w } : {}), bytes: b.bytes };
     return null;
   };
   const doBig = async () => {
@@ -473,7 +533,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       const r = await ask(level === 1 ? "1" : "2");
       if (r.aborted) return r;
       if (r.v === "i") return stop(r);
-      done[level] = row(r, level === 1 ? { ...(r.af ? { af: r.af } : {}), ...(r.fc ? { fc: r.fc } : {}) } : { ...(r.br ? { br: r.br } : {}) });
+      done[level] = row(r, level === 1 ? { ...(r.af ? { af: r.af } : {}), ...(r.afw ? { afw: r.afw } : {}), ...(r.fc ? { fc: r.fc } : {}) } : { ...(r.br ? { br: r.br } : {}) });
     } else if (level === 3) {
       if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
       if (bigFirst && !done[5]) {
@@ -487,7 +547,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       const b = await ask("3b");                                                                    // L3 passed earlier (or by the big step): only the 157 KB request answers L4
       if (b.aborted) return b;
       if (b.v === "i") return stop(b);
-      done[4] = b.v === "p" ? { v: b.l4 ?? "f", ...(b.l4why ? { why: b.l4why } : {}), bytes: b.bytes } : { v: "n", why: "not run: the 157 KB request did not pass" };
+      done[4] = b.v === "p" ? { v: b.l4 ?? "f", ...(b.l4why ? { why: b.l4why } : {}), ...(b.l4w ? { w: b.l4w } : {}), bytes: b.bytes } : { v: "n", why: "not run: the 157 KB request did not pass" };
     } else if (level === 5) {
       if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
       if (!bigFirst && !passed(3)) { notRun("not run: L3 did not pass"); continue; }                // (big-first asks it ahead of L3, above, and needs no L3)

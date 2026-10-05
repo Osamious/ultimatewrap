@@ -261,7 +261,7 @@ test("3b (the 157 KB request): accepted and answered passes L3 and ALSO answers 
 
 test("the big step (5): accepted and answered passes; any 400 there is about SIZE (after 157 KB was accepted); a rate or tokens-per-minute limit is never a verdict", async () => {
   assert.equal((await kind("5", goodModel)).r.v, "p");
-  const big = await kind("5", () => http(400, "bad request"));
+  const big = await kind("5", () => http(400, "request too large"));
   assert.deepEqual([big.r.v, big.r.kind], ["f", "size"]);
   for (const [status, msg] of [[413, "Request too large for model on tokens per minute (TPM): Limit 6000, Requested 40000"], [400, "Rate limit reached: 30 requests per minute"], [422, "quota exceeded, try again in 20s"]]) {
     const { r } = await kind("5", () => http(status, msg));

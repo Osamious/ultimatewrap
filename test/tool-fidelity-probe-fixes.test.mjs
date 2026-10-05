@@ -230,7 +230,7 @@ test("BIG-FIRST order (a known context of 200,000 or more): the big step runs ah
   assert.deepEqual(kinds(f), ["1", "2", "5"], "no 3a, no 3b");
   assert.deepEqual([r.done[5].v, r.done[3].v, r.done[3].implied], ["p", "p", "big"]);
   assert.ok(r.done[3].bytes > 390000);
-  const fail = fakeFetch((c) => (kindOf(c) === "5" ? http(400, "bad request") : goodModel(c)));
+  const fail = fakeFetch((c) => (kindOf(c) === "5" ? http(400, "request too large") : goodModel(c)));
   const r2 = await probeModel({ levels: [1, 2, 3, 5], order: "big-first", ctx: 256000, ...FREE, ...conn(fail) });
   assert.deepEqual(kinds(fail), ["1", "2", "5", "3a", "3b"], "the big step failed (a size refusal): L3 is asked to tell size from schema");
   assert.deepEqual([r2.done[5].v, r2.done[5].kind, r2.done[3].v], ["f", "size", "p"]);

@@ -1472,6 +1472,12 @@ lifting L1+L2 for the paid tier is the same lift as lifting the deep levels. Dro
 the dry run prints what is still missing. Management is never probed, lifted or not. No environment variable, config file, incremental run or
 onboarding entry point lifts it.
 
+**What a refusal means (classification).** A 400, 413 or 422 on a tool-bearing request is the model or its provider refusing the request itself: a verdict (a strike, see below) unless the provider's OWN sentence (read from `error.message`, never from a body that echoes a tool name or description) says one of these, each pending and never a strike:
+- `pay`: an account state, also in words such as "wallet balance is insufficient, recharge at ...", "out of credits", "top up your account", "credit limit reached", "payment required". The provider is named in the report's attention block. A tool or schema name that merely contains `balance`, `recharge` or `purchase` is NOT an account state.
+- `route-shape`: the route says the model must be called another way ("must be called via /provider/v1/messages", "wrong endpoint", "use /v1/...", "unsupported protocol"). The fix is in routing, not in the model. The report has a block `providers needing a routing fix` with the provider, how many models and the provider's words.
+- `upstream-400`: a 400 whose sentence names nothing about the request (no schema, tool, parameter, format, size or similar word), such as "Upstream provider rejected the request". It is asked once more in the same run: the SAME words twice are the provider's answer and are read like any other refusal (a schema verdict, or a size cap at the big step); anything else stays pending.
+A first schema refusal is provisional (a strike) and the second at the same level confirms it, as before.
+
 **What is stored (one record per `provider/id`, every field).**
 
 | Field | Meaning |
@@ -1486,7 +1492,10 @@ onboarding entry point lifts it.
 | `capBelow` | bytes: the provider REFUSED a request of about this size or larger (an observed upper bound). The compiler lowers the model's payload cap `pb` to it, so big requests skip the model and small subagents may still use it. Written only for a refusal about SIZE (413, a body naming size or context length, any refusal at the big step), never for a rate or tokens-per-minute limit |
 | `strikes`, `sl` | two strikes (below): the first failure at level `sl` (1, 2, 3 or 6) is provisional |
 | `fc`, `af`, `nm`, `cc`, `br`, `er`, `sp` | one-letter `p` (passed) or `f` (failed) markers for the extra checks: `fc` L1 needed a forced call, `af` argument fidelity, `nm` long MCP name, `cc` cache_control accepted, `br` the fact at the end of the 20 KB result, `er` the error result, `sp` spawn. Kept OUT of `lvr`. They never change `lv`, `t`, `ok` except `fc`, which caps class `v` to `t`. `summaryOf(record)` in `refresh/tool-fidelity.mjs` turns a record into one printable line |
+| `afw`, `l4w` | what differed when a non-blocking marker failed, in at most 60 printable characters: `afw` for argument fidelity (`old_string: newline lost`, `file_path: backslash doubled`, `start_line: integer sent as string`, `old_string: unicode normalisation (NFC/NFD)`, `old_string: CRLF line endings`, `old_string: trailing whitespace changed`, `old_string: unicode escaped as \u`, ...), `l4w` for the parallel-call check (`1 call of 2`, `args not streamed`, `shared id or no arg`). Never a verdict; cleared by a later pass; `summaryOf` prints them |
 | `d3` | which part of L3 failed: `a` (the constructs), `b` (the 157 KB request), `i` (inconclusive) |
+
+**Argument fidelity is exact on purpose.** A real Edit finds its `old_string` only when it is byte for byte what the file holds, so a lost newline, CRLF, a doubled backslash, a different Unicode normalisation (NFC against NFD), trailing whitespace or a number sent as a string is a call that fails in use. Key order and fields the schema does not name do not matter. To learn WHAT a model mangled, ask L1 again for it: `node refresh/tool-fidelity-cli.mjs --force --levels 12 --only provider/model --live` (a handful of tiny requests); the record then carries `afw`.
 
 **Two strikes.** A first failure at L1, L2, or L3 for a reason that is not size does not make a model `x`. The record keeps what it was
 (a model never tested stays untested, a model that passed keeps its class), remembers the strike, and the next ordinary run asks that
@@ -1589,7 +1598,7 @@ a model dropped by a bug is a loud failure, never a smaller denominator. Three c
 (provisional, never reported as failed), models pending for `--pending-runs` runs in a row (default 3), and tested models whose record
 is against an older fixture (`*`, a re-sweep is recommended and never automatic). The run counts live in an optional top-level `pending` object in
 `state/tool-fidelity.json`: `"pending": { "provider/id": { "r": "rate", "n": 3, "at": "2026-10-05T10:00:00.000Z" } }`. `r` is a short code (`rate`, `pay`,
-`auth`, `timeout`, `error`, `gone`, `empty`, `reasoning-budget`, `request-cap`, `priced-over-row-cap`, `slow`, `cap`, `spend`, `row-cost`, `not-run`; lower case, digits and hyphens, at most 24 characters), `n` the
+`auth`, `timeout`, `error`, `gone`, `empty`, `reasoning-budget`, `request-cap`, `priced-over-row-cap`, `slow`, `route-shape`, `upstream-400`, `cap`, `spend`, `row-cost`, `not-run`; lower case, digits and hyphens, at most 24 characters), `n` the
 number of runs in a row (1 to 9999) in which the model was in the queue and ended untested, `at` the last of them. It is bookkeeping, not a result: an entry goes away
 when the model gets a result or waits on its second strike, entries of models that left the probe set are dropped, at most 5,000 are kept, it is counted in the
 file's size cap, and the ledger ignores the entry of a model that is tested.

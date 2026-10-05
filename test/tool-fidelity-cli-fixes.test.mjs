@@ -169,7 +169,7 @@ test("a cap below ONE model's cost says what cap is needed: a warning in the dry
 test("the BIG step: needs --l3 yes and a named provider; asked only of models that passed L3; a pass is `big: p`, a refusal is `big: f` with a size cap, a rate limit records nothing", async () => {
   const e = env([["fa", "a1"], ["fa", "a2"], ["fa", "a3"], ["fa", "a4"]], { answer: (c) => {
     if (c.bytes < 300000) return goodModel(c);
-    if (c.body.model === "fa/a2") return http(400, "bad request");
+    if (c.body.model === "fa/a2") return http(400, "request too large");
     if (c.body.model === "fa/a3") return http(429, "slow down");
     return goodModel(c);
   } });

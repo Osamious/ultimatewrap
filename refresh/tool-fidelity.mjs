@@ -32,6 +32,7 @@
 //   nm        an MCP-style ~60-character tool name came back exactly (p / f), from the L3 constructs request (3a)
 //   cc        the cache_control markers Claude Code sends were accepted (p) or rejected by name (f); a model that rejected them is not sent them again
 //   sp        the Agent (spawn) tool: a valid call with a prompt and a recognised subagent_type (p / f), L6. Two strikes like L1-L3 (sl 6); never lowers the class
+//   afw, l4w  what differed when argument fidelity (af) or the parallel-call check (L4) failed: a few printable words, at most 60 characters ("old_string: newline lost", "1 call of 2"). Never a verdict; cleared by a later pass
 //   d3        what decided L3: a (failed at the 3a constructs request), b (failed at the 157 KB request), i (passed by implication: the big step passed first)
 // L4 (parallel calls) is answered by the same 157 KB request as L3. None of these fields is part of lvr, and none changes the class except fc (class t at best).
 // Compiler reads `t`, `alias`, `capBelow`, `big` and `lvr[3]` (L4): inside class v a model ranks big p, then big not run, then big f, and
@@ -63,7 +64,9 @@ export const BIG_LEVEL = 5;                          // the ~400 KB step, a leve
 
 const LVR_RE = /^[pfn]{4}$/;
 const FX_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3"]);
+const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w"]);
+const NOTE_FIELDS = ["afw", "l4w"];                                      // short reasons of non-blocking marker failures (printable ASCII, at most 60 characters): what differed, never a verdict
+const noteOk = (x) => typeof x === "string" && /^[ -~]{1,60}$/.test(x);
 const PF_FIELDS = ["fc", "af", "nm", "cc", "br", "er", "sp"];            // the one-letter p / f markers, in the order they are written
 const WHY_CHARS = 160;
 const BAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -126,12 +129,14 @@ export function cleanFidelity(raw) {
   if (strikes !== undefined && !((strikes === 1 || strikes === 2) && [1, 2, 3, 6].includes(sl))) return null;
   for (const k of PF_FIELDS) if (raw[k] !== undefined && !/^[pf]$/.test(raw[k])) return null;
   if (d3 !== undefined && !/^[abi]$/.test(d3)) return null;
+  for (const k of NOTE_FIELDS) if (raw[k] !== undefined && !noteOk(raw[k])) return null;
   const d = classOf({ lvr, strikes, sl, capBelow, fc: raw.fc });
   if (lv !== lvOf(lvr) || t !== d || ok !== (d === "v" || d === "t")) return null;
   const w = why ? redactClip(why, WHY_CHARS) : "";
   return { lv, lvr, t, ok, ...(w ? { why: w } : {}), at, fx, maxBytes, ...(alias ? { alias: true } : {}),
            ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
-           ...Object.fromEntries(PF_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(d3 ? { d3 } : {}) };
+           ...Object.fromEntries(PF_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(d3 ? { d3 } : {}),
+           ...Object.fromEntries(NOTE_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])) };
 }
 
 /** A key this file may hold: `provider/id`, no whitespace, at most 200 characters, never a prototype name. */
@@ -167,7 +172,7 @@ export function loadFidelity(file = REAL_FILE) {
 /**
  * The PENDING map: for a model that was in a run's queue and ended it still untested, why, and in how many runs in a row. It is bookkeeping for the
  * coverage ledger (a model that waits for many runs is starving), not a result: it is dropped as soon as the model has one. `r` is a short reason code
- * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
+ * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, route-shape, upstream-400, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
  */
 export const PENDING_MAX = 5000;
 export function cleanPending(raw) {
@@ -288,10 +293,11 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
   } else if (prior?.strikes === 1 && !ran(prior.sl)) { strikes = 1; sl = prior.sl; }       // this probe did not look at the struck level: the strike waits
 
   // the markers: a provisional probe changes none of them
-  const keep = { ...Object.fromEntries(PF_FIELDS.map((k) => [k, prior?.[k]])), d3: prior?.d3 };
+  const keep = { ...Object.fromEntries(PF_FIELDS.map((k) => [k, prior?.[k]])), d3: prior?.d3, afw: prior?.afw, l4w: prior?.l4w };
   const m = { ...keep };
   if (!provisional) {
-    if (ran(1)) { m.af = done[1].af; m.fc = done[1].fc; }
+    if (ran(1)) { m.af = done[1].af; m.fc = done[1].fc; m.afw = m.af === "f" && noteOk(done[1].afw) ? done[1].afw : undefined; }
+    if (ran(4)) m.l4w = done[4].v === "f" && noteOk(done[4].w) ? done[4].w : undefined;
     if (ran(2)) m.br = done[2].br;
     if (ran(7)) m.er = done[7].v;
     for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc; }
@@ -326,6 +332,7 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     ...(alias ? { alias: true } : {}),
     ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
     ...Object.fromEntries(PF_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])), ...(m.d3 ? { d3: m.d3 } : {}),
+    ...Object.fromEntries(NOTE_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])),
   };
 }
 
@@ -352,7 +359,7 @@ export function requeueL3Failures(store, provider) {
     const keepStrike = r.strikes && r.sl !== 3;
     const f = lvr.indexOf("f");
     const next = { lv: lvOf(lvr), lvr, at: r.at, fx: r.fx, maxBytes: r.maxBytes, ...(r.alias ? { alias: true } : {}), ...(keepStrike ? { strikes: r.strikes, sl: r.sl } : {}),
-                   ...Object.fromEntries(PF_FIELDS.filter((k) => r[k] !== undefined).map((k) => [k, r[k]])),
+                   ...Object.fromEntries(PF_FIELDS.filter((k) => r[k] !== undefined).map((k) => [k, r[k]])), ...Object.fromEntries(NOTE_FIELDS.filter((k) => r[k] !== undefined).map((k) => [k, r[k]])),
                    ...(f >= 0 && r.why?.startsWith(`L${f + 1}:`) ? { why: r.why } : {}) };
     next.t = classOf({ lvr, strikes: next.strikes, sl: next.sl, fc: next.fc });
     next.ok = next.t === "v" || next.t === "t";
@@ -985,6 +992,8 @@ export function summaryOf(rec) {
   if (!rec) return null;
   const m = (v) => (v === "p" || v === "f" ? v : "n");
   const out = { class: rec.t, lvr: rec.lvr, l4: m(rec.lvr[3] === "n" ? undefined : rec.lvr[3]), big: m(rec.big), sp: m(rec.sp), af: m(rec.af), nm: m(rec.nm), cc: m(rec.cc), br: m(rec.br), er: m(rec.er), fc: m(rec.fc), d3: rec.d3 ?? null, capBelow: rec.capBelow ?? 0, notes: [] };
+  if (rec.af === "f" && rec.afw) out.notes.push(`argument fidelity failed: ${rec.afw}`);
+  if (rec.l4w) out.notes.push(`parallel calls failed: ${rec.l4w}`);
   if (rec.fc === "p") out.notes.push("passed only when the tool call was forced: class t at best");
   if (rec.d3 === "i") out.notes.push("L3 passed by implication (the big step passed first)");
   if (rec.d3 === "a") out.notes.push("L3 failed at the constructs request (3a), before the 157 KB request");

@@ -395,6 +395,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     const sx = r.inconclusive?.s;
     if (sx === "rate") { if (++ps.rateStreak >= RATE_PAUSE_AFTER) ps.paused = true; } else ps.rateStreak = 0;
     if (!ps.answered) { if (sx === "auth" || sx === "pay" || sx === "gone") ps.blocked = sx; else if (!r.inconclusive) ps.answered = true; }
+    if (r.inconclusive?.reason === "route-shape" || r.inconclusive?.reason === "upstream-400") return { s: "skip", w: r.inconclusive.reason, ...(r.inconclusive.hint ? { hint: r.inconclusive.hint } : {}) };
     if (r.inconclusive) return { s: r.inconclusive.s, ...(r.inconclusive.escalated ? { escalated: true } : {}), ...(r.inconclusive.reason ? { reason: r.inconclusive.reason } : {}), ...(r.inconclusive.secs !== undefined ? { secs: r.inconclusive.secs } : {}), ...(r.inconclusive.ra !== undefined ? { ra: r.inconclusive.ra } : {}), ...(r.inconclusive.http ? { http: r.inconclusive.http } : {}), p: r.inconclusive.why, m: r.inconclusive.why };
     return { s: "ok", tf: { done: t.done }, ...(r.escalated ? { escalated: true } : {}) };
   };
@@ -527,9 +528,10 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const periodic = () => { try { writeOnce(); sinceSave = 0; } catch (e) { if (!saveWarned) { saveWarned = true; console.error(`tool-fidelity: warning: could not save (${e?.message ?? e}); the records are kept and the save is retried`); } } };
   const tally = { t: 0, v: 0, x: 0, u: 0, pending: 0 }, other = {}, why = new Map(), got = new Set(), escalated = new Set(), clampedKeys = new Set(), telemetry = makeTelemetry(), prov = {};
   let recorded = 0;
-  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [];
+  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {};
   const onResult = (r) => {
     if (r.escalated) escalated.add(r.key);
+    if (r.w === "route-shape") { const pv = r.key.slice(0, r.key.indexOf("/")); const x = (routeBy[pv] ??= { n: 0, hint: r.hint ?? "" }); x.n += 1; }
     if (r.reason === "slow") { const pv = r.key.slice(0, r.key.indexOf("/")); slowBy[pv] = (slowBy[pv] ?? 0) + 1; slowList.push({ key: r.key, secs: r.secs }); }
     if (r.s !== "ok" || !r.tf) { other[r.s] = (other[r.s] ?? 0) + 1; why.set(r.key, pendingReasonOf(r, p.kept.find((k) => k.key === r.key))); return; }
     const e = p.kept.find((k) => k.key === r.key);
@@ -620,6 +622,12 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   if (slowList.length) console.log(show(`  pending: slow (the L1 request timed out twice, at the doubled time; never a verdict, a later run asks again): ${slowList.slice(0, 12).map((x) => `${x.key} (${x.secs} s)`).join(", ")}${slowList.length > 12 ? `, ... and ${slowList.length - 12} more` : ""}`, 900));
   const paused = Object.entries(prov).filter(([, x]) => x.paused && !x.blocked).map(([k]) => `${show(k, 18)} (rate-limited)`);
   if (paused.length) console.log(`  left alone for the rest of this run, their models stay pending: ${paused.join(", ")}`);
+  if (Object.keys(routeBy).length) {
+    console.log("  providers needing a routing fix (the route says the model must be called another way: a different endpoint or message shape; not a model failure, never a strike; pending: route-shape):");
+    for (const [k, x] of Object.entries(routeBy)) console.log(show(`    ${k}: ${x.n} model(s) -- the provider said: ${x.hint}`, 260));
+  }
+  const upstream = [...why].filter(([, r]) => r === "upstream-400").length;
+  if (upstream) console.log(`  pending: upstream-400 (a 400 that says nothing about the request; asked twice, not word for word the same twice; never a verdict, a later run asks again): ${num(upstream)} model(s)`);
   const attention = Object.entries(prov).filter(([, x]) => x.blocked);
   if (attention.length) {
     const WHAT = { auth: "the key was rejected", pay: "no credit or the plan does not allow it", gone: "the route or model no longer exists" };

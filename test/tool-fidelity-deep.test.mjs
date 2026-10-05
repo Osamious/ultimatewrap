@@ -259,7 +259,7 @@ test("BIG-FIRST at the CLI: a model with a known context of 200,000 or more gets
 test("the PILOT's report compares l3-first with big-first from the measured pass rates", async () => {
   const rows = [{ provider: "fa", keyId: "k.fa.free", models: Array.from({ length: 6 }, (_, i) => m(`a${i}`)) }];
   const w = { snap: { rows }, bench: { get: () => ({ s: "ok", t: 400, a: 1790699779 }) }, tiers: { fa: "free" } };
-  const e = env(w, (c) => (kindOf(c) === "5" && /a[0-1]$/.test(c.body.model) ? http(400, "bad request") : goodModel(c)));
+  const e = env(w, (c) => (kindOf(c) === "5" && /a[0-1]$/.test(c.body.model) ? http(400, "request too large") : goodModel(c)));
   const r = await run(["--live", "--sample", "6", "--seed", "z", "--levels", "1235", ...DEEP], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
   assert.match(r.out, /pilot: L3 failure rate among the models that passed L1\+L2: 0\.0% \(0 failed of 6 tested/);
