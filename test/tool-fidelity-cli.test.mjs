@@ -229,18 +229,18 @@ test("TWO STRIKES end to end: a first failure is provisional and asked again by 
     const m = c.body.model;
     if (m === "fa/a2") return kindOf(c) === "1" || kindOf(c) === "1f" ? ok(stream(ev.text(0, "nope"), ev.stop())) : goodModel(c);
     if (m === "pb/b1") return http(402, "payment required");
-    if (m === "pb/b2") return http(429, "slow down");
+    if (m === "pb/b2") return http(402, "payment required");
     return goodModel(c);
   } });
-  const r = await run(["--live"], e.deps);
+  const r = await run(["--live", "--per-provider", "1"], e.deps);          // one at a time per provider: the evidence of the first answers is in before the next one is asked
   let s = loadFidelity(e.out).models;
   assert.deepEqual([s["fa/a2"].lvr, s["fa/a2"].t, s["fa/a2"].ok, s["fa/a2"].strikes, s["fa/a2"].sl], ["nnnn", "u", false, 1, 1], "first strike: untested, not x");
   assert.match(s["fa/a2"].why, /^L1: answered in text/);
   assert.equal(s["pb/b1"], undefined, "402 is the account's state, not a verdict about the model");
-  assert.equal(s["pb/b2"], undefined, "429 neither");
+  assert.equal(s["pb/b2"], undefined, "nor is the second 402: two distinct models out of credit pause the provider");
   assert.ok(s["fa/a1"]);
-  assert.equal(s["pb/b3"], undefined, "pb's canary (its first answer) was a 402: the rest of the provider is left alone, with ZERO further requests");
-  assert.equal(probeCalls(e.f).filter((c) => c.body.model.startsWith("pb/")).length, 1, "one request to pb in the whole run");
+  assert.equal(s["pb/b3"], undefined, "two models of pb were out of credit: the rest of the provider is left alone, with ZERO further requests");
+  assert.equal(probeCalls(e.f).filter((c) => c.body.model.startsWith("pb/")).length, 2, "two requests to pb in the whole run");
   assert.match(r.out, /providers needing attention \(an account state, not a verdict on any model; fix the account, then run again; nothing was retried in this run\):/);
   assert.match(r.out, /pb: pay \(no credit or the plan does not allow it\) -- 3 model\(s\) skipped/, "the provider, the state, and how many models were skipped");
   assert.match(r.out, /failed once, asked again next run 1/);

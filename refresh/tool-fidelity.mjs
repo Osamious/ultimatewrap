@@ -788,14 +788,19 @@ export function selectCandidates({ set, policy, tiers = {}, includeTiers = [], r
   const byKey = new Set(set.models.map((e) => e.key));
   const allowed = new Set(["free", ...includeTiers]);
   const need = ctxNeededFor(3, maxTokens);
-  const entries = [], excluded = [];
+  const entries = [], excluded = [], small = [];
   set.models.forEach((e, order) => {
     const tier = tiers?.[e.provider];
     const pinIdx = pinList.indexOf(e.key);
     {                                                                                // the tier rule holds for a pin too: only free-labelled providers are probed at all
       if (!isTier(tier) || !allowed.has(tier)) { excluded.push({ key: e.key, reason: tier === "subscription" ? TIER_EXCLUSION.subscription : NOT_FREE_REASON, tier: isTier(tier) ? tier : null }); return; }
     }
-    if (pinIdx < 0 && e.ctx > 0 && e.ctx < need) { excluded.push({ key: e.key, reason: "ctx-too-small-for-fixture" }); return; }
+    if (pinIdx < 0 && e.ctx > 0 && e.ctx < need) {
+      excluded.push({ key: e.key, reason: "ctx-too-small-for-fixture" });
+      const listed0 = !e.free && (e.pin > 0 || e.pout > 0);
+      small.push({ ...e, ...(tier === "free" && !listed0 ? { free: true } : {}), ...(tier === "free" && listed0 ? { pricedOnFree: true } : {}), tier, prio: 5, smallOnly: true });       // too small for the 157 KB fixture, not for L1 and L2
+      return;
+    }
     const row = rank.get(e.key);
     const prio = pinIdx >= 0 || (row && Number.isFinite(row.c) && row.c >= floor) ? 1 : presetKeys?.has(e.key) ? 2 : e.ctx >= floor ? 3 : e.ctx > 0 ? 5 : 4;
     // a key of tier `free` is free of charge only where the LISTING is too (no listed price, or price 0 / a free tag). A model with a LISTED price is costed at that price, so the row ceiling
@@ -806,7 +811,7 @@ export function selectCandidates({ set, policy, tiers = {}, includeTiers = [], r
   entries.sort((a, b) => { for (let i = 0; i < 4; i++) if (a._o[i] !== b._o[i]) return a._o[i] < b._o[i] ? -1 : 1; return 0; });
   for (const e of entries) delete e._o;
   for (const k of set.relay) excluded.push({ key: k, reason: "relay-by-provenance" });
-  return { entries, excluded, floor, pinned: pinList.filter((p) => !byKey.has(p)) };
+  return { entries, excluded, small, floor, pinned: pinList.filter((p) => !byKey.has(p)) };
 }
 
 // ------------------------------------------------------------------ the stratified pilot (`--sample`)
@@ -1001,6 +1006,8 @@ export function ledgerUniverses({ set, cand = null }) {
  * (`reasonOf(key)`: a status such as rate or pay, spend, cap, not-run); one that got a result, or is waiting on its second strike (the strike is the
  * state), is dropped. Entries of models outside `keepKeys` are dropped. The ledger ignores an entry of a model that is tested. Pure.
  */
+/** Pending reasons that come from an ASK (the model was sent a request and got no verdict): such a model queues behind the ones never asked, and a later `cap` wait does not erase that history. */
+export const TRIED_REASONS = new Set(["rate", "pay", "auth", "gone", "error", "timeout", "empty", "slow", "reasoning-budget", "route-shape", "upstream-unavailable", "request-cap"]);
 export function updatePending(pending, { queue, recorded, store, reasonOf, now = new Date(), keepKeys = null }) {
   const out = { ...pending };
   if (keepKeys) for (const k of Object.keys(out)) if (!keepKeys.has(k)) delete out[k];             // a model that has left the probe set is not pending
@@ -1008,6 +1015,7 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, now =
     const r = store[e.key];
     if (recorded.has(e.key) || r?.strikes === 1) { delete out[e.key]; continue; }
     const code = String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
+    if (code === "cap" && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
     out[e.key] = { r: code, n: Math.min(9999, (out[e.key]?.n ?? 0) + 1), at: now.toISOString() };
   }
   return out;
@@ -1047,6 +1055,50 @@ export function migrateStrikes(store) {
     out[key] = { ...rest, t, ok: t === "v" || t === "t" };
   }
   return { store: out, cleared };
+}
+
+// ------------------------------------------------------------------ holds that were wrong, and the per-provider table of what is untested
+
+/** The providers that have at least one CONFIRMED result (class t or v): a provider that has answered is never gone and never out of credit as a whole. `{provider: n}`. */
+export function confirmedProviders(store) {
+  const out = {};
+  for (const [k, r] of Object.entries(store ?? {})) if (r && (r.t === "t" || r.t === "v")) { const p = k.slice(0, k.indexOf("/")); out[p] = (out[p] ?? 0) + 1; }
+  return out;
+}
+/** A hold on gone or pay grounds for a provider that has confirmed results is wrong: gone and pay are answers about MODELS there. (An auth hold stays: the key is the account.) */
+export const holdIsWrong = (h, confirmed, provider) => !!h && (h.r === "gone" || h.r === "pay") && (confirmed?.[provider] ?? 0) > 0;
+/**
+ * Releases holds: the named `providers` and, with `wrong`, every hold on gone or pay grounds whose provider has confirmed results. The `canary-*` pending entries of a released provider go too (they were
+ * written by the pause and are judged again). Pure: `{held, pending, released: [{provider, r, confirmed, named}], missing: [provider]}`.
+ */
+export function releaseHolds(store, pending, held, { providers = [], wrong = false } = {}) {
+  const confirmed = confirmedProviders(store), hold = { ...(held ?? {}) }, pend = { ...(pending ?? {}) }, released = [];
+  const named = new Set(providers);
+  for (const [p, h] of Object.entries(held ?? {})) {
+    const isNamed = named.has(p), isWrong = wrong && holdIsWrong(h, confirmed, p);
+    if (!isNamed && !isWrong) continue;
+    delete hold[p];
+    released.push({ provider: p, r: h.r, confirmed: confirmed[p] ?? 0, named: isNamed });
+  }
+  const gone = new Set(released.map((x) => x.provider));
+  for (const k of Object.keys(pend)) if (gone.has(k.slice(0, k.indexOf("/"))) && /^canary-/.test(pend[k].r)) delete pend[k];
+  return { held: hold, pending: pend, released, missing: providers.filter((p) => !(held && Object.hasOwn(held, p))) };
+}
+
+/**
+ * Why the untested models of each provider are untested, from a ledger (`coverage(...)`): `[{provider, tested, untested, why: {reason: n}, runnable}]`, most untested first. `held:pay` the provider is
+ * held, `paused:pay` the provider was paused by its canary in an earlier run, `cap` waiting for the per-provider cap, `queued` this run will ask it, the rest are the stored reasons (rate, pay, gone,
+ * error, not-run, ...). `runnable`: the provider is not held and has models queued or waiting for the cap.
+ */
+export function untestedTable(cov) {
+  const by = new Map(), prov = (k) => k.slice(0, k.indexOf("/"));
+  const row = (p) => { if (!by.has(p)) by.set(p, { provider: p, tested: 0, untested: 0, why: {}, runnable: false }); return by.get(p); };
+  for (const e of cov.tested) row(prov(e.key)).tested += 1;
+  const add = (e, reason) => { const r = row(prov(e.key)); r.untested += 1; r.why[reason] = (r.why[reason] ?? 0) + 1; };
+  for (const e of cov.pending) add(e, /^canary-/.test(e.reason) ? `paused:${e.reason.slice(7)}` : e.reason);
+  for (const e of cov.held) add(e, `held:${e.reason}`);
+  for (const r of by.values()) r.runnable = !Object.keys(r.why).some((k) => k.startsWith("held:")) && ((r.why.queued ?? 0) + (r.why.cap ?? 0) > 0);
+  return [...by.values()].filter((r) => r.untested > 0).sort((a, b) => b.untested - a.untested || (a.provider < b.provider ? -1 : 1));
 }
 
 // ------------------------------------------------------------------ canary migration

@@ -178,13 +178,13 @@ test("the rule cannot be lifted by an environment variable, a config file, or th
 test("CANARY: a provider whose first answer is a dead key, an empty balance or a missing model costs ZERO further requests; its models stay pending with the reason; other providers go on", async () => {
   for (const [status, why] of [[401, "auth"], [402, "pay"]]) {
     const e = env(world(), (c) => (c.body.model.startsWith("fa/") ? http(status, "nope") : goodModel(c)));
-    const r = await run(["--live"], e.deps);
-    assert.equal(byProvider(e.f).fa.length, 1, `${why}: one request to fa, then nothing`);
+    const r = await run(["--live", "--per-provider", "1"], e.deps);
+    assert.equal(byProvider(e.f).fa.length, why === "pay" ? 2 : 1, `${why}: auth is the key's state (one request); pay needs two distinct models out of credit; then nothing`);
     assert.match(r.out, new RegExp(`providers needing attention .*\\n\\s+fa: ${why} \\(.*\\) -- 3 model\\(s\\) skipped`), "the attention block names the provider, its state and how many models were skipped");
     const st = loadFidelity(e.out);
     assert.deepEqual(Object.keys(st.models).filter((k) => k.startsWith("fa/")), [], "no record: the account's state is not a verdict");
-    assert.equal(st.pending["fa/a2"].r, `canary-${why}`);
     assert.equal(st.pending["fa/a3"].r, `canary-${why}`);
+    assert.equal(st.pending["fa/a2"].r, why === "pay" ? "pay" : `canary-${why}`);
     assert.ok(st.models["fc/c1"], "another provider is unaffected");
   }
   const ok = env(world(), (c) => (c.body.model === "fa/a1" ? http(500, "oops") : goodModel(c)));

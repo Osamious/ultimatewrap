@@ -209,12 +209,13 @@ test("SIGINT flushes the finished records to the file BEFORE anything else happe
 
 test("providers needing attention: a free-labelled provider whose canary is auth, pay or gone is named with its state and how many models were skipped; nothing is retried in the run", async () => {
   for (const [status, why] of [[401, "auth"], [402, "pay"], [404, "gone"]]) {
-    const rows = [{ provider: "fa", keyId: "k.fa.free", models: [m("a1"), m("a2"), m("a3")] }, { provider: "fb", keyId: "k.fb.free", models: [m("b1")] }];
+    const n = why === "gone" ? 6 : 3;                                  // gone needs FOUR distinct models and no answer before a provider is paused
+    const rows = [{ provider: "fa", keyId: "k.fa.free", models: Array.from({ length: n }, (_, i) => m(`a${i + 1}`)) }, { provider: "fb", keyId: "k.fb.free", models: [m("b1")] }];
     const inner = fakeFetch(goodModel);
     const e = env(rows, { fetch: async (url, init) => { const b = init?.body ? JSON.parse(init.body) : null; return b?.model?.startsWith("fa/") ? new Response(JSON.stringify({ error: { message: "nope" } }), { status }) : inner(url, init); } });
     const r = await run(["--live", "--per-provider", "1"], e.deps);
     assert.match(r.out, /providers needing attention \(an account state, not a verdict on any model; fix the account, then run again; nothing was retried in this run\):/);
-    assert.match(r.out, new RegExp(`fa: ${why} \\(.*\\) -- 3 model\\(s\\) skipped`));
+    assert.match(r.out, new RegExp(`fa: ${why} \\(.*\\) -- ${n} model\\(s\\) skipped`));
     assert.doesNotMatch(r.out, /fb: (auth|pay|gone)/);
     assert.ok(loadFidelity(e.out).models["fb/b1"], "other providers go on");
   }

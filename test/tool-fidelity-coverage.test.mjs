@@ -362,7 +362,7 @@ test("DRY RUN with --candidates policy: the candidate block with priority counts
   assert.match(r.out, /candidates \(free tier\): 7 of 8 model\(s\) in the probe set, whether or not their context is known; priority 1 policy allowed >= 128,000 or pinned 3, 2 preset union 1, 3 other >= 128,000 0, 4 unknown context 1, 5 known below 128,000 2 \(an ordering, never a limit\)/);
   assert.match(r.out, /excluded: ctx-too-small-for-fixture 1, relay-by-provenance 1/);
   assert.match(r.out, /big step skipped for 2 model\(s\) whose known context is below 200,000 \(never recorded as a failure\)/);
-  assert.match(r.out, /envelope, the WHOLE queue at full depth \(before any cap\): \d+ requests, ~[\d.]+[Mk] input tokens, 7 model\(s\) of 8 in the probe set on 2 provider\(s\)/);
+  assert.match(r.out, /envelope, the WHOLE queue at full depth \(before any cap\): \d+ requests, ~[\d.]+[Mk] input tokens, 8 model\(s\) of 8 in the probe set on 2 provider\(s\)/, "the small-context model is in the queue too: for its small requests only");
   assert.match(r.out, /finishing in ONE run needs --tf-max-tokens-per-provider [\d,]+ \(largest: fa [\d.]+[Mk].*\); at the cap of 150,000 it takes about \d+ run\(s\)/);
   assert.doesNotMatch(r.out, /WARNING: .* cost more than the cap on their own/, "a fully tested model is about 150,000 tokens: it fits the default cap of 150,000 (just)");
   assert.match(r.out, /per request \(a full-depth model sends each row once/);
