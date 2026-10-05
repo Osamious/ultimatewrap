@@ -1,0 +1,4 @@
+# The router files are hashed (sha256) by the sandbox harness and by the deploy script, and the
+# plan hash covers their bytes. Pin LF so the same file has the same hash in every checkout
+# (the machine default core.autocrlf=true would otherwise rewrite them as CRLF).
+router/*.cjs text eol=lf

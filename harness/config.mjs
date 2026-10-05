@@ -30,6 +30,13 @@ export const WEB_PORT = 39458;
 export const GATEWAY_PORT = 39456;
 export const GATEWAY_CORE_PORT = 39457;
 export const LIVE_PORTS = [3456, 3457, 3458];
+export const RELAY_PORT = 4517;                 // the live Anthropic OAuth relay: never bound or contacted by any sandbox
+// The single home of the S0 sandbox port numbers (subagent-sandbox-spec.mjs, stub-upstream.mjs and subagent-e2e.mjs import them; none
+// restates a literal). The stub upstream sits at 39459. The stopped CCR 3.1.1 trial plan (plans/ccr-3.1.1-g3-plan.md section 1.4) reserved
+// 39459-39465 as HEADROOM for CCR's web-port scan; that trial is stopped and the two plans never run together, but if it is ever
+// resumed the stub must move (the trial's preflight refuses any listener in 39456-39489, so a clash is loud, not silent).
+export const STUB_PORT = 39459;
+export const PORT_RANGE = [39456, 39489];       // the only ports a sandbox process may listen on or connect to (the preload guard enforces it)
 export const WEB_AUTH_TOKEN = "uw-harness-local-only-token";
 
 // The scratch settings file CCR's applyProfile may write, and the test CLI's own
@@ -73,14 +80,30 @@ export function resolveWebPort() {
   return { port: Number(url.port), pid: svc.pid };
 }
 
-export async function rpc(method, args = []) {
+/** The web RPC gave no answer within its per-call timeout: the run treats it as fatal (a hung saveConfig may or may not have been applied), so it fails closed with teardown and evidence. */
+export class RpcTimeoutError extends Error { constructor(m) { super(m); this.name = "RpcTimeoutError"; } }
+export const RPC_TIMEOUT_MS = 120000;                  // per call; the third argument of rpc() overrides it for tests only
+
+export async function rpc(method, args = [], { timeoutMs = RPC_TIMEOUT_MS } = {}) {
   const { port } = resolveWebPort();
-  const res = await fetch(`http://127.0.0.1:${port}/api/ccr/rpc`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-ccr-web-auth": WEB_AUTH_TOKEN },
-    body: JSON.stringify({ method, args })
-  });
-  const json = await res.json();
+  // Every caller of this function drives the SANDBOX daemon (the live web UI is 3458 and its token is not ours). A service.json that
+  // says anything but WEB_PORT is refused, so a scratch service.json edited (or a scan shifted to a live port) can never aim a
+  // saveConfig at another instance. redirect:"error": a 30x from the target is never followed to another host.
+  if (port !== WEB_PORT) throw new Error(`rpc refused: the sandbox service.json names web port ${port}, not ${WEB_PORT}`);
+  let json;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/ccr/rpc`, {
+      method: "POST",
+      redirect: "error",
+      headers: { "Content-Type": "application/json", "x-ccr-web-auth": WEB_AUTH_TOKEN },
+      body: JSON.stringify({ method, args }),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    json = await res.json();
+  } catch (e) {
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) throw new RpcTimeoutError(`${method} timed out after ${timeoutMs} ms (no answer from the sandbox web RPC)`);
+    throw e;
+  }
   // Never interpolate the config/provider objects: getConfig returns api_key
   // values unredacted, and an error string is the easiest place for one to leak.
   if (!json.ok) throw new Error(`${method} failed: ${String(json.error?.message).slice(0, 300)}`);

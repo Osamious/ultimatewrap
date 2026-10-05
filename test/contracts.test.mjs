@@ -279,7 +279,7 @@ const TAG_ALLOW = new Map([
 test("the tag literals and the data-folder names appear only in the CCR contract module", () => {
   const root = path.join(process.env.HOME ?? process.env.USERPROFILE, ".uw");
   const offenders = [];
-  for (const dir of ["menu", "refresh", "keysync", "harness", "spike"]) {
+  for (const dir of ["menu", "refresh", "keysync", "harness", "spike", "router"]) {
     const d = path.join(root, dir);
     if (!fs.existsSync(d)) continue;
     for (const f of fs.readdirSync(d)) {

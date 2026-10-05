@@ -30,6 +30,8 @@ spike/Usersosami*
 
 # Isolated-test scratch tree — recreated by harness/bootstrap.mjs.
 harness/scratch/
+# S0 sandbox run: retained evidence of a refused run (g1-evidence/) and the owner's plan approval (g1-approval.json); local only.
+harness/g1-*
 
 # Runtime state: per-machine, not source.
 state/

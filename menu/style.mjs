@@ -21,6 +21,7 @@ import { PREVIEW_CHARS, STATUSES, statusCode, statusTone, fmtMs, fmtTps, preview
 // arguments, so this does not become a cycle even though the legend renders
 // through `provenanceDot` defined in this file.
 import { legendLines } from "./legend.mjs";
+import { POOL_ALIAS_RE } from "./pool-rule.mjs";
 // The output-modality vocabulary (the `modality` column). Also import-free.
 import { modalityWord, MODALITY_COLOURS } from "./modality.mjs";
 
@@ -688,8 +689,8 @@ const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 // diverge; `free` earns a label here without earning a change to that tag
 // rule, since a pool's ctx is already null (see the real snapshot row) and
 // never reaches tagOneM's ctx>=1M gate regardless.
-const POOL_ALIAS_LABEL_IDS = /(^|\/)(auto|router|default|free)$/i;
-const withPoolLabel = (id) => (POOL_ALIAS_LABEL_IDS.test(String(id ?? "")) ? `${id} [pool]` : id);
+// The alternation now lives in `menu/pool-rule.mjs` (one shared constant, also read by the subagent funnel).
+const withPoolLabel = (id) => (POOL_ALIAS_RE.test(String(id ?? "")) ? `${id} [pool]` : id);
 
 // #51 (§2.5(a)), revision 11: the model-count cell carries BOTH numbers
 // instead of a new column. A provider withholding nothing renders the BARE

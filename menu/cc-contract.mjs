@@ -31,6 +31,32 @@ export const CONTRACT = Object.freeze({
     settings: path.join(os.homedir(), ".claude", "settings.json"),
     statusLineKey: "statusLine",
   }),
+  // Subagent policy (plan 4, section 6): what the router reads off a request to tell main from a subagent from a
+  // helper call, and the settings env names whose values the compiler reads. The router is a .cjs and cannot import
+  // this module, so it carries these as literals; test/subagent-contract.test.mjs asserts the two stay equal.
+  subagent: Object.freeze({
+    headers: Object.freeze({
+      agentId: "x-claude-code-agent-id",
+      sessionId: "x-claude-code-session-id",
+      sessionIdAlt: "x-claude-session-id",
+      requestClass: "x-claude-code-request-class",
+      agentType: "x-claude-code-agent-type",
+      beta: "anthropic-beta",
+      contentLength: "content-length",
+    }),
+    billingPrefix: "x-anthropic-billing-header",
+    beta1m: "context-1m-2025-08-07",
+    toolNames: Object.freeze(["agent", "task"]),
+    envKeys: Object.freeze({
+      model: "ANTHROPIC_MODEL",
+      opus: "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      fable: "ANTHROPIC_DEFAULT_FABLE_MODEL",
+      smallFast: "ANTHROPIC_SMALL_FAST_MODEL",
+      subagentOverride: "CLAUDE_CODE_SUBAGENT_MODEL",
+    }),
+  }),
   statusline: Object.freeze({
     modelPath: "model.id",
     displayPath: "model.display_name",

@@ -193,6 +193,115 @@ node keysync/key.mjs default-model clear                                    # an
 - With **no** default set, a live profile run prints a WARNING first if it is about
   to change a hand-set `env.ANTHROPIC_MODEL` to the profile anchor.
 
+### 5b. The subagent model policy (which model your subagents run on)
+
+A policy chooses the model each Claude Code subagent runs on, instead of the model it asked for.
+It is owner data, written only by the CLI, and it starts in **shadow**: it logs what it would
+do and changes nothing. `shadow` is the word on every screen; nothing is enforced until you
+say so, and a wizard or a preset never enforces.
+
+```powershell
+node keysync/key.mjs subagent-policy status                 # the verdict first (off, saved, waiting, idle, shadow, enforcing, paused or degraded) and the one command that helps, then about four lines: the policy, the compiled copy, what the router last reported
+node keysync/key.mjs subagent-policy preset                 # the five ready-made choices with live counts
+node keysync/key.mjs subagent-policy preset free            # preview one (the equivalent flags and what it would do); nothing is saved
+node keysync/key.mjs subagent-policy preset free --confirm yes --live yes
+node keysync/key.mjs subagent-policy wizard --live yes      # three questions on a terminal, a preview, then a save in shadow mode (it needs --live yes like every command that saves)
+node keysync/key.mjs subagent-policy last 20 --since 24h    # what the last subagents asked for, what ran, what the policy would use, in local time (--json yes for scripts)
+node keysync/key.mjs subagent-policy explain groq/llama-3.3-70b --mode free --free-scope providers   # would this model be allowed? saves nothing
+node keysync/key.mjs subagent-policy why EMPTY_SET          # what a warning means in plain words, and the command that fixes it
+node keysync/key.mjs subagent-policy pause                  # subagents run exactly as they asked from the next request; your toggles are kept
+node keysync/key.mjs subagent-policy resume --live yes      # continue (checked like set --enforce enforce)
+node keysync/key.mjs subagent-policy undo --live yes        # back one step (refused while paused: resume first, or add --lift-pause yes)
+node keysync/key.mjs subagent-policy help                   # the toggle map and every command
+```
+
+- **Running the examples in a fixture.** A test run names its own files instead of the real ones
+  (`T=$(mktemp -d); F=$(node test/fixtures/subagent-flags.mjs --dir "$T")`), and the flags it needs
+  depend on the command. `set`, `show`, `status`, `explain`, `rebuild`, `preset`, `wizard`, `resume`
+  and `undo` take the full set `$F`. `last` takes only `--state-dir "$T/state"`. `pause`, `rollback`
+  and `clear` take only `--policy-file "$T/llmkeys/subagent-policy.json" --state-dir "$T/state"`.
+  `why` and `help` take no file flag. `$F` given to `last`, `pause`, `rollback`, `clear` or `why` is
+  refused as E_USAGE ("unknown or not applicable flag"), and a half set is refused as "incomplete
+  test-flag set". A fixture run never needs `--live yes`; a run on the real files always does.
+- **What `status` prints.** Not one line: the verdict and its next command first, then the policy,
+  the compiled copy (age, eligible models of the snapshot routes, how many are not tool-tested) and
+  what the router last reported (when, how many subagent requests of how many), plus one plain line
+  for each router warning. States: `OFF` (no policy saved), `SAVED-NOT-COMPILED`, `WAITING` (saved and
+  compiled; the router has not reported this exact copy yet and uses it from its next request: run
+  `status` again after you use Claude Code), `NOT-WIRED` (no router has ever reported and the compiled
+  copy is older than about ten minutes, or a router that ran for a long time still reports an older
+  copy), `IDLE` (the router reported this exact copy earlier and has been silent for over a day: it
+  reports only while Claude Code runs, so nothing is wrong unless you used Claude Code since),
+  `SHADOW`, `ENFORCING`, `PAUSED` and `DEGRADED(CODE)`. A saved policy file that cannot be read is
+  `DEGRADED(E_OWNER_CORRUPT)` with exit 4 and the command that clears it. After a `set` the first line
+  is `SAVED:` (the same state `status` calls `WAITING`).
+- **The free presets.** `preset free` (and answer 3 of the wizard) is the NARROW set: only models
+  tagged free (the count is printed in the preview: `N models tagged free; M models on free-labelled
+  providers`). `preset free-wide` is the wide set: every working model on a provider you labelled
+  free, which is a much larger set and can include models that have a price. Every free preview shows
+  both counts from the live funnel.
+
+- **The three toggles.** Toggle 1 *source* (`--source same-provider|all-providers`: only main's
+  own provider, or any provider). Toggle 2 *mode* (`--mode dynamic|inherit|free`: any model,
+  main's own model, or free models only; with `free`, `--free-scope models|providers|providers+deposit`
+  says which models count as free). Toggle 3 *context* (`--ctx any|prefer-1m|1m`). Also
+  `--banded yes|no`, `--handoff-notice yes|no`, `--enforce shadow|enforce`, `--inject off|on`
+  and `--allow provider/model`. The presets: `follow-main` (mode inherit), `any` (dynamic, all
+  providers), `free` (free, all providers, free scope models: only models tagged free), `free-wide`
+  (the same with free scope providers: every model on a free-labelled provider), `free-1m` (free
+  scope providers with ctx 1m).
+  `set`, `show` and `preset` print the verdict first, then the change against the previous policy
+  (`mode dynamic -> free; eligible 14 -> 7 models, 5 -> 2 providers`); `--detail yes` adds the whole
+  funnel and every raw warning.
+- **Files.** Your choices: `~/.llmkeys/subagent-policy.json` (and `.prev`, the one generation `undo`
+  restores: written before every `set` or `clear` that changes something). The compiled copy the
+  router reads: `state/subagent/policy.json` (a saved choice is not live until it is compiled; `set`
+  does it, `rebuild --live yes` redoes it after a bench sweep or a key change). The router writes
+  `state/subagent/status-<worker>.json`, `agents.jsonl` (one line per new subagent, plus three
+  rotated files of 1 MiB) and `cooling.json`; `shadow.flag` is the pause (the router stats it on
+  every request) and `paused-from.json` remembers what `resume` should restore.
+- **Pause, resume, undo.** `pause` (and its older name `rollback`) is compile-free and needs no
+  `--live yes`: one word must work in an emergency. A pause that the router set by itself (a safety
+  check tripped, shown as `DEGRADED(AUTO_ROLLBACK)`) is cleared by `resume` or by a `set`. `resume`
+  puts enforcement back to what it was when you paused, through the SAME checks as
+  `set --enforce enforce`, so it refuses (and the pause stays) while a precondition is unmet. `undo`
+  restores the previous generation and recompiles it; while the policy is paused it is REFUSED
+  (E_PRECONDITION, naming `resume`) because it would lift the pause as a side effect: add
+  `--lift-pause yes` to go back one step and lift the pause in one command, and it says so. If the
+  earlier policy cannot be compiled, `undo` prints the whole refusal and leaves you paused with the
+  earlier toggles saved. A real `set` during a pause lifts it and says so (including that enforcement
+  stays shadow when it was enforce before the pause). Every writing command on the REAL files (`set`
+  without `--dry yes`, `rebuild`, `clear`, `resume`, `undo`, `wizard`, a confirmed `preset`) needs
+  `--live yes`: a real save never happens without it on the command line (the wizard is refused before
+  its first question without it). A test run names its own files with the test flags instead and
+  never needs it.
+- **Restore command.** The router file is replaced and restored only through
+  `node harness/deploy-router.mjs --deploy yes --candidate <file>` and
+  `node harness/deploy-router.mjs --restore yes [--from <backup>]` (a backup is made first); the
+  CLI never touches it. `clear` removes the policy files and the router goes back to its exact
+  legacy behaviour on its next request.
+- **Tag-stripper note.** With `--inject on` main is asked to start a subagent prompt with
+  `<CCR-SUBAGENT-MODEL>Provider/model</CCR-SUBAGENT-MODEL>`; CCR removes that tag before the agent
+  runs. The router never relies on the tag being obeyed: an id outside the allowed list is replaced
+  by the policy and the replacement is logged.
+- **Native `/model` is not covered.** The policy chooses the model of SUBAGENTS only. What you pick
+  with Claude Code's own `/model` (main) is yours, and CCR's own model list (a provider with model
+  descriptions) is a second list the policy does not edit. Helper calls (titles, summaries,
+  compaction) are never rewritten in any mode.
+- **Reading `last`.** Claude Code's transcript shows the model that was REQUESTED, not the one that
+  served the request: the served model is in `last`, in the doctor and in CCR's `request_logs`.
+  A free subagent that runs out of limits is handed to the next free model on its next request; for a
+  daily cap the honest bound is ONE failure, then avoidance: Claude Code fails the subagent at once
+  when the retry delay is over a minute, so no retry reaches the router, and the router marks the
+  model as resting so the next subagent starts elsewhere.
+- **The 6 h rest.** A model that fails rests 2 min, then 10 min, then 60 min, then 6 h. The router has
+  no memory of a failure that happened "consecutively" in the strict sense: it approximates it with
+  the rest period plus one quiet hour, so a model that fails every 30 to 60 minutes reaches the 6 h
+  rung in about 3 hours.
+- **Counts carry their denominator.** Every figure printed says what it is a count of ("7 of 7
+  eligible models are not tool-tested"). "Eligible" means allowed by the toggles; "usable" means it
+  can stand in for a subagent (a known context of at least 128,000) and fits the request.
+
 ## 6. Phase B — catalogue refresh and health
 
 Refresh actions 6a to 6d are deliberate, manually-invoked commands by design; none

@@ -22,6 +22,8 @@ import { loadVault, filterRegistry, chooseKeys, loadKeyChoices, KEY_CHOICES_FILE
   from "./keysync.mjs";
 import { setDefaultModel, clearDefaultModel, showDefaultModel, formatShow, SET_NOTE, CLEAR_NOTE, DefaultModelError }
   from "./default-model.mjs";
+import { tierList } from "../menu/tiers.mjs";
+import { tierError, runRetier } from "./retier.mjs";
 
 const VAULT_SCRIPT = path.join(os.homedir(), ".llmkeys", "ApiKeyVault.ps1");
 const dotSource = (cmd) => `. '${VAULT_SCRIPT.replace(/'/g, "''")}'; ${cmd}`;
@@ -81,11 +83,14 @@ function writeChoice(provider, id) {
 
 async function cmdAdd(args) {
   const [bucket, provider, tier] = args._;
-  if (!bucket || !provider || !tier) {
-    console.error("usage: key.mjs add <bucket> <provider> <tier> [--notes \"...\"]");
+  if (!bucket || !provider) {
+    console.error(`usage: key.mjs add <bucket> <provider> <tier> [--notes "..."]; valid tiers: ${tierList().join(", ")}`);
     process.exitCode = 1;
     return;
   }
+  // Before PowerShell is reached: a typo would otherwise create a key no tier scope recognises (plan 7.1).
+  const badTier = tierError(tier);
+  if (badTier) { console.error(badTier); process.exitCode = 1; return; }
   const notes = args.notes ?? "";
   const ok = runInherited(
     `Add-AndVerifyKey -Bucket ${q(bucket)} -Provider ${q(provider)} -Tier ${q(tier)} -Notes ${q(notes)}`);
@@ -223,7 +228,16 @@ switch (sub) {
   case "test": cmdTest(args); break;
   case "prefer": cmdPrefer(args); break;
   case "default-model": cmdDefaultModel(args); break;
+  case "retier":
+    process.exitCode = runRetier(rest, { out: (s) => console.log(s), err: (s) => console.error(s) });
+    break;
+  case "subagent-policy": {
+    // Loaded lazily: the library pulls in the snapshot and bench readers the other subcommands never need.
+    const { runSubagentPolicy } = await import("./subagent-policy.mjs");
+    process.exitCode = await runSubagentPolicy(rest, { out: (s) => console.log(s), err: (s) => console.error(s) });
+    break;
+  }
   default:
-    console.error("usage: key.mjs <add|remove|list|test|prefer|default-model> ...");
+    console.error("usage: key.mjs <add|remove|list|test|prefer|retier|default-model|subagent-policy> ...");
     process.exitCode = 1;
 }
