@@ -6,13 +6,15 @@ import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, fakeFetch, ev, stream, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, parseLevels, plan, printPlan, liveRefusal, runIncremental } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, saveFidelity, buildRecord, probeSet, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
 
@@ -38,11 +40,13 @@ function env(extra = {}) {
     now: () => NOW, isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1, tiers: { fa: "free", pb: "free" }, ...extra.deps };
   return { dir, deps, f, benchFile, out: deps.outFile, ...w };
 }
-async function run(argv, deps) {
+// a live run with priced models needs an explicit --max-spend (liveRefusal): these tests add the default value so the rule is exercised on its own in one test, with `raw`
+const spendFor = (argv) => (argv.includes("--live") && !argv.includes("--max-spend") ? [...argv, "--max-spend", "5"] : argv);
+async function run(argv, deps, { raw = false } = {}) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(raw ? argv : spendFor(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const probeCalls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
@@ -105,7 +109,7 @@ test("DRY RUN with levels 3 and 4 prints the per-request cost BEFORE anything is
   assert.match(r.out, /whole queue, before the cap: 8 requests, ~1\d\dk input tokens/);
   assert.match(r.out, /L3 constructs \+ 157 KB \(\+L4 parallel\) 2 req ~4\dk in/);
   assert.match(r.out, /output budgets: .*3b 256/);
-  assert.match(r.out, /timeouts: small 15 s, 157 KB 60 s, 400 KB 90 s/);
+  assert.match(r.out, /timeouts: adaptive per model, 3 x its bench time, small 45-120 s, 157 KB 90-180 s, 400 KB 120-240 s \(this run's small requests: .*a timeout is asked once more at double/);
   assert.match(r.out, /per tier this run: free 3 model\(s\)/);
   assert.match(r.out, /needs --l3 yes and --only|deep levels need --l3 yes and --only/);
   assert.equal(e.f.calls.length, 0);
@@ -142,11 +146,17 @@ test("--live refusals: levels 3 and 4 need --l3 yes AND a named provider or an e
   saveFidelity(e.out, Object.fromEntries(probeSet(e.snapshot.snap, e.bench).models.map((m) => [m.key, buildRecord(null, { 1: { v: "p" }, 2: { v: "p" } }, { now: NOW })])), { now: NOW });
   const a = await run(["--live", "--levels", "34"], e.deps);
   assert.equal(a.code, 2); assert.match(a.err, /add --l3 yes/);
-  const b = await run(["--live", "--levels", "34", "--l3", "yes"], e.deps);
+  const b = await run(["--live", "--levels", "34", "--l3", "yes"], e.deps, { raw: true });
   assert.equal(b.code, 2); assert.match(b.err, /named provider subset \(--only\) or an explicit cap/);
   const e2 = env();
   const c = await run(["--live", "--max-spend", "0.0000001", "--max-row-cost", "1"], e2.deps);
   assert.equal(c.code, 2); assert.match(c.err, /the estimate \$[\d.]+ is above the cap \$0\.0000?001?|above the cap/);
+  const priced = env();
+  const d = await run(["--live"], priced.deps, { raw: true });
+  assert.equal(d.code, 2);
+  assert.match(d.err, /3 priced model\(s\) are queued .*a live run with money at stake needs an explicit --max-spend \(the default is not accepted\)/, "the priced-run rule: no explicit --max-spend, no live run");
+  assert.equal((await run(["--live", "--only", "fa"], env().deps, { raw: true })).code, 0, "a run with nothing priced in it needs none");
+  assert.equal(priced.f.calls.length, 0);
   assert.equal(e.f.calls.length + e2.f.calls.length, 0, "refused before the gateway was even asked");
   assert.ok(!fs.existsSync(e2.deps.lockFile));
 });
@@ -231,7 +241,8 @@ test("TWO STRIKES end to end: a first failure is provisional and asked again by 
   assert.ok(s["fa/a1"]);
   assert.equal(s["pb/b3"], undefined, "pb's canary (its first answer) was a 402: the rest of the provider is left alone, with ZERO further requests");
   assert.equal(probeCalls(e.f).filter((c) => c.body.model.startsWith("pb/")).length, 1, "one request to pb in the whole run");
-  assert.match(r.out, /left alone for the rest of this run, their models stay pending: pb \(canary: pay\)/);
+  assert.match(r.out, /providers needing attention \(an account state, not a verdict on any model; fix the account, then run again; nothing was retried in this run\):/);
+  assert.match(r.out, /pb: pay \(no credit or the plan does not allow it\) -- 3 model\(s\) skipped/, "the provider, the state, and how many models were skipped");
   assert.match(r.out, /failed once, asked again next run 1/);
   assert.match(r.out, /not recorded \(they stay queued; a refusal about the account is not a verdict on the model\): .*\b(pay|rate) \d/);
   assert.match(r.out, /still queued 4\b/, "a2 (one strike) and the three pb models");

@@ -3,7 +3,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { ev, stream, fakeFetch, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
-import { runKind, buildBody, kindSize, levelSize, kindsOf, judge, BUDGETS, TIMEOUTS_MS } from "../refresh/tool-fidelity-probe.mjs";
+import { runKind, buildBody, kindSize, levelSize, kindsOf, judge, BUDGETS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR } from "../refresh/tool-fidelity-probe.mjs";
 import { AWKWARD, BIG_RESULT_FACT, LONG_TOOL, ERROR_RESULT } from "../refresh/tool-fidelity-fixture.mjs";
 
 guardRealState(after, assert);
@@ -56,9 +56,11 @@ test("cache_control rides on the system block and the LAST tool of 3a, 3b and th
   assert.ok(buildBody("3b", "p/m").tools.some((t) => t.name === LONG_TOOL), "and so does the 157 KB set");
 });
 
-test("budgets and timeouts are small and pinned: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step and spawn; 15 s, 60 s and 90 s by request class", () => {
+test("budgets and timeouts are small and pinned: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step and spawn; timeout floors 45 s, 90 s and 120 s by request class, caps 120 s, 180 s and 240 s", () => {
   assert.deepEqual({ ...BUDGETS }, { "1": 256, "1f": 256, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
-  assert.deepEqual({ ...TIMEOUTS_MS }, { small: 15000, "157": 60000, big: 90000 });
+  assert.deepEqual({ ...TIMEOUTS_MS }, { small: 45000, "157": 90000, big: 120000 });
+  assert.deepEqual({ ...TIMEOUT_CAPS_MS }, { small: 120000, "157": 180000, big: 240000 });
+  assert.equal(TIMEOUT_FACTOR, 3);
   for (const k of Object.keys(BUDGETS)) assert.equal(buildBody(k, "p/m").max_tokens, BUDGETS[k], k);
   assert.equal(buildBody("1", "p/m", 999).max_tokens, 999, "an explicit budget wins");
 });

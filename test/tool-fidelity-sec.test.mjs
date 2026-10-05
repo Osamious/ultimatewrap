@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, fakeFetch, goodModel, http, ok, ev, stream, streamWith, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { probeModel, runKind, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { main, plan, parseArgs, LIFT_PREVIEW, pendingReasonOf } from "../refresh/tool-fidelity-cli.mjs";
@@ -13,8 +14,9 @@ import { resolveTierRows, loadTiers, loadTiersInfo, describeTiers, TIERS_STALE_D
 import { filterRegistry, chooseKeys } from "../keysync/keysync.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const FREE = { tier: "free" };
 const conn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", ...extra });
@@ -198,7 +200,7 @@ test("M1: the dry run and the report print the tier SOURCE and its age; stale ti
   const ok1 = await run(["--candidates", "policy", ...CAP], fresh.deps);
   assert.match(ok1.out, /provider tiers: policy given by the caller \(compiled 2026-10-05 09:00, under a day old\); 0 of 1 provider\(s\) with probe-ok models have no tier in it/);
   assert.doesNotMatch(ok1.out, /WARNING: the provider tiers are older|missing from the tier map/);
-  const live = await run(["--candidates", "policy", "--live", "--l3", "yes", ...CAP, "--max-row-cost", "5"], fresh.deps);
+  const live = await run(["--candidates", "policy", "--live", "--l3", "yes", ...CAP, "--max-row-cost", "5", "--max-spend", "5"], fresh.deps);
   assert.match(live.out, /provider tiers: policy given by the caller[\s\S]*verified \(v\)/, "the report carries it too");
 });
 

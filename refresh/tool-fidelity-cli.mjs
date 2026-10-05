@@ -55,13 +55,14 @@ import {
   presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
-import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
+import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
 
 const NUMERIC = {
   "--limit": ["limit", true], "--tf-max-tokens-per-provider": ["tfMaxTokens", true], "--max-spend": ["maxSpend", false], "--max-row-cost": ["maxRowCost", false],
   "--max-tokens": ["maxTokens", true], "--concurrency": ["concurrency", true], "--per-provider": ["perProvider", true], "--timeout": ["timeoutSec", false],
   "--max-minutes": ["maxMinutes", false], "--pending-runs": ["pendingRuns", true],
   "--timeout-small": ["timeoutSmall", false], "--timeout-157": ["timeout157", false], "--timeout-big": ["timeoutBig", false],
+  "--timeout-max-small": ["timeoutMaxSmall", false], "--timeout-max-157": ["timeoutMax157", false], "--timeout-max-big": ["timeoutMaxBig", false],
 };
 export const LIFT_PREVIEW = "  lifting would cost, per tier (computed as if --live were given):";
 const PRICED_OVER_ROW = "priced-over-row-cap";   // a model on a free-tier key whose listing has a price above the row ceiling: pending, never an error
@@ -84,7 +85,7 @@ export function parseLevels(text) {
 
 /** Parses argv into options, or `{ error }`. */
 export function parseArgs(argv) {
-  const o = { ...DEFAULTS, maxTokens: null, order: "l3-first", timeoutSmall: TIMEOUTS_MS.small / 1000, timeout157: TIMEOUTS_MS["157"] / 1000, timeoutBig: TIMEOUTS_MS.big / 1000, tfMaxTokens: DEFAULT_TOKENS_PER_PROVIDER, levels: [...DEFAULT_LEVELS], live: false, force: false, retryFailed: false, l3: false, only: null, limit: null, economy: false,
+  const o = { ...DEFAULTS, maxTokens: null, order: "l3-first", timeoutSmall: TIMEOUTS_MS.small / 1000, timeout157: TIMEOUTS_MS["157"] / 1000, timeoutBig: TIMEOUTS_MS.big / 1000, timeoutMaxSmall: TIMEOUT_CAPS_MS.small / 1000, timeoutMax157: TIMEOUT_CAPS_MS["157"] / 1000, timeoutMaxBig: TIMEOUT_CAPS_MS.big / 1000, tfMaxTokens: DEFAULT_TOKENS_PER_PROVIDER, levels: [...DEFAULT_LEVELS], live: false, force: false, retryFailed: false, l3: false, only: null, limit: null, economy: false,
     candidates: false, policyFile: null, tiersFile: null, includeTiers: [], allow: [], pendingRuns: 3, levelsExplicit: false, sample: 0, seed: "1" };
   const explicit = new Set();
   for (let i = 0; i < argv.length; i++) {
@@ -142,6 +143,9 @@ export function parseArgs(argv) {
   if (o.keyChoicesFile && !o.tiersFile) return { error: "--key-choices-file goes with --tiers-file (the vault registry): a compiled policy already holds the compiler's key choice" };
   if (o.candidates && !o.levelsExplicit) o.levels = [1, 2, 3, 4, 5, 6, 7];   // L1+L2 for the ones with no result, then L3 (with L4 inside it), the big step, spawn and the error result
   if (o.retryFailed && o.force) return { error: "--retry-failed and --force contradict each other (retry-failed asks again only the failed levels of failed models)" };
+  for (const [lo, hi, name] of [["timeoutSmall", "timeoutMaxSmall", "small"], ["timeout157", "timeoutMax157", "157"], ["timeoutBig", "timeoutMaxBig", "big"]]) {
+    if (o[lo] > o[hi]) return { error: `the ${name} timeout floor (${o[lo]} s) is above its cap (${o[hi]} s): raise --timeout-max-${name} or lower --timeout-${name}` };
+  }
   o.explicit = explicit;
   return o;
 }
@@ -205,8 +209,11 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const latencyMs = ttfts.length ? ttfts[Math.floor(ttfts.length / 2)] : 3000;
   const heavy = kept.some((e) => e.kinds.some((k) => kindSize(k).bytes >= 100000));
   const perProvider = heavy ? 1 : o.perProvider ?? 2;
+  const floorS = o.timeoutSmall * 1000, capS = o.timeoutMaxSmall * 1000;
+  const smalls = kept.map((e) => timeoutsFor(bench?.get?.(e.key), { small: floorS, "157": o.timeout157 * 1000, big: o.timeoutBig * 1000 }, { small: capS, "157": o.timeoutMax157 * 1000, big: o.timeoutMaxBig * 1000 }).small).sort((a, b) => a - b);
+  const timeoutStats = smalls.length ? `${Math.round(smalls[0] / 1000)} s at the least, ${Math.round(smalls[Math.floor(smalls.length / 2)] / 1000)} s median, ${Math.round(smalls.at(-1) / 1000)} s at the most` : null;
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
-  return { overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
+  return { timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
 /** Where the provider tiers came from, how old they are and which providers they do not cover (printed in the plan and in the report). */
@@ -256,7 +263,7 @@ async function mergeUnsaved(o, outFile, deps) {
 
 /** Why a model that did not get a result ends the run pending: the short code kept in the pending map (a reason is never an error, and never a verdict). */
 export function pendingReasonOf(r, entry) {
-  if (r.reason === "reasoning-budget" || r.reason === "request-cap") return r.reason;
+  if (r.reason === "reasoning-budget" || r.reason === "request-cap" || r.reason === "slow") return r.reason;
   if (r.s !== "skip") return r.s;
   if (r.w === "spend-cap") return "spend";
   if (r.w === "row-cost") return entry?.pricedOnFree ? PRICED_OVER_ROW : "row-cost";
@@ -315,7 +322,7 @@ export function printPlan(p, o) {
   }
   if (big || p.queued.length) {
     L.push(`  per request (a full-depth model sends each row once; the stream is cancelled once the needed calls are closed): ${levelCosts(o.maxTokens).map((x) => `${x.label} ${x.requests} req ~${tok(x.inTokens)} in, up to ${x.outTokens} out`).join("; ")}`);
-    L.push(`  output budgets: ${Object.entries(BUDGETS).filter(([k]) => k !== "1f").map(([k, v]) => `${k} ${o.maxTokens ?? v}`).join(", ")} tokens (a thinking-only stop is asked once more at ${ESCALATED_MAX_TOKENS}); timeouts: small ${o.timeoutSmall} s, 157 KB ${o.timeout157} s, 400 KB ${o.timeoutBig} s (a timeout is inconclusive); in flight per provider: ${p.perProvider} (1 for requests of 100 KB or more), ${o.concurrency ?? 8} overall`);
+    L.push(`  output budgets: ${Object.entries(BUDGETS).filter(([k]) => k !== "1f").map(([k, v]) => `${k} ${o.maxTokens ?? v}`).join(", ")} tokens (a thinking-only stop is asked once more at ${ESCALATED_MAX_TOKENS}); timeouts: adaptive per model, ${TIMEOUT_FACTOR} x its bench time, small ${o.timeoutSmall}-${o.timeoutMaxSmall} s, 157 KB ${o.timeout157}-${o.timeoutMax157} s, 400 KB ${o.timeoutBig}-${o.timeoutMaxBig} s (${p.timeoutStats ? `this run's small requests: ${p.timeoutStats}; ` : ""}a timeout is asked once more at double, then pending timeout, or slow on L1: never a verdict); in flight per provider: ${p.perProvider} (1 for requests of 100 KB or more), ${o.concurrency ?? 8} overall`);
   }
   if (big) L.push(`  deep levels need --l3 yes and --only or an explicit --max-spend or --tf-max-tokens-per-provider`);
   { // per-tier totals and the deep-probe rule
@@ -340,6 +347,8 @@ export function liveRefusal(o, p) {
   if (big && !o.l3) return "levels 3, 4 and 5 send the 157 KB and 400 KB fixtures (about 40,000 to 100,000 input tokens per request): add --l3 yes";
   if (big && !o.only && !o.explicit.has("maxSpend") && !o.explicit.has("tfMaxTokens")) return "levels 3, 4 and 5 need a named provider subset (--only) or an explicit cap (--max-spend or --tf-max-tokens-per-provider)";
   if (o.includeTiers?.length && o.levelsExplicit && o.levels.some((l) => l > 2) && !p.lift.ok) return `deep probes on the paid or deposit tier need ALL of: ${p.lift.missing.join("; ")}`;
+  const priced = p.kept.filter((e) => !e.free);
+  if (priced.length && !o.explicit.has("maxSpend")) return `${num(priced.length)} priced model(s) are queued (a listed price counts, also on a free-labelled provider): a live run with money at stake needs an explicit --max-spend (the default is not accepted); the estimate for them is ${usd(p.run.usd)}`;
   if (!p.kept.length && p.tooBig.length) return `--tf-max-tokens-per-provider ${num(o.tfMaxTokens)} is below the cost of one model for these levels: nothing would run. Use at least ${num(p.needed)}`;
   if (p.run.usd > o.maxSpend) return `the estimate ${usd(p.run.usd)} is above the cap ${usd(o.maxSpend)}: narrow the run (--only, --limit, --levels) or raise --max-spend`;
   return null;
@@ -350,10 +359,10 @@ export function liveRefusal(o, p) {
  * well as in the engine: every level a probe COMPLETED is charged, also when a later level errors (the engine charges only what a finished result
  * reports), so the report and the budget of the next phase count it.
  */
-function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys }) {
+function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench = null, stats = { started: new Set(), active: new Map() } }) {
   // Spend is charged per REQUEST that was sent and billed, from what the answer reported (or the estimate when it did not): a level that was only part way, an answer that was all thinking
-  // (and the larger-budget request asked again after it) and a request that timed out after the provider read it all count; a rate limit, a dead key or a server error cost nothing.
-  const BILLED = new Set(["empty", "timeout"]);
+  // (and the larger-budget request asked again after it) count; a rate limit, a dead key, a server error and a TIME-OUT (no complete answer: nothing was delivered) cost nothing.
+  const BILLED = new Set(["empty"]);
   const charge = (t, tele) => {
     const price = t.entry.price ?? { in: 0, out: 0 };
     for (const x of tele) {
@@ -362,7 +371,8 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
       spend.total += (inT * price.in + outT * price.out) / 1e6;
     }
   };
-  const timeouts = { small: o.timeoutSmall * 1000, "157": o.timeout157 * 1000, big: o.timeoutBig * 1000 };
+  const floors = { small: o.timeoutSmall * 1000, "157": o.timeout157 * 1000, big: o.timeoutBig * 1000 };
+  const caps = { small: o.timeoutMaxSmall * 1000, "157": o.timeoutMax157 * 1000, big: o.timeoutMaxBig * 1000 };
   return async (t, ctx) => {
     t.done ??= {};
     // a provider whose first answer was a dead key, an empty balance or a missing model costs nothing more; one that keeps rate-limiting is left for the next run
@@ -370,8 +380,14 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     if (ps.blocked) return { s: "skip", w: `canary-${ps.blocked}` };
     if (ps.paused) return { s: "skip", w: "rate-paused" };
     const tele = [];
-    const r = await probeModel({ levels: t.entry.todo, prior: t.entry.prior?.lvr ?? "nnnn", flags: t.entry.prior, done: t.done, state: (t.pstate ??= {}), tier: t.entry.tier ?? null, lift, order: o.order, ctx: t.entry.ctx ?? 0, tele,
+    stats.started.add(t.key);
+    stats.active.set(t.provider, (stats.active.get(t.provider) ?? 0) + 1);
+    const timeouts = timeoutsFor(bench?.get?.(t.key), floors, caps);                       // adaptive: 3 x this model's bench time, between the floor and the cap of each request class
+    let r;
+    try {
+    r = await probeModel({ levels: t.entry.todo, prior: t.entry.prior?.lvr ?? "nnnn", flags: t.entry.prior, done: t.done, state: (t.pstate ??= {}), tier: t.entry.tier ?? null, lift, order: o.order, ctx: t.entry.ctx ?? 0, tele,
       fetchImpl, url: `${gw.base}/v1/messages`, key: gw.key, model: t.key, ...(o.maxTokens ? { maxTokens: o.maxTokens } : {}), timeouts, signal: ctx?.signal ? AbortSignal.any([ac.signal, ctx.signal]) : ac.signal });
+    } finally { stats.active.set(t.provider, Math.max(0, (stats.active.get(t.provider) ?? 1) - 1)); }
     for (const x of tele) telemetry.add(t.provider, x);
     charge(t, tele);
     if (r.aborted) return { aborted: true };
@@ -379,21 +395,34 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     const sx = r.inconclusive?.s;
     if (sx === "rate") { if (++ps.rateStreak >= RATE_PAUSE_AFTER) ps.paused = true; } else ps.rateStreak = 0;
     if (!ps.answered) { if (sx === "auth" || sx === "pay" || sx === "gone") ps.blocked = sx; else if (!r.inconclusive) ps.answered = true; }
-    if (r.inconclusive) return { s: r.inconclusive.s, ...(r.inconclusive.escalated ? { escalated: true } : {}), ...(r.inconclusive.reason ? { reason: r.inconclusive.reason } : {}), ...(r.inconclusive.ra !== undefined ? { ra: r.inconclusive.ra } : {}), ...(r.inconclusive.http ? { http: r.inconclusive.http } : {}), p: r.inconclusive.why, m: r.inconclusive.why };
+    if (r.inconclusive) return { s: r.inconclusive.s, ...(r.inconclusive.escalated ? { escalated: true } : {}), ...(r.inconclusive.reason ? { reason: r.inconclusive.reason } : {}), ...(r.inconclusive.secs !== undefined ? { secs: r.inconclusive.secs } : {}), ...(r.inconclusive.ra !== undefined ? { ra: r.inconclusive.ra } : {}), ...(r.inconclusive.http ? { http: r.inconclusive.http } : {}), p: r.inconclusive.why, m: r.inconclusive.why };
     return { s: "ok", tf: { done: t.done }, ...(r.escalated ? { escalated: true } : {}) };
   };
 }
 
 /** The measured cost of a run, per request kind and per provider, against the estimate (so the estimates can be calibrated). */
 function makeTelemetry() {
-  const blank = () => ({ n: 0, ms: 0, inTok: 0, inEst: 0, outTok: 0, outEst: 0, usage: 0, early: 0, timeouts: 0 });
+  const blank = () => ({ n: 0, ms: 0, inTok: 0, inEst: 0, outTok: 0, outEst: 0, usage: 0, early: 0, timeouts: 0, lat: [] });
   const kinds = new Map(), provs = new Map();
   return {
     kinds, provs,
+    /** The totals so far, for the heartbeat. */
+    total() { return [...kinds.values()].reduce((a, r) => ({ n: a.n + r.n, ms: a.ms + r.ms, inTok: a.inTok + r.inTok, inEst: a.inEst + r.inEst, outTok: a.outTok + r.outTok, usage: a.usage + r.usage, timeouts: a.timeouts + r.timeouts }), { n: 0, ms: 0, inTok: 0, inEst: 0, outTok: 0, usage: 0, timeouts: 0 }); },
+    /** One line per provider that timed out or was slow: how many requests timed out, the median and the longest seconds, how many models were pending slow. A slow provider must read as slow, not as untested. */
+    timeoutLines(slowBy = {}) {
+      const rows = [...provs].filter(([k, r]) => r.timeouts || slowBy[k]).sort(([, a], [, b]) => b.timeouts - a.timeouts);
+      if (!rows.length) return [];
+      const med = (a) => { const v = [...a].sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : 0; };
+      return [`  provider latency where requests timed out (seconds per request; slow = models whose L1 timed out twice, left pending: slow):`, ...rows.slice(0, 15).map(([k, r]) => `    ${show(k, 18).padEnd(18)} ${r.timeouts} timeout(s) of ${r.n} request(s), median ${(med(r.lat) / 1000).toFixed(1)} s, max ${(Math.max(0, ...r.lat) / 1000).toFixed(1)} s, slow ${slowBy[k] ?? 0}`), ...(rows.length > 15 ? [`    ... and ${rows.length - 15} more provider(s)`] : [])];
+    },
     add(provider, x) {
       for (const rec of [kinds.get(x.kind) ?? kinds.set(x.kind, blank()).get(x.kind), provs.get(provider) ?? provs.set(provider, blank()).get(provider)]) {
-        rec.n += 1; rec.ms += x.ms ?? 0; if (x.early) rec.early += 1; if (x.s === "timeout") rec.timeouts += 1;
-        if (Number.isFinite(x.inTok)) { rec.usage += 1; rec.inTok += x.inTok; rec.inEst += kindSize(x.kind).inTokens; rec.outTok += Number.isFinite(x.outTok) ? x.outTok : 0; rec.outEst += BUDGETS[x.kind]; }
+        rec.n += 1; rec.ms += x.ms ?? 0; rec.lat.push(x.ms ?? 0); if (x.early) rec.early += 1; if (x.s === "timeout") rec.timeouts += 1;
+        // usage counts only when the provider REALLY reported tokens (a zero is "not reported", not a measurement)
+        const hasIn = x.inTok > 0, hasOut = x.outTok > 0;
+        if (hasIn || hasOut) rec.usage += 1;
+        if (hasIn) { rec.inTok += x.inTok; rec.inEst += kindSize(x.kind).inTokens; }
+        if (hasOut) { rec.outTok += x.outTok; rec.outEst += x.max ?? BUDGETS[x.kind]; }
       }
     },
     lines(wallSec) {
@@ -403,7 +432,7 @@ function makeTelemetry() {
       L.push(`telemetry, actual against estimate, per request kind: ${[...kinds].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, r]) => row(k, r)).join("; ")}`);
       const top = [...provs].sort(([, a], [, b]) => b.ms - a.ms).slice(0, 5).map(([k, r]) => `${show(k, 18)} ${(r.ms / 1000).toFixed(0)} s over ${r.n} request(s)`).join(", ");
       L.push(`  slowest providers: ${top}; total wall time ${fmtDur(wallSec)}`);
-      L.push(`  calibration (this run, not stored): input tokens actual/estimate ${t.inEst ? (t.inTok / t.inEst).toFixed(2) : "n/a"}, output actual/budget ${t.outEst ? (t.outTok / t.outEst).toFixed(2) : "n/a"} over ${t.usage} of ${t.n} request(s) that reported usage; ${t.early} cut early, ${t.timeouts} timed out`);
+      L.push(`  calibration (this run, not stored): input tokens actual/estimate ${t.inEst ? (t.inTok / t.inEst).toFixed(2) : "n/a"}, output actual/budget ${t.outEst ? (t.outTok / t.outEst).toFixed(2) : "n/a"} over ${t.usage} of ${t.n} request(s) that reported usage${t.usage ? "" : " (no usage was reported by any request: these ratios say nothing)"}; ${t.early} cut early, ${t.timeouts} timed out`);
       return L;
     },
   };
@@ -477,11 +506,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const again = liveRefusal(o, p2);
     if (again) { console.error(`tool-fidelity: refused: ${again}`); return 2; }
     if (!p2.kept.length) { console.log("tool-fidelity: nothing to probe (another run finished the work while this one waited for the lock)."); return 0; }
-    return await runLive({ o, p: p2, loaded, stored: fresh, outFile, gw, fetchImpl, deps });
+    return await runLive({ o, p: p2, loaded, stored: fresh, outFile, gw, fetchImpl, deps, bench });
   } finally { got.release(); }
 }
 
-async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps }) {
+async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, bench = null }) {
   const now = deps.now ?? (() => new Date());
   const save = deps.saveImpl ?? saveFidelity;
   const store = { ...stored.models };
@@ -489,7 +518,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps }) {
   const ac = new AbortController();
   const spend = { total: 0 };
   let interrupts = 0, sinceSave = 0, saveWarned = false;
-  const onSigint = () => { if (++interrupts > 1) process.exit(130); console.error("\ntool-fidelity: stopping -- probes in flight are dropped (not recorded) and what finished is saved (Ctrl-C again to force)"); ac.abort(); };
+  const onSigint = () => { try { periodic(); } catch { /* the final save retries */ } if (++interrupts > 1) process.exit(130); console.error("\ntool-fidelity: stopping -- probes in flight are dropped (not recorded) and what finished is saved (Ctrl-C again to force)"); ac.abort(); };
   process.on("SIGINT", onSigint);
   let pending = { ...(stored.pending ?? {}) };
   let capDropped = [];                                           // records the file's size cap pushed out in the last save
@@ -498,8 +527,10 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps }) {
   const periodic = () => { try { writeOnce(); sinceSave = 0; } catch (e) { if (!saveWarned) { saveWarned = true; console.error(`tool-fidelity: warning: could not save (${e?.message ?? e}); the records are kept and the save is retried`); } } };
   const tally = { t: 0, v: 0, x: 0, u: 0, pending: 0 }, other = {}, why = new Map(), got = new Set(), escalated = new Set(), clampedKeys = new Set(), telemetry = makeTelemetry(), prov = {};
   let recorded = 0;
+  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [];
   const onResult = (r) => {
     if (r.escalated) escalated.add(r.key);
+    if (r.reason === "slow") { const pv = r.key.slice(0, r.key.indexOf("/")); slowBy[pv] = (slowBy[pv] ?? 0) + 1; slowList.push({ key: r.key, secs: r.secs }); }
     if (r.s !== "ok" || !r.tf) { other[r.s] = (other[r.s] ?? 0) + 1; why.set(r.key, pendingReasonOf(r, p.kept.find((k) => k.key === r.key))); return; }
     const e = p.kept.find((k) => k.key === r.key);
     const rec = buildRecord(store[r.key] ?? null, r.tf.done, { now: now(), alias: !!e?.alias });
@@ -511,10 +542,27 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps }) {
     if (++sinceSave >= SAVE_EVERY) periodic();
   };
   const lift = p.lift.ok ? p.lift.lift : null;
-  const probe = makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys });
+  const probe = makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench, stats });
   const opts = { ...sweepOptions(o), perProvider: p.perProvider, ...(deps.sweep ?? {}) };
   const phases = [["free tier", p.kept.filter((e) => e.free)], ["paid tier", p.kept.filter((e) => !e.free)]].filter(([, l]) => l.length);
   const started = Date.now();
+  // A long live run is never silent: one line per heartbeat with the progress, the requests, the tokens so far against the estimate, who is active, who is paused and, from the pace seen so far
+  // (per request kind), how long the rest should take.
+  const planned = {};
+  for (const e of p.run.entries) for (const k of e.kinds) planned[k] = (planned[k] ?? 0) + 1;
+  const heartbeat = () => {
+    const tot = telemetry.total(), el = (Date.now() - started) / 1000;
+    const act = [...stats.active].filter(([, n]) => n > 0).map(([k, n]) => `${show(k, 14)} ${n}`).join(", ") || "none";
+    const stopped = Object.entries(prov).filter(([, x]) => x.paused || x.blocked).map(([k, x]) => `${show(k, 14)} (${x.blocked ?? "rate"})`).join(", ") || "none";
+    const toks = tot.usage ? `${tok(tot.inTok)} in / ${tok(tot.outTok)} out reported so far (estimate for the run ~${tok(p.run.inTokens)} in)` : `no usage reported yet (estimate for the run ~${tok(p.run.inTokens)} in)`;
+    let remain = 0, known = tot.n > 0;
+    for (const [k, n] of Object.entries(planned)) { const r = telemetry.kinds.get(k), left = Math.max(0, n - (r?.n ?? 0)); remain += left * ((r?.n ? r.ms / r.n : tot.n ? tot.ms / tot.n : 0) / 1000); }
+    const live = new Set(p.kept.map((e) => e.provider).filter((pv) => !(prov[pv]?.paused || prov[pv]?.blocked)));
+    const conc = Math.max(1, Math.min(o.concurrency ?? 8, live.size * p.perProvider));
+    console.log(show(`  [heartbeat ${fmtDur(el)}] models: ${recorded} recorded, ${stats.started.size} attempted of ${num(p.kept.length)} queued; requests ${tot.n} of ~${num(p.run.requests)} (${tot.timeouts} timed out); ${toks}; active: ${act}; paused: ${stopped}${known ? `; at the pace seen so far about ${fmtDur(remain / conc)} remain` : ""}`, 700));
+  };
+  const hb = setInterval(heartbeat, deps.heartbeatMs ?? 60000);
+  hb.unref?.();
   let probes = 0, code = 0, saved = true;
   const skips = {};
   try {
@@ -528,6 +576,8 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps }) {
       if (result.aborted) { console.log(`  stopped (${result.stopped}); re-run to resume: models with a result are not asked again`); break; }
     }
   } finally {
+    clearInterval(hb);
+    if (interrupts) heartbeat();
     process.removeListener("SIGINT", onSigint);
     // The final save is retried, and when it still fails the records go to a side file: a finished probe is never thrown away.
     const queue = [...p.kept, ...p.waiting, ...p.tooBig];
@@ -566,8 +616,19 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps }) {
   if (left) console.log(left);
   console.log(`  now: with a record ${num(after.withRecord)} of ${num(after.probeSet)} probe-ok (${num(after.probeOk)} incl. relay not probed); against the current fixture ${num(after.withRecordCurrent)} of ${num(after.probeSet)}; still queued ${num(after.queued)}; context length unknown ${num(after.ctxUnknown)} of ${num(after.probeSet)}`);
   for (const line of telemetry.lines((Date.now() - started) / 1000)) console.log(show(line, 900));
-  const paused = Object.entries(prov).filter(([, x]) => x.paused || x.blocked).map(([k, x]) => `${show(k, 18)} (${x.blocked ? `canary: ${x.blocked}` : "rate-limited"})`);
+  for (const line of telemetry.timeoutLines(slowBy)) console.log(show(line, 300));
+  if (slowList.length) console.log(show(`  pending: slow (the L1 request timed out twice, at the doubled time; never a verdict, a later run asks again): ${slowList.slice(0, 12).map((x) => `${x.key} (${x.secs} s)`).join(", ")}${slowList.length > 12 ? `, ... and ${slowList.length - 12} more` : ""}`, 900));
+  const paused = Object.entries(prov).filter(([, x]) => x.paused && !x.blocked).map(([k]) => `${show(k, 18)} (rate-limited)`);
   if (paused.length) console.log(`  left alone for the rest of this run, their models stay pending: ${paused.join(", ")}`);
+  const attention = Object.entries(prov).filter(([, x]) => x.blocked);
+  if (attention.length) {
+    const WHAT = { auth: "the key was rejected", pay: "no credit or the plan does not allow it", gone: "the route or model no longer exists" };
+    console.log("  providers needing attention (an account state, not a verdict on any model; fix the account, then run again; nothing was retried in this run):");
+    for (const [k, x] of attention) {
+      const n = [...why].filter(([key, r]) => key.slice(0, key.indexOf("/")) === k && (r === x.blocked || r === `canary-${x.blocked}`)).length;
+      console.log(show(`    ${k}: ${x.blocked} (${WHAT[x.blocked] ?? "account state"}) -- ${n} model(s) skipped`, 200));
+    }
+  }
   if (clampedKeys.size) console.log(`  ${NOT_FREE_REASON}: ${num(clampedKeys.size)} model(s) were refused by the engine itself (no request sent)`);
   if (escalated.size) console.log(`  escalated: ${num(escalated.size)} model(s) spent their whole output budget on thinking and were asked again once with ${ESCALATED_MAX_TOKENS} tokens instead of their small budget; the ones still empty are pending: reasoning-budget (never failed)`);
   if (p.sample) {

@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, checkTmpDir, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import {
   contiguous, outOfOrder, lvOf, classOf, compiledClass, cellOf, cleanFidelity, loadFidelity, saveFidelity, capRecords, renderFile, buildRecord, mergeRecord,
@@ -22,9 +23,10 @@ import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 import { loadBench } from "../menu/bench-data.mjs";
 import { compact, createLogWriter } from "../refresh/bench-store.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 const touched = guardRealState(after, assert);
-// the end of the run: the real state file must not exist (checked with the ORIGINAL existsSync, which the guard does not wrap)
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+// the end of the run: the real state file is exactly as it was before it
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const at = (ms) => new Date(NOW.getTime() + ms);
 const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");

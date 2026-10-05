@@ -5,13 +5,15 @@ import assert from "node:assert/strict";
 import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, fakeFetch, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, plan, parseArgs } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, saveFidelity, cleanFidelity, FILE_NAME, REAL_FILE, KIND } from "../refresh/tool-fidelity.mjs";
 import { funnel } from "../menu/subagent-funnel.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 
 /** models: [provider, id, {pin, pout, ctx}]; a model with a price is paid. */
@@ -31,11 +33,13 @@ function env(models, extra = {}) {
     tiers: Object.fromEntries(rows.map((r) => [r.provider, "free"])), ...extra.deps };
   return { dir, deps, f, out: deps.outFile, rows };
 }
-async function run(argv, deps) {
+// a live run with priced models needs an explicit --max-spend (liveRefusal): these tests add the default value so the rule is exercised on its own in one test, with `raw`
+const spendFor = (argv) => (argv.includes("--live") && !argv.includes("--max-spend") ? [...argv, "--max-spend", "5"] : argv);
+async function run(argv, deps, { raw = false } = {}) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(raw ? argv : spendFor(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
@@ -175,7 +179,7 @@ test("the BIG step: needs --l3 yes and a named provider; asked only of models th
   assert.match(dry.out, /big 400 KB 1 req ~100k in, up to 512 out/);
   assert.match(dry.out, /3 model\(s\) queued of 4/, "a4 did not pass L3: not queued");
   assert.equal((await run(["--live", "--levels", "5"], e.deps)).code, 2);
-  assert.equal((await run(["--live", "--levels", "5", "--l3", "yes"], e.deps)).code, 2, "and a named provider or a cap");
+  assert.equal((await run(["--live", "--levels", "5", "--l3", "yes"], e.deps, { raw: true })).code, 2, "and a named provider or a cap");
   const r = await run(["--live", "--levels", "5", "--l3", "yes", "--only", "fa", "--tf-max-tokens-per-provider", "400000"], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
   const s = loadFidelity(e.out).models;

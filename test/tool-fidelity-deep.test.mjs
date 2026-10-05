@@ -5,12 +5,14 @@ import assert from "node:assert/strict";
 import { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, fakeFetch, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, plan, printPlan } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const m = (id, over = {}) => ({ id, outModality: "chat", ctx: 256000, tools: true, pin: 0, pout: 0, badge: "FREE", ...over });
 const paid = (id) => m(id, { pin: 1, pout: 2, badge: "PAID" });
@@ -52,7 +54,10 @@ test("arguments: --order l3-first|big-first; the three timeout classes in second
   assert.ok(parseArgs(["--order", "fastest"]).error);
   assert.ok(parseArgs(["--order"]).error);
   const o = parseArgs([]);
-  assert.deepEqual([o.timeoutSmall, o.timeout157, o.timeoutBig, o.maxTokens], [15, 60, 90, null]);
+  assert.deepEqual([o.timeoutSmall, o.timeout157, o.timeoutBig, o.maxTokens], [45, 90, 120, null], "the floors");
+  assert.deepEqual([o.timeoutMaxSmall, o.timeoutMax157, o.timeoutMaxBig], [120, 180, 240], "the caps");
+  assert.ok(parseArgs(["--timeout-small", "130"]).error, "a floor above its cap is refused");
+  assert.deepEqual([parseArgs(["--timeout-max-small", "60"]).timeoutMaxSmall, parseArgs(["--timeout-max-157", "200"]).timeoutMax157, parseArgs(["--timeout-max-big", "300"]).timeoutMaxBig], [60, 200, 300]);
   const t = parseArgs(["--timeout-small", "5", "--timeout-157", "30", "--timeout-big", "45", "--max-tokens", "300"]);
   assert.deepEqual([t.timeoutSmall, t.timeout157, t.timeoutBig, t.maxTokens], [5, 30, 45, 300]);
   assert.ok(parseArgs(["--timeout-small", "0"]).error);
@@ -175,7 +180,7 @@ test("CANARY: a provider whose first answer is a dead key, an empty balance or a
     const e = env(world(), (c) => (c.body.model.startsWith("fa/") ? http(status, "nope") : goodModel(c)));
     const r = await run(["--live"], e.deps);
     assert.equal(byProvider(e.f).fa.length, 1, `${why}: one request to fa, then nothing`);
-    assert.match(r.out, new RegExp(`left alone for the rest of this run, their models stay pending: fa \\(canary: ${why}\\)`));
+    assert.match(r.out, new RegExp(`providers needing attention .*\\n\\s+fa: ${why} \\(.*\\) -- 3 model\\(s\\) skipped`), "the attention block names the provider, its state and how many models were skipped");
     const st = loadFidelity(e.out);
     assert.deepEqual(Object.keys(st.models).filter((k) => k.startsWith("fa/")), [], "no record: the account's state is not a verdict");
     assert.equal(st.pending["fa/a2"].r, `canary-${why}`);

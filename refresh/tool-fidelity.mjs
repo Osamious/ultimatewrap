@@ -167,7 +167,7 @@ export function loadFidelity(file = REAL_FILE) {
 /**
  * The PENDING map: for a model that was in a run's queue and ended it still untested, why, and in how many runs in a row. It is bookkeeping for the
  * coverage ledger (a model that waits for many runs is starving), not a result: it is dropped as soon as the model has one. `r` is a short reason code
- * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
+ * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
  */
 export const PENDING_MAX = 5000;
 export function cleanPending(raw) {
@@ -645,7 +645,7 @@ export function loadTiersInfo(file, { choicesFile = null } = {}) {
 }
 export const loadTiers = (file) => loadTiersInfo(file)?.tiers ?? null;
 
-/** Where the tiers came from, how old they are, and which providers of the probe set they do not cover (default-deny: those get L1+L2 only). */
+/** Where the tiers came from, how old they are, and which providers with probe-ok models they do not cover (default-deny: a provider that is not `free` or has no tier is NOT probed at all, at any level). */
 export const TIERS_STALE_DAYS = 2;
 export function describeTiers({ info = null, source, tiers, providers = [], nowMs }) {
   const stamp = info?.compiledAt ?? info?.mtime ?? null, t = stamp ? Date.parse(stamp) : NaN;

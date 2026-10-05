@@ -6,13 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, cleanupDirs, madeDirs, fakeFetch, ev, stream, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main } from "../refresh/tool-fidelity-cli.mjs";
 import { probeSet, selectCandidates, drawSample, stratumOf, l3Rates, loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 import { STREAM_LIMITS } from "../refresh/tool-fidelity-probe.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const POLICY = { schema: 1, models: [] };
 

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
+import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs } from "../refresh/tool-fidelity-cli.mjs";
 import {
@@ -12,8 +13,9 @@ import {
 } from "../refresh/tool-fidelity.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 
+const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(rawExists(REAL_FILE), false, "state/tool-fidelity.json must not exist after the tests"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 
 /** A snapshot of `fa` with `n` models m1..mn (ctx given per id), a free provider `fb`, and the relay; every one probe-ok except `dead`. */

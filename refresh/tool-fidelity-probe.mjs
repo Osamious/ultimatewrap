@@ -36,7 +36,17 @@ export const ESCALATED_MAX_TOKENS = 2048;  // the ONE bump for a model whose who
 export const BUDGETS = Object.freeze({ "1": 256, "1f": 256, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
 export const PROBE_MAX_TOKENS = BUDGETS["1"];          // the smallest budget; kept as the name callers print
 /** Timeout classes in ms: small requests, the 157 KB request, the 400 KB request. A timeout is inconclusive, never a verdict. */
-export const TIMEOUTS_MS = Object.freeze({ small: 15000, "157": 60000, big: 90000 });
+// Timeouts are ADAPTIVE: 3 x the model's own bench total time, between a floor and a cap per request class (the floors alone for a model with no bench record). The real free-tier
+// latency through the gateway is far above a fixed few seconds, and a timeout is never a verdict. A timed-out request is asked once more at DOUBLE the time inside the same run.
+export const TIMEOUTS_MS = Object.freeze({ small: 45000, "157": 90000, big: 120000 });          // the floors
+export const TIMEOUT_CAPS_MS = Object.freeze({ small: 120000, "157": 180000, big: 240000 });
+export const TIMEOUT_FACTOR = 3;
+/** The timeouts of one model, in ms per request class: `TIMEOUT_FACTOR` x its bench total time (`rec.d`), clamped to [floor, cap]; the floors when the bench has no usable time for it. */
+export function timeoutsFor(rec, floors = TIMEOUTS_MS, caps = TIMEOUT_CAPS_MS) {
+  const d = Number.isFinite(rec?.d) && rec.d > 0 ? rec.d : null;
+  const one = (k) => (d === null ? floors[k] : Math.min(caps[k], Math.max(floors[k], TIMEOUT_FACTOR * d)));
+  return { small: one("small"), "157": one("157"), big: one("big") };
+}
 const CLASS_OF = Object.freeze({ "1": "small", "1f": "small", "2": "small", "2e": "small", "3a": "small", "3b": "157", "5": "big", "6": "small" });
 const LEVEL_OF = Object.freeze({ "1": 1, "1f": 1, "2": 2, "2e": 7, "3a": 3, "3b": 3, "5": 5, "6": 6 });
 const EXPECT_TOOLS = Object.freeze({ "1": 1, "1f": 1, "2": 0, "2e": 0, "3a": 1, "3b": 2, "5": 1, "6": 1 });
@@ -395,7 +405,8 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
   const spent = (r) => { requests += r.reqs ?? 1; state.requests = (state.requests ?? 0) + (r.reqs ?? 1); };
   const ask = async (kind) => {
     if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
-    const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc };
+    const base = (conn.timeouts ?? TIMEOUTS_MS)[CLASS_OF[kind]];
+    const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc, timeoutMs: base * (state.tmult ?? 1) };
     let r = await runKind(kind, opts);
     if (r.aborted) return r;
     spent(r);
@@ -409,11 +420,19 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       spent(r);
     }
     tele.push(teleOf(r, state.escalated ? ESCALATED_MAX_TOKENS : opts.maxTokens));
+    // a timeout: asked once more at DOUBLE the time inside this run (it counts toward the request ceiling, and the model's later requests keep the doubled time); a second timeout at the
+    // doubled value ends the model for this run: on L1 as "slow" (with the seconds it was given), elsewhere as a plain timeout. Never a verdict.
+    if (r.v === "i" && r.s === "timeout") {
+      if ((state.tmult ?? 1) < 2) { state.tmult = 2; return ask(kind); }
+      return kind === "1" ? { ...r, slow: true, secs: Math.round((opts.timeoutMs ?? 0) / 100) / 10 } : r;
+    }
     // a 400 that names cache_control: note it, stop sending the markers to this model and ask the same request again so the level is still learned
     if (r.ccFail && !opts.noCc) { state.noCc = true; state.ccFail = true; const again = await ask(kind); return again.aborted || again.v === "i" ? again : { ...again, cc: "f" }; }
     return r;
   };
-  const stop = (r) => (r.capped
+  const stop = (r) => (r.slow
+    ? { inconclusive: { s: "timeout", reason: "slow", secs: r.secs, why: r.why }, requests, tele }
+    : r.capped
     ? { inconclusive: { s: "error", reason: "request-cap", why: r.why }, requests, tele }
     : r.v === "i" && r.s === "empty"
     ? { inconclusive: { s: "empty", reason: "reasoning-budget", why: r.why, ...(state.escalated ? { escalated: true } : {}) }, requests, tele }
