@@ -175,6 +175,14 @@ export function funnel(inputs, toggles) {
     else if (g.toolsAny) { tier = "u"; basis = "unprobed"; }
     else { g.stage = "tools-false-claim"; continue; }
     g.toolTier = tier; g.toolBasis = basis;
+    // Measured tool fidelity beyond the class (state/tool-fidelity.json): the big step and L4 are rank keys inside class v, and a REFUSAL about size
+    // (capBelow, an observed upper bound) lowers the payload cap. maxBytes is only a lower bound and never sets a cap.
+    if (basis === "tool-fidelity") {
+      g.tfBig = tf.big === "p" || tf.big === "f" ? tf.big : "n";
+      g.tfL4 = typeof tf.lvr === "string" && (tf.lvr[3] === "p" || tf.lvr[3] === "f") ? tf.lvr[3] : "n";
+      const cap = Number.isInteger(tf.capBelow) && tf.capBelow > 0 ? tf.capBelow : 0;
+      if (cap) g.limit = g.limit > 0 ? Math.min(g.limit, cap) : cap;
+    }
     if (!toolEligible(tier, T.unverified, allow.has(g.selector))) { counts.unverifiedExcluded += 1; g.stage = tier === "x" ? "tools-failed" : "tools-unverified"; continue; }
     counts.toolsPass += 1;
     g.stage = "tools-pass";
@@ -269,7 +277,10 @@ export function funnel(inputs, toggles) {
     const ttft = num(rec?.t);
     const h = ttft === null ? 2 : ttft < 1000 ? 0 : ttft < 3000 ? 1 : 2;
     g.h = h;
-    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxClass, pc, recency, pv, -g.c, h, g.alias ? 1 : 0];
+    // inside class v (never elsewhere): big step passed, then not run, then failed; then L4 the same way. Constant 0 outside v, so no other row moves.
+    const inV = g.toolTier === "v" && g.toolBasis === "tool-fidelity";
+    const pnf = { p: 0, n: 1, f: 2 };
+    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxClass, pc, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, recency, pv, -g.c, h, g.alias ? 1 : 0];
   };
   for (const g of set) g.rk = keyOf(g);
   const cmpKeys = (a, b) => { for (let i = 0; i < a.rk.length; i++) if (a.rk[i] !== b.rk[i]) return a.rk[i] - b.rk[i]; return 0; };

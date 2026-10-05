@@ -1409,6 +1409,131 @@ held) beside the bench file and log.
 Issues: #126 tagging, #127 overlay, #128 usage feed, #129 classifier and rules, #130 confirmation probe, #131 picker, #132 `--redact` / `--status` / `--reset`, #133 docs, #138 kill switch, all in
 `Osamious/ultimatewrap`; the follow-ups are the ones named above.
 
+### 6g. Tool fidelity — does the model really handle tools? (issue #121)
+
+The bench (6d) asks every model to say hello, with no tools. A model can answer that cleanly and still choke on the tool schemas a
+coding agent sends, and the catalogue's `tools` flag is a claim, not a measurement. The tool-fidelity probe measures it: a few
+requests per model through the gateway, the same way the bench does, with the result kept in its OWN file `state/tool-fidelity.json`
+(never in `bench.json` or the snapshot; the bench cannot overwrite it and it cannot change the bench).
+
+| Level | What the request asks | Passes when |
+|---|---|---|
+| L1 | one forced tool call | a well-formed `tool_use` with valid JSON arguments and the required argument comes back (a 400 that names `tool_choice` is retried once with the choice left to the model) |
+| L2 | a `tool_result` round trip | a final text answer comes back and the gateway returns no 400 |
+| L3 | the large synthetic fixture (about 157 KB, about 40,000 input tokens, awkward schema constructs included) | the request is accepted and answered |
+| L4 | two parallel tool calls, same fixture | two `tool_use` blocks with their own ids and valid, streamed arguments |
+| big | the same kind of fixture at about 400 KB (about 100,000 input tokens) | accepted and answered; asked only of a model that passed L3 |
+
+L1 and L2 always run together. L3 and L4 are sent only to a model that passed L1 and L2, and only when you ask for them (`--levels 34`);
+the big step only to a model that passed L3 (`--levels 5`). A thinking block is not an answer: a reply that only thought and ran out of
+output budget says nothing about tools and is tried again later.
+
+**What is stored (one record per `provider/id`, every field).**
+
+| Field | Meaning |
+|---|---|
+| `lvr` | four letters, one per level L1..L4: `p` passed, `f` failed, `n` not run (only confirmed results) |
+| `lv`, `t`, `ok` | derived from the fields below, never set by hand: `lv` the levels passed in a row (0, 1 for L1+L2, 3, 4); `t` the class `v` (L3 passed: verified at that size), `t` (L1 and L2 passed), `x` (failed), `u` (nothing run); `ok` whether the model is usable with tools |
+| `why` | the first failed level's reason, redacted |
+| `at`, `fx` | when it was probed; the fixture id the L3/L4 result was measured against (an older id earns the record a `*` and a re-sweep recommendation, never a re-queue) |
+| `maxBytes` | the largest request the model ANSWERED. A lower bound; it never sets a payload cap |
+| `alias` | a pool alias such as `auto`: it keeps its digit but compiles no higher than `u`, because the model behind that id can change |
+| `big` | `p` or `f` for the 400 KB step; absent means not run. Not part of `lvr` |
+| `capBelow` | bytes: the provider REFUSED a request of about this size or larger (an observed upper bound). The compiler lowers the model's payload cap `pb` to it, so big requests skip the model and small subagents may still use it. Written only for a refusal about SIZE (413, a body naming size or context length, any refusal at the big step), never for a rate or tokens-per-minute limit |
+| `strikes`, `sl` | two strikes (below): the first failure at level `sl` (1 to 3) is provisional |
+
+**Two strikes.** A first failure at L1, L2, or L3 for a reason that is not size does not make a model `x`. The record keeps what it was
+(a model never tested stays untested, a model that passed keeps its class), remembers the strike, and the next ordinary run asks that
+level once more. A second failure at the same level confirms it: `x`. An L3 failure that is not about size, confirmed, is `x` too (the
+model cannot take the real tool set). A refusal about size is never `x`: it sets `capBelow` and the model works for small payloads. A
+pass clears the strike. A rate limit, an empty balance, a dead key, a 5xx, a timeout or an exhausted output budget is never a failure: the
+model gets no record and stays queued. A route that says it has no tool support (even as a 404) is a failure.
+
+**What the compiler does with it.** The class `t` is read as before. Inside class `v` the compiled order now also prefers a model whose
+big step passed, then one that has not run it, then one that failed it; then the same for L4 (rank keys 4 and 5 of the explain output).
+`capBelow` lowers `pb`. Nothing else changes, and class `t` and `u` rows are not reordered by these keys.
+
+**Candidates: which models get the large requests.** L1 and L2 go to every probe-ok model with no result (the ordinary run). L3, and the
+400 KB step for the models that pass L3, go to every model the router could ever pick, not to the top 3 of each provider (that is the
+router's spread, not a test boundary). `--candidates policy` builds that set from the compiled policy (`state/subagent/policy.json`, or
+`--policy-file` for a fixture): its ALLOWED set with a known context of at least 128,000 (the substitute floor), plus the models you pin
+with `--allow provider/model,...` (pins come first and need neither the context nor a place in the toggles, only a probe-ok model). They
+are tested in the policy's own rank, best first; the per-provider token cap and the spend cap stop the run, and the untested tail stays
+queued for the next run (`pending: cap`). A candidate with no L1+L2 result is asked those first, in the same run. The default levels of
+this mode are 1, 2, 3 and 5 (`--levels` overrides). The dry run prints how many candidates there are and why the others are out
+(`ctx-below-floor`, `ctx-unknown`, `outside-toggles`, `relay-by-provenance`).
+
+```bash
+node refresh/tool-fidelity-cli.mjs --candidates policy                                  # dry: the plan and both ledgers
+node refresh/tool-fidelity-cli.mjs --candidates policy --l3 yes --live --tf-max-tokens-per-provider 600000
+node refresh/tool-fidelity-cli.mjs --candidates policy --allow groq/some-model --l3 yes --live --tf-max-tokens-per-provider 600000
+```
+
+**Coverage ledger.** Every model of a step ends in exactly one terminal state, and the dry run and the end-of-run report print the counts
+with their denominators (`coverage L1+L2 ...` over every listed model, `coverage L3 ...` over the probe-ok models split into candidates
+and excluded):
+
+| State | Meaning |
+|---|---|
+| `tested` | has a result for the step: its tier (`v`, `t`, `x`) and the evidence (`pppp big p`, `ppfn cap<150000`) |
+| `pending` | waiting, with the reason: `first-strike` (failed once, asked again, not yet `x`), a status from earlier runs (`rate`, `pay`, `auth`, `timeout`, `error`, `gone`, `empty`), `cap`, `spend`, `row-cost`, `queued` (this run will do it), `not-run` |
+| `excluded` | out by rule, with the reason: `ctx-below-floor`, `ctx-unknown`, `outside-toggles`, `invalid-id`, `relay-by-provenance`, `not-probe-ok` |
+
+`coverage()` in `refresh/tool-fidelity.mjs` builds the ledger and `assertPartition()` throws if a model is in no state, in two, or twice:
+a model dropped by a bug is a loud failure, never a smaller denominator. Three capped lists follow the counts: models that failed once
+(provisional, never reported as failed), models pending for `--pending-runs` runs in a row (default 3), and tested models whose record
+is against an older fixture (`*`, a re-sweep is recommended and never automatic). The run counts live in an optional `pending` object in
+`state/tool-fidelity.json` (`{ "provider/id": { r: reason, n: runs, at } }`); an entry goes away when the model gets a result.
+
+**Inheritance marks (data only; nothing reads them yet).** `inherited(key, store, catalog)` says what the records of OTHER providers imply
+for a model that has no result of its own, so a planner can decide how to show it. A pass never propagates as a pass.
+
+| Mark | When | Meaning |
+|---|---|---|
+| `likely-x` (`from`) | the same model has a CONFIRMED failure at another provider | probably cannot take the tool set; the real probe may still say otherwise (`conflict: true` when another provider passed) |
+| `upper-bound` (level 3, `from`) | the same model passed L3 at another provider | at most that good, shown as `~3`; never a pass |
+| `claim-only` (`prior: "c"`) | only the catalogue's `tools` claim | a prior, never eligibility; `prior: "c"` is also added to the other marks when the claim is true |
+
+The helper returns null for a model that has its own confirmed result, ignores sources that failed once, alias rows, the same provider
+and untested records, and takes `catalog = { identityOf?, toolsClaim?, resellers? }` (the default identity is the last path segment of
+the id without a tier suffix; pass your own to use the catalogue's canonical ids). It is not wired into the compiler or the picker.
+
+**Context length unknown** is reported as its own count (the dry run and the end-of-run line): a model with no listed context length is
+not a failure, but the policy cannot rank it by context.
+
+```bash
+# Dry (the default): counts, request and token estimates, dollars, per-provider plan. Sends nothing, writes nothing.
+node refresh/tool-fidelity-cli.mjs
+# Live: L1+L2 for every probe-ok model that has no record yet. Free-tier providers first, then paid under the bench's row ceiling
+# and spend cap, which this pass measures on INPUT tokens as well as output. One sweep at a time (the bench's lock).
+node refresh/tool-fidelity-cli.mjs --live
+# One provider, or one model; a sample (one model per provider first).
+node refresh/tool-fidelity-cli.mjs --live --only groq
+node refresh/tool-fidelity-cli.mjs --live --limit 40
+# The large fixture and parallel calls: needs --l3 yes AND a named provider or an explicit cap. Level 5 is the 400 KB step.
+node refresh/tool-fidelity-cli.mjs --levels 34 --l3 yes --live --only groq/some-model
+node refresh/tool-fidelity-cli.mjs --levels 5 --l3 yes --live --only groq
+# Ask again for models that already have a record (a re-sweep), or ONLY for confirmed failures (never touches a record that passed).
+node refresh/tool-fidelity-cli.mjs --live --force --only groq
+node refresh/tool-fidelity-cli.mjs --live --retry-failed --l3 yes --only groq
+```
+
+`--tf-max-tokens-per-provider N` (default 150,000 input tokens per provider per run) keeps a provider with hundreds of models from
+spending its whole allowance at once: models past the cap simply wait, and the next run continues where this one stopped. A cap below the
+cost of one model is reported with the cap that is needed (a warning in the dry run, a refusal live). A run refuses to start when its own
+estimate is above `--max-spend`; a probe that stops part way is charged for the levels it completed. The dry run prints, with their
+denominators, how many models are probe-ok, how many have a record, how many against the current fixture, how many failed once and wait
+for a second try, how many `tools: false` models are in the set, how many have no listed context length, and how many are queued.
+
+The first live run is the owner's decision (it spends real quota on free tiers and a little money on paid ones). Later runs for
+newly discovered models follow the same caps. Nothing here is scheduled yet: `runIncremental` in `refresh/tool-fidelity-cli.mjs` is the
+function a scheduler will call, and `requeueL3Failures` in `refresh/tool-fidelity.mjs` is the function to call after a provider's key
+tier changes (a free key and a paid key can behave differently); it only returns the changed records and is not wired to `retier` yet.
+
+Nothing in the tests can write the real state file: the writer compares against a `realFile` the tests set to a temp file, and the test
+guard throws before any write under the real state folder. The records this version cannot read (a newer writer's fields, say) are kept
+in the file on every save, not deleted.
+
 ## 7. Troubleshooting
 
 - **The picker shows a `live feed ...` note, or a status in UPPERCASE you did not expect:** that is the live feed; see 6f (Troubleshooting

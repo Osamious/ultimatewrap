@@ -216,15 +216,15 @@ test("Q6 rank key 2b: class 0 (price 0, free-tier row) above class 0t (ft row) a
   const k = (x) => r.groups.get(x).rk;
   const [alpha, fxd, fxp] = ["fx-free-a/fxa-alpha", "fx-dep/fxd-model:free", "fx-paid/fxp/free/x"];
   assert.deepEqual([fxd, fxp].map((x) => k(x).slice(0, 3)), [k(alpha).slice(0, 3), k(alpha).slice(0, 3)], "keys 1 to 3 (tool tier, health, ctx class) are EQUAL for the rows under test");
-  assert.ok(k(fxd)[6] < k(alpha)[6] && k(fxp)[6] < k(alpha)[6], "the ctx key favours the 0t rows (more context)");
-  assert.ok(k(fxd)[7] < k(alpha)[7] && k(fxp)[7] < k(alpha)[7], "the TTFT key favours the 0t rows (TTFT bucket 0 against 2)");
+  assert.ok(k(fxd)[8] < k(alpha)[8] && k(fxp)[8] < k(alpha)[8], "the ctx key favours the 0t rows (more context)");
+  assert.ok(k(fxd)[9] < k(alpha)[9] && k(fxp)[9] < k(alpha)[9], "the TTFT key favours the 0t rows (TTFT bucket 0 against 2)");
   assert.deepEqual([alpha, fxd, fxp, "fx-free-a/fxa-gamma", "fx-free-a/fxa-beta"].map((x) => k(x)[3]), [0, 1, 1, 2, 3], "classes: 0, 0t, 0t, U, P");
   assert.deepEqual(sels(r), Q6_NEW, "class 0 first, then the ft rows, then unknown price, then positive price");
   assert.deepEqual([alpha, fxd, fxp].map((x) => cell(r, x).fp + "/" + cell(r, x).ft), ["1/0", "0/1", "0/1"], "the classes are the fp and ft flags of the compiled rows");
   // D1: AGE is no longer a band key and no longer outranks the price class: a stale probe on alpha leaves it in price class 0, above the fresh 0t rows (recency only orders INSIDE a band)
   const stale = await fx((d) => { q6Mutate(d); const b = rd(path.join(d, "bench.json")); b.models[alpha].a = NOW / 1000 - 20 * 86400; wr(path.join(d, "bench.json"), b); });
   const rs = run(stale.g, { mode: "free", freeScope: "providers+deposit", source: "all-providers" });
-  assert.equal(rs.groups.get(alpha).rk[4], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
+  assert.equal(rs.groups.get(alpha).rk[6], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
   assert.equal(rs.groups.get(alpha).rk[1], 0, "and health (the latest status is ok) is yes: age is ignored");
   assert.ok(sels(rs).indexOf(alpha) < sels(rs).indexOf(fxd), "the price class (band key) beats recency (ordering key): an older class 0 row still ranks above a fresh 0t row");
 });
@@ -620,7 +620,7 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; an ORDERING key i
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 2 * day + 3600, l: 1 } } });   // newer than the probe: the overlay wins (a tie is the probe's)
   });
   const r = run(g, { mode: "dynamic" });
-  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[4];
+  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[6];
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map(k2), [0, 1, 2], "recency class: live and fresh, fresh, older");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).rk[1]), [0, 0, 0], "health (latest status ok) is yes for all three: age is ignored");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).b), [r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b], "and the three rows share ONE band");
@@ -634,7 +634,7 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; an ORDERING key i
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 8 * day + 3600, l: 1 } } });
   });
   const e = run(edge.g, { mode: "dynamic" });
-  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[4]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
+  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[6]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
 });
 
 test("F8: rank key 4 (TTFT bucket <1000 ms, <3000 ms, else or missing) orders rows that tie on every key above it; the buckets are right at the boundaries", async () => {

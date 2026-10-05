@@ -1101,7 +1101,7 @@ test("R13: explain describes the REAL rule: the lead rank band, its band id, the
   assert.equal(e.status, 0, e.err);
   assert.match(e.out, /^band: \d+ \(equal tool tier, health, ctx class and price class/m);
   assert.match(e.out, /^fallback: a cooling model .*demoted, never removed.*LOWER tool tier only if it is tested \(v, then t\), never an untested u/m);
-  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx class, prefer-1m \(band\)=0, price class 2b \(band\)=\d, recency \(order only\)=\d/);
+  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx class, prefer-1m \(band\)=0, price class 2b \(band\)=\d, big step \(v only\)=\d, L4 \(v only\)=\d, recency \(order only\)=\d/);
   const low = cli(["explain", "fx-free-a/fxa-big:free", ...s.F]);
   assert.match(low.out, /would be chosen as the substitute never, for any provider in the set/, "an unverified row behind a verified band: never");
   assert.equal(SET(s, "--banded", "no").status, 0);

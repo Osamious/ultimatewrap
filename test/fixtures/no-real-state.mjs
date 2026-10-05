@@ -20,6 +20,16 @@ const PROMISES = { readFile: 1, stat: 1, lstat: 1, writeFile: 1, appendFile: 1, 
 // NOTE (documented, not editable here): menu/uwpick.mjs:18 does `import { openSync, readSync, closeSync } from "node:fs"`. A NAMED import of a builtin binds the original function when
 // that module is evaluated, BEFORE a test file calls guardRealState, so those three calls are not seen by this guard (the default-import callers are). If a test must observe them, patch
 // the callers' module or pass the picker an fs seam; this guard cannot rebind a named import after the fact.
+// Which argument positions of a WRITE-class call name the path it changes (the others are only read). A call that writes under the real state folder
+// THROWS before it reaches the file system (a recorded touch is reported at the end of the run, after the damage): a test file must never write there.
+// `open` is judged by its flags. The guard's own self-test uses a temp root and only records.
+const WRITES = { writeFile: [0], appendFile: [0], rename: [0, 1], unlink: [0], rm: [0], rmdir: [0], mkdir: [0], truncate: [0], utimes: [0], lutimes: [0], copyFile: [1], cp: [1],
+  symlink: [1], link: [1], chmod: [0], chown: [0], mkdtemp: [0], createWriteStream: [0] };
+const writeIdx = (name, args) => {
+  const base = name.replace(/^promises./, "").replace(/Sync$/, "").replace(/.native$/, "");
+  if (base === "open") { const fl = args[1]; return typeof fl === "string" ? (/[wa+]/.test(fl) ? [0] : []) : typeof fl === "number" ? (fl & 3 ? [0] : []) : []; }
+  return WRITES[base] ?? [];
+};
 const asPath = (p) => (typeof p === "string" ? p : p instanceof URL ? fileURLToPath(p) : Buffer.isBuffer(p) ? p.toString() : null);
 
 /** `opts.root` replaces the real state folder (the guard's own self-test uses a temp folder: no test may name the real one to prove the guard works). */
@@ -29,7 +39,7 @@ export function guardRealState(after, assert, opts = {}) {
   // A canonical-path or link lookup (realpath, readlink) of the real folder ITSELF is the protective comparison keysync/subagent-policy.mjs makes on purpose (it resolves the protected
   // folders to refuse a fixture path that lies under one) and reveals no content, so it is not a touch; the same lookup of anything INSIDE the folder is.
   const LOOKUP = /^(promises\.)?(realpath|readlink)(Sync)?(\.native)?$/;
-  const hit = (name, args, n) => { for (let i = 0; i < n; i++) { const p = asPath(args[i]); if (p === null) continue; const r = path.resolve(p).toLowerCase(); if (r.startsWith(real) && !(LOOKUP.test(name) && r.replace(/[\/]+$/, "") === real.replace(/[\/]+$/, ""))) { touched.push(`${name}:${p}`); return; } } };
+  const hit = (name, args, n) => { for (let i = 0; i < n; i++) { const p = asPath(args[i]); if (p === null) continue; const r = path.resolve(p).toLowerCase(); if (r.startsWith(real) && !(LOOKUP.test(name) && r.replace(/[\/]+$/, "") === real.replace(/[\/]+$/, ""))) { touched.push(`${name}:${p}`); if (opts.root === undefined && writeIdx(name, args).includes(i)) throw new Error(`refused: a test tried to write under the real state folder (${name} ${p})`); return; } } };
   const wrap = (holder, name, n, label) => {
     const orig = holder[name];
     if (typeof orig !== "function") return;

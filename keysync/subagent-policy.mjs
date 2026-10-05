@@ -1489,7 +1489,7 @@ async function cmdExplain(p, flags, io, target) {
   L.push(`toggles: source=${owner.source} mode=${owner.mode} ctx=${owner.ctx}: ${grp.stage === "in-set" ? "IN the allowed set" : `NOT in the allowed set (stopped at ${grp.stage})`}`);
   const idx = res.models.findIndex((r) => r.s === grp.selector);
   if (idx >= 0) {
-    const labels = ["tool tier (band)", "health: latest status ok (band)", "ctx class, prefer-1m (band)", "price class 2b (band)", "recency (order only)", "price 2b", "-ctx", "ttft bucket", "alias"];
+    const labels = ["tool tier (band)", "health: latest status ok (band)", "ctx class, prefer-1m (band)", "price class 2b (band)", "big step (v only)", "L4 (v only)", "recency (order only)", "price 2b", "-ctx", "ttft bucket", "alias"];
     L.push(`rank: position ${idx + 1} of ${res.models.length} (ordered by reliability then context, NOT by quality or price); keys ${labels.map((l, i) => `${l}=${grp.rk[i]}`).join(", ")}`);
     L.push(`shortlist: ${idx < INJECT_MAX_ENTRIES ? "listed" : "beyond the 20-entry injected shortlist"}; ${substituteLine(res, grp.selector, owner.banded !== false)}`);
     L.push(`band: ${grp.b} (equal tool tier, health, ctx class and price class; rows in one band are interchangeable for the spread)`, FALLBACK_RULE);
