@@ -14,7 +14,7 @@ import { STREAM_LIMITS } from "../refresh/tool-fidelity-probe.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const POLICY = { schema: 1, models: [] };
 

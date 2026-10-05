@@ -10,15 +10,20 @@ guardRealState(after, assert);
 const conn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", ...extra });
 const kind = async (k, answer, extra) => { const f = fakeFetch(answer); const r = await runKind(k, conn(f, extra)); return { r, f }; };
 const edit = (over = {}) => JSON.stringify({ file_path: AWKWARD.file_path, old_string: AWKWARD.old_string, new_string: AWKWARD.new_string, replace_all: AWKWARD.replace_all, start_line: AWKWARD.start_line, ...over });
+const callEcho = (json = '{"message":"hello"}') => ok(stream(ev.tool(0, "fx_echo", json), ev.stop("tool_use")));
 const callEdit = (json = edit()) => ok(stream(ev.tool(0, "fx_edit", json), ev.stop("tool_use")));
 
 test("request shapes: L1 leaves the choice to the model, 1f forces it, L2 carries a ~20 KB result with the fact at the END, 2e an is_error result, 3a is small, 3b ~157 KB, 5 ~400 KB, 6 offers the Agent tool", () => {
   const b1 = buildBody("1", "p/m");
   assert.deepEqual(b1.tool_choice, { type: "auto" });
-  assert.equal(b1.tools.length, 1);
+  assert.deepEqual([b1.tools.length, b1.tools[0].name], [1, "fx_echo"], "L1 is a SIMPLE echo call");
   assert.equal(b1.stream, true);
-  assert.ok(b1.messages[0].content.includes(AWKWARD.file_path) && b1.messages[0].content.includes(AWKWARD.old_string) && b1.messages[0].content.includes(AWKWARD.new_string), "the task carries the awkward texts it must copy");
-  assert.deepEqual(buildBody("1f", "p/m").tool_choice, { type: "tool", name: "fx_edit" });
+  assert.ok(b1.messages[0].content.includes('"hello"') && !b1.messages[0].content.includes(AWKWARD.old_string), "a plain short message: no awkward content in L1");
+  assert.deepEqual(buildBody("1f", "p/m").tool_choice, { type: "tool", name: "fx_echo" });
+  const b1a = buildBody("1a", "p/m");
+  assert.deepEqual([b1a.tool_choice, b1a.tools.length, b1a.tools[0].name], [{ type: "auto" }, 1, "fx_edit"]);
+  assert.ok(b1a.messages[0].content.includes(AWKWARD.file_path) && b1a.messages[0].content.includes(AWKWARD.old_string) && b1a.messages[0].content.includes(AWKWARD.new_string), "the argument-fidelity request carries the awkward texts it must copy");
+  assert.deepEqual(buildBody("1af", "p/m").tool_choice, { type: "tool", name: "fx_edit" });
   const b2 = buildBody("2", "p/m");
   const [u, a, r] = b2.messages;
   assert.equal(a.content[0].type, "tool_use");
@@ -30,7 +35,7 @@ test("request shapes: L1 leaves the choice to the model, 1f forces it, L2 carrie
   const b7 = buildBody("2e", "p/m");
   assert.equal(b7.messages[2].content[0].is_error, true);
   assert.equal(b7.messages[2].content[0].content, ERROR_RESULT);
-  assert.ok(kindSize("1").bytes < 3000 && kindSize("2e").bytes < 3000 && kindSize("6").bytes < 3000, "the cheap requests are small");
+  assert.ok(kindSize("1").bytes < 1500 && kindSize("1a").bytes < 3000 && kindSize("2e").bytes < 3000 && kindSize("6").bytes < 3000, "the cheap requests are small");
   assert.ok(kindSize("3a").bytes > 4000 && kindSize("3a").bytes < 12000, `3a is about 6-9 KB: ${kindSize("3a").bytes}`);
   assert.ok(kindSize("3b").bytes > 150000 && kindSize("3b").bytes < 165000, `3b: ${kindSize("3b").bytes}`);
   assert.ok(kindSize("3b").inTokens > 37000 && kindSize("3b").inTokens < 42000);
@@ -56,8 +61,8 @@ test("cache_control rides on the system block and the LAST tool of 3a, 3b and th
   assert.ok(buildBody("3b", "p/m").tools.some((t) => t.name === LONG_TOOL), "and so does the 157 KB set");
 });
 
-test("budgets and timeouts are small and pinned: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step and spawn; timeout floors 45 s, 90 s and 120 s by request class, caps 120 s, 180 s and 240 s", () => {
-  assert.deepEqual({ ...BUDGETS }, { "1": 256, "1f": 256, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
+test("budgets and timeouts are small and pinned: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step, spawn and the argument-fidelity request; timeout floors 45 s, 90 s and 120 s by request class, caps 120 s, 180 s and 240 s", () => {
+  assert.deepEqual({ ...BUDGETS }, { "1": 256, "1f": 256, "1a": 512, "1af": 512, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
   assert.deepEqual({ ...TIMEOUTS_MS }, { small: 45000, "157": 90000, big: 120000 });
   assert.deepEqual({ ...TIMEOUT_CAPS_MS }, { small: 120000, "157": 180000, big: 240000 });
   assert.equal(TIMEOUT_FACTOR, 3);
@@ -66,10 +71,10 @@ test("budgets and timeouts are small and pinned: 256 for L1, L2, 3a, 3b and the 
 });
 
 test("which requests a todo sends: L3 is 3a then 3b, L4 alone is 3b, L4 beside L3 is nothing extra; the level sizes follow", () => {
-  assert.deepEqual(kindsOf([1, 2]), ["1", "2"]);
+  assert.deepEqual(kindsOf([1, 2]), ["1", "1a", "2"], "L1 is two requests: the simple call and the argument-fidelity request");
   assert.deepEqual(kindsOf([3, 4]), ["3a", "3b"]);
   assert.deepEqual(kindsOf([4]), ["3b"]);
-  assert.deepEqual(kindsOf([1, 2, 3, 4, 5, 6, 7]), ["1", "2", "2e", "3a", "3b", "5", "6"]);
+  assert.deepEqual(kindsOf([1, 2, 3, 4, 5, 6, 7]), ["1", "1a", "2", "2e", "3a", "3b", "5", "6"]);
   assert.equal(levelSize(4).requests, 0);
   assert.equal(levelSize(4, { withLevel3: false }).requests, 1);
   assert.equal(levelSize(3).requests, 2);
@@ -86,14 +91,26 @@ test("every request goes to the gateway URL with the probe client tag and stream
   assert.equal(c.body.stream, true);
 });
 
-test("L1: a tool call with the choice left AUTO passes, with argument fidelity `af` p when every field comes back byte for byte (multi-line, quotes, backslashes, unicode, JSON in a string, boolean, integer)", async () => {
-  const { r, f } = await kind("1", () => callEdit());
-  assert.deepEqual([r.v, r.af, r.reqs, r.forced], ["p", "p", 1, undefined]);
+test("L1: a SIMPLE echo call with the choice left AUTO passes on a tool_use with valid JSON and the required argument; it says nothing about awkward content", async () => {
+  const { r, f } = await kind("1", () => callEcho());
+  assert.deepEqual([r.v, r.af, r.reqs, r.forced], ["p", undefined, 1, undefined]);
   assert.equal(f.calls.length, 1, "a pass under auto sends no forced request");
   assert.equal(kindOf(f.calls[0]), "1");
 });
 
-test("argument fidelity `af`: any change in any field fails `af` but NOT L1 (the call itself was well formed)", async () => {
+test("1a (argument fidelity): the awkward-content Edit call under AUTO, `af` p when every field comes back byte for byte (multi-line, quotes, backslashes, unicode, JSON in a string, boolean, integer); never a failure of the level", async () => {
+  const { r, f } = await kind("1a", () => callEdit());
+  assert.deepEqual([r.v, r.af, r.reqs], ["p", "p", 1]);
+  assert.equal(kindOf(f.calls[0]), "1a");
+  const bad = await kind("1a", () => callEdit('{"file_path":"x'));
+  assert.deepEqual([bad.r.v, bad.r.af, bad.r.afw], ["p", "f", "arguments not valid JSON"], "invalid JSON for awkward content is an af failure, not a failed request");
+  const other = await kind("1a", () => ok(stream(ev.tool(0, "rm_rf", "{}"), ev.stop("tool_use"))));
+  assert.deepEqual([other.r.v, other.r.af, other.r.afw], ["p", "f", "called another tool"]);
+  const missing = await kind("1a", () => callEdit('{"old_string":"a","new_string":"b"}'));
+  assert.deepEqual([missing.r.v, missing.r.af, missing.r.afw], ["p", "f", "file_path: missing"]);
+});
+
+test("argument fidelity `af`: any change in any field fails `af`, never the request (the call itself was well formed)", async () => {
   const mutations = {
     "a backslash lost": { old_string: AWKWARD.old_string.replace(String.fromCharCode(92) + " and a literal", " and a literal") }, "unicode mangled": { new_string: AWKWARD.new_string.replace("🚀", "?") },
     "newline turned into space": { old_string: AWKWARD.old_string.replace("\n\t", " \t") }, "JSON string re-escaped": { new_string: JSON.stringify(JSON.parse(AWKWARD.new_string.split("\n")[0])) + "\n" + AWKWARD.new_string.split("\n")[1] },
@@ -101,31 +118,31 @@ test("argument fidelity `af`: any change in any field fails `af` but NOT L1 (the
     "trailing space": { old_string: `${AWKWARD.old_string} ` },
   };
   for (const [name, over] of Object.entries(mutations)) {
-    const { r } = await kind("1", () => callEdit(edit(over)));
+    const { r } = await kind("1a", () => callEdit(edit(over)));
     assert.deepEqual([r.v, r.af], ["p", "f"], name);
   }
-  const exact = await kind("1", () => callEdit(edit({ replace_all: true, start_line: 12 })));
+  const exact = await kind("1a", () => callEdit(edit({ replace_all: true, start_line: 12 })));
   assert.equal(exact.r.af, "p");
 });
 
 test("L1 failure modes: text instead of a call, no content, invalid JSON, a tool that was not offered, the required argument missing", async () => {
   const text = await kind("1", () => ok(stream(ev.text(0, "done"), ev.stop())), { });
   assert.deepEqual([text.r.v, text.r.nocall], ["f", true]);
-  const bad = await kind("1", () => callEdit('{"file_path":"x'));
-  assert.deepEqual([bad.r.v, bad.r.why], ["f", "tool call arguments are not valid JSON"]);
-  assert.equal((await kind("1", () => callEdit('["x"]'))).r.v, "f", "arguments must be a JSON object");
+  const bad = await kind("1", () => callEcho('{"message":"x'));
+  assert.deepEqual([bad.r.v, bad.r.why], ["f", "tool call arguments are not valid JSON"], "a SIMPLE call with broken JSON is a real L1 failure");
+  assert.equal((await kind("1", () => callEcho('["x"]'))).r.v, "f", "arguments must be a JSON object");
   const other = await kind("1", () => ok(stream(ev.tool(0, "rm_rf", "{}"), ev.stop("tool_use"))));
   assert.deepEqual([other.r.v, other.r.why], ["f", "tool call names a tool that was not offered"]);
-  const miss = await kind("1", () => callEdit('{"old_string":"a","new_string":"b"}'));
-  assert.deepEqual([miss.r.v, miss.r.why], ["f", "a tool call lacks the required argument `file_path`"]);
+  const miss = await kind("1", () => callEcho("{}"));
+  assert.deepEqual([miss.r.v, miss.r.why], ["f", "a tool call lacks the required argument `message`"]);
 });
 
 test("FORCED fallback: only when auto yields NO call. A model that calls when forced is `fc` p (clean L1 pass but class t at best), one that fails forced too is `fc` f; a backend that rejects a forced choice leaves the auto verdict", async () => {
   const seen = [];
-  const f = fakeFetch((c) => { seen.push(kindOf(c)); return kindOf(c) === "1f" ? callEdit() : ok(stream(ev.text(0, "I would edit the file."), ev.stop())); });
+  const f = fakeFetch((c) => { seen.push(kindOf(c)); return kindOf(c) === "1f" ? callEcho() : ok(stream(ev.text(0, "I would echo it."), ev.stop())); });
   const r = await runKind("1", conn(f));
   assert.deepEqual(seen, ["1", "1f"]);
-  assert.deepEqual([r.v, r.fc, r.forced, r.reqs, r.af], ["p", "p", true, 2, "p"]);
+  assert.deepEqual([r.v, r.fc, r.forced, r.reqs, r.af], ["p", "p", true, 2, undefined]);
   const both = await runKind("1", conn(fakeFetch(() => ok(stream(ev.text(0, "no"), ev.stop())))));
   assert.deepEqual([both.v, both.fc, both.reqs], ["f", "f", 2]);
   const refused = await runKind("1", conn(fakeFetch((c) => (kindOf(c) === "1f" ? http(400, "tool_choice is not supported by this model") : ok(stream(ev.text(0, "no"), ev.stop()))))));
@@ -286,7 +303,7 @@ test("a THINKING block is not content: thinking, then a stop on max_tokens with 
   const sse = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
   const think = (i, t) => sse("content_block_start", { type: "content_block_start", index: i, content_block: { type: "thinking", thinking: "" } }) + sse("content_block_delta", { type: "content_block_delta", index: i, delta: { type: "thinking_delta", thinking: t } }) + sse("content_block_stop", { type: "content_block_stop", index: i });
   assert.deepEqual([(await kind("1", () => ok(stream(think(0, "hmm"), ev.stop("max_tokens"))))).r.s], ["empty"]);
-  assert.equal((await kind("1", () => ok(stream(think(0, "hmm"), ev.tool(1, "fx_edit", edit()), ev.stop("tool_use"))))).r.v, "p");
+  assert.equal((await kind("1", () => ok(stream(think(0, "hmm"), ev.tool(1, "fx_echo", '{"message":"hello"}'), ev.stop("tool_use"))))).r.v, "p");
   assert.equal((await kind("1", () => ok(stream(think(0, "hmm"), ev.stop("end_turn"))))).r.v, "f", "thinking and a normal stop with no call is a real miss");
 });
 

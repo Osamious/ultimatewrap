@@ -13,7 +13,7 @@ import { loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const FREE = { tier: "free" };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -64,9 +64,9 @@ test("a timeout is asked ONCE more at double the time inside the same run: the s
   assert.equal(r.inconclusive, undefined, "a verdict, not a timeout");
   assert.deepEqual([done[1].v, done[2].v], ["p", "p"]);
   assert.equal(state.tmult, 2);
-  assert.equal(f.calls.length, 3, "L1 twice (the first timed out), L2 once at the doubled time (80 ms would have timed out at 50)");
-  assert.equal(r.requests, 3, "the timed-out request counts toward the model's request ceiling");
-  assert.equal(state.requests, 3);
+  assert.equal(f.calls.length, 4, "L1 twice (the first timed out), then 1a and L2 once each at the doubled time (80 ms would have timed out at 50)");
+  assert.equal(r.requests, 4, "the timed-out request counts toward the model's request ceiling");
+  assert.equal(state.requests, 4);
 });
 
 test("a second timeout at the doubled value on L1 makes the model `slow` (pending, never a verdict, the seconds it was given); on any other level it is a plain timeout; nothing is recorded", async () => {
@@ -130,7 +130,7 @@ test("a model whose L1 times out twice is `pending: slow` with the seconds it wa
   assert.equal(st.models["fa/slow1"], undefined, "no record: slowness is not a verdict");
   assert.ok(st.models["fa/ok1"] && st.models["fa/late1"] && st.models["fb/b1"], "late models pass after the doubled retry; other providers go on");
   assert.equal(calls(f).filter((c) => c.body.model === "fa/slow1").length, 2, "the original and the doubled retry, then it moves on");
-  assert.equal(calls(f).filter((c) => c.body.model === "fa/late1").length, 3, "L1 twice (the first timed out), L2 once");
+  assert.equal(calls(f).filter((c) => c.body.model === "fa/late1").length, 4, "L1 twice (the first timed out), argument fidelity once, L2 once");
   assert.match(r.out, /pending: slow \(the L1 request timed out twice, at the doubled time; never a verdict, a later run asks again\): fa\/slow1 \(0\.1 s\)/);
   assert.match(r.out, /provider latency where requests timed out/);
   assert.match(r.out, /fa\s+3 timeout\(s\) of \d+ request\(s\), median [\d.]+ s, max [\d.]+ s, slow 1/, "a slow provider reads as slow in the per-provider table");
@@ -246,7 +246,7 @@ test("the CLI applies the ADAPTIVE timeout per model from the bench: a model who
   assert.equal(r.code, 3, "partial: two models stayed pending (the bench exit code for that)");
   const st = loadFidelity(e.out);
   assert.ok(st.models["fa/known"], "its own bench time gave it room");
-  assert.equal(calls(f).filter((c) => c.body.model === "fa/known").length, 2, "L1 and L2, no timeout at all");
+  assert.equal(calls(f).filter((c) => c.body.model === "fa/known").length, 3, "L1, argument fidelity and L2, no timeout at all");
   assert.equal(st.pending["fa/unknown"].r, "slow", "no bench time: the floor only");
   assert.equal(st.pending["fa/pricey"].r, "slow");
   assert.match(r.out, /est\. spend \$0\.000 of the \$5\.00 cap/, "the priced model that only ever timed out (four requests at $100 per million) cost nothing");

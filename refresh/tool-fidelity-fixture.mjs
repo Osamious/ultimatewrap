@@ -90,7 +90,9 @@ export const bigResult = () => {
 export const ERROR_RESULT = "Error: ENOENT: no such file or directory, open '/ws/missing.txt'";
 
 /** The small tools of L1: the Edit-style tool. (L2 sends the Read-style tool, the error case too.) */
-export const smallTools = () => [editTool()];
+export const smallTools = () => [echoTool()];      // L1: a plain echo call
+/** The tools of the argument-fidelity request (1a): an Edit-style call with awkward content. */
+export const awkwardTools = () => [editTool()];
 
 // ------------------------------------------------------------------ the constructs request (L3a, about 6 KB)
 

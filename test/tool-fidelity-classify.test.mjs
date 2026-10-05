@@ -14,7 +14,7 @@ import { AWKWARD, EDIT_TOOL, ECHO_TOOL } from "../refresh/tool-fidelity-fixture.
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const FREE = { tier: "free" };
 const conn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", ...extra });
@@ -182,9 +182,9 @@ test("afCheck is exact where an Edit would fail (a lost newline, a doubled backs
 });
 
 test("L1: a mangled argument fails `af` (never L1), carries `afw` in the verdict, and the record keeps it, clears it on a later pass, and summaryOf prints it", async () => {
-  const bad = await one("1", calling(mangled("old_string", (s) => s.replace(/\n/g, ""))));
+  const bad = await one("1a", calling(mangled("old_string", (s) => s.replace(/\n/g, ""))));
   assert.deepEqual([bad.r.v, bad.r.af, bad.r.afw], ["p", "f", "old_string: newline lost"]);
-  const good = await one("1", calling({ ...AWKWARD }));
+  const good = await one("1a", calling({ ...AWKWARD }));
   assert.deepEqual([good.r.v, good.r.af, good.r.afw], ["p", "p", undefined]);
   const rec = buildRecord(null, { 1: { v: "p", af: "f", afw: "old_string: newline lost" }, 2: { v: "p" } }, { now: NOW });
   assert.equal(rec.afw, "old_string: newline lost");

@@ -23,7 +23,7 @@ import { createSseParser, classifyHttp, classifyTight, parseRetryAfter, extractM
 import { redactClip } from "../menu/redact.mjs";
 import { CONTRACT as CCR } from "../menu/ccr-client.mjs";
 import {
-  fixture, bigFixture, constructsTools, echoTool, readTool, agentTool, smallTools, bigResult, AWKWARD, BIG_RESULT_FACT, ERROR_RESULT, CACHE_CONTROL,
+  fixture, bigFixture, constructsTools, echoTool, editTool, readTool, agentTool, bigResult, AWKWARD, BIG_RESULT_FACT, ERROR_RESULT, CACHE_CONTROL,
   ECHO_TOOL, EDIT_TOOL, READ_TOOL, AGENT_TOOL, LONG_TOOL, AGENT_TYPES,
 } from "./tool-fidelity-fixture.mjs";
 
@@ -33,7 +33,7 @@ export const MAX_MODEL_REQUESTS = 12;      // a HARD ceiling on the requests sen
 const ERROR_BODY_BYTES = 2048;             // how much of a refusal is read
 export const ESCALATED_MAX_TOKENS = 2048;  // the ONE bump for a model whose whole budget went on thinking (see probeModel)
 /** The output budget of each request: just enough for the answer it asks for. */
-export const BUDGETS = Object.freeze({ "1": 256, "1f": 256, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
+export const BUDGETS = Object.freeze({ "1": 256, "1f": 256, "1a": 512, "1af": 512, "2": 256, "2e": 256, "3a": 256, "3b": 256, "5": 512, "6": 512 });
 export const PROBE_MAX_TOKENS = BUDGETS["1"];          // the smallest budget; kept as the name callers print
 /** Timeout classes in ms: small requests, the 157 KB request, the 400 KB request. A timeout is inconclusive, never a verdict. */
 // Timeouts are ADAPTIVE: 3 x the model's own bench total time, between a floor and a cap per request class (the floors alone for a model with no bench record). The real free-tier
@@ -47,9 +47,9 @@ export function timeoutsFor(rec, floors = TIMEOUTS_MS, caps = TIMEOUT_CAPS_MS) {
   const one = (k) => (d === null ? floors[k] : Math.min(caps[k], Math.max(floors[k], TIMEOUT_FACTOR * d)));
   return { small: one("small"), "157": one("157"), big: one("big") };
 }
-const CLASS_OF = Object.freeze({ "1": "small", "1f": "small", "2": "small", "2e": "small", "3a": "small", "3b": "157", "5": "big", "6": "small" });
-const LEVEL_OF = Object.freeze({ "1": 1, "1f": 1, "2": 2, "2e": 7, "3a": 3, "3b": 3, "5": 5, "6": 6 });
-const EXPECT_TOOLS = Object.freeze({ "1": 1, "1f": 1, "2": 0, "2e": 0, "3a": 1, "3b": 2, "5": 1, "6": 1 });
+const CLASS_OF = Object.freeze({ "1": "small", "1f": "small", "1a": "small", "1af": "small", "2": "small", "2e": "small", "3a": "small", "3b": "157", "5": "big", "6": "small" });
+const LEVEL_OF = Object.freeze({ "1": 1, "1f": 1, "1a": 1, "1af": 1, "2": 2, "2e": 7, "3a": 3, "3b": 3, "5": 5, "6": 6 });
+const EXPECT_TOOLS = Object.freeze({ "1": 1, "1f": 1, "1a": 1, "1af": 1, "2": 0, "2e": 0, "3a": 1, "3b": 2, "5": 1, "6": 1 });
 const WHY_CHARS = 160;
 const STREAM_CHAR_CAP = 40000;             // a model that never stops streaming is judged on what it sent so far
 const AFTER_DONE_EVENTS = 50;              // events read after the expected calls are closed while waiting for the usage event
@@ -57,7 +57,8 @@ const AFTER_DONE_EVENTS = 50;              // events read after the expected cal
 export const STREAM_LIMITS = Object.freeze({ bytes: 2 * 1024 * 1024, events: 20000, blocks: 64 });
 
 const ASK = Object.freeze({
-  1: `Edit the file ${AWKWARD.file_path}: replace the text between <old> and </old> with the text between <new> and </new>, in every occurrence, starting from line ${AWKWARD.start_line}. Call the ${EDIT_TOOL} tool; copy both texts exactly, character for character.\n<old>${AWKWARD.old_string}</old>\n<new>${AWKWARD.new_string}</new>`,
+  1: `Call the ${ECHO_TOOL} tool once with the message "hello".`,
+  "1a": `Edit the file ${AWKWARD.file_path}: replace the text between <old> and </old> with the text between <new> and </new>, in every occurrence, starting from line ${AWKWARD.start_line}. Call the ${EDIT_TOOL} tool; copy both texts exactly, character for character.\n<old>${AWKWARD.old_string}</old>\n<new>${AWKWARD.new_string}</new>`,
   2: "The report you just read is above. What is the deployment code of this release? Answer in one short sentence.",
   "2e": "Read /ws/missing.txt and tell me its first line.",
   "3a": `Call the ${LONG_TOOL} tool with mode "demo" and limit 3.`,
@@ -77,7 +78,8 @@ const systemBlocks = (text, cc) => (cc ? [{ type: "text", text, cache_control: {
 export function buildBody(kind, model, maxTokens = BUDGETS[kind], { noCc = false } = {}) {
   const base = { model, max_tokens: maxTokens, stream: true };
   const cc = !noCc;
-  if (kind === "1" || kind === "1f") return { ...base, tools: smallTools(), ...(kind === "1f" ? { tool_choice: { type: "tool", name: EDIT_TOOL } } : { tool_choice: { type: "auto" } }), messages: [{ role: "user", content: ASK[1] }] };
+  if (kind === "1" || kind === "1f") return { ...base, tools: [echoTool()], ...(kind === "1f" ? { tool_choice: { type: "tool", name: ECHO_TOOL } } : { tool_choice: { type: "auto" } }), messages: [{ role: "user", content: ASK[1] }] };
+  if (kind === "1a" || kind === "1af") return { ...base, tools: [editTool()], ...(kind === "1af" ? { tool_choice: { type: "tool", name: EDIT_TOOL } } : { tool_choice: { type: "auto" } }), messages: [{ role: "user", content: ASK["1a"] }] };
   if (kind === "2" || kind === "2e") {
     const err = kind === "2e";
     return {
@@ -104,7 +106,7 @@ export function kindSize(kind) {
 /** The request kinds a todo list sends, in order: L3 is 3a then 3b (3b also answers L4); L4 alone is 3b; L7 is the error-result request. */
 export const kindsOf = (todo) => {
   const t = new Set(todo), out = [];
-  if (t.has(1)) out.push("1");
+  if (t.has(1)) out.push("1", "1a");
   if (t.has(2)) out.push("2");
   if (t.has(7)) out.push("2e");
   if (t.has(3)) out.push("3a", "3b"); else if (t.has(4)) out.push("3b");
@@ -138,6 +140,8 @@ function tightRead(text) {
   if (ROUTE_WORDS.test(msg)) return { s: "error", reason: "route-shape", hint: clip(msg).slice(0, 120) };
   return null;
 }
+/** What the provider's own sentence in a refusal says about the ACCOUNT or the ROUTE, for records written before those readings existed: `"pay"`, `"route-shape"` or null. */
+export const accountOrRoute = (text) => { const t = tightRead(text); return t ? (t.s === "pay" ? "pay" : t.reason ?? null) : null; };
 const sameText = (a, b) => { const n = (x) => String(x ?? "").replace(/[0-9a-f-]{8,}/gi, "#").replace(/\s+/g, " ").trim(); return n(a) === n(b); };
 
 const TRANSIENT_WORDS = /overload|rate.?limit|too many|try again|timed? ?out|unavailable|capacity|temporar|busy|quota/i;
@@ -272,14 +276,22 @@ export function judge(kind, r) {
   if (!r.events) return inconclusive("error", "HTTP 200 with no stream events");
   if (!usable && r.stopReason === "max_tokens") return inconclusive("empty", "output budget spent before any text or tool call (stop_reason max_tokens)");
   const bad = tools.find((b) => !argsOf(b).ok);
+  // a tool call cut off by the output budget (stop_reason max_tokens, arguments unfinished) says nothing about the model: the budget is asked once more, larger
+  if (bad && r.stopReason === "max_tokens") return inconclusive("empty", "output budget spent in the middle of a tool call (stop_reason max_tokens)");
+  if (kind === "1a" || kind === "1af") {
+    if (!tools.length) return fail(textOf(r) ? "answered in text instead of calling the tool" : "no tool call in the answer", { nocall: true });
+    if (bad) return pass({ af: "f", afw: "arguments not valid JSON" });
+    const call = tools.find((b) => b.name === EDIT_TOOL);
+    if (!call) return pass({ af: "f", afw: "called another tool" });
+    return pass(afCheck(argsOf(call).value));
+  }
   if (kind === "1" || kind === "1f") {
     if (!tools.length) return fail(textOf(r) ? "answered in text instead of calling the tool" : "no tool call in the answer", { nocall: true });
     if (bad) return fail("tool call arguments are not valid JSON");
-    const call = tools.find((b) => b.name === EDIT_TOOL);
+    const call = tools.find((b) => b.name === ECHO_TOOL);
     if (!call) return fail("tool call names a tool that was not offered");
-    const v = argsOf(call).value;
-    if (typeof v.file_path !== "string") return fail("a tool call lacks the required argument `file_path`");
-    return pass(afCheck(v));
+    if (typeof argsOf(call).value.message !== "string") return fail("a tool call lacks the required argument `message`");
+    return pass();
   }
   if (kind === "2") {
     if (r.streamError) return fail(`stream error: ${r.streamError}`);
@@ -320,6 +332,10 @@ export function judge(kind, r) {
   return pass({ l4: par ? "p" : "f", ...(par ? {} : { l4why: echoes.length < 2 ? `${echoes.length} tool call instead of 2 parallel calls` : echoes.length >= 2 && echoes.some((b) => b.json === "") ? "the tool call arguments were not streamed (no argument deltas)" : "parallel tool calls share one id or lack the argument",
     l4w: echoes.length < 2 ? `${echoes.length} call of 2` : echoes.some((b) => b.json === "") ? "args not streamed" : "shared id or no arg" }) });
 }
+
+/** A server that cannot take the AUTO tool choice ("auto" tool choice requires --enable-auto-tool-choice): only a FORCED choice can pass, so this routes to the forced fallback and is never a strike by itself. */
+const AUTO_REFUSED = /auto(matic)?"? tool[ _-]?choice|enable-auto-tool-choice|tool[_ ]choice.{0,60}(\bauto\b|requires|not supported|unsupported|only)/i;
+const autoRefused = (r) => (r.http === 400 || r.http === 422 || r.http === 501) && AUTO_REFUSED.test(String(r.body ?? ""));
 
 /** The text of a refusal, at most `limit` bytes of it: the body is read in chunks and cancelled when enough has come, so a hostile or huge error page costs nothing. */
 async function readBounded(res, limit) {
@@ -406,10 +422,11 @@ export async function runKind(kind, { fetchImpl = fetch, url, key, model, maxTok
   const go = (k) => send(k, JSON.stringify(buildBody(k, model, budget, { noCc })), { ...conn, timeoutMs: limit });
   const first = await go(kind);
   if (first.aborted) return first;
-  if (kind === "1" && first.v === "f" && first.nocall) {
-    const forced = await go("1f");
+  if ((kind === "1" || kind === "1a") && first.v === "f" && (first.nocall || autoRefused(first))) {
+    const forced = await go(kind === "1" ? "1f" : "1af");
     if (forced.aborted) return forced;
     if (forced.v === "i") return { ...forced, reqs: 2 };
+    if (kind === "1a") return { ...forced, reqs: 2, forced: true, ms: first.ms + forced.ms };
     if (forced.http === 400 && /tool_choice/i.test(forced.body ?? "")) return { ...first, reqs: 2, forcedRejected: true };       // the backend does not take a forced choice: the auto answer stands
     return { ...forced, reqs: 2, forced: true, fc: forced.v === "p" ? "p" : "f", ms: first.ms + forced.ms };
   }
@@ -533,7 +550,15 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       const r = await ask(level === 1 ? "1" : "2");
       if (r.aborted) return r;
       if (r.v === "i") return stop(r);
-      done[level] = row(r, level === 1 ? { ...(r.af ? { af: r.af } : {}), ...(r.afw ? { afw: r.afw } : {}), ...(r.fc ? { fc: r.fc } : {}) } : { ...(r.br ? { br: r.br } : {}) });
+      done[level] = row(r, level === 1 ? { ...(r.fc ? { fc: r.fc } : {}) } : { ...(r.br ? { br: r.br } : {}) });
+      if (level === 1 && r.v === "p") {
+        // argument fidelity is its own small request AFTER L1 passed: awkward content (multi-line text, quotes, backslashes, unicode) in an Edit-style call. A failure sets `af` f and `afw` only: it is
+        // never a strike and never lowers the class. No verdict (a timeout, a limit) leaves `af` unset.
+        const a = await ask("1a");
+        if (a.aborted) return a;
+        if (a.v === "p") { done[1].af = a.af; if (a.afw) done[1].afw = a.afw; }
+        else if (a.v === "f") { done[1].af = "f"; done[1].afw = a.nocall ? "no tool call" : a.http ? `HTTP ${a.http}` : "no usable call"; }
+      }
     } else if (level === 3) {
       if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
       if (bigFirst && !done[5]) {

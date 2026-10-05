@@ -16,7 +16,7 @@ import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const FREE = { tier: "free" };
 const conn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", ...extra });
@@ -73,13 +73,13 @@ test("B1: the ceiling counts every kind of request together: retries, the forced
 
 test("L1: an error body is read in chunks and cancelled after 2 KB: a refusal of unbounded size costs nothing, and its first words still decide the verdict", async () => {
   let reads = 0, cancelled = false;
-  const body = { getReader: () => ({ read: async () => { reads += 1; return { done: false, value: new TextEncoder().encode(reads === 1 ? "tool_choice is not supported; " + "x".repeat(1000) : "y".repeat(1024)) }; }, cancel: async () => { cancelled = true; } }) };
+  const body = { getReader: () => ({ read: async () => { reads += 1; return { done: false, value: new TextEncoder().encode(reads === 1 ? "the tool schema is not supported; " + "x".repeat(1000) : "y".repeat(1024)) }; }, cancel: async () => { cancelled = true; } }) };
   const fetchImpl = async () => ({ ok: false, status: 400, headers: { get: () => null }, body, text: async () => { throw new Error("must not be read whole"); } });
   const r = await runKind("1", { fetchImpl, url: "http://gw.test/v1/messages", key: "k", model: "p/m", maxTokens: 256, timeouts: { small: 1000, "157": 1000, big: 1000 } });
   assert.ok(reads <= 4, `read ${reads} chunks`);
   assert.equal(cancelled, true);
   assert.ok(r.body.length <= 2048, `kept ${r.body.length} characters`);
-  assert.match(r.body, /tool_choice is not supported/);
+  assert.match(r.body, /the tool schema is not supported/);
 });
 
 // ---------------------------------------------------------------- H2: the tier of a provider with several keys
@@ -208,7 +208,7 @@ test("M2: the cost of lifting is printed as if --live were given, per tier, and 
   const rows = [{ provider: "fa", keyId: "k.fa.free", models: [m("a1")] }, { provider: "pb", keyId: "k.pb.paid", models: [m("b1", { badge: "PAID", pin: 1, pout: 2 }), m("b2", { badge: "PAID", pin: 1, pout: 2 })] }];
   const e = env(rows, { tiers: { fa: "free", pb: "paid" } });
   const dry = await run(["--candidates", "policy", "--include-tier", "paid", "--levels", "1234567", "--max-spend", "5", "--max-row-cost", "5", ...CAP], e.deps);
-  assert.ok(dry.out.split("\n").some((l) => l.startsWith(LIFT_PREVIEW) && /paid 2 model\(s\), 14 requests, ~\d+k input tokens, \$\d+\.\d+/.test(l)), dry.out);
+  assert.ok(dry.out.split("\n").some((l) => l.startsWith(LIFT_PREVIEW) && /paid 2 model\(s\), 16 requests, ~\d+k input tokens, \$\d+\.\d+/.test(l)), dry.out);
   assert.match(dry.out, /stay skipped until all of these hold: --live/, "in a dry run the lift still lacks --live; the preview is not what is missing");
   assert.equal(calls(e.f).length, 0);
   const live = await run(["--candidates", "policy", "--include-tier", "paid", "--levels", "1234567", "--max-spend", "5", "--max-row-cost", "5", "--l3", "yes", "--live", ...CAP], e.deps);

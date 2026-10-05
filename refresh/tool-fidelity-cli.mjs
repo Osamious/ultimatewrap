@@ -52,7 +52,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, migrateStrikes, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -94,6 +94,7 @@ export function parseArgs(argv) {
     else if (a === "--force") o.force = true;
     else if (a === "--retry-failed") o.retryFailed = true;
     else if (a === "--merge-unsaved") o.mergeUnsaved = true;
+    else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
     else if (a === "--l3") { if (argv[++i] !== "yes") return { error: "--l3 needs the word yes (it allows the 157 KB level 3 and level 4 requests and the 400 KB big step)" }; o.l3 = true; }
     else if (a === "--levels") {
       const l = parseLevels(argv[++i]);
@@ -271,6 +272,38 @@ export function pendingReasonOf(r, entry) {
   return r.w ?? "skip";
 }
 
+/**
+ * `--reset-awkward-json`: clears the strikes (and confirmed failures) that the old awkward-content L1 produced ("tool call arguments are not valid JSON", or a server's refusal of the AUTO
+ * tool choice), so the next run asks L1 again with the plain echo call. Dry by default (counts only); `--live` applies it under the lock, atomically.
+ */
+async function resetAwkward(o, outFile, deps) {
+  const cur = loadFidelity(outFile);
+  if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was changed`); return 1; }
+  const plan1 = migrateStrikes(cur.models);
+  const by = (f) => { const x = {}; for (const c of plan1.cleared) x[f(c)] = (x[f(c)] ?? 0) + 1; return Object.entries(x).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none"; };
+  const total = Object.keys(cur.models).length;
+  console.log(`tool-fidelity: ${num(plan1.cleared.length)} of ${num(total)} record(s) came from the awkward-content L1 or a refused auto tool choice: ${by((c) => c.kind === "strike" ? "first strikes" : "confirmed failures")}; reason: ${by((c) => c.reason)}; ${num(plan1.cleared.filter((c) => c.removed).length)} would be removed (asked again from scratch), ${num(plan1.cleared.filter((c) => !c.removed).length)} keep their other results`);
+  const prov = {};
+  for (const c of plan1.cleared) { const p = c.key.slice(0, c.key.indexOf("/")); prov[p] = (prov[p] ?? 0) + 1; }
+  const top = Object.entries(prov).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${show(k, 18)} ${num(n)}`).join(", ");
+  if (top) console.log(`  by provider: ${top}`);
+  if (!o.live) { console.log("nothing was written. Re-run with --reset-awkward-json --live to apply it."); return 0; }
+  if (!plan1.cleared.length) { console.log("tool-fidelity: nothing to clear"); return 0; }
+  const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
+  if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  try {
+    const fresh = loadFidelity(outFile);
+    if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
+    const m = migrateStrikes(fresh.models);
+    const pending = { ...(fresh.pending ?? {}) };
+    for (const c of m.cleared) delete pending[c.key];
+    (deps.saveImpl ?? saveFidelity)(outFile, m.store, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending });
+    console.log(`tool-fidelity: ${num(m.cleared.length)} record(s) cleared in ${path.basename(outFile)}; the next run asks L1 again with the plain echo call`);
+    return 0;
+  } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
+  finally { got.release(); }
+}
+
 /** The text of the dry run. */
 export function printPlan(p, o) {
   const c = p.counts, L = [];
@@ -322,7 +355,7 @@ export function printPlan(p, o) {
   }
   if (big || p.queued.length) {
     L.push(`  per request (a full-depth model sends each row once; the stream is cancelled once the needed calls are closed): ${levelCosts(o.maxTokens).map((x) => `${x.label} ${x.requests} req ~${tok(x.inTokens)} in, up to ${x.outTokens} out`).join("; ")}`);
-    L.push(`  output budgets: ${Object.entries(BUDGETS).filter(([k]) => k !== "1f").map(([k, v]) => `${k} ${o.maxTokens ?? v}`).join(", ")} tokens (a thinking-only stop is asked once more at ${ESCALATED_MAX_TOKENS}); timeouts: adaptive per model, ${TIMEOUT_FACTOR} x its bench time, small ${o.timeoutSmall}-${o.timeoutMaxSmall} s, 157 KB ${o.timeout157}-${o.timeoutMax157} s, 400 KB ${o.timeoutBig}-${o.timeoutMaxBig} s (${p.timeoutStats ? `this run's small requests: ${p.timeoutStats}; ` : ""}a timeout is asked once more at double, then pending timeout, or slow on L1: never a verdict); in flight per provider: ${p.perProvider} (1 for requests of 100 KB or more), ${o.concurrency ?? 8} overall`);
+    L.push(`  output budgets: ${Object.entries(BUDGETS).filter(([k]) => k !== "1f" && k !== "1af").map(([k, v]) => `${k} ${o.maxTokens ?? v}`).join(", ")} tokens (a thinking-only stop is asked once more at ${ESCALATED_MAX_TOKENS}); timeouts: adaptive per model, ${TIMEOUT_FACTOR} x its bench time, small ${o.timeoutSmall}-${o.timeoutMaxSmall} s, 157 KB ${o.timeout157}-${o.timeoutMax157} s, 400 KB ${o.timeoutBig}-${o.timeoutMaxBig} s (${p.timeoutStats ? `this run's small requests: ${p.timeoutStats}; ` : ""}a timeout is asked once more at double, then pending timeout, or slow on L1: never a verdict); in flight per provider: ${p.perProvider} (1 for requests of 100 KB or more), ${o.concurrency ?? 8} overall`);
   }
   if (big) L.push(`  deep levels need --l3 yes and --only or an explicit --max-spend or --tf-max-tokens-per-provider`);
   { // per-tier totals and the deep-probe rule
@@ -451,6 +484,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (o.error) { console.error(`tool-fidelity: ${o.error}`); return 2; }
   const outFile = deps.outFile ?? REAL_FILE;
   if (o.mergeUnsaved) return mergeUnsaved(o, outFile, deps);
+  if (o.resetAwkwardJson) return resetAwkward(o, outFile, deps);
   const loaded = deps.snapshot ?? loadSnapshot();
   if (!loaded.ok) { console.error(`tool-fidelity: no usable snapshot (${loaded.reason}) -- run: node menu/snapshot.mjs --build`); return 1; }
   const stored = loadFidelity(outFile);

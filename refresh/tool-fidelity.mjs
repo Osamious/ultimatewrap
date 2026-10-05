@@ -48,7 +48,7 @@ import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { RELAY_KEY_ID, isTier } from "../menu/tiers.mjs";
 import { SUBSTITUTE_FLOOR, funnel } from "../menu/subagent-funnel.mjs";
 import { isFree, UNPRICED_PER_M } from "./bench.mjs";
-import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON } from "./tool-fidelity-probe.mjs";
+import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute } from "./tool-fidelity-probe.mjs";
 export { NOT_FREE_REASON };
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 
@@ -496,7 +496,7 @@ export function paidFallback(models) {
 
 /** The request kinds that answer one LEVEL of a todo list (L4 rides in the L3 request: no cost of its own unless it is asked alone). */
 const kindsOfLevel = (l, todo) => (l === 4 ? (todo.includes(3) ? [] : ["3b"]) : kindsOf([l]));
-const BIG_LEVELS = Object.freeze({ 1: "L1 edit call (arguments)", 2: "L2 round trip (20 KB result)", 3: "L3 constructs + 157 KB (+L4 parallel)", 5: "big 400 KB", 6: "spawn (Agent)", 7: "error result" });
+const BIG_LEVELS = Object.freeze({ 1: "L1 simple call + argument fidelity", 2: "L2 round trip (20 KB result)", 3: "L3 constructs + 157 KB (+L4 parallel)", 5: "big 400 KB", 6: "spawn (Agent)", 7: "error result" });
 /** The per-level request, byte and token table the dry run prints (a full-depth model sends every row once). */
 export function levelCosts(maxTokens = null) {
   return [1, 2, 3, 5, 6, 7].map((l) => {
@@ -979,6 +979,42 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, now =
     out[e.key] = { r: code, n: Math.min(9999, (out[e.key]?.n ?? 0) + 1), at: now.toISOString() };
   }
   return out;
+}
+
+// ------------------------------------------------------------------ migration: strikes that came from the awkward-content L1
+
+/**
+ * The first L1 requests of the probe carried awkward content (multi-line text, quotes, backslashes, unicode) in an Edit-style call, so a model that CAN call tools but emitted invalid JSON for
+ * that content, or whose server refused the AUTO tool choice outright (`"auto" tool choice requires --enable-auto-tool-choice`), was recorded as an L1 failure and a strike. L1 is now a plain
+ * echo call, argument fidelity is its own request, and a refused auto choice goes to the forced fallback. The records those requests produced say so in their `why`.
+ */
+export const OLD_L1_WHY = /^L1: (tool call arguments are not valid JSON|a tool call lacks the required argument `file_path`|HTTP 4\d\d: .*(auto(matic)?"? tool[ _-]?choice|enable-auto-tool-choice))/i;
+/** Why a stored L1 reason is not about the model, or null: the old awkward-content L1, a refused auto choice, an empty wallet or a route that wants another shape (both read only since the later fixes). */
+export function oldL1Reason(why) {
+  if (typeof why !== "string") return null;
+  if (OLD_L1_WHY.test(why)) return /JSON|file_path/.test(why) ? "awkward-json" : "auto-choice";
+  const m = /^L1: HTTP 4\d\d: ([\s\S]*)$/.exec(why);
+  const r = m ? accountOrRoute(m[1]) : null;
+  return r === "pay" ? "wallet" : r === "route-shape" ? "route-shape" : null;
+}
+/**
+ * Clears them. A record whose reason is one of the above and that is a strike (first or second) or an L1 failure is dropped when nothing else is known about the model (it asks L1 again from
+ * scratch), otherwise only its strike and reason are removed and its class is worked out again. Pure: returns `{store, cleared: [{key, kind: "strike" | "failed", reason: "awkward-json" | "auto-choice" | "wallet" | "route-shape", removed}]}`.
+ */
+export function migrateStrikes(store) {
+  const out = {}, cleared = [];
+  for (const [key, rec] of Object.entries(store ?? {})) {
+    const reason = rec ? oldL1Reason(rec.why) : null;
+    const hit = reason !== null && (rec.strikes !== undefined || rec.lvr?.[0] === "f");
+    if (!hit) { out[key] = rec; continue; }
+    const removed = rec.lvr[0] !== "p";
+    cleared.push({ key, kind: rec.strikes === 1 ? "strike" : "failed", reason, removed });
+    if (removed) continue;
+    const { strikes, sl, why, ...rest } = rec;
+    const t = classOf({ lvr: rest.lvr, capBelow: rest.capBelow, fc: rest.fc });
+    out[key] = { ...rest, t, ok: t === "v" || t === "t" };
+  }
+  return { store: out, cleared };
 }
 
 // ------------------------------------------------------------------ the one-line summary of a record

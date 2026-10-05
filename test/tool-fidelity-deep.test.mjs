@@ -12,7 +12,7 @@ import { loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs
 
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const m = (id, over = {}) => ({ id, outModality: "chat", ctx: 256000, tools: true, pin: 0, pout: 0, badge: "FREE", ...over });
 const paid = (id) => m(id, { pin: 1, pout: 2, badge: "PAID" });
@@ -135,7 +135,7 @@ test("LIFTING needs ALL of: --include-tier, an explicit --levels, --live and an 
   const l12 = env(world());
   const r12 = await run(["--live", "--candidates", "policy", "--include-tier", "paid", "--levels", "12", "--max-spend", "5", "--max-row-cost", "1", ...DEEP], l12.deps);
   assert.equal(r12.code, 0, r12.err + r12.out);
-  assert.deepEqual([...new Set(byProvider(l12.f).pb)].sort(), ["1", "2"], "the paid tier gets exactly the levels asked");
+  assert.deepEqual([...new Set(byProvider(l12.f).pb)].sort(), ["1", "1a", "2"], "the paid tier gets exactly the levels asked (L1 is two requests)");
   // each condition dropped in turn
   const drops = {
     "no --include-tier": ["--live", "--candidates", "policy", ...levels, "--max-spend", "5", "--max-row-cost", "1", ...DEEP],
@@ -235,9 +235,9 @@ test("TELEMETRY: per request kind and per provider, actual tokens in and out and
   });
   const r = await run(["--live", "--only", "fa", "--levels", "12"], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
-  assert.match(r.out, /telemetry, actual against estimate, per request kind: 1 x3 in \d+ of ~\d+ estimated, out \d+ of up to \d+, [\d.]+ s each, 3 cut early; 2 x3 in [\d.]+k of ~[\d.]+k estimated/);
-  assert.match(r.out, /slowest providers: fa \d+ s over 6 request\(s\); total wall time \d+ s/);
-  assert.match(r.out, /calibration \(this run, not stored\): input tokens actual\/estimate [\d.]+, output actual\/budget [\d.]+ over 6 of 6 request\(s\) that reported usage; 3 cut early, 0 timed out/);
+  assert.match(r.out, /telemetry, actual against estimate, per request kind: 1 x3 in \d+ of ~\d+ estimated, out \d+ of up to \d+, [\d.]+ s each, 3 cut early; 1a x3 [^;]*; 2 x3 in [\d.]+k of ~[\d.]+k estimated/);
+  assert.match(r.out, /slowest providers: fa \d+ s over 9 request\(s\); total wall time \d+ s/);
+  assert.match(r.out, /calibration \(this run, not stored\): input tokens actual\/estimate [\d.]+, output actual\/budget [\d.]+ over \d+ of 9 request\(s\) that reported usage; \d+ cut early, 0 timed out/);
   const file = (await import("node:fs")).readFileSync(e.out, "utf8");
   assert.equal(/telemetry|calibration/.test(file), false, "nothing of it is stored in the results file");
 });
@@ -246,12 +246,12 @@ test("BIG-FIRST at the CLI: a model with a known context of 200,000 or more gets
   const bf = env(world());
   const r = await run(["--live", "--only", "fa", "--order", "big-first", "--levels", "1235", ...DEEP], bf.deps);
   assert.equal(r.code, 0, r.err + r.out);
-  assert.deepEqual([...new Set(byProvider(bf.f).fa)].sort(), ["1", "2", "5"], "no 3a, no 3b");
+  assert.deepEqual([...new Set(byProvider(bf.f).fa)].sort(), ["1", "1a", "2", "5"], "no 3a, no 3b");
   const rec = loadFidelity(bf.out).models["fa/a1"];
   assert.deepEqual([rec.lvr, rec.big, rec.d3, rec.t], ["pppn", "p", "i", "v"]);
   const lf = env(world());
   await run(["--live", "--only", "fa", "--levels", "1235", ...DEEP], lf.deps);
-  assert.deepEqual([...new Set(byProvider(lf.f).fa)].sort(), ["1", "2", "3a", "3b", "5"]);
+  assert.deepEqual([...new Set(byProvider(lf.f).fa)].sort(), ["1", "1a", "2", "3a", "3b", "5"]);
   const rec2 = loadFidelity(lf.out).models["fa/a1"];
   assert.deepEqual([rec2.lvr, rec2.big, rec2.d3], ["pppp", "p", undefined]);
 });
@@ -269,11 +269,11 @@ test("the PILOT's report compares l3-first with big-first from the measured pass
 test("the dry run prints the per-level cost table, the budgets, the timeouts and a wall-time RANGE; with --max-tokens the budgets are overridden everywhere", async () => {
   const e = env(world());
   const r = await run(["--levels", "1234567", ...DEEP], e.deps);
-  assert.match(r.out, /output budgets: 1 256, 2 256, 5 512, 6 512, 2e 256, 3a 256, 3b 256 tokens/);
-  assert.match(r.out, /per request \(a full-depth model sends each row once.*L1 edit call \(arguments\) 1 req ~318 in, up to 256 out; L2 round trip \(20 KB result\) 1 req ~5k in/);
+  assert.match(r.out, /output budgets: 1 256, 2 256, 5 512, 6 512, 1a 512, 2e 256, 3a 256, 3b 256 tokens/);
+  assert.match(r.out, /per request \(a full-depth model sends each row once.*L1 simple call \+ argument fidelity 2 req ~\d+ in, up to 768 out; L2 round trip \(20 KB result\) 1 req ~5k in/);
   assert.match(r.out, /wall time, an estimate: about \d+ (s|min|h) to \d+ (s|min|h) for this run/);
   const o = await run(["--levels", "12", "--max-tokens", "300"], e.deps);
-  assert.match(o.out, /output budgets: 1 300, 2 300, 5 300, 6 300, 2e 300, 3a 300, 3b 300 tokens/);
+  assert.match(o.out, /output budgets: 1 300, 2 300, 5 300, 6 300, 1a 300, 2e 300, 3a 300, 3b 300 tokens/);
 });
 
 test("saved results are untouched by a dry run, and a re-run never re-sends a confirmed level (resume): a model with L1+L2 done is asked only what is missing", async () => {
@@ -293,7 +293,7 @@ test("RATE PAUSE counts rate limits IN A ROW: an answer between them starts the 
   const w = world();
   w.snap.rows = [{ provider: "fa", keyId: "k.fa.free", models: ["s1", "s2", "s3", "s4", "s5", "s6"].map((id) => m(id)) }];
   let n = 0;   // every model meets two rate limits and then answers: 2 in a row, a good answer, again 2 in a row, and so on
-  const e = env(w, (c) => ((n++ % 4) < 2 ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)));
+  const e = env(w, (c) => ((n++ % 5) < 2 ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)));
   const r = await run(["--live", "--per-provider", "1"], e.deps);
   assert.doesNotMatch(r.out, /left alone for the rest of this run/);
   const st = loadFidelity(e.out);

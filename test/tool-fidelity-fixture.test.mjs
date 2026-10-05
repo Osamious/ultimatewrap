@@ -69,7 +69,7 @@ test("the 20 KB result puts the fact on its LAST line, and the Agent tool has th
 
 test("it is deterministic, and every callable tool is where its request needs it", () => {
   assert.equal(JSON.stringify(fixture()), JSON.stringify(fixture()));
-  assert.equal(smallTools()[0].name, "fx_edit");
+  assert.equal(smallTools()[0].name, "fx_echo");
   assert.ok(fixture().tools.some((t) => t.name === ECHO_TOOL) && bigFixture().tools.some((t) => t.name === ECHO_TOOL), "the echo tool is inside both big sets");
   assert.equal(echoTool().name, ECHO_TOOL);
   assert.equal(new Set(fixture().tools.map((t) => t.name)).size, fixture().tools.length, "tool names are unique");

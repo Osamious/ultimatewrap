@@ -17,15 +17,15 @@ const kinds = (f) => f.calls.map(kindOf);
 const verdicts = (r) => Object.fromEntries(Object.entries(r.done).map(([k, v]) => [k, v.v]));
 const FREE = { tier: "free" };
 
-test("the full ladder on a good model: 1, 2, 3a, 3b, 5, 6, 2e are the only requests (L4 rides in 3b), and every level has its verdict and markers", async () => {
+test("the full ladder on a good model: 1, 1a, 2, 3a, 3b, 5, 6, 2e are the only requests (L4 rides in 3b), and every level has its verdict and markers", async () => {
   const f = fakeFetch(goodModel);
   const r = await probeModel({ levels: [1, 2, 3, 4, 5, 6, 7], ...FREE, ...conn(f) });
-  assert.deepEqual(kinds(f), ["1", "2", "3a", "3b", "5", "6", "2e"]);
+  assert.deepEqual(kinds(f), ["1", "1a", "2", "3a", "3b", "5", "6", "2e"]);
   assert.deepEqual(verdicts(r), { 1: "p", 2: "p", 3: "p", 4: "p", 5: "p", 6: "p", 7: "p" });
   assert.deepEqual([r.done[1].af, r.done[2].br, r.done[3].nm, r.done[3].cc], ["p", "p", "p", "p"]);
   assert.ok(r.done[3].bytes > 150000 && r.done[5].bytes > 390000);
-  assert.equal(r.requests, 7);
-  assert.equal(r.tele.length, 7, "one telemetry entry per request");
+  assert.equal(r.requests, 8);
+  assert.equal(r.tele.length, 8, "one telemetry entry per request");
 });
 
 test("L3 is TWO requests: a construct rejection at 3a is the schema verdict and the model NEVER pays the 157 KB request; 3a passing does not imply L3", async () => {
@@ -118,11 +118,11 @@ test("FREE-KEYS-ONLY RULE in the engine: a model whose tier is not `free` (paid,
   }
   const f = fakeFetch(goodModel);
   const free = await probeModel({ levels: [1, 2, 3, 5, 6], prior: "nnnn", tier: "free", ...conn(f) });
-  assert.deepEqual([kinds(f), free.clamped], [["1", "2", "3a", "3b", "5", "6"], []]);
+  assert.deepEqual([kinds(f), free.clamped], [["1", "1a", "2", "3a", "3b", "5", "6"], []]);
   const lifted = liftDeepProbes({ includeTiers: ["paid"], levelsExplicit: true, levels: [1, 2], live: true, maxSpendExplicit: true, printed: true }).lift;
   const g = fakeFetch(goodModel);
   await probeModel({ levels: [1, 2], tier: "paid", lift: lifted, ...conn(g) });
-  assert.deepEqual(kinds(g), ["1", "2"], "a LIFTED tier gets any level that was asked, L1 and L2 included: lifting them is the same lift");
+  assert.deepEqual(kinds(g), ["1", "1a", "2"], "a LIFTED tier gets any level that was asked, L1 and L2 included: lifting them is the same lift");
 });
 
 test("nothing but a validated capability lifts the rule: a forged object, a plain flag, a copy of a real one, an empty object and a string do not", async () => {
@@ -150,7 +150,7 @@ test("EARLY CANCEL: once the expected calls are closed and the usage is seen the
   const endless = async () => new Response(new ReadableStream({
     pull(c) {
       pulled += 1;
-      const head = pulled === 1 ? ev.start(500) + ev.tool(0, "fx_edit", JSON.stringify({ file_path: "C:\\Users\\demo\\notes\\todo.md", old_string: "a", new_string: "b" })) + sse("message_delta", { type: "message_delta", delta: { stop_reason: null }, usage: { output_tokens: 30 } }) : "";
+      const head = pulled === 1 ? ev.start(500) + ev.tool(0, "fx_echo", '{"message":"hello"}') + sse("message_delta", { type: "message_delta", delta: { stop_reason: null }, usage: { output_tokens: 30 } }) : "";
       c.enqueue(new TextEncoder().encode(head + sse("content_block_delta", { type: "content_block_delta", index: 5, delta: { type: "text_delta", text: "and more and more " } })));
       if (pulled > 100000) c.close();
     },
@@ -180,10 +180,11 @@ test("a normal stream is read through message_stop; a call-less 3a answer in tex
 test("TELEMETRY: every request reports its bytes, time, kind and the usage the provider sent (input and output tokens) when it sent any", async () => {
   const f = fakeFetch((c) => (kindOf(c) === "2" ? ok(streamWith(5300, ev.text(0, "ZK-7731-QX"), ev.stop("end_turn", 12))) : goodModel(c)));
   const r = await probeModel({ levels: [1, 2], ...FREE, ...conn(f) });
-  const [t1, t2] = r.tele;
+  const [t1, t1a, t2] = r.tele;
   assert.deepEqual([t1.kind, t1.level, t1.v], ["1", 1, "p"]);
+  assert.deepEqual([t1a.kind, t1a.level, t1a.v], ["1a", 1, "p"], "the argument-fidelity request is part of level 1");
   assert.deepEqual([t2.kind, t2.level, t2.inTok, t2.outTok], ["2", 2, 5300, 12]);
-  assert.ok(t1.bytes > 1000 && t2.bytes > 19000 && Number.isFinite(t1.ms) && t1.inTok === null, "no usage reported: null, never guessed");
+  assert.ok(t1.bytes > 300 && t2.bytes > 19000 && Number.isFinite(t1.ms) && t1.inTok === null, "no usage reported: null, never guessed");
 });
 
 test("THINKING-ONLY escalation: the first empty answer is asked again ONCE with 2048 tokens, the model's later requests use 2048, and a pass after the bump is a verdict", async () => {
@@ -191,13 +192,13 @@ test("THINKING-ONLY escalation: the first empty answer is asked again ONCE with 
   const f = fakeFetch((c) => { seen.push(c.body.max_tokens); return c.body.max_tokens < 2048 ? ok(stream(thinking(0, "hmm"), ev.stop("max_tokens"))) : goodModel(c); });
   const state = {};
   const r = await probeModel({ levels: [1, 2], state, ...FREE, ...conn(f) });
-  assert.deepEqual(seen, [256, 2048, 2048], "L1 at its 256 (empty), L1 again at 2048, L2 straight at 2048");
-  assert.deepEqual([r.done[1].v, r.done[2].v, r.requests, r.escalated], ["p", "p", 3, true]);
-  assert.deepEqual({ ...state }, { escalated: true, maxTokens: 2048, requests: 3 });
+  assert.deepEqual(seen, [256, 2048, 2048, 2048], "L1 at its 256 (empty), L1 again at 2048, then 1a and L2 straight at 2048");
+  assert.deepEqual([r.done[1].v, r.done[2].v, r.requests, r.escalated], ["p", "p", 4, true]);
+  assert.deepEqual({ ...state }, { escalated: true, maxTokens: 2048, requests: 4 });
   const kept = [];
   const f2 = fakeFetch((c) => { kept.push(c.body.max_tokens); return goodModel(c); });
   await probeModel({ levels: [1], state, done: {}, ...FREE, ...conn(f2) });
-  assert.deepEqual(kept, [2048], "state kept by the caller across the engine's retries: no second bump, and no return to the small budget");
+  assert.deepEqual(kept, [2048, 2048], "L1 and 1a: state kept by the caller across the engine's retries: no second bump, and no return to the small budget");
   assert.equal(ESCALATED_MAX_TOKENS, 2048);
 });
 
@@ -227,22 +228,22 @@ test("THINKING-ONLY escalation: still empty after the bump is inconclusive `reas
 test("BIG-FIRST order (a known context of 200,000 or more): the big step runs ahead of L3; a pass IMPLIES L3 (recorded, 3a and 3b skipped, the 40k saved); a failure then runs L3 to locate the cause", async () => {
   const f = fakeFetch(goodModel);
   const r = await probeModel({ levels: [1, 2, 3, 5], order: "big-first", ctx: 256000, ...FREE, ...conn(f) });
-  assert.deepEqual(kinds(f), ["1", "2", "5"], "no 3a, no 3b");
+  assert.deepEqual(kinds(f), ["1", "1a", "2", "5"], "no 3a, no 3b");
   assert.deepEqual([r.done[5].v, r.done[3].v, r.done[3].implied], ["p", "p", "big"]);
   assert.ok(r.done[3].bytes > 390000);
   const fail = fakeFetch((c) => (kindOf(c) === "5" ? http(400, "request too large") : goodModel(c)));
   const r2 = await probeModel({ levels: [1, 2, 3, 5], order: "big-first", ctx: 256000, ...FREE, ...conn(fail) });
-  assert.deepEqual(kinds(fail), ["1", "2", "5", "3a", "3b"], "the big step failed (a size refusal): L3 is asked to tell size from schema");
+  assert.deepEqual(kinds(fail), ["1", "1a", "2", "5", "3a", "3b"], "the big step failed (a size refusal): L3 is asked to tell size from schema");
   assert.deepEqual([r2.done[5].v, r2.done[5].kind, r2.done[3].v], ["f", "size", "p"]);
   const small = fakeFetch(goodModel);
   await probeModel({ levels: [1, 2, 3, 5], order: "big-first", ctx: 128000, ...FREE, ...conn(small) });
-  assert.deepEqual(kinds(small), ["1", "2", "3a", "3b", "5"], "a context under 200,000 (or unknown) keeps the l3-first order");
+  assert.deepEqual(kinds(small), ["1", "1a", "2", "3a", "3b", "5"], "a context under 200,000 (or unknown) keeps the l3-first order");
   const unk = fakeFetch(goodModel);
   await probeModel({ levels: [1, 2, 3, 5], order: "big-first", ctx: 0, ...FREE, ...conn(unk) });
-  assert.deepEqual(kinds(unk), ["1", "2", "3a", "3b", "5"]);
+  assert.deepEqual(kinds(unk), ["1", "1a", "2", "3a", "3b", "5"]);
   const l3 = fakeFetch(goodModel);
   await probeModel({ levels: [1, 2, 3, 5], order: "l3-first", ctx: 256000, ...FREE, ...conn(l3) });
-  assert.deepEqual(kinds(l3), ["1", "2", "3a", "3b", "5"]);
+  assert.deepEqual(kinds(l3), ["1", "1a", "2", "3a", "3b", "5"]);
   const notDeep = fakeFetch(goodModel);
   await probeModel({ levels: [1, 2, 3, 5], order: "big-first", ctx: 256000, tier: "paid", ...conn(notDeep) });
   assert.deepEqual(kinds(notDeep), [], "big-first cannot bypass the free-keys-only rule");

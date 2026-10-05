@@ -73,11 +73,12 @@ export function fakeFetch(answer) {
 export const ok = (body) => ({ status: 200, body, headers: { "content-type": "text/event-stream" } });
 export const http = (status, message, headers = {}) => ({ status, body: JSON.stringify({ error: { message } }), headers });
 
-/** Which request KIND a call is (read from its body): 1, 1f (forced), 2, 2e (error result), 3a (constructs), 3b (157 KB, parallel), 5 (big), 6 (spawn). */
+/** Which request KIND a call is (read from its body): 1 (a simple echo call), 1f (forced), 1a (argument fidelity), 1af (forced),  2, 2e (error result), 3a (constructs), 3b (157 KB, parallel), 5 (big), 6 (spawn). */
 export function kindOf(call) {
   const b = call.body, names = (b.tools ?? []).map((t) => t.name), last = b.messages.at(-1);
   if (names.length === 1 && names[0] === "Agent") return "6";
-  if (names.length === 1 && names[0] === "fx_edit") return b.tool_choice?.type === "tool" ? "1f" : "1";
+  if (names.length === 1 && names[0] === "fx_echo") return b.tool_choice?.type === "tool" ? "1f" : "1";
+  if (names.length === 1 && names[0] === "fx_edit") return b.tool_choice?.type === "tool" ? "1af" : "1a";
   if (Array.isArray(last?.content) && last.content.some((c) => c.type === "tool_result")) return last.content.some((c) => c.is_error) ? "2e" : "2";
   if (names.includes("mcp__plugin_demo__a_long_tool_name_for_testing_construct_x") && names.length < 10) return "3a";
   return names.length > 100 ? "5" : "3b";
@@ -86,7 +87,8 @@ const ASKED = JSON.stringify({ file_path: AWKWARD.file_path, old_string: AWKWARD
 /** The answer of a well-behaved model for the request kind it receives (read from the request, so one answer function serves a whole sweep). */
 export function goodModel(call) {
   const k = kindOf(call), b = call.body;
-  if (k === "1" || k === "1f") return ok(stream(ev.tool(0, "fx_edit", ASKED), ev.stop("tool_use")));
+  if (k === "1" || k === "1f") return ok(stream(ev.tool(0, "fx_echo", '{"message":"hello"}'), ev.stop("tool_use")));
+  if (k === "1a" || k === "1af") return ok(stream(ev.tool(0, "fx_edit", ASKED), ev.stop("tool_use")));
   if (k === "2") return ok(stream(ev.text(0, `The deployment code is ${BIG_RESULT_FACT}.`), ev.stop()));
   if (k === "2e") return ok(stream(ev.text(0, "The file does not exist, so I cannot read its first line."), ev.stop()));
   if (k === "3a") return ok(stream(ev.tool(0, "mcp__plugin_demo__a_long_tool_name_for_testing_construct_x", '{"mode":"demo","limit":3}'), ev.stop("tool_use")));

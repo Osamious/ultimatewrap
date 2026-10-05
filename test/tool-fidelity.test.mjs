@@ -26,7 +26,7 @@ import { compact, createLogWriter } from "../refresh/bench-store.mjs";
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 const touched = guardRealState(after, assert);
 // the end of the run: the real state file is exactly as it was before it
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const at = (ms) => new Date(NOW.getTime() + ms);
 const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
@@ -541,20 +541,20 @@ test("--only and --limit narrow like the bench: provider or provider/model; limi
 
 // ---------------------------------------------------------------- estimates and caps
 
-test("estimate: L1+L2 is 2 requests per model (~5.5k tokens: the 20 KB result is in L2); L3 is two requests (3a + 3b, ~41k) and L4 rides in them; the big step is ~100k; free costs nothing; paid is priced in AND out", () => {
+test("estimate: L1+L2 is 3 requests per model (the simple call, the argument-fidelity request and L2: ~5.5k tokens, the 20 KB result is in L2); L3 is two requests (3a + 3b, ~41k) and L4 rides in them; the big step is ~100k; free costs nothing; paid is priced in AND out", () => {
   const { snap, bench } = world();
   const set = probeSet(snap, bench);
   const q = queueFor(set, {});
   const e = estimate(q, { maxTokens: 512 });
-  assert.equal(e.requests, 14, "2 requests x 7 models");
+  assert.equal(e.requests, 21, "3 requests x 7 models");
   assert.ok(e.inTokens > 7 * 5000 && e.inTokens < 7 * 6200, `L1 (~320 tokens) + L2 (~5,200 with the 20 KB result): ${e.inTokens}`);
   assert.equal(e.paidModels, 3);
   const b1 = e.entries.find((x) => x.key === "pb/b1"), a1 = e.entries.find((x) => x.key === "fa/a1");
   assert.equal(a1.cost, 0);
-  assert.ok(Math.abs(b1.cost - ((b1.tin * 1 + 2 * 512 * 4) / 1e6)) < 1e-12, "input tokens x input price + output tokens x output price (a maxTokens override applies to every request)");
+  assert.ok(Math.abs(b1.cost - ((b1.tin * 1 + 3 * 512 * 4) / 1e6)) < 1e-12, "input tokens x input price + output tokens x output price (a maxTokens override applies to every request)");
   assert.ok(Math.abs(Object.values(b1.lc).reduce((a, b) => a + b, 0) - b1.cost) < 1e-12 && Object.keys(b1.lc).join() === "1,2", "the cost of each level is available, so a probe that stops part way can be charged for the levels it completed");
   const b3 = e.entries.find((x) => x.key === "pb/b3");
-  assert.ok(Math.abs(b3.cost - ((b3.tin * 2 + 2 * 512 * 8) / 1e6)) < 1e-12, "an unpriced paid row is charged the HIGHEST listed paid price (2 in, 8 out here)");
+  assert.ok(Math.abs(b3.cost - ((b3.tin * 2 + 3 * 512 * 8) / 1e6)) < 1e-12, "an unpriced paid row is charged the HIGHEST listed paid price (2 in, 8 out here)");
   const done = Object.fromEntries(set.models.map((m) => [m.key, rec("ppnn")]));
   const l3 = estimate(queueFor(set, done, [3, 4]), { fallback: null });
   assert.equal(l3.requests, 14, "L3 is two requests per model, and L4 (parallel calls) rides in the 157 KB one: it adds none");
@@ -567,8 +567,8 @@ test("estimate: L1+L2 is 2 requests per model (~5.5k tokens: the 20 KB result is
   assert.ok(bigStep.sizes[5].inTokens > 95000 && bigStep.sizes[5].inTokens < 105000, `the big step: ${bigStep.sizes[5].inTokens}`);
   const full = estimate([{ key: "fa/z", provider: "fa", id: "z", free: true, todo: [1, 2, 3, 4, 5, 6, 7] }]);
   assert.ok(full.inTokens > 140000 && full.inTokens < 156000, `a fully tested model is about 150,000 input tokens: ${full.inTokens}`);
-  assert.equal(full.entries[0].reqs, 7, "L1, L2, 3a, 3b, big, spawn, error result");
-  assert.deepEqual(full.entries[0].kinds, ["1", "2", "2e", "3a", "3b", "5", "6"]);
+  assert.equal(full.entries[0].reqs, 8, "L1, 1a, L2, 3a, 3b, big, spawn, error result");
+  assert.deepEqual(full.entries[0].kinds, ["1", "1a", "2", "2e", "3a", "3b", "5", "6"]);
 });
 
 test("the unpriced-row price is the highest listed paid price of the WHOLE probe set, so a narrowed run is charged like a full one", () => {
@@ -579,13 +579,13 @@ test("the unpriced-row price is the highest listed paid price of the WHOLE probe
   const narrow = estimate(only, { maxTokens: 512 }), whole = estimate(only, { maxTokens: 512, fallback: paidFallback(set.models) });
   assert.ok(narrow.usd < whole.usd, "left to itself a lone unpriced row would fall back to the documented default, far below the set's highest price");
   const b3 = whole.entries[0];
-  assert.ok(Math.abs(b3.cost - ((b3.tin * 2 + 2 * 512 * 8) / 1e6)) < 1e-12);
+  assert.ok(Math.abs(b3.cost - ((b3.tin * 2 + 3 * 512 * 8) / 1e6)) < 1e-12);
 });
 
 test("with no listed paid price at all, an unpriced paid row is charged the bench's documented unpriced price", () => {
   const e = estimate([{ key: "p/x", provider: "p", id: "x", free: false, pin: null, pout: null, todo: [1, 2] }], { maxTokens: 100 });
   const tin = e.entries[0].tin;
-  assert.ok(Math.abs(e.usd - ((tin * 0.6 + 200 * 3) / 1e6)) < 1e-12);
+  assert.ok(Math.abs(e.usd - ((tin * 0.6 + 300 * 3) / 1e6)) < 1e-12);
 });
 
 test("the per-provider cap: models are taken in order until the next would pass it; the rest of that provider waits; a model that alone passes the cap never blocks the others and says what cap it needs", () => {
@@ -911,10 +911,10 @@ test("orderCosts: expected input tokens per passer of l3-first and big-first fro
   const narrow = wallEstimate(rated(20, "a", [1, 2]), { concurrency: 8, perProvider: 2, latencyMs: 2000 });
   assert.ok(narrow.lowSec > wide.lowSec, "the same requests on one provider take longer than spread over four");
   const lc = levelCosts();
-  assert.deepEqual(lc.map((x) => [x.level, x.requests]), [[1, 1], [2, 1], [3, 2], [5, 1], [6, 1], [7, 1]]);
-  assert.ok(lc.find((x) => x.level === 3).inTokens > 40000 && lc.find((x) => x.level === 5).inTokens > 95000 && lc.find((x) => x.level === 1).inTokens < 400);
+  assert.deepEqual(lc.map((x) => [x.level, x.requests]), [[1, 2], [2, 1], [3, 2], [5, 1], [6, 1], [7, 1]]);
+  assert.ok(lc.find((x) => x.level === 3).inTokens > 40000 && lc.find((x) => x.level === 5).inTokens > 95000 && lc.find((x) => x.level === 1).inTokens < 800);
   assert.ok(lc.reduce((a, x) => a + x.inTokens, 0) > 140000 && lc.reduce((a, x) => a + x.inTokens, 0) < 156000, "a fully tested model: about 150,000");
-  assert.equal(levelCosts(100).find((x) => x.level === 1).outTokens, 100, "a --max-tokens override applies");
+  assert.equal(levelCosts(100).find((x) => x.level === 1).outTokens, 200, "a --max-tokens override applies to both requests of level 1");
 });
 
 test("requeueL3Failures keeps the markers (af, br, er, sp, nm, cc, fc) of the record it resets", () => {

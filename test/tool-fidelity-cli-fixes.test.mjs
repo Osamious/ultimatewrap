@@ -13,7 +13,7 @@ import { funnel } from "../menu/subagent-funnel.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 
 /** models: [provider, id, {pin, pout, ctx}]; a model with a price is paid. */
@@ -58,7 +58,7 @@ test("--retry-failed asks again ONLY models of class x, only at the levels that 
   assert.equal(r.code, 0, r.err + r.out);
   const by = {};
   for (const c of calls(e.f)) (by[c.body.model] ??= []).push(kindOf(c));
-  assert.deepEqual(by, { "fa/a1": ["1", "2"], "fa/a2": ["3a", "3b"], "fa/auto": ["2"] }, "a3 passed and is not asked anything; L1 of `auto` passed and is not asked again");
+  assert.deepEqual(by, { "fa/a1": ["1", "1a", "2"], "fa/a2": ["3a", "3b"], "fa/auto": ["2"] }, "a3 passed and is not asked anything; L1 of `auto` passed and is not asked again");
   const s = loadFidelity(e.out).models;
   assert.deepEqual([s["fa/a1"].lvr, s["fa/a1"].t, s["fa/a1"].strikes], ["ppnn", "t", undefined], "retried and passed: the strike is gone");
   assert.deepEqual([s["fa/a2"].lvr, s["fa/a2"].t], ["pppp", "v"], "the retried L3 request also answers L4");
@@ -156,14 +156,14 @@ test("a cap below ONE model's cost says what cap is needed: a warning in the dry
   const e = env(FREE4);
   const dry = await run(["--tf-max-tokens-per-provider", "100"], e.deps);
   assert.equal(dry.code, 0);
-  assert.match(dry.out, /WARNING: 4 queued model\(s\) cost more than the cap on their own and will never run under it: raise --tf-max-tokens-per-provider to at least 5,5\d\d/);
+  assert.match(dry.out, /WARNING: 4 queued model\(s\) cost more than the cap on their own and will never run under it: raise --tf-max-tokens-per-provider to at least 5,6\d\d/);
   const live = await run(["--live", "--tf-max-tokens-per-provider", "100"], e.deps);
   assert.equal(live.code, 2);
-  assert.match(live.err, /--tf-max-tokens-per-provider 100 is below the cost of one model for these levels: nothing would run\. Use at least 5,5\d\d/);
+  assert.match(live.err, /--tf-max-tokens-per-provider 100 is below the cost of one model for these levels: nothing would run\. Use at least 5,6\d\d/);
   assert.equal(e.f.calls.length, 0);
   const some = await run(["--live", "--tf-max-tokens-per-provider", "6000"], e.deps);
   assert.equal(some.code, 0, some.err);
-  assert.equal(Object.keys(loadFidelity(e.out).models).length, 1, "6,000 tokens fits one model of about 5,550 per provider");
+  assert.equal(Object.keys(loadFidelity(e.out).models).length, 1, "6,000 tokens fits one model of about 5,670 per provider");
 });
 
 test("the BIG step: needs --l3 yes and a named provider; asked only of models that passed L3; a pass is `big: p`, a refusal is `big: f` with a size cap, a rate limit records nothing", async () => {

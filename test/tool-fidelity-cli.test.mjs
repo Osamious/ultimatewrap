@@ -14,7 +14,7 @@ import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
 guardRealState(after, assert);
-after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is exactly as it was: a test never creates, changes or deletes it"); });
+after(() => { assert.equal(realFileState(REAL_FILE), REAL_BEFORE, "the real state/tool-fidelity.json is still there (or still absent): a test never creates or deletes it"); });
 const NOW = new Date("2026-10-05T10:00:00.000Z");
 const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");
 
@@ -91,7 +91,7 @@ test("DRY RUN (the default): prints the counts with denominators and the estimat
   assert.match(r.out, /tools:false in the probe set: 1 of 7 .*probed like the rest/);
   assert.match(r.out, /context length unknown: 0 of 7 model\(s\) in the probe set/);
   assert.match(r.out, /7 model\(s\) queued of 7/);
-  assert.match(r.out, /requests 14 /);
+  assert.match(r.out, /requests 21 /);
   assert.match(r.out, /free tier 4 model\(s\): no money; paid tier 3 model\(s\): estimate \$/);
   assert.match(r.out, /no request was made\. Re-run with --live to probe\./);
   assert.ok(!/\b(D-a[a-z]|QB-\d+|CQ\d|G[1-7]\b)/.test(r.out), "plan ids are not user-visible");
@@ -167,7 +167,7 @@ test("--live L1+L2: every probe-ok model gets a record, the relay does not, noth
   const r = await run(["--live"], e.deps);
   assert.equal(r.code, 0, r.err + r.out);
   const calls = probeCalls(e.f);
-  assert.equal(calls.length, 14, "2 requests x 7 models");
+  assert.equal(calls.length, 21, "3 requests x 7 models");
   assert.ok(!calls.some((c) => c.body.model.startsWith("anthropic/")), "the relay is never probed");
   const s = loadFidelity(e.out);
   assert.equal(s.ok, true);
@@ -196,7 +196,7 @@ test("AUTOMATIC INCREMENTAL: a second run probes NOTHING (every model has a reco
   const bench = { get: (k) => (k === "fa/a-new" ? { s: "ok", a: 1790699779 } : e.bench.get(k)) };
   const third = await run(["--live"], { ...e.deps, snapshot: fresh, bench });
   assert.equal(third.code, 0, third.err);
-  assert.deepEqual(probeCalls(e.f).map((c) => c.body.model), ["fa/a-new", "fa/a-new"], "only the new model, its 2 small requests");
+  assert.deepEqual(probeCalls(e.f).map((c) => c.body.model), ["fa/a-new", "fa/a-new", "fa/a-new"], "only the new model, its 3 small requests (the simple call, argument fidelity, L2)");
   assert.ok(loadFidelity(e.out).models["fa/a-new"]);
 });
 
@@ -210,7 +210,7 @@ test("a record against an OUTDATED fixture is NOT re-queued by a run (its `*` is
   assert.equal(e.f.calls.length, 0);
   const f = await run(["--live", "--force", "--only", "fa/a1"], e.deps);
   assert.equal(f.code, 0, f.err);
-  assert.equal(probeCalls(e.f).length, 2);
+  assert.equal(probeCalls(e.f).length, 3, "L1, argument fidelity, L2");
   assert.equal(loadFidelity(e.out).models["fa/a1"].fx, "cc-tools-2", "re-swept: now against the current fixture");
   assert.equal(loadFidelity(e.out).models["fa/a2"].fx, "cc-tools-0", "the others keep their older record");
 });
@@ -278,7 +278,7 @@ test("the per-provider token cap: a provider stops at the cap, the rest wait for
   const r2 = await run(["--live", "--tf-max-tokens-per-provider", "12000"], e.deps);
   assert.equal(r2.code, 0, r2.err);
   assert.deepEqual(Object.keys(loadFidelity(e.out).models).sort(), ["fa/a1", "fa/a2", "fa/a3", "fa/auto", "pb/b1", "pb/b2", "pb/b3"], "covered over two runs");
-  assert.equal(probeCalls(e.f).length, 14, "no model was asked twice across the runs");
+  assert.equal(probeCalls(e.f).length, 21, "no model was asked twice across the runs");
 });
 
 test("L3 on a named FREE-tier model: --l3 yes --only; a size refusal at the 157 KB request writes lvr ppfn, class t, a payload cap and d3 b; L1 and L2 are not asked again", async () => {
@@ -362,7 +362,7 @@ test("an interrupted run keeps what finished: records written so far are saved a
   const r2 = await run(["--live"], e.deps);
   assert.equal(r2.code, 0);
   assert.equal(Object.keys(loadFidelity(e.out).models).length, 7);
-  assert.equal(probeCalls(e.f).length, 14, "3 models, then the 4 others: each exactly once");
+  assert.equal(probeCalls(e.f).length, 21, "3 models, then the 4 others: each exactly once");
 });
 
 test("runIncremental: the function a scheduler can call: the queue is the probe-ok models with no record, inside the per-provider cap", () => {
