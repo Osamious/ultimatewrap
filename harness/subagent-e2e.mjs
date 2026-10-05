@@ -38,7 +38,10 @@ import {
   hashExecutedFiles, descendantsLeafFirst, PROTECTED_ROOTS, REPO_ROOT, resolveCcrInstall, ccrInstallLines, approvalUsedFile, isUnder, realish,
 } from "./subagent-sandbox-spec.mjs";
 
-const { redactSecrets, redactDaemonLog } = createRequire(import.meta.url)("./trial31/redact31.cjs");   // read-only reuse of the 3.1.1 trial redactor
+const { redactSecrets: redactBase, redactDaemonLog } = createRequire(import.meta.url)("./trial31/redact31.cjs");   // read-only reuse of the 3.1.1 trial redactor
+/** Literal secrets this run knows (the sandbox profile key, found or generated): the shared redactor masks keys by context (x-api-key:, "key":), not a bare ccr-profile-... token in free text, so every one is also masked verbatim. Cleared at the start of each run. */
+const RUN_SECRETS = new Set();
+const redactSecrets = (t) => { let s = redactBase(t); for (const k of RUN_SECRETS) s = s.split(k).join("<redacted>"); return s; };
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ANCHOR = "uwstub/m-main";
@@ -144,17 +147,43 @@ export function buildRequest(shape, { key, model, session = "uws0-main", agentId
 /** sha256 of the JSON text of messages and of tools as a request carries them: the stub hashes the parsed body the same way, so equal hashes mean the upstream received the same bytes of those two fields. */
 export const bodyHashes = (body) => ({ messages: sha(JSON.stringify(body.messages ?? null)), tools: sha(JSON.stringify(body.tools ?? null)) });
 
-/** The enricher matches the request key to the enabled claude-code profile by id (V22). Field names only are reported on a miss, never values. */
+/**
+ * CCR 3.0.22 (dist/main/cli.js os()/mLe()): the id of a profile's API key entry is `profile:` + the profile's id (else name, else agent) trimmed, every run of characters outside
+ * [a-zA-Z0-9_.-] turned into one '-', leading and trailing '-' cut, CASE KEPT (an empty result is 'profile'). The gateway sets x-auth-api-key-id to the matched ENTRY id and the enricher
+ * (V6/Oy) accepts the request only when that id equals os(profile). Nothing else matches: no lower-casing, no match by name, no legacy single APIKEY.
+ */
+export const profileKeyId = (p) => `profile:${String(p.id || p.name || p.agent).trim().replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "profile"}`;
+const enabledClaudeProfile = (cfg) => (cfg?.profile?.profiles ?? []).find((x) => x && x.agent === "claude-code" && x.enabled);
+/** The enricher matches the request key to the enabled claude-code profile by the exact entry id profileKeyId(profile). Field names only are reported on a miss, never values; the wanted id is not a secret. */
 export function findProfileKey(cfg) {
-  const slug = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  const p = (cfg?.profile?.profiles ?? []).find((x) => x && x.agent === "claude-code" && x.enabled);
+  const p = enabledClaudeProfile(cfg);
   if (!p) return { error: "no enabled claude-code profile in the sandbox config" };
-  const want = slug(p.id || p.name || p.agent);
-  const keys = [...(Array.isArray(cfg.APIKEYS) ? cfg.APIKEYS : []), ...(cfg.APIKEY ? [{ id: "default", key: cfg.APIKEY }] : [])];
-  const hit = keys.find((k) => k && typeof k.key === "string" && k.key && slug(k.id || k.name) === want);
-  if (hit) return { key: hit.key, profileId: p.id };
+  const want = profileKeyId(p), keys = Array.isArray(cfg.APIKEYS) ? cfg.APIKEYS : [];
+  const hit = keys.find((k) => k && typeof k.key === "string" && k.key.trim() && k.id === want);
+  if (hit) return { key: hit.key, profileId: p.id, keyId: want };
   const fields = [...new Set(keys.flatMap((k) => (k && typeof k === "object" ? Object.keys(k) : [])))].sort().join(",");
-  return { error: `no API key whose id matches profile "${oneLine(p.id, 40)}" (${keys.length} key entries, fields: ${fields || "none"})` };
+  return { error: `no API key whose id is "${oneLine(want, 80)}" (the id CCR derives for profile "${oneLine(p.id, 40)}"; ${keys.length} key entries, fields: ${fields || "none"})` };
+}
+/**
+ * Adds, to the SANDBOX config object about to be saved (applyProfile stays false, the live files are never touched), the API key entry CCR would create for the enabled claude-code profile
+ * through its applyProfile path, which saveConfig(..., {applyProfile:false}) skips: {createdAt, id: profileKeyId, key: ccr-profile-<24 random url-safe characters>, name: "Profile: <name||id||agent>"}.
+ * The key is generated here at run time, never printed and never kept in the plan or the evidence (RUN_SECRETS masks it). Idempotent: an entry with that id and a non-blank key is left alone;
+ * one with a blank key gets a key (what CCR's O8 does). Returns {id, added} or null when there is no enabled claude-code profile.
+ */
+export function ensureProfileKey(cfg) {
+  const p = enabledClaudeProfile(cfg);
+  if (!p) return null;
+  const id = profileKeyId(p);
+  if (!Array.isArray(cfg.APIKEYS)) cfg.APIKEYS = [];
+  const fresh = () => `ccr-profile-${crypto.randomBytes(18).toString("base64url").slice(0, 24)}`;
+  const at = cfg.APIKEYS.findIndex((k) => k && k.id === id);
+  if (at >= 0) {
+    if (typeof cfg.APIKEYS[at].key === "string" && cfg.APIKEYS[at].key.trim()) return { id, added: false };
+    cfg.APIKEYS[at] = { ...cfg.APIKEYS[at], key: fresh() };
+    return { id, added: true };
+  }
+  cfg.APIKEYS.push({ createdAt: new Date().toISOString(), id, key: fresh(), name: `Profile: ${p.name?.trim() || p.id || p.agent}` });
+  return { id, added: true };
 }
 
 // ---------------------------------------------------------------- the evaluators: pure functions of evidence (unit-tested without a daemon)
@@ -415,7 +444,7 @@ export function evalX7(ev) {
   return L("PASS", "probe", "X7", `a request-scoped setTimeout(...).unref() fired ${Date.parse(t.t) - Date.parse(a.t)} ms after its request, AFTER the next request re-evaluated the module (m=${b.m}, n=${b.n}: the cache entry was deleted): the failure-path retry timer is viable`);
 }
 
-/** One X8 arm. arm: {probe, stubRec, sent: {messages, tools, blocks, ccIdx}} (sent = the sha256 of the messages and tools and the system blocks the harness sent). Returns the problems, or null when the arm is unmeasured. */
+/** One X8 arm. arm: {probe, stubRec, sent: {messages, tools, blocks, ccIdx, stripped}} (sent = the sha256 of the messages and tools and the system blocks the harness sent). Returns the problems, or null when the arm is unmeasured. */
 function x8Arm(shape, arm) {
   const { probe, stubRec: r, sent } = arm ?? {};
   if (!probe || !r || !sent) return null;
@@ -426,8 +455,11 @@ function x8Arm(shape, arm) {
   if (r.messagesSha256 !== sent.messages) bad.push(`messages differ at the upstream (${shape})`);
   if (r.toolsSha256 !== sent.tools) bad.push(`tools differ at the upstream (${shape})`);
   if (shape === "array") {
-    if (r.sysBlocks !== sent.blocks + 1) bad.push(`the upstream holds ${r.sysBlocks} system blocks, ${sent.blocks + 1} expected (the original blocks plus the marker block)`);
-    if (!(r.sysCc ?? []).includes(sent.ccIdx)) bad.push(`cache_control on system block ${sent.ccIdx} is GONE at the upstream (blocks with it: ${(r.sysCc ?? []).join(",") || "none"})`);
+    // CCR 3.0.22 (VUe) REMOVES the leading x-anthropic-billing-header block of a subagent-flagged array system before the custom router runs: the harness reports how many it sent (`stripped`), so the
+    // expected count is the original blocks minus those plus the marker block, and cache_control moves up by the same number
+    const strip = sent.stripped ?? 0, ccWant = sent.ccIdx - strip;
+    if (r.sysBlocks !== sent.blocks - strip + 1) bad.push(`the upstream holds ${r.sysBlocks} system blocks, ${sent.blocks - strip + 1} expected (the ${sent.blocks} sent, minus ${strip} billing block${strip === 1 ? "" : "s"} CCR strips, plus the marker block)`);
+    if (!(r.sysCc ?? []).includes(ccWant)) bad.push(`cache_control on system block ${ccWant} (${sent.ccIdx} as sent) is GONE at the upstream (blocks with it: ${(r.sysCc ?? []).join(",") || "none"})`);
   }
   return bad;
 }
@@ -437,7 +469,7 @@ export function evalX8(ev) {
   if (s === null || a === null) return UNM("X8", `the ${s === null ? "string" : "array"} arm has no probe line or no upstream request`);
   const bad = [...s, ...a];
   if (bad.length) return L("FINDING", "probe", "X8", `${bad.join("; ")}: the handoff notice is BEST EFFORT and the runbook says so (the handoff still shows in last, the status headline and show)`);
-  return L("PASS", "probe", "X8", `a router edit of the system prompt reaches the upstream in both shapes on the plain /v1/messages path (string: marker appended; array: marker block appended, cache_control kept on block ${ev.array.sent.ccIdx}); messages and tools byte-identical by sha256; the OpenAI-converted path is NOT-RUN`);
+  return L("PASS", "probe", "X8", `a router edit of the system prompt reaches the upstream in both shapes on the plain /v1/messages path (string: marker appended; array: marker block appended, cache_control kept on block ${ev.array.sent.ccIdx - (ev.array.sent.stripped ?? 0)}${ev.array.sent.stripped ? ` after CCR stripped the ${ev.array.sent.stripped} billing block` : ""}); messages and tools byte-identical by sha256; the OpenAI-converted path is NOT-RUN`);
 }
 
 const x9case = (ev, mode, id) => (ev?.cases ?? []).find((c) => c.mode === mode && c.id === id);
@@ -675,7 +707,7 @@ export const EXPERIMENTS = [
   { id: "X4", router: "probe", what: "do team agent ids (`name@session`), the parent agent id and the session id reach the router, and in which shape?", evidence: "one request with agent id ccr-logs@session-f49cde2f, parent team-lead@session-f49cde2f and a session id: presence, length, form and charset (^[A-Za-z0-9_@.:-]{1,128}$) at the router, forwarded upstream or not", fail: "FINDING (informational: a rejected shape means widening the charset BEFORE G2)" },
   { id: "X5", router: "probe", what: "messages.length per turn of an agent, on a retry and across a compaction", evidence: "one agent sends 1, 3, 5, the same body again (the retry), then 3 (a compaction): the router's records of messages.length and of the last message's hash; the len rule must fire on the retry only", fail: "FINDING (informational: decides whether len can false-positive)" },
   { id: "X7", router: "probe", what: "REQUIRED: does a request-scoped setTimeout(...).unref() still fire after CCR deletes the module's cache entry on the next request?", evidence: "call A in probe mode timer (a 300 ms timer), call B at once (mode observe, re-evaluates the module, m=1), a wait of up to 2.5 s for the timer's line, which must come AFTER B's line", fail: "FAIL when it never fires (the failure-path retry timer must be removed), which fails the run; FINDING when unmeasured or undecidable (the module was not re-evaluated)" },
-  { id: "X8", router: "probe", what: "does a router edit of a SUBAGENT request's system (string and array shape) reach the upstream byte for byte, messages and tools untouched, cache_control kept?", evidence: `the probe appends ${X8_MARK} to a string system and pushes a marker block onto an array system whose last block carries cache_control; the stub records the shape, the marker, the cache_control indexes and the sha256 of messages and tools, compared with the hashes sent. The OpenAI-converted path is NOT-RUN (no second stub provider)`, fail: "FINDING (informational: the handoff notice is best effort)" },
+  { id: "X8", router: "probe", what: "does a router edit of a SUBAGENT request's system (string and array shape) reach the upstream byte for byte, messages and tools untouched, cache_control kept?", evidence: `the probe appends ${X8_MARK} to a string system and pushes a marker block onto an array system whose last block carries cache_control (CCR 3.0.22 strips the leading x-anthropic-billing-header block of a subagent request BEFORE the router runs, so the expected block count and the cache_control index are adjusted by that one block); the stub records the shape, the marker, the cache_control indexes and the sha256 of messages and tools, compared with the hashes sent. The OpenAI-converted path is NOT-RUN (no second stub provider)`, fail: "FINDING (informational: the handoff notice is best effort)" },
   { id: "X9a", router: "probe", what: "does hot-swapping Router.fallback (model-chain with one stub model, retry) take effect with the sandbox gateway pid unchanged?", evidence: "the sandbox web RPC saveConfig (never the live config) with a local check per swap; attempts for a 429 without Retry-After under off, model-chain, retry; listener pid of the sandbox gateway before and after. Router.fallback is restored to its original value (off) at the end and read back through assertRouterClean on a FRESH getConfig (the echo of saveConfig is checked too, but it is not a read of what the daemon persisted)", fail: "FINDING (informational; the fallback chain stays OFF whatever it shows, 6.1c)" },
   { id: "X9b", router: "probe", what: "status, delay, attempts and x-ccr-fallback-* headers for a 429 with Retry-After 3, 3600 and none, a 400, a 413 and a 502, under off, model-chain and retry", evidence: "18 cases, each one inbound request with stub steps [failure, 200]; the table is printed; the CCR waits are real (Retry-After clamped to 60 s, so the 3600 cases under model-chain and retry take about a minute each); request_logs fields are NOT recorded (no harness seam reads the sandbox database)", fail: "FINDING (informational)" },
   { id: "X9c", router: "probe", what: "the probe router sees exactly ONE call per inbound request, also when CCR makes more than one upstream attempt", evidence: "router calls per inbound request over all 19 requests; at least one case must have more than one upstream attempt or the claim is untested", fail: "FINDING (informational)" },
@@ -699,7 +731,7 @@ export const OPERATING_NOTES = [
   "`--teardown` is IRREVERSIBLE: it deletes the September scratch leftovers (appdata incl. config.sqlite and its WAL, localappdata, claude-config, daemon-env.json, claude-settings.json) and every other SANDBOX_OWNED name listed above. start.ps1 says that config.sqlite may hold a REAL provider key: back up anything you want to keep BEFORE it. A run refuses while those leftovers exist, so G1 needs this deletion first.",
   "the approval is ONE-USE: a run consumes harness/g1-approval.json at start (an atomic rename to harness/g1-approval.used-<pid>-<ts>, then removed; before the preflight), so a second run, or a rerun after any refusal, needs a fresh `--approve-plan`. That includes the first-run outcomes below. The approval proves that the plan text and the executed files are unchanged since the hash was typed and it blocks an accidental run; it does NOT prove a human acted.",
   "a CLOSED terminal usually leaves time to stop the daemon but this is NOT guaranteed: the daemon tree is stopped FIRST by the teardown, after its identity checks (about 6 PowerShell calls at 1.5-2.3 s each) and before the slower probes, but Windows ends a console process some seconds after its window closes and the handler runs only if the console delivers SIGHUP/SIGBREAK. If in doubt run `node harness/subagent-e2e.mjs --teardown` before anything else, and always after a killed terminal.",
-  "the run uses the ENABLED claude-code profile that bootstrap-live-safe.mjs leaves and the API key whose id matches it (findProfileKey); it does not create either. A missing profile or key is FAIL A0 (the first-run outcome to expect if the sandbox config has no APIKEYS entry for the profile), the run is torn down, and the approval is already consumed: a new attempt needs a fresh `--approve-plan`.",
+  "the run uses the ENABLED claude-code profile that bootstrap-live-safe.mjs leaves and the API key entry whose id is exactly profile:<profile id with every run outside [a-zA-Z0-9_.-] turned into '-', case kept> (CCR's own id for it; findProfileKey). It does not create the profile. It ADDS that key entry to the SANDBOX config when it is missing (ensureProfileKey: CCR creates it only in its applyProfile path, which these saves skip), in the payload of the sandbox-only saveConfig with applyProfile:false; the key is generated at run time, never printed and never written to the plan or the evidence, and no live file, vault or credential is touched. A missing profile, or a key that does not read back with that id, is FAIL A0 before any request (the run is torn down, and the approval is already consumed: a new attempt needs a fresh `--approve-plan`).",
   "LEGITIMATE live activity that turns the proof or the tripwire RED (a false RED: the run is refused or fails and must be repeated; quiesce these first): writes to ~/.claude/settings.json or settings.local.json (any /config, /model, /theme, a plugin change, an 'always allow' answered in a session whose cwd is the home folder); a new, renamed or deleted file anywhere under ~/Downloads; a change of the user PATH by an installer; a bench, refresh, keysync or uwpick run that changes the names or sizes in catalog/, in ~/.llmkeys or in state/subagent; another application adding or removing a Windows credential whose target contains LLMKEY: (other applications' credentials are not hashed); a change inside the real Claude-3p configLibrary folder; any other process whose command line contains `claude-code-router`. NOT a false RED any more: a Claude desktop restart, window move, resize or update (config.json, claude_desktop_config.json and top-level names are no longer watched).",
   "anything else whose command line contains `claude-code-router` while the run is going (another ccr process, other agents' sessions) turns the process-table check RED and refuses the run: quiesce other sessions first.",
   "uwpick, keysync and ccr commands must NOT run during G1: they talk to or restart the live gateway, and a ccr command line contains `claude-code-router`, which turns the process-table check RED.",
@@ -723,9 +755,9 @@ export function renderPlan(spec, opts = {}) {
   p("  commands, in order:");
   for (const c of spec.commands) p(`    ${c.id}: ${path.basename(c.cmd)} ${c.args.map((a) => (path.isAbsolute(a) ? path.relative(path.dirname(HERE), a) : a)).join(" ")}   (${c.note})`);
   p("    the start step runs under the forced sandbox environment below; the bootstrap step runs under the REAL home (so its tripwire watches the real settings file) with a MINIMAL environment: " + MINIMAL_ENV_KEYS.join(", ") + " only");
-  p(`    then in-process: rpc getConfig/saveConfig against the SANDBOX web port only (the rpc refuses any port but ${SANDBOX_PORTS.web}; provider uwstub -> stub, CUSTOM_ROUTER_PATH -> scratch copy: set through the web RPC port ${SANDBOX_PORTS.web} (not the core port ${SANDBOX_PORTS.core}) and asserted after the save; the ENABLED claude-code profile that bootstrap-live-safe.mjs leaves gets model uwstub/m-main: the script does NOT create a profile or a key, it finds them (findProfileKey); a missing profile or key is FAIL A0 and a teardown, and the approval is already consumed, so a new attempt needs a fresh --approve-plan; a first run can legitimately end that way if the sandbox config has no APIKEYS entry), applyProfile:false; every sandbox fetch uses redirect:error`);
+  p(`    then in-process: rpc getConfig/saveConfig against the SANDBOX web port only (the rpc refuses any port but ${SANDBOX_PORTS.web}; provider uwstub -> stub, CUSTOM_ROUTER_PATH -> scratch copy: set through the web RPC port ${SANDBOX_PORTS.web} (not the core port ${SANDBOX_PORTS.core}) and asserted after the save; the ENABLED claude-code profile that bootstrap-live-safe.mjs leaves gets model uwstub/m-main: the script does NOT create a profile; it ADDS ONLY a sandbox-config API key entry for it when missing (ensureProfileKey, id profile:<mLe of the profile id>, key generated at run time and never printed) through this same sandbox-only save, never touching live files, and finds it again on the persisted config (findProfileKey, exact id); a missing profile, or a key that does not read back, is FAIL A0 before any request and a teardown, and the approval is already consumed, so a new attempt needs a fresh --approve-plan), applyProfile:false; every sandbox fetch uses redirect:error`);
   p("  HOT EDITS of the SANDBOX config, through the same web RPC and never the live config: X1 adds and removes the stub model m-x1 on provider uwstub; X9 swaps Router.fallback (off, then model-chain with the ONE model uwstub/m-free, then retry with retryCount 1, restored to its original value at the end and read back through assertRouterClean on a FRESH getConfig: saveConfig's return value is the daemon's normalised echo, not a read of what it persisted, so it is checked too but is not the proof; every later isolation proof reads Router.fallback fresh again and runs assertRouterClean on it, which refuses a leftover model-chain or retry, a stray rule and a missing fallback object once the swap step has started; before it an absent fallback is only reported, because assertRouterClean already refused it at the configure step). Each payload passes assertPayloadIsolated and a local check (mode off|retry|model-chain, chain models only uwstub/*, no enabled Router.rules) BEFORE it is sent, each result assertIsolatedConfig, and the tripwire runs after each edit; the teardown scrubs Router.fallback again when the daemon was not stopped");
-  p("  DURATION: expected about 8-15 minutes, ESTIMATED from CCR's 60 s Retry-After clamp (the two 3600 cases under model-chain and retry take about a minute each) plus A8's 5.5 s pause and the per-request waits; NOT MEASURED, this run has never been done. WORST CASE: the 18 X9 cases at the 150 s request ceiling are 45 minutes, plus the rest of the run. Every request has that 150 s ceiling and every sandbox web RPC call a 120 s timeout (harness/config.mjs): a call that gets no answer fails the run CLOSED (teardown, evidence), it is never skipped as 'unmeasured', so a hung saveConfig no longer waits for Ctrl+C. Each hot edit round-trips the WHOLE sandbox config through saveConfig and may restart the sandbox gateway (X9a records whether the pid changed) or trigger the desktop sync into the scratch Claude-3p");
+  p("  DURATION: expected about 8-15 minutes, ESTIMATED from CCR's 60 s Retry-After clamp (the two 3600 cases under model-chain and retry take about a minute each) plus A8's 5.5 s pause and the per-request waits; NOT MEASURED, this run has never been done. WORST CASE: the 18 X9 cases at the 150 s request ceiling are 45 minutes, plus the rest of the run. Every request has that 150 s ceiling and every sandbox web RPC call a 120 s timeout (harness/config.mjs): a call that gets no answer fails the run CLOSED (teardown, evidence), it is never skipped as 'unmeasured', so a hung saveConfig no longer waits for Ctrl+C. CCR may respawn its core worker (the daemon's child holding the core port) during the Router.fallback swaps, and the web RPC can fail for a moment meanwhile (G1 attempt 3): the web-RPC calls INSIDE the isolation proof are retried for a transient network error only (fetch failed, ECONNRESET, ECONNREFUSED, a timeout), at most 5 attempts 1.5 s apart and 10 s in all, each re-reading service.json and re-checking port and pid; a mismatch (wrong port or pid, a config that is not isolated) is NEVER retried and is RED at once, and a failure that persists after the retries is RED with its cause. A changed core worker pid is printed as a RECORD line, not a failure Each hot edit round-trips the WHOLE sandbox config through saveConfig and may restart the sandbox gateway (X9a records whether the pid changed) or trigger the desktop sync into the scratch Claude-3p");
   p();
   p("-- PREFLIGHT (refuses before anything starts) --");
   p("  this shell's own NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY or ALL_PROXY (any letter case, non-empty) REFUSES the run (exit 1, the names only are printed, BEFORE the approval is consumed): the orchestrator's own fetch and web RPC must not be able to leave through a proxy (NO_PROXY alone is fine; the daemon environment already drops them all)");
@@ -772,7 +804,8 @@ export function renderPlan(spec, opts = {}) {
   p("-- THE ISOLATION PROOF (every check below must be GREEN) --");
   p("  live listeners 3456/3457/3458/4517 owned by the same pids; live settings/service.json/credentials/proxy/PATH/vault/state/catalog/Downloads/Claude-3p unchanged; process table: the live CCR set unchanged and every new CCR process descends from the sandbox daemon;");
   p("  tripwire; sandbox ports held by the daemon's process TREE (stub by this orchestrator) with EVERY listener of EVERY tree process loopback, inside the range and not live; daemon web port and token; persisted config; takeover file;");
-  p("  the preload guard loaded in the daemon pid and every node process of its tree, and violations.log empty");
+  p("  the preload guard loaded in the daemon pid and every node process of its tree, and violations.log empty;");
+  p("  the proof's calls to the sandbox web RPC (daemon identity, persisted config, Router.fallback read) retry a transient network error only (5 attempts, 1.5 s apart, 10 s in all, service.json re-read and port and pid re-verified at each attempt; the attempt count and the cause are in the line) and never an isolation mismatch; a core worker pid that changed since the previous proof is a RECORD line");
   p();
   p("-- SIDE EFFECTS CHECKED (mode: prevent = stopped, detect = compared before/after, record = measured) --");
   for (const s of SIDE_EFFECTS) p(`  [${s.mode}] ${s.id}: ${s.what}\n      how: ${s.how}`);
@@ -858,13 +891,15 @@ async function configureSandbox(d, spec) {
   const g = d.guard;
   const cfg = structuredClone(await d.rpc("getConfig"));
   if (!cfg.profile || !Array.isArray(cfg.profile.profiles)) refuse("the sandbox config has no profile.profiles array: the enabled claude-code profile (and its key) cannot be found");
-  if (cfg.routing?.enhancedRoute === false) refuse("routing.enhancedRoute is false in the sandbox config: CCR's enricher does not run, so builtInClaudeCodeSubagent can never be true and A0 cannot pass (V22)");
+  const prof = cfg.profile.profiles.find((x) => x.agent === "claude-code" && x.enabled);
+  if (cfg.routing?.enhancedRoute === false || prof?.routing?.enhancedRoute === false) refuse("enhancedRoute is false in the sandbox config (" + (prof?.routing?.enhancedRoute === false ? "profile.routing of the enabled claude-code profile, the field CCR's enricher reads" : "routing") + "): CCR's enricher does not run, so builtInClaudeCodeSubagent can never be true and A0 cannot pass (V22)");
   g.assertRouterClean(cfg);
   cfg.Providers = [{ name: "uwstub", provider: "uwstub", type: "anthropic_messages", api_base_url: `http://127.0.0.1:${SANDBOX_PORTS.stub}`, api_key: "stub", models: [...STUB_MODELS], autoFetchModels: false, enabled: true }];
   cfg.CUSTOM_ROUTER_PATH = SCRATCH_ROUTER;
   cfg.observability = { ...cfg.observability, requestLogs: true };
-  const prof = cfg.profile.profiles.find((x) => x.agent === "claude-code" && x.enabled);
   if (prof) prof.model = ANCHOR;
+  const ensured = ensureProfileKey(cfg);                         // the key CCR creates only in its applyProfile path, which this save skips; sandbox config only
+  for (const k of cfg.APIKEYS ?? []) if (k && typeof k.key === "string" && k.key.length >= 8) RUN_SECRETS.add(k.key);
   cfg.profile.claudeCode = { ...cfg.profile.claudeCode, model: ANCHOR, smallFastModel: ANCHOR };
   g.assertPayloadIsolated(cfg, { allowProviders: true });         // validate what is about to be SENT, not just the echo
   const saved = await d.rpc("saveConfig", [cfg, { applyProfile: false }]);
@@ -873,8 +908,9 @@ async function configureSandbox(d, spec) {
   if (saved.CUSTOM_ROUTER_PATH !== SCRATCH_ROUTER || /[\\/]\.uw[\\/]spike[\\/]/i.test(String(saved.CUSTOM_ROUTER_PATH))) refuse("the persisted CUSTOM_ROUTER_PATH is not the scratch copy");
   g.assertDesktopSyncLandedInScratch();
   g.assertGatewayBound();
-  const k = findProfileKey(saved);
-  return { ...k, fallback: structuredClone(saved.Router?.fallback ?? { mode: "off", models: [] }) };   // the original Router.fallback (off, asserted above): X9 restores exactly this
+  const k = findProfileKey(saved);                                 // exact id match on the PERSISTED config: a key CCR normalised away is an error here, before any request
+  if (k.key) RUN_SECRETS.add(k.key);
+  return { ...k, keyAdded: ensured?.added === true, fallback: structuredClone(saved.Router?.fallback ?? { mode: "off", models: [] }) };   // the original Router.fallback (off, asserted above): X9 restores exactly this
 }
 
 const PROBE_LOG = path.join(SCRATCH_STATE_DIR, "probe.jsonl");
@@ -1000,7 +1036,8 @@ async function runX8Arm(c, shape) {
   const before = callsOf(probeAll(d)).length;
   const r = await send(d, key, "sub", { model: ASKED_MODEL, agentId: `uws0-x8-${shape}`, session: "uws0-x8", systemShape: shape, systemCache: shape === "array", agentTool: false });
   const sys = r.req?.body?.system;
-  return { probe: await nextCall(d, before), stubRec: stub.records[0], sent: { ...(r.hashes ?? {}), blocks: Array.isArray(sys) ? sys.length : null, ccIdx: Array.isArray(sys) ? sys.length - 1 : null } };
+  return { probe: await nextCall(d, before), stubRec: stub.records[0], sent: { ...(r.hashes ?? {}), blocks: Array.isArray(sys) ? sys.length : null, ccIdx: Array.isArray(sys) ? sys.length - 1 : null,
+    stripped: Array.isArray(sys) && sys.length && String(sys[0]?.text ?? "").startsWith("x-anthropic-billing-header:") ? 1 : 0 } };
 }
 async function runX7(c) {
   const { d, key, stub } = c;
@@ -1351,13 +1388,14 @@ export async function runE2e(argv, io = {}) {
   d.out(`approval consumed (plan sha256 ${plan.sha}); executed files:`);
   for (const f of fileHashes) d.out(`  ${f.file}  raw ${f.raw}  lf ${f.lf}`);
   const routers = opts.router === "both" ? ["probe", "next"] : [opts.router];
+  RUN_SECRETS.clear();
   const lines = [], shared = {};                                    // lines: every result line, in the order emitted (the verdict reads all of them); shared: what the phases hand to each other and to the proof (x8Reached, swapStarted)
   let failure, baseline, stub, daemonPid, started = false, evidence, td, unhook = () => {};
   const say = (s) => d.out(s);
   const emit = (l) => { lines.push(l); say(l); };
-  const deps = (tripwire) => ({ sys: d.sys, tripwire, assertIsolatedInstance: d.guard.assertIsolatedInstance, assertIsolatedConfig: d.guard.assertIsolatedConfig, resolveWebPort: d.resolveWebPort, getConfig: () => d.rpc("getConfig"), assertRouterClean: d.guard.assertRouterClean });
+  const deps = (tripwire) => ({ sys: d.sys, tripwire, assertIsolatedInstance: d.guard.assertIsolatedInstance, assertIsolatedConfig: d.guard.assertIsolatedConfig, resolveWebPort: d.resolveWebPort, getConfig: () => d.rpc("getConfig"), assertRouterClean: d.guard.assertRouterClean, sleep: d.sleep, now: d.now, redact: (t) => redactSecrets(t) });
   const prove = async (tripwire, phase, stage) => {
-    const r = await proveIsolation({ spec, baseline, phase, daemonPid, selfPid: d.sys.selfPid, stage, swapRan: shared.swapStarted === true }, deps(tripwire));
+    const r = await proveIsolation({ spec, baseline, phase, daemonPid, selfPid: d.sys.selfPid, stage, swapRan: shared.swapStarted === true, track: (shared.proofTrack ??= {}) }, deps(tripwire));
     for (const ch of r.checks) say(`${ch.recorder ? "RECORD" : ch.ok ? "GREEN " : "RED   "} ${ch.n} ${ch.name} :: ${ch.detail}`);
     return assertIsolationProven(r);
   };

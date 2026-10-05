@@ -19,12 +19,12 @@ import {
   NEXT_ROUTER_SRC, SCRATCH_ROUTER, SCRATCH_STATE_DIR, LIVE_SETTINGS, LIVE_SERVICE_JSON, GUARD_LOADED_LOG, VIOLATIONS_LOG, TAKEOVER_FILE,
   PRELOAD_ARG, RefusalError, formatLine, parseLine, evaluateRun, REQUIRED, fingerprintLive, diffFingerprint, describeFingerprint, baselineOf, proveIsolation,
   assertIsolationProven, parseListenPorts, PROTECTED_ROOTS, SANDBOX_PORTS, REAL_PORTS, SCRATCH_SETTINGS, EVIDENCE_ROOT, APPROVAL_FILE, PRECREATE_DIRS, START_CREATES, MUST_BE_ABSENT, ENV_DIR_VARS,
-  treeOf, liveServicePid, realish, CCR_CONFIG_DIR, hashExecutedFiles, EXECUTED_FILES, descendantsLeafFirst, BOOTSTRAP_LIVE_SAFE, resolveCcrInstall, ccrInstallLines, approvalUsedFile, isApprovalUsedFile, distOf, isUnder,
+  treeOf, liveServicePid, realish, CCR_CONFIG_DIR, hashExecutedFiles, EXECUTED_FILES, descendantsLeafFirst, BOOTSTRAP_LIVE_SAFE, resolveCcrInstall, ccrInstallLines, approvalUsedFile, isApprovalUsedFile, distOf, isUnder, PROOF_RETRY, isTransientNetError,
 } from "../harness/subagent-sandbox-spec.mjs";
 import {
   parseArgs, runE2e, renderPlan, planOf, buildRequest, findProfileKey, buildShadowPolicy, realSys, evalA0Probe, evalE4, evalE5, evalE12, evalE7, evalE13, evalA1,
   evalA0Next, evalA2, evalA8, evalA11, ANCHOR, TAG_MODEL, ASKED_MODEL, E4_MARK, EXPERIMENTS, bareOf, modelIs, minimalEnv, MINIMAL_ENV_KEYS, assertGatewayUrl, USAGE,
-  realOnSignal, HANDLED_SIGNALS, OPERATING_NOTES, llmkeyTargetLines,
+  realOnSignal, HANDLED_SIGNALS, OPERATING_NOTES, llmkeyTargetLines, ensureProfileKey, profileKeyId,
   buildEnforcePolicy, X8_MARK, NOTICE_MARK, X9_MODES, X9_CASES, fallbackFor, evalX1, evalX2, evalX3, evalX4, evalX5, evalX7, evalX8, evalX9a, evalX9b, evalX9c, evalX9d, evalX9e, x9Table, evalH1,
   hostCheckX6, X6_DEFAULTS, bodyHashes, X5_LENGTHS, NOT_RUN, policyContentHash, proxyVarsSet,
 } from "../harness/subagent-e2e.mjs";
@@ -517,12 +517,51 @@ test("requests: the four shapes carry exactly the signals the router classes on;
   assert.equal(bg.headers["x-claude-code-agent-id"], undefined); assert.equal(bg.body.tools, undefined);
   for (const r of [main, sub, aux, bg]) { assert.match(r.headers["user-agent"], /claude/i); assert.equal(r.headers["x-api-key"], key); }
   assert.throws(() => buildRequest("nope", { key }));
-  const cfg = { profile: { profiles: [{ id: "default-claude-code", agent: "claude-code", enabled: true }] }, APIKEYS: [{ id: "other", key: fake("a") }, { id: "Default Claude Code", key }] };
-  assert.equal(findProfileKey(cfg).key, key);
+  const cfg = { profile: { profiles: [{ id: "default-claude-code", agent: "claude-code", enabled: true }] }, APIKEYS: [{ id: "default", key: fake("a") }, { id: "profile:default-claude-code", key, name: "Profile: Default Claude Code" }] };
+  assert.equal(findProfileKey(cfg).key, key); assert.equal(findProfileKey(cfg).keyId, "profile:default-claude-code");
   const miss = findProfileKey({ ...cfg, APIKEYS: [{ id: "other", key: fake("b"), secretField: 1 }] });
-  assert.match(miss.error, /no API key whose id matches profile "default-claude-code" \(1 key entries, fields: id,key,secretField\)/);
+  assert.match(miss.error, /no API key whose id is "profile:default-claude-code" \(the id CCR derives for profile "default-claude-code"; 1 key entries, fields: id,key,secretField\)/);
   assert.ok(!miss.error.includes("test-"), "no key value in the message");
   assert.match(findProfileKey({ profile: { profiles: [] } }).error, /no enabled claude-code profile/);
+});
+
+test("profile key (CCR 3.0.22 os()/mLe()): the entry id is exactly profile:<id with runs outside [a-zA-Z0-9_.-] as '-', ends trimmed, case kept>; every other spelling MUST miss, the legacy single APIKEY does not count", () => {
+  const key = fake("k");
+  const withId = (id) => ({ profile: { profiles: [{ id: "default-claude-code", agent: "claude-code", enabled: true }] }, APIKEYS: [{ id, key }] });
+  for (const wrong of ["profile-default-claude-code", "default-claude-code", "Default Claude Code", "Profile:default-claude-code", "PROFILE:default-claude-code", "profile:Default-Claude-Code", "default"]) {
+    const r = findProfileKey(withId(wrong));
+    assert.ok(r.error && !r.key, `"${wrong}" must not match`);
+  }
+  assert.equal(findProfileKey(withId("profile:default-claude-code")).key, key);
+  assert.ok(findProfileKey({ ...withId("x"), APIKEY: key }).error, "the legacy single APIKEY is not a profile key");
+  assert.ok(findProfileKey({ ...withId("profile:default-claude-code"), APIKEYS: [{ id: "profile:default-claude-code", key: "  " }] }).error, "a blank key does not count");
+  const idOf = (p) => findProfileKey({ profile: { profiles: [{ agent: "claude-code", enabled: true, ...p }] }, APIKEYS: [] }).error.match(/id is "([^"]*)"/)[1];
+  assert.equal(idOf({ id: "My Profile.1" }), "profile:My-Profile.1");
+  assert.equal(idOf({ id: "", name: "X Y" }), "profile:X-Y");
+  assert.equal(idOf({ id: "  --a  b__c!!  " }), "profile:a-b__c");
+  assert.equal(idOf({ id: "", name: "" }), "profile:claude-code", "agent is the last fallback");
+  assert.equal(idOf({ id: "!!!", name: "" }), "profile:profile", "an id with no usable character becomes 'profile'");
+  assert.equal(profileKeyId({ id: "My Profile.1" }), "profile:My-Profile.1");
+});
+
+test("ensureProfileKey: adds ONE entry {createdAt, id, key, name} for the enabled claude-code profile when missing, with a runtime-generated key; idempotent; a blank key is filled; nothing without such a profile; never touches other entries", () => {
+  const mkCfg = (apikeys) => ({ profile: { profiles: [{ id: "My Profile.1", agent: "claude-code", enabled: true }, { id: "other", agent: "claude-code", enabled: false }] }, APIKEYS: apikeys });
+  const c = mkCfg([{ id: "default", key: fake("d") }]);
+  const r = ensureProfileKey(c);
+  assert.deepEqual(r, { id: "profile:My-Profile.1", added: true });
+  assert.equal(c.APIKEYS.length, 2); assert.equal(c.APIKEYS[0].id, "default");
+  const e = c.APIKEYS[1];
+  assert.deepEqual(Object.keys(e).sort(), ["createdAt", "id", "key", "name"]);
+  assert.equal(e.id, "profile:My-Profile.1"); assert.equal(e.name, "Profile: My Profile.1"); assert.match(e.key, /^ccr-profile-[A-Za-z0-9_-]{24}$/); assert.ok(Number.isFinite(Date.parse(e.createdAt)));
+  const again = ensureProfileKey(c);
+  assert.deepEqual(again, { id: "profile:My-Profile.1", added: false }); assert.equal(c.APIKEYS.length, 2, "no duplicate on a second call"); assert.equal(c.APIKEYS[1].key, e.key, "the key is kept");
+  const k1 = mkCfg([]), k2 = mkCfg([]); ensureProfileKey(k1); ensureProfileKey(k2); assert.notEqual(k1.APIKEYS[0].key, k2.APIKEYS[0].key, "generated at run time, not a constant");
+  const blank = mkCfg([{ createdAt: "t", id: "profile:My-Profile.1", key: "", name: "Profile: x" }]);
+  assert.deepEqual(ensureProfileKey(blank), { id: "profile:My-Profile.1", added: true }); assert.equal(blank.APIKEYS.length, 1); assert.match(blank.APIKEYS[0].key, /^ccr-profile-/); assert.equal(blank.APIKEYS[0].name, "Profile: x");
+  const noKeys = { profile: { profiles: [{ id: "p", agent: "claude-code", enabled: true, name: "  Shown  " }] } };
+  assert.equal(ensureProfileKey(noKeys).added, true); assert.equal(noKeys.APIKEYS[0].name, "Profile: Shown", "the name is trimmed, as CCR's hLe does");
+  assert.equal(ensureProfileKey({ profile: { profiles: [{ id: "p", agent: "claude-code", enabled: false }] } }), null);
+  assert.equal(ensureProfileKey({}), null);
 });
 
 test("arguments: usage, value flag validation, unknown flags, the approval flags, mode exclusivity", () => {
@@ -578,7 +617,7 @@ function world(opt = {}) {
   const stubObj = { records: stubRecs, start: async () => { w.stubUp = true; return 39459; }, stop: async () => { w.stubUp = false; }, clear: () => { stubRecs.length = 0; },
     setScript: (sc) => { w.script = sc ?? {}; w.pending = (w.script.sequence ?? []).map((x) => (typeof x === "number" ? { status: x } : { status: 200, ...x })); }, pending: () => w.pending.length };
   w.script = {}; w.pending = [];
-  const cfg = { profile: { enabled: true, profiles: [{ id: "default-claude-code", agent: "claude-code", enabled: true }] }, APIKEYS: [{ id: "default-claude-code", key: fake("profilekey") }], Providers: [], ...(opt.startFallback ? { Router: { fallback: opt.startFallback } } : {}) };
+  const cfg = { profile: { enabled: true, profiles: [{ id: "default-claude-code", agent: "claude-code", enabled: true }] }, APIKEYS: opt.profileKey ? [{ createdAt: "2026-10-04T00:00:00.000Z", id: "profile:default-claude-code", key: opt.profileKey, name: "Profile: default-claude-code" }] : [], Providers: [], ...(opt.startFallback ? { Router: { fallback: opt.startFallback } } : {}) };
   const sandboxRows = () => (w.started ? [DAEMON_ROW, ...(w.childAlive ? [CHILD_ROW] : []), ...(opt.strayCcr ? [{ pid: 6000, ppid: 1, name: "node.exe", cmd: "node claude-code-router/cli.js" }] : [])] : []);
   const guardPids = () => (opt.noGuard ? [] : [5000, ...(opt.childNoGuard || !w.childAlive ? [] : [5001])]);
   const sys = {
@@ -663,7 +702,7 @@ function world(opt = {}) {
     },
     rpc: async (method, args) => {
       w.calls.rpc.push(method);
-      if (method === "getConfig") { const c = structuredClone(cfg); if (opt.noProfile) delete c.profile; if (opt.enhancedRouteFalse) c.routing = { enhancedRoute: false }; if (opt.rulesEnabled && w.gatewayUp) c.Router = { ...c.Router, rules: [{ id: "r1", enabled: true }] }; if (opt.editedRouterPath && w.gatewayUp) c.CUSTOM_ROUTER_PATH = opt.editedRouterPath; return c; }
+      if (method === "getConfig") { const c = structuredClone(cfg); if (opt.noProfile) delete c.profile; if (opt.enhancedRouteFalse) c.routing = { enhancedRoute: false }; if (opt.profileRouteFalse) c.profile.profiles[0].routing = { enhancedRoute: false }; if (opt.rulesEnabled && w.gatewayUp) c.Router = { ...c.Router, rules: [{ id: "r1", enabled: true }] }; if (opt.editedRouterPath && w.gatewayUp) c.CUSTOM_ROUTER_PATH = opt.editedRouterPath; return c; }
       if (method === "saveConfig") { (w.fbSeen ??= []).push(args[0].Router?.fallback?.mode ?? null); if (opt.rejectSwap && args[0].Router?.fallback?.mode === opt.rejectSwap) throw new Error("saveConfig failed: boom"); if (opt.rebindAfterEdit && args[0].Providers?.[0]?.models?.length === 4) w.down = opt.rebindAfterEdit; if (opt.failRestore && w.everSwapped && args[0].Router?.fallback?.mode === "off") throw new Error("saveConfig failed: boom"); Object.assign(cfg, structuredClone(args[0])); if (w.swapped) w.everSwapped = true; w.swapped = !!args[0].Router?.fallback?.mode && args[0].Router.fallback.mode !== "off"; if (args[0].Providers?.length) { w.gatewayUp = true; w.calls.providerSaves = (w.calls.providerSaves ?? 0) + 1; } const out = structuredClone(cfg); if (opt.restoreDoesNotPersist && w.everSwapped && args[0].Router?.fallback?.mode === "off") cfg.Router = { ...cfg.Router, fallback: { mode: "model-chain", models: ["uwstub/m-free"], retryCount: 1 } }; if (opt.routerPathRewrite) out.CUSTOM_ROUTER_PATH = opt.routerPathRewrite; return out; }
       throw new Error(`unexpected rpc ${method}`);
     },
@@ -674,8 +713,11 @@ function world(opt = {}) {
       if (w.down > 0) { w.down--; w.failedFetches = (w.failedFetches ?? 0) + 1; throw new TypeError("fetch failed"); }
       const body = JSON.parse(init.body), orig = JSON.parse(init.body), h = init.headers;
       const text = JSON.stringify(body.messages);
-      const tag = /<CCR-SUBAGENT-MODEL>([^<]+)</.exec(text)?.[1] ?? null;
-      const sub = h["x-claude-code-agent-id"] !== undefined && /cc_is_subagent=true/.test(JSON.stringify(body.system));
+      // CCR's enricher (V6/Oy) runs only when the key the request carries is the entry whose id is exactly profile:<mLe of the profile id> (G1 attempt 2 failed on this)
+      const keyOk = !!opt.skipKeyCheck || (cfg.APIKEYS ?? []).some((k) => k.id === "profile:default-claude-code" && typeof k.key === "string" && k.key !== "" && k.key === h["x-api-key"]);
+      const tag = keyOk ? /<CCR-SUBAGENT-MODEL>([^<]+)</.exec(text)?.[1] ?? null : null;
+      const sub = keyOk && h["x-claude-code-agent-id"] !== undefined && /cc_is_subagent=true/.test(JSON.stringify(body.system));
+      if (!opt.noBillingStrip && Array.isArray(body.system) && String(body.system[0]?.text ?? "").startsWith("x-anthropic-billing-header:")) { body.system.shift(); if (!body.system.length) delete body.system; }
       const desc0 = body.tools?.find((t) => t.name === "Agent")?.description ?? "";
       const isMain = h["x-claude-code-agent-id"] === undefined && !!body.tools?.some((t) => t.name === "Agent");
       const pid = opt.workers ? opt.workers[(w.callN = (w.callN ?? 0) + 1) % opt.workers.length] : 5000;
@@ -1052,7 +1094,8 @@ test("flow: each guard a run depends on refuses on its own: spec tamper, payload
     ["the desktop sync did not land in scratch", { desktopSyncMissing: true }, /desktop sync/, {}],
     ["the gateway is not bound", { gatewayNotBound: true }, /gateway not bound/, {}],
     ["the sandbox config has no profile object", { noProfile: true }, /no profile\.profiles array/, { noSave: true }],
-    ["routing.enhancedRoute is false", { enhancedRouteFalse: true }, /routing\.enhancedRoute is false/, { noSave: true }],
+    ["routing.enhancedRoute is false", { enhancedRouteFalse: true }, /enhancedRoute is false in the sandbox config \(routing\)/, { noSave: true }],
+    ["profile.routing.enhancedRoute is false (the field CCR's enricher reads)", { profileRouteFalse: true }, /enhancedRoute is false in the sandbox config \(profile\.routing of the enabled claude-code profile, the field CCR's enricher reads\)/, { noSave: true }],
   ];
   for (const [name, opt, re, ex] of cases) {
     const r = await run(GO, opt);
@@ -1187,7 +1230,7 @@ test("flow: a missing profile key aborts with FAIL A0 and field names only", asy
   d.rpc = async (m, a) => { const v = await orig(m, a); if (m === "saveConfig") v.APIKEYS = [{ id: "unrelated", key: fake("x") }]; return v; };
   seedApproval(w, GO);
   assert.equal(await runE2e(GO, d), 1);
-  assert.match(w.out.join("\n") + w.err.join("\n"), /no API key whose id matches profile "default-claude-code" \(1 key entries, fields: id,key\)/);
+  assert.match(w.out.join("\n") + w.err.join("\n"), /no API key whose id is "profile:default-claude-code" \(the id CCR derives for profile "default-claude-code"; 1 key entries, fields: id,key\)/);
   assert.equal(w.calls.fetch, 0);
 });
 
@@ -1292,10 +1335,10 @@ async function proveTree(over = {}) {
   const sys = fakeSys({ processes: () => [...rows, ...treeRows], listenerPid: (p) => holders[p], listenPortsOf: (pid) => listen[pid] ?? [],
     readText: (p) => (norm(p) === norm(GUARD_LOADED_LOG) ? guard.map((pid) => JSON.stringify({ pid })).join("\n") : norm(p) === norm(VIOLATIONS_LOG) ? over.violations ?? null : fakeSys().readText(p)) });
   const ctx = { spec: buildSpec({ PATH: "x" }), baseline, phase: over.phase ?? "post-provider", daemonPid: 5000, selfPid: 1, stage: "t" };
-  ctx.swapRan = over.swapRan;
-  const res = await proveIsolation(ctx, { sys, tripwire: { assert() {} }, assertIsolatedInstance: async () => {}, assertIsolatedConfig: async () => {}, resolveWebPort: () => ({ port: 39458, pid: 5000 }), getConfig: over.getConfig, assertRouterClean: realAssertRouterClean });
+  ctx.swapRan = over.swapRan; ctx.track = over.track;
+  const res = await proveIsolation(ctx, { sys, tripwire: { assert() {} }, assertIsolatedInstance: over.assertIsolatedInstance ?? (async () => {}), assertIsolatedConfig: over.assertIsolatedConfig ?? (async () => {}), resolveWebPort: over.resolveWebPort ?? (() => ({ port: 39458, pid: 5000 })), getConfig: over.getConfig, assertRouterClean: realAssertRouterClean, sleep: over.sleep, now: over.now, redact: over.redact });
   const by = (re) => res.checks.find((c) => re.test(c.name));
-  return { res, ports: by(/sandbox ports held/), guard: by(/guard loaded/), proc: by(/process table/), fallback: by(/persisted Router.fallback/) };
+  return { res, ports: by(/sandbox ports held/), guard: by(/guard loaded/), proc: by(/process table/), fallback: by(/persisted Router.fallback/), web: by(/daemon web port and token/), cfg: by(/persisted config isolated/), core: by(/core worker pid changed/) };
 }
 test("proof (sec#1 HIGH): the live-shaped tree (daemon: gateway+web, CHILD: core) is GREEN; a child on 0.0.0.0:8080, on a live port, outside the range, a grandchild, or a stranger on a sandbox port is RED", async () => {
   const g = await proveTree();
@@ -1852,8 +1895,9 @@ test("text (J1, J2, J5, J7, J11, J12): the plan, the operating notes and --help 
   has(help, /A11 \(live gateway untouched\) is evaluated after EACH router run, on both routers/);
   has(help, /129 SIGHUP, 130 SIGINT, 143 SIGTERM, 149 SIGBREAK/);
   has(plan, /set through the web RPC port 39458 \(not the core port 39457\) and asserted after the save/);
-  has(plan, /the script does NOT create a profile or a key, it finds them \(findProfileKey\).*FAIL A0 and a teardown.*approval is already consumed.*fresh --approve-plan/s);
-  has(plan, /a first run can legitimately end that way if the sandbox config has no APIKEYS entry/);
+  has(plan, /the script does NOT create a profile; it ADDS ONLY a sandbox-config API key entry for it when missing \(ensureProfileKey, id profile:<mLe of the profile id>, key generated at run time and never printed\) through this same sandbox-only save, never touching live files.*FAIL A0 before any request and a teardown.*approval is already consumed.*fresh --approve-plan/s);
+  has(plan, /\[record\] sandbox-profile-key: an API key entry for the enabled claude-code profile, ADDED to the SANDBOX config when missing/);
+  assert.ok(!/the script does NOT create a profile or a key/.test(plan), "the old claim is gone");
   has(plan, /it records per request the model, content-length, body byte length and sha256, the tool NAMES, the Agent tool description and the whitelisted headers \(anthropic-beta/);
   assert.ok(!/ONLY model/.test(plan + help));
   has(plan, /it reads only the files hashed under EXECUTED FILES and the installed CCR it prints there/);
@@ -1972,7 +2016,13 @@ test("evaluators (T4) X8: PASS when both shapes carry the marker with messages a
   assert.match(evalX8(good), /^PASS \[probe\] X8 a router edit of the system prompt reaches the upstream in both shapes on the plain \/v1\/messages path \(string: marker appended; array: marker block appended, cache_control kept on block 1\); messages and tools byte-identical by sha256; the OpenAI-converted path is NOT-RUN/);
   const f = (string, array) => evalX8({ string: string ?? good.string, array: array ?? good.array });
   assert.match(f(arm("string", {}, { markers: { [X8_MARK]: false } })), /^FINDING \[probe\] X8 the string marker did NOT reach the upstream.*BEST EFFORT/);
-  assert.match(f(null, arm("array", {}, { sysCc: [] })), /cache_control on system block 1 is GONE at the upstream/);
+  assert.match(f(null, arm("array", {}, { sysCc: [] })), /cache_control on system block 1 \(1 as sent\) is GONE at the upstream/);
+  // CCR 3.0.22 strips the leading billing block of a subagent request before the router: one block fewer and cache_control one index lower
+  const stripped = (o = {}, ro = {}) => arm("array", { stripped: 1, ...o }, { sysBlocks: 2, sysCc: [0], ...ro });
+  assert.match(f(null, stripped()), /^PASS \[probe\] X8 .*cache_control kept on block 0 after CCR stripped the 1 billing block/);
+  assert.match(f(null, stripped({}, { sysBlocks: 3 })), /the upstream holds 3 system blocks, 2 expected \(the 2 sent, minus 1 billing block CCR strips, plus the marker block\)/);
+  assert.match(f(null, stripped({}, { sysCc: [1] })), /cache_control on system block 0 \(1 as sent\) is GONE/);
+  assert.match(f(null, arm("array", {}, { sysBlocks: 3, sysCc: [1] })), /^PASS /, "the case it must not break: with nothing stripped the old expectation holds");
   assert.match(f(null, arm("array", {}, { sysBlocks: 2 })), /the upstream holds 2 system blocks, 3 expected/);
   assert.match(f(arm("string", {}, { messagesSha256: "x".repeat(64) })), /messages differ at the upstream \(string\)/);
   assert.match(f(null, arm("array", {}, { toolsSha256: "x".repeat(64) })), /tools differ at the upstream \(array\)/);
@@ -2063,7 +2113,8 @@ test("flow (T4, T6): a gateway that deviates turns the informational experiments
     [P, "X7", { timerEarly: true }, "FINDING", /the timer fired BEFORE the next call was recorded/],
     [P, "X7", { cacheNotDeleted: true }, "FINDING", /undecidable: the module was not re-evaluated/],
     [P, "X8", { x8Dropped: true }, "FINDING", /marker did NOT reach the upstream/],
-    [P, "X8", { ccDropped: true }, "FINDING", /cache_control on system block 1 is GONE/],
+    [P, "X8", { ccDropped: true }, "FINDING", /cache_control on system block 0 \(1 as sent\) is GONE/],
+    [P, "X8", { noBillingStrip: true }, "FINDING", /the upstream holds 3 system blocks, 2 expected \(the 2 sent, minus 1 billing block CCR strips, plus the marker block\)/],
     [P, "X8", { x8TouchMessages: true }, "FINDING", /messages differ at the upstream/],
     [P, "X9a", { noFallbackSwap: true }, "FINDING", /the swap was not observed to take effect/],
     [P, "X9a", { gatewayPidFlip: true }, "FINDING", /gateway pid changed or was not observed \(5000 -> 5001\)/],
@@ -2837,4 +2888,189 @@ test("F10: a run is REFUSED (exit 1, before the approval is consumed, names only
   const ok = await run(GO, {});
   assert.equal(ok.code, 0, "the case it must not break: a shell with NO_PROXY only (the default world) runs");
   assert.ok(renderPlan(buildSpec({ PATH: "x" }), { router: "both", ccr: CCR_FAKE }).join("\n").includes("this shell's own NODE_USE_ENV_PROXY, HTTP_PROXY, HTTPS_PROXY or ALL_PROXY"));
+});
+
+// ================================================================ fix round 2: CCR 3.0.22's profile key id (G1 attempt 2 failed at A0)
+const profileKeyEntries = (w) => (w.cfg.APIKEYS ?? []).filter((k) => k.id === "profile:default-claude-code");
+
+test("G1-2 root cause: a sandbox config WITHOUT the profile key gets exactly ONE sandbox-only entry {createdAt, id profile:default-claude-code, key ccr-profile-<24>, name} in the same save (applyProfile:false), A0 PASSes (the fake enricher accepts only that id), and the key is never printed", async () => {
+  const r = await run([...GO, "--router", "probe"], {});
+  assert.equal(r.code, 0, r.err + r.out.slice(-300)); assert.equal(kindOf(r.out, "A0"), "PASS");
+  const es = profileKeyEntries(r.w);
+  assert.equal(es.length, 1, "one entry, not two");
+  assert.deepEqual(Object.keys(es[0]).sort(), ["createdAt", "id", "key", "name"]); assert.match(es[0].key, /^ccr-profile-[A-Za-z0-9_-]{24}$/); assert.equal(es[0].name, "Profile: default-claude-code");
+  for (const where of [r.out, r.err, renderPlan(buildSpec({ PATH: "x" }), { router: "both", ccr: CCR_FAKE }).join("\n")]) assert.ok(!where.includes(es[0].key), "the generated key is never printed");
+  assert.ok(evidenceOf(r.w).length === 0 && ![...r.w.mem.files.values()].some((v) => String(v).includes(es[0].key)), "and never written to a file the harness makes");
+  // the case it must not break: a key CCR (or an earlier step) already created is KEPT, no second entry, the same key is used
+  const K = ["ccr-profile-", fake("seed").replace(/[^A-Za-z0-9]/g, "").slice(0, 24).padEnd(24, "x")].join("");
+  const have = await run([...GO, "--router", "probe"], { profileKey: K });
+  assert.equal(have.code, 0, have.err); assert.equal(kindOf(have.out, "A0"), "PASS");
+  assert.equal(profileKeyEntries(have.w).length, 1); assert.equal(profileKeyEntries(have.w)[0].key, K, "the existing key is not replaced");
+  assert.ok(!have.out.includes(K) && !have.err.includes(K));
+});
+
+test("G1-2: with the OLD wrong key id the enricher would not run: a fake gateway that accepts only the real id shows A0 FAIL when the persisted config lacks that entry, and nothing is sent (pre-flight, before A0's request)", async () => {
+  const { w, d } = world({});
+  wrapRpc(d, async (m, a, orig) => { const v = await orig(m, a); if (m === "saveConfig") v.APIKEYS = [{ id: "profile-default-claude-code", key: ["ccr-profile-", fake("old")].join("") }]; return v; });
+  const r = await go(w, d, [...GO, "--router", "probe"]);
+  assert.equal(r.code, 1); assert.equal(w.calls.fetch, 0, "no request was sent");
+  assert.match(r.err, /no API key whose id is "profile:default-claude-code" \(the id CCR derives for profile "default-claude-code"; 1 key entries, fields: id,key\)/);
+  assert.match(r.out, /FAIL \[probe\] A0 no API key whose id is "profile:default-claude-code"/);
+});
+
+test("G1-2: the profile key never leaks: a bare ccr-profile-... token in a CCR log line, the evidence, the output and the teardown notes are masked verbatim (the shared redactor only masks keys by context)", async () => {
+  const K = ["ccr-profile-", fake("leak").replace(/[^A-Za-z0-9]/g, "").padEnd(24, "q").slice(0, 24)].join("");
+  const r = await run([...GO, "--router", "probe"], { profileKey: K, ccrLog: `daemon booted, using key ${K} for the profile\nline 2`, tripwireAt: "e2e:after-x9-model-chain" });
+  assert.equal(r.code, 1);
+  const ev = evidenceOf(r.w);
+  assert.ok(ev.length > 0 && ev.some(([k]) => /daemon\.out\.log\.txt$/.test(k)), "the CCR log was retained");
+  for (const [k, v] of ev) assert.ok(!String(v).includes(K), `evidence ${path.basename(k)} leaks the key`);
+  assert.ok(!r.out.includes(K) && !r.err.includes(K));
+  assert.match(evText(r.w, "ccr-logs__daemon.out.log.txt"), /daemon booted, using key <redacted> for the profile/);
+  const plain = await run([...GO, "--router", "probe"], { ccrLog: `using key ${K}`, tripwireAt: "e2e:after-x9-model-chain" });
+  assert.ok(evText(plain.w, "ccr-logs__daemon.out.log.txt").includes(K), "control: without the key in the run, nothing else is masked (the literal is what the run registered)");
+});
+
+test("G1-2: a leaking run key survives only as long as the run: RUN_SECRETS is cleared at the start of the next run", async () => {
+  const K = ["ccr-profile-", fake("old2").replace(/[^A-Za-z0-9]/g, "").padEnd(24, "z").slice(0, 24)].join("");
+  await run([...GO, "--router", "probe"], { profileKey: K });
+  const next = await run([...GO, "--router", "probe"], { ccrLog: `using key ${K}`, tripwireAt: "e2e:after-x9-model-chain", skipKeyCheck: true });
+  assert.ok(evText(next.w, "ccr-logs__daemon.out.log.txt").includes(K), "a previous run's key is not masked in a later run (no state leaks between runs)");
+});
+
+test("G1-2: a string-shaped system on a subagent request is NOT flagged by CCR (VUe wants an array whose first block starts with the billing header): documented here; the X8 string arm and H1 do not depend on bl", () => {
+  const q = buildRequest("sub", { key: "k", model: "m", systemShape: "string" });
+  assert.equal(typeof q.body.system, "string"); assert.ok(q.body.system.startsWith("x-anthropic-billing-header:"));
+  const a = buildRequest("sub", { key: "k", model: "m" });
+  assert.ok(Array.isArray(a.body.system) && a.body.system[0].text.startsWith("x-anthropic-billing-header:") && /cc_is_subagent=true;/.test(a.body.system[0].text), "the array shape starts with the billing block");
+  assert.ok(a.headers["user-agent"].toLowerCase().includes("claude"));
+});
+
+// ================================================================ fix round 3: the proof's web-RPC calls survive a transient network error (G1 attempt 3: CCR respawned its core worker, one fetch failed, the run went RED)
+const netErr = (code) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(`connect ${code} 127.0.0.1:39458`), { code }) });
+const clock = () => { let t = 1e12; const sleeps = []; return { sleeps, sleep: async (ms) => { sleeps.push(ms); t += ms; }, now: () => t, advance: (ms) => { t += ms; } }; };
+const web = (r) => r.web;
+
+test("G1-3: a transient network error in the daemon-identity check is retried (service.json re-read and re-verified at EVERY attempt), the check goes GREEN, and the line says on which attempt", async () => {
+  const c = clock(); let calls = 0, resolves = 0; const resolvesAtCall = [];
+  const t = await proveTree({ ...c, resolveWebPort: () => { resolves++; return { port: 39458, pid: 5000 }; },
+    assertIsolatedInstance: async () => { resolvesAtCall.push(resolves); if (++calls < 3) throw netErr("ECONNREFUSED"); } });
+  assert.equal(web(t).ok, true, web(t).detail); assert.equal(calls, 3);
+  assert.match(web(t).detail, /^web 39458 pid 5000; reached on attempt 3 of 5 after a transient network error$/);
+  assert.deepEqual(c.sleeps, [1500, 1500], "1.5 s between attempts");
+  assert.ok(resolvesAtCall[1] > resolvesAtCall[0] && resolvesAtCall[2] > resolvesAtCall[1], "service.json was re-read before every attempt");
+  assert.equal(t.res.ok, true, JSON.stringify(t.res.checks.filter((x) => !x.ok)));
+  const first = await proveTree({ ...clock(), assertIsolatedInstance: async () => {} });
+  assert.equal(web(first).detail, "web 39458 pid 5000", "the case it must not break: no failure, no retry note");
+});
+
+test("G1-3: five transient failures stay RED and name the cause (error.cause.code and message, one line, redacted), the attempt count and the elapsed time; no sixth attempt; a persistent ECONNREFUSED stays RED", async () => {
+  const c = clock(); let calls = 0;
+  const t = await proveTree({ ...c, assertIsolatedInstance: async () => { calls++; throw netErr("ECONNREFUSED"); }, redact: (x) => x.replace("127.0.0.1", "<ip>") });
+  assert.equal(web(t).ok, false); assert.equal(t.res.ok, false); assert.equal(calls, 5, "at most five attempts");
+  assert.match(web(t).detail, /^threw: ECONNREFUSED connect ECONNREFUSED <ip>:39458: still failing after 5 attempts over 6000 ms \(transient network errors only; an isolation mismatch is never retried\)$/);
+  assert.throws(() => assertIsolationProven(t.res), /isolation NOT proven: .*daemon web port and token.*ECONNREFUSED/);
+  assert.equal(c.sleeps.length, 4);
+  // the 10 s ceiling: slow attempts stop the retries early
+  const slow = clock(); let n = 0;
+  const s2 = await proveTree({ ...slow, assertIsolatedInstance: async () => { n++; slow.advance(4000); throw netErr("ETIMEDOUT"); } });
+  assert.equal(web(s2).ok, false); assert.equal(n, 2, "never past the 10 s ceiling in all"); assert.match(web(s2).detail, /ETIMEDOUT.*after 2 attempts over \d+ ms/);
+  // a message-only transport error (no cause) is transient too, and a plain failure is not
+  let m = 0; const msgOnly = await proveTree({ ...clock(), assertIsolatedInstance: async () => { m++; throw new Error("read ECONNRESET"); } });
+  assert.equal(m, 5); assert.equal(web(msgOnly).ok, false);
+  let b = 0; const boom = await proveTree({ ...clock(), assertIsolatedInstance: async () => { b++; throw new Error("boom"); } });
+  assert.equal(b, 1, "an error that is not a network error is not retried"); assert.match(web(boom).detail, /^threw: boom$/);
+});
+
+test("G1-3: an isolation MISMATCH is never retried: a wrong pid or port in service.json, an isolation violation from the identity check or the config check, and a refusal are RED on the FIRST attempt (no sleep, no second call); a mismatch that appears on a later attempt stops the retries at once", async () => {
+  for (const [name, over, re] of [["wrong pid", { resolveWebPort: () => ({ port: 39458, pid: 9999 }) }, /service\.json says port 39458 pid 9999/], ["wrong port", { resolveWebPort: () => ({ port: 3458, pid: 5000 }) }, /service\.json says port 3458 pid 5000/]]) {
+    const c = clock(); let calls = 0;
+    const t = await proveTree({ ...c, ...over, assertIsolatedInstance: async () => { calls++; } });
+    assert.equal(web(t).ok, false, name); assert.match(web(t).detail, re, name); assert.equal(calls, 0, `${name}: the daemon was not even asked`); assert.deepEqual(c.sleeps, [], name);
+  }
+  for (const [name, key, err] of [["identity violation", "assertIsolatedInstance", new Error("ISOLATION VIOLATION: daemon reports configDir=\"C:\\real\" under ECONNRESET")], ["config violation", "assertIsolatedConfig", new Error("ISOLATION VIOLATION: persisted gateway.port=3456")], ["refusal", "assertIsolatedInstance", new RefusalError("REFUSED: x")]]) {
+    const c = clock(); let calls = 0;
+    const t = await proveTree({ ...c, [key]: async () => { calls++; throw err; } });
+    assert.equal(t.res.ok, false, name); assert.equal(calls, 1, `${name}: exactly one attempt`); assert.deepEqual(c.sleeps, [], `${name}: no sleep`);
+  }
+  // pid flips after one transient failure: RED at attempt 2, no further call
+  const c = clock(); let calls = 0, res = 0;
+  const t = await proveTree({ ...c, resolveWebPort: () => ({ port: 39458, pid: ++res <= 1 ? 5000 : 9999 }), assertIsolatedInstance: async () => { calls++; throw netErr("ECONNRESET"); } });
+  assert.equal(web(t).ok, false); assert.equal(calls, 1); assert.match(web(t).detail, /service\.json says port 39458 pid 9999/); assert.deepEqual(c.sleeps, [1500]);
+});
+
+test("G1-3: every proof call to the sandbox web RPC has the retry: the persisted-config check and the fresh Router.fallback read go GREEN after transient errors (attempts reported), and stay RED when they persist", async () => {
+  let ci = 0, gc = 0;
+  const t = await proveTree({ ...clock(), swapRan: true, assertIsolatedConfig: async () => { if (++ci < 2) throw netErr("ECONNRESET"); }, getConfig: async () => { if (++gc < 3) throw netErr("ECONNREFUSED"); return { Router: { fallback: { mode: "off", models: [] } } }; } });
+  assert.equal(t.cfg.ok, true); assert.match(t.cfg.detail, /^ok; reached on attempt 2 of 5/);
+  assert.equal(t.fallback.ok, true); assert.match(t.fallback.detail, /swap step has run; reached on attempt 3 of 5 after a transient network error$/);
+  assert.equal(t.res.ok, true, JSON.stringify(t.res.checks.filter((x) => !x.ok)));
+  let n = 0;
+  const bad = await proveTree({ ...clock(), swapRan: true, getConfig: async () => { n++; throw netErr("ECONNREFUSED"); } });
+  assert.equal(n, 5); assert.equal(bad.fallback.ok, false); assert.match(bad.fallback.detail, /ECONNREFUSED.*5 attempts/);
+  let k = 0; const cfgBad = await proveTree({ ...clock(), assertIsolatedConfig: async () => { k++; throw netErr("ECONNREFUSED"); } });
+  assert.equal(k, 5); assert.equal(cfgBad.cfg.ok, false);
+  let kk = 0; const gb = await proveTree({ ...clock(), assertIsolatedConfig: async () => { kk++; throw new Error("ISOLATION VIOLATION: persisted PORT=3456"); } });
+  assert.equal(kk, 1); assert.equal(gb.cfg.ok, false);
+});
+
+test("G1-3: a core worker pid that changed since the previous post-provider proof is a RECORD line (old -> new, gateway and daemon pids), never a failure; the first proof, an unchanged pid and a proof without a tracker print none", async () => {
+  const track = {};
+  const first = await proveTree({ track });
+  assert.equal(first.core, undefined, "nothing to compare with yet"); assert.equal(track.core, 5001);
+  const same = await proveTree({ track }); assert.equal(same.core, undefined, "unchanged: no line");
+  const CH2 = { pid: 7777, ppid: 5000, name: "node.exe", cmd: CHILD_ROW.cmd };
+  const moved = await proveTree({ track, rows: [DAEMON_ROW, CH2], holders: { 39457: 7777 }, listen: { 7777: [{ addr: "127.0.0.1", port: 39457 }], 5001: [] }, guard: [5000, 7777] });
+  assert.equal(moved.res.ok, true, JSON.stringify(moved.res.checks.filter((x) => !x.ok)));
+  assert.equal(moved.core.ok, true); assert.equal(moved.core.recorder, true);
+  assert.match(moved.core.detail, /^sandbox core worker pid changed 5001 -> 7777 during the run; gateway pid unchanged \(5000\), daemon pid 5000 unchanged \(service\.json check\)$/);
+  assert.equal(track.core, 7777, "the new pid is remembered");
+  assert.equal(moved.res.checks.at(-1).name, moved.core.name, "last in the list: the numbering of the other checks does not move");
+  const gw = await proveTree({ track: { core: 7777, gateway: 4000 } , rows: [DAEMON_ROW, CH2], holders: { 39457: 8888, 39456: 5000 }, listen: { 7777: [{ addr: "127.0.0.1", port: 39457 }] } });
+  assert.ok(gw.core === undefined || gw.core.recorder === true);
+  assert.equal((await proveTree({})).core, undefined, "no tracker: no record");
+  assert.equal((await proveTree({ phase: "pre-provider", track: { core: 1 } })).core, undefined, "pre-provider: the core port is not judged yet");
+});
+
+test("G1-3 flow: a transient fetch failure in the proof after EACH router run (probe and next) is retried and the run still ends OK; a persistent one is RED, exit 1, cause in the message; an isolation violation there is RED at once with ONE call", async () => {
+  const mkWorld = (opt) => { const { w, d } = world(opt); return { w, d }; };
+  const { w, d } = mkWorld({}); const failed = {}; let calls = 0; const sl = [], osl = d.sleep; d.sleep = async (ms) => { sl.push(ms); return osl(ms); };
+  d.guard.assertIsolatedInstance = async () => { calls++; const st = w.tripStages.at(-1); if ((st === "after-probe-run" || st === "after-next-run") && !failed[st]) { failed[st] = true; throw netErr("ECONNREFUSED"); } };
+  const r = await go(w, d, GO);
+  assert.equal(r.code, 0, r.err + r.out.slice(-500));
+  assert.equal((r.out.match(/GREEN +\d+ daemon web port and token \(service\.json\) are ours.*reached on attempt 2 of 5 after a transient network error/g) ?? []).length, 2, "after the probe run AND after the next run");
+  assert.equal(sl.filter((x) => x === 1500).length, 2, "the orchestrator hands its own sleep to the proof: one 1.5 s gap per retried proof");
+  const p = mkWorld({}); p.d.guard.assertIsolatedInstance = async () => { if (p.w.tripStages.at(-1) === "after-probe-run") throw netErr("ECONNREFUSED"); };
+  const pr = await go(p.w, p.d, GO);
+  assert.equal(pr.code, 1); assert.match(pr.err, /isolation NOT proven: #\d+ daemon web port and token.*ECONNREFUSED connect ECONNREFUSED 127\.0\.0\.1:39458: still failing after 5 attempts/);
+  assert.equal(lineOf(pr.out, "X9a") !== undefined, true, "the probe lines printed before the RED proof are kept");
+  let vc = 0; const v = mkWorld({}); v.d.guard.assertIsolatedInstance = async () => { if (v.w.tripStages.at(-1) === "after-probe-run") { vc++; throw new Error("ISOLATION VIOLATION: daemon paths"); } };
+  const vr = await go(v.w, v.d, GO);
+  assert.equal(vr.code, 1); assert.equal(vc, 1, "a violation is never retried");
+});
+
+test("G1-3 flow: a core worker respawned during the probe run prints a RECORD line (old -> new, gateway unchanged), the run does not fail, and the next proof says nothing more", async () => {
+  const { w, d } = world({}), s = d.sys, oL = s.listenerPid, oP = s.processes, oLP = s.listenPortsOf, oR = s.readText;
+  const swapped = () => w.ranProbe && w.started;
+  const CH2 = { pid: 5002, ppid: 5000, name: "node.exe", cmd: CHILD_ROW.cmd };
+  s.listenerPid = (p) => (p === 39457 && swapped() && w.childAlive ? 5002 : oL(p));
+  s.processes = () => oP().map((r) => (swapped() && r.pid === 5001 ? CH2 : r));
+  s.listenPortsOf = (pid) => (pid === 5002 ? oLP(5001) : oLP(pid));
+  s.readText = (p) => (norm(p) === norm(GUARD_LOADED_LOG) && swapped() ? [5000, 5002].map((pid) => JSON.stringify({ pid })).join("\n") + "\n" : oR(p));
+  const r = await go(w, d, GO);
+  assert.equal(r.code, 0, r.err + r.out.slice(-600));
+  const rec = r.out.split("\n").filter((l) => /^RECORD +\d+ sandbox core worker pid changed/.test(l));
+  assert.equal(rec.length, 1, rec.join("\n")); assert.match(rec[0], /changed 5001 -> 5002 during the run; gateway pid unchanged \(5000\), daemon pid 5000 unchanged/);
+  assert.ok(!/RED /.test(r.out));
+  assert.ok(SIDE_EFFECTS.some((e) => e.id === "sandbox-core-worker-respawn" && e.mode === "record"), "listed in the side-effect inventory as a record");
+  assert.match(renderPlan(buildSpec({ PATH: "x" }), { router: "both", ccr: CCR_FAKE }).join("\n"), /\[record\] sandbox-core-worker-respawn: [\s\S]*retried \(at most 5 attempts, 1\.5 s apart, 10 s in all/);
+});
+
+test("G1-3: the plan says CCR may respawn its core child during the fallback swaps, that the proof's web-RPC calls retry a transient network error only (bounded) and never a mismatch, and the retry limits are the ones the code uses", () => {
+  const text = renderPlan(buildSpec({ PATH: "x" }), { router: "both", ccr: CCR_FAKE }).join("\n");
+  for (const need of ["CCR may respawn its core worker (the daemon's child holding the core port) during the Router.fallback swaps", "retried for a transient network error only (fetch failed, ECONNRESET, ECONNREFUSED, a timeout), at most 5 attempts 1.5 s apart and 10 s in all", "a mismatch (wrong port or pid, a config that is not isolated) is NEVER retried and is RED at once", "A changed core worker pid is printed as a RECORD line, not a failure",
+    "the proof's calls to the sandbox web RPC (daemon identity, persisted config, Router.fallback read) retry a transient network error only (5 attempts, 1.5 s apart, 10 s in all"]) assert.ok(text.includes(need), `plan lacks: ${need}`);
+  assert.deepEqual(PROOF_RETRY, { attempts: 5, gapMs: 1500, ceilingMs: 10000 });
+  for (const e of [netErr("ECONNRESET"), netErr("ECONNREFUSED"), new Error("fetch failed"), Object.assign(new Error("x"), { name: "TimeoutError" }), new config.RpcTimeoutError("saveConfig timed out after 1 ms")]) assert.equal(isTransientNetError(e), true, String(e.message));
+  for (const e of [new Error("boom"), new Error("ISOLATION VIOLATION: ECONNRESET"), new RefusalError("REFUSED: ECONNRESET"), Object.assign(new Error("service.json says port 1"), { mismatch: true }), new Error("rpc refused: the sandbox service.json names web port 3458, not 39458"), null]) assert.equal(isTransientNetError(e), false, String(e?.message));
 });

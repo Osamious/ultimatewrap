@@ -336,6 +336,8 @@ export const SIDE_EFFECTS = [
   { id: "logs", what: "CCR logs and the guard logs", mode: "record", how: "CCR logs land under the scratch CONFIGDIR; violations.log and guard-loaded.log are in the scratch root and are read by the proof" },
   { id: "scheduled-supervisor", what: "the 'UW Process Supervision' scheduled task state (could restart or fight the sandbox)", mode: "record", how: "state read before and after" },
   { id: "live-custom-router-path", what: "the live CUSTOM_ROUTER_PATH and live router file", mode: "prevent", how: "never read or written; the sandbox config gets the scratch copy path, read back and asserted free of the \\.uw\\spike\\ folder" },
+  { id: "sandbox-core-worker-respawn", what: "the sandbox daemon's core worker (its child holding the core port) replaced by CCR during the run (observed in G1 attempt 3, around the Router.fallback swaps)", mode: "record", how: "the pid holding the core port is remembered at each post-provider proof; a change is printed as a RECORD line with the gateway and daemon pids (which the checks still judge), never as a failure; a proof call to the sandbox web RPC that fails with a transient network error meanwhile is retried (at most 5 attempts, 1.5 s apart, 10 s in all, re-resolving service.json and re-verifying port and pid each time), a mismatch never" },
+  { id: "sandbox-profile-key", what: "an API key entry for the enabled claude-code profile, ADDED to the SANDBOX config when missing (id profile:<profile id, mLe-normalised>, name Profile: <name>, key ccr-profile-<24 random characters> generated at run time)", mode: "record", how: "added only in the payload of the sandbox-only saveConfig with applyProfile:false over the sandbox web RPC (CCR creates it only in its applyProfile path, which the harness never uses); read back on the persisted config by exact id (a miss is FAIL A0 before any request); the key is never printed and never written to the plan or the retained evidence (masked verbatim); the live config, ~/.claude, ~/.llmkeys and the Credential Manager are never touched; it disappears with the scratch config at teardown" },
   { id: "sandbox-router-fallback", what: "the SANDBOX config's Router.fallback, hot-swapped through the sandbox web RPC for X9 (off -> model-chain with ONE stub model -> retry), and a Providers edit for X1", mode: "detect", how: "every swap passes assertPayloadIsolated and a local check (mode off|retry|model-chain, chain models only uwstub/*, no enabled Router.rules); the original value is restored at the end of the probe run and read back through assertRouterClean on a FRESH getConfig (saveConfig's return value is the daemon's normalised echo, not a read of what it persisted), and every later isolation proof reads Router.fallback fresh again and runs assertRouterClean on it (mode off, no chain models, no enabled rules); the teardown scrubs it again when the daemon was not stopped; the live config is never read or written (the rpc refuses every port but the sandbox web port)" },
 ];
 
@@ -468,8 +470,27 @@ const takeoverTargets = (text) => {
 };
 
 /**
- * ctx: {spec, baseline, phase: "pre-provider" | "post-provider", daemonPid, selfPid, stage, swapRan (true once the X9 Router.fallback swap step has started)}
- * deps: {sys, tripwire, assertIsolatedInstance, assertIsolatedConfig, resolveWebPort, getConfig, assertRouterClean (the last two: the fresh-read Router.fallback check of the post-provider proof)}
+ * G1 attempt 3: CCR respawned its core worker during the probe run and a fetch of the sandbox web RPC inside the proof failed ("fetch failed") for a moment, which turned a whole run RED. A call
+ * the proof makes to the sandbox web RPC is therefore retried, but ONLY for a transient NETWORK error (fetch failed, ECONNRESET, ECONNREFUSED, a timeout): at most PROOF_RETRY.attempts attempts,
+ * PROOF_RETRY.gapMs apart, never past PROOF_RETRY.ceilingMs in all, and every attempt re-resolves the web port from service.json and re-verifies port and pid against the daemon the run started.
+ * An isolation MISMATCH (wrong port, wrong pid, a config that is not isolated, a non-loopback listener, a refusal) is never retried and never softened: it is RED on the first attempt.
+ */
+export const PROOF_RETRY = { attempts: 5, gapMs: 1500, ceilingMs: 10000 };
+const TRANSIENT_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ECONNABORTED", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+export function isTransientNetError(e) {
+  if (!e || e.mismatch === true || e instanceof RefusalError) return false;
+  const msg = String(e.message ?? "");
+  if (/ISOLATION VIOLATION|rpc refused|service\.json|REFUSED/.test(msg)) return false;
+  if (e.name === "RpcTimeoutError" || e.name === "TimeoutError" || e.name === "AbortError") return true;
+  if (TRANSIENT_CODES.has(e.code) || TRANSIENT_CODES.has(e.cause?.code)) return true;
+  return /^fetch failed$|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|timed out/i.test(msg);
+}
+/** One line naming what went wrong underneath a transport error (error.cause.code / message, else the error itself). */
+const causeOf = (e) => oneLine([e?.cause?.code ?? e?.code, e?.cause?.message ?? e?.message].filter(Boolean).join(" "), 140);
+
+/**
+ * ctx: {spec, baseline, phase: "pre-provider" | "post-provider", daemonPid, selfPid, stage, swapRan (true once the X9 Router.fallback swap step has started), track (an object shared by every proof of a run: the core worker pid is remembered in it)}
+ * deps: {sys, tripwire, assertIsolatedInstance, assertIsolatedConfig, resolveWebPort, getConfig, assertRouterClean (the last two: the fresh-read Router.fallback check of the post-provider proof), sleep, now, redact (optional: the transient retry's timers and the redaction of its cause line)}
  * Returns {ok, checks:[{n, name, ok, detail, recorder?}]}. A check that throws is a failed check (the proof never throws).
  */
 export async function proveIsolation(ctx, deps) {
@@ -478,6 +499,28 @@ export async function proveIsolation(ctx, deps) {
     const n = checks.length + 1;
     try { const r = await fn(); checks.push({ n, name, ok: r.ok !== false, detail: oneLine(r.detail ?? ""), recorder: !!r.recorder }); }
     catch (e) { checks.push({ n, name, ok: false, detail: oneLine(`threw: ${e.message}`) }); }
+  };
+  const sleepMs = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))), nowMs = deps.now ?? (() => Date.now()), redact = deps.redact ?? ((t) => t), held = {};
+  /** The service.json of the daemon this run started, re-read at EVERY attempt: its port and pid must still be ours (a mismatch is final, not transient). */
+  const liveWeb = () => {
+    const w = deps.resolveWebPort();
+    if (w.port !== ctx.spec.ports.web || w.pid !== ctx.daemonPid) throw Object.assign(new Error(`service.json says port ${w.port} pid ${w.pid}`), { mismatch: true });
+    return w;
+  };
+  /** Runs fn (which calls the sandbox web RPC) with the bounded transient-network retry described at PROOF_RETRY. Returns {value, attempts, note}; a non-transient error propagates at once, with the attempt count of 1. */
+  const net = async (fn) => {
+    const t0 = nowMs();
+    for (let attempt = 1; ; attempt++) {
+      try { const value = await fn(); return { value, attempts: attempt, note: attempt > 1 ? `; reached on attempt ${attempt} of ${PROOF_RETRY.attempts} after a transient network error` : "" }; }
+      catch (e) {
+        if (!isTransientNetError(e)) throw e;
+        const waited = nowMs() - t0;
+        if (attempt >= PROOF_RETRY.attempts || waited + PROOF_RETRY.gapMs > PROOF_RETRY.ceilingMs) {
+          throw new Error(redact(`${causeOf(e)}: still failing after ${attempt} attempt${attempt === 1 ? "" : "s"} over ${waited} ms (transient network errors only; an isolation mismatch is never retried)`));
+        }
+        await sleepMs(PROOF_RETRY.gapMs);
+      }
+    }
   };
   const now = fingerprintLive(sys);
   const { ccrPids: _baseCcr, ...baseFp } = ctx.baseline;      // the process list is compared by its own check below
@@ -508,6 +551,7 @@ export async function proveIsolation(ctx, deps) {
       const problems = [], pre = ctx.phase === "pre-provider";
       for (const name of pre ? ["web"] : ["gateway", "core", "web"]) {
         const got = sys.listenerPid(ctx.spec.ports[name]);
+        held[name] = got;
         if (!inTree(got)) problems.push(`${name} ${ctx.spec.ports[name]} held by ${got ?? "nobody"}, expected one of the sandbox daemon tree ${tree.join(",")}`);
       }
       if (pre) for (const name of ["gateway", "core"]) { const got = sys.listenerPid(ctx.spec.ports[name]); if (got && !inTree(got)) problems.push(`${name} ${ctx.spec.ports[name]} is held by ${got}, not the sandbox daemon tree`); }
@@ -521,25 +565,24 @@ export async function proveIsolation(ctx, deps) {
       return { ok: problems.length === 0, detail: problems.length ? problems.join("; ") : `sandbox tree listens on ${seen.join(" ")}` };
     });
     await add("daemon web port and token (service.json) are ours, daemon paths are under the scratch CONFIGDIR", async () => {
-      const w = deps.resolveWebPort();
-      if (w.port !== ctx.spec.ports.web || w.pid !== ctx.daemonPid) return { ok: false, detail: `service.json says port ${w.port} pid ${w.pid}` };
-      await deps.assertIsolatedInstance();
-      return { detail: `web ${w.port} pid ${w.pid}` };
+      let w;
+      const r = await net(async () => { w = liveWeb(); await deps.assertIsolatedInstance(); });
+      return { detail: `web ${w.port} pid ${w.pid}${r.note}` };
     });
-    await add("persisted config isolated (ports, HOST, PORT, settingsFile, profiles)", async () => { await deps.assertIsolatedConfig(); return { detail: "ok" }; });
+    await add("persisted config isolated (ports, HOST, PORT, settingsFile, profiles)", async () => { const r = await net(async () => { liveWeb(); await deps.assertIsolatedConfig(); }); return { detail: `ok${r.note}` }; });
     // F2: saveConfig's return value is the daemon's normalised ECHO, not a read of what it persisted, and assertIsolatedConfig does not look at Router.fallback: a leftover model-chain or retry
     // would pass every check above. So once providers are saved (post-provider, which needs a deps.getConfig seam) a FRESH getConfig must pass assertRouterClean (mode off, no chain models, no
     // enabled rules, no availableModels allowlist). A Router.fallback that is ABSENT is reported, not judged, until the swap step has run (assertRouterClean itself refuses a missing fallback as
     // mode "undefined", and the configure step already ran it on the first getConfig); after the swap step the restore wrote an explicit fallback, so an absent one is RED.
     if (deps.getConfig && ctx.phase === "post-provider") {
       await add("persisted Router.fallback read back on a FRESH getConfig (mode off, no chain models, no enabled rules)", async () => {
-        const c = await deps.getConfig(), fb = c?.Router?.fallback;
+        const got = await net(async () => { liveWeb(); return deps.getConfig(); }), c = got.value, fb = c?.Router?.fallback;
         if (fb == null || typeof fb !== "object") {
           if (ctx.swapRan) return { ok: false, detail: "Router.fallback is ABSENT after the swap step: the restore wrote an explicit off, so it must read back" };
           return { detail: "Router.fallback is absent in the fresh config (recorded, not judged before the swap step: assertRouterClean refuses a missing fallback, and the configure step already ran it)", recorder: true };
         }
         deps.assertRouterClean(c);
-        return { detail: `mode ${oneLine(fb.mode, 20)}, ${(fb.models ?? []).length} chain models, swap step ${ctx.swapRan ? "has run" : "not yet run"}` };
+        return { detail: `mode ${oneLine(fb.mode, 20)}, ${(fb.models ?? []).length} chain models, swap step ${ctx.swapRan ? "has run" : "not yet run"}${got.note}` };
       });
     }
   }
@@ -560,6 +603,15 @@ export async function proveIsolation(ctx, deps) {
       const missing = need.filter((pid) => !loaded.includes(pid));
       return { ok: missing.length === 0 && viol === 0, detail: `guard loaded in pids ${[...new Set(loaded)].join(",") || "none"}; missing from the tree ${missing.join(",") || "-"}; violations ${viol}` };
     });
+  }
+  // RECORD (never a failure): CCR may respawn its core worker (the daemon's child that holds the core port) during a run, for instance around the Router.fallback swaps. The pid it held at the
+  // previous post-provider proof is remembered in ctx.track; a change is reported with the gateway and daemon pids, which the checks above still judge.
+  if (ctx.track && ctx.daemonPid && ctx.phase === "post-provider" && held.core != null) {
+    const t = ctx.track;
+    if (t.core != null && t.core !== held.core) {
+      await add("sandbox core worker pid changed since the previous proof (record)", () => ({ recorder: true, detail: `sandbox core worker pid changed ${t.core} -> ${held.core} during the run; gateway pid ${t.gateway === held.gateway ? `unchanged (${held.gateway})` : `CHANGED ${t.gateway ?? "?"} -> ${held.gateway ?? "?"}`}, daemon pid ${ctx.daemonPid} unchanged (service.json check)` }));
+    }
+    t.core = held.core; t.gateway = held.gateway;
   }
   return { ok: checks.every((c) => c.ok), checks };
 }
