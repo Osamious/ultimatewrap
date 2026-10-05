@@ -58,7 +58,7 @@ export const ENUMS = Object.freeze({
   source: ["same-provider", "all-providers"], mode: ["dynamic", "inherit", "free"], "free-scope": [...FREE_SCOPES],
   ctx: [...CTX_VALUES], enforce: ["shadow", "enforce"], inject: ["off", "on"], unverified: ["allow-warn", "allow-t", "pin-only"],
 });
-const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause", "outcomes", "plan", "approve-plan", "run"];
+const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause", "outcomes", "plan", "approve-plan", "run", "real"];
 export const FILE_FLAGS = Object.freeze(["policy-file", "state-dir", "providers-file", "snapshot-file", "bench-file", "observed-file",
   "default-model-file", "registry-file", "key-choices-file", "vault-providers-file", "settings-file", "tool-fidelity-file"]);
 const OWNER_FLAGS = ["source", "mode", "free-scope", "ctx", "enforce", "inject", "unverified", "allow", "banded", "handoff-notice"];
@@ -73,7 +73,7 @@ const CMD_FLAGS = Object.freeze({
   resume: ["min-set", "live", ...FILE_FLAGS], undo: ["min-set", "live", "lift-pause", ...FILE_FLAGS],
   preset: ["confirm", "dry", "live", "detail", "min-set", ...FILE_FLAGS], wizard: ["min-set", "live", ...FILE_FLAGS], why: [],
   // S2a and S2c: report only reads (the prices come from the snapshot, the ground truth from the request log, both named by a fixture run); selftest prints, approves or runs
-  report: ["since", "session", "json", "outcomes", "logs-file", "state-dir", "snapshot-file"], selftest: ["plan", "approve-plan", "run", "live"],
+  report: ["since", "session", "json", "outcomes", "logs-file", "state-dir", "snapshot-file"], selftest: ["plan", "approve-plan", "run", "live", "real"],
 });
 export const COMMANDS = Object.freeze(Object.keys(CMD_FLAGS));
 
