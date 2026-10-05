@@ -371,9 +371,16 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   serve, a 429 handoff, all models limited, team agents, a `/model` switch, a corrupt, missing or
   newer policy, a worker restart, helper calls, rollback, a 20-agent fan-out, a daily-cap 429) and
   four chaos checks, what each must prove, and a plan hash, without reading or starting anything.
-  A run (`--approve-plan` in a terminal, then `--run`, optionally `--only 2,3`, `--runs N`,
-  `--real yes`) uses the same sandbox and the same one-use typed approval as the other sandbox runs
-  and prints PASS, FAIL, FINDING or DEGRADED per scenario with its run count. A FINDING names
+  A run (`--approve-plan` in a terminal, then `--run`, optionally `--only 2,3` and `--runs N`)
+  uses the same sandbox and the same one-use typed approval as the other sandbox runs, replays the
+  request shapes a real client sends (no client is started), pins the installed CCR in the approval,
+  and prints PASS, FAIL, FINDING or DEGRADED per scenario with its run count and the client used; a
+  line that is not a PASS says it is not G3 evidence, and the exit code is non-zero for a FAIL or
+  for a FINDING outside scenarios 2, 7 and C4. `--real yes` (also on `selftest`) is a SEPARATE,
+  riskier mode with its own consent: it starts a real headless Claude Code for scenarios 1, 2, 3
+  and 11 only, pins the launcher's path, hash and version in the approval, and checks afterwards
+  that the real `~/.claude.json` and `~/.claude/projects` were not touched and no request of the
+  client reached the live gateway. A FINDING names
   something the sandbox could not show (for example that no retry signal reached the router); a
   DEGRADED line is the daily-cap case: one failure and then avoidance, never a seamless handoff.
 - **Counts carry their denominator.** Every figure printed says what it is a count of ("7 of 7

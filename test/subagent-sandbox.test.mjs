@@ -3077,3 +3077,55 @@ test("G1-3: the plan says CCR may respawn its core child during the fallback swa
   for (const e of [netErr("ECONNRESET"), netErr("ECONNREFUSED"), new Error("fetch failed"), Object.assign(new Error("x"), { name: "TimeoutError" }), new config.RpcTimeoutError("saveConfig timed out after 1 ms")]) assert.equal(isTransientNetError(e), true, String(e.message));
   for (const e of [new Error("boom"), new Error("ISOLATION VIOLATION: ECONNRESET"), new RefusalError("REFUSED: ECONNRESET"), Object.assign(new Error("service.json says port 1"), { mismatch: true }), new Error("rpc refused: the sandbox service.json names web port 3458, not 39458"), null]) assert.equal(isTransientNetError(e), false, String(e?.message));
 });
+
+// ---- the session hooks the scenario suite (harness/subagent-scenarios.mjs) and the self-test use: an injected approval ceremony, injected phases and an injected verdict. The default path is unchanged (every test above).
+test("flow (S2d hooks): d.externalApproval replaces the approval FILE (not read, not consumed), d.sessionPhases replace the probe and next phases AFTER the same proofs, and d.sessionVerdict decides the exit", async () => {
+  const seen = { approvals: 0, phases: 0, ctxKeys: null };
+  const { w, d } = world({});
+  d.externalApproval = async ({ plan, fileHashes, ccr }) => { seen.approvals += 1; assert.match(plan.sha, /^[0-9a-f]{64}$/); assert.ok(fileHashes.length > 5); assert.equal(ccr?.found, true, "the orchestrator hands the CCR install it resolved to the external approval, which compares it with the pin"); return null; };
+  d.sessionPhases = async (ctx) => { seen.phases += 1; seen.ctxKeys = Object.keys(ctx).sort(); ctx.emit("SCENARIO PASS 1 T (1 of 1 run) :: ok"); return { abort: false }; };
+  d.sessionVerdict = (lines) => ({ ok: lines.some((l) => /^SCENARIO PASS/.test(l)), problems: [], counts: { PASS: 1 } });
+  const r = await go(w, d, [...GO, "--router", "next"], { none: true });
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.deepEqual([seen.approvals, seen.phases], [1, 1]);
+  for (const k of ["d", "key", "stub", "emit", "out", "approved", "tripwire", "fallback", "shared"]) assert.ok(seen.ctxKeys.includes(k), `ctx.${k}`);
+  assert.ok(!w.mem.log.some((x) => x[0] === "rename" && norm(x[1]) === norm(APPROVAL_FILE)), "the approval FILE was never consumed");
+  assert.ok(!/probe router installed|router under test installed/.test(r.out), "the probe and next phases did not run");
+  assert.match(r.out, /GREEN {1,2}1 live listeners/); assert.match(r.out, /live state identical before and after/); assert.match(r.out, /summary: {"PASS":1}; OK/);
+  assert.deepEqual(w.calls.stopProcess, [5001, 5000], "the same identity-verified teardown");
+});
+
+test("flow (S2d hooks): a refusal from d.externalApproval exits 2 and starts nothing; a sessionVerdict that is not ok exits 1; without the hooks the approval FILE is still required", async () => {
+  let { w, d } = world({});
+  d.externalApproval = async () => "no approval for this suite";
+  d.sessionPhases = async () => { throw new Error("must not run"); };
+  let r = await go(w, d, [...GO, "--router", "next"], { none: true });
+  assert.equal(r.code, 2); assert.match(r.err, /refusing: no approval for this suite/); assert.equal(w.calls.runStep, 0, "nothing was started");
+  ({ w, d } = world({}));
+  d.externalApproval = async () => null; d.sessionPhases = async (ctx) => { ctx.emit("SCENARIO FAIL 2 T (0 of 1 run) :: bad"); return {}; };
+  d.sessionVerdict = () => ({ ok: false, problems: ["scenario 2 FAILED: bad"], counts: { FAIL: 1 } });
+  r = await go(w, d, [...GO, "--router", "next"], { none: true });
+  assert.equal(r.code, 1); assert.match(r.err, /PROBLEM: scenario 2 FAILED: bad/); assert.match(r.out, /NOT OK/);
+  r = await run([...GO, "--router", "next"], {}, { none: true });
+  assert.equal(r.code, 2, "no hooks and no approval file: refused as before"); assert.match(r.err, /no approval file/);
+});
+
+test("stub: script.decide scripts ONE model's failure per request and falls through to the sequence and the default when it returns nothing", async () => {
+  const stub = createStub({ port: 0, script: { decide: (r) => (r.model === "uwstub/m-free" ? { status: 429, retryAfter: 90 } : undefined), sequence: [503] } });
+  const port = await stub.start();
+  try {
+    const post = (model) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "x" }] }) });
+    const a = await post("uwstub/m-free"), b = await post("uwstub/m-big"), c = await post("uwstub/m-big");
+    assert.deepEqual([a.status, a.headers.get("retry-after"), b.status, c.status], [429, "90", 503, 200], "decide first, then the sequence (consumed only when decide passes), then 200");
+  } finally { await stub.stop(); }
+});
+
+test("stub: a decide rule that THROWS (or returns an invalid step) never crashes the stub: the request falls through to the sequence and the default", async () => {
+  const stub = createStub({ port: 0, script: { decide: (r) => { if (r.model === "uwstub/m-free") throw new Error("rule bug"); return 99999; }, sequence: [503] } });
+  const port = await stub.start();
+  try {
+    const post = (model) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, max_tokens: 1, messages: [{ role: "user", content: "x" }] }) });
+    const a = await post("uwstub/m-free"), b = await post("uwstub/m-big"), c = await post("uwstub/m-big");
+    assert.deepEqual([a.status, b.status, c.status], [503, 200, 200], "a thrown rule and an invalid step fall through (the first request consumes the sequence), nothing crashes");
+  } finally { await stub.stop(); }
+});

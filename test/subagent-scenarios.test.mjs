@@ -1,0 +1,755 @@
+// Stage S2d, the scenario suite (harness/subagent-scenarios.mjs), BUILT OFFLINE: nothing here starts a daemon, a gateway, a CCR process or a Claude Code. The judges are checked against fake transcripts
+// (a scenario FAILS when the served model is wrong, a helper call is rewritten, a handoff is missing from the log); the runners are driven against a FAKE SANDBOX (a toy router and a fake stub behind the
+// `prims` interface) and against the REAL stub on a loopback ephemeral port; the ceremony is driven with fake seams. The real router bytes and the real gateway are never involved.
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { guardRealState } from "./fixtures/no-real-state.mjs";
+import * as S from "../harness/subagent-scenarios.mjs";
+import { createStub } from "../harness/stub-upstream.mjs";
+import { buildRequest, ANCHOR, TAG_MODEL, ASKED_MODEL, modelIs, bareOf, X4_AGENT } from "../harness/subagent-e2e.mjs";
+import { NEXT_ROUTER_SRC, REPO_ROOT } from "../harness/subagent-sandbox-spec.mjs";
+
+guardRealState(after, assert);
+const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
+
+// ====================================================================================== the plan
+test("--plan prints every scenario with what it must prove, the client, and the plan hash; it uses NO seam (no file read, no process): every seam throws", async () => {
+  const out = [];
+  const trap = new Proxy({}, { get: (_, k) => { throw new Error(`--plan touched the seam ${String(k)}`); } });
+  const code = await S.main(["--plan"], { out: (l) => out.push(l), err: () => assert.fail("--plan wrote to stderr") }, trap);
+  assert.equal(code, 0);
+  const text = out.join("\n");
+  for (const s of S.ALL) { assert.ok(text.includes(s.title), `scenario ${s.id} ${s.title}`); assert.ok(text.includes(s.proves), `what ${s.id} must prove`); }
+  assert.equal(S.SCENARIOS.length, 11); assert.equal(S.CHAOS.length, 4);
+  assert.deepEqual(S.SCENARIOS.map((s) => s.id), ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
+  assert.match(text, /plan sha256: [0-9a-f]{64}$/);
+  const { lines, sha: planSha } = S.planOf();
+  assert.equal(planSha, sha(lines.join("\n") + "\n"));
+  assert.ok(text.includes(`plan sha256: ${planSha}`));
+  assert.deepEqual(S.planOf(), S.planOf(), "deterministic: a pure function of constants");
+  assert.match(text, /BUILT OFFLINE, NOT RUN/);
+  assert.match(text, /REAL with --real yes, else replay/); assert.match(text, /\[REPLAY, /);
+});
+
+test("the plan names the exact router bytes, and a test pins that constant to router/uw-router.next.cjs (a router change voids the plan and any approval)", () => {
+  assert.equal(S.ROUTER_SHA256, "5da75baa60dadb3aa24ff281d4c5ac460f38067428f8f9067826c7bf516f1182");
+  assert.equal(sha(fs.readFileSync(NEXT_ROUTER_SRC)), S.ROUTER_SHA256, "the router file in the working tree is the one the suite was written for");
+  assert.ok(S.planLines().some((l) => l.includes(S.ROUTER_SHA256)));
+  const changed = S.planLines().map((l) => l.replace(S.ROUTER_SHA256, "0".repeat(64)));
+  assert.notEqual(sha(changed.join("\n") + "\n"), S.planOf().sha, "the router hash is part of the plan hash");
+});
+
+test("the executed files are the orchestrator set plus the suite itself, and the plan lists each", () => {
+  for (const f of ["harness/subagent-e2e.mjs", "harness/subagent-sandbox-spec.mjs", "harness/stub-upstream.mjs", "harness/guard.mjs", "router/uw-router.next.cjs", "harness/subagent-scenarios.mjs", "keysync/subagent-policy.mjs"]) assert.ok(S.EXECUTED_FILES.includes(f), f);
+  const text = S.planLines().join("\n");
+  for (const f of S.EXECUTED_FILES) assert.ok(text.includes(`  ${f}`), f);
+  assert.ok(S.hashFiles().every((x) => x.raw !== "(absent)"), "every file the run executes exists (read-only hashing)");
+});
+
+// ====================================================================================== arguments and the approval ceremony
+test("arguments: exactly one of --plan, --approve-plan, --run; --only, --runs and --real are validated", () => {
+  assert.equal(S.parseArgs(["--plan"]).errors.length, 0);
+  assert.ok(S.parseArgs([]).errors.length); assert.ok(S.parseArgs(["--plan", "--run"]).errors.length);
+  assert.deepEqual(S.parseArgs(["--run", "--only", "2,C1", "--runs", "3", "--real", "yes"]).only, ["2", "C1"]);
+  for (const bad of [["--run", "--only", "99"], ["--run", "--runs", "0"], ["--run", "--runs", "x"], ["--run", "--real", "maybe"], ["--run", "--wat"]]) assert.ok(S.parseArgs(bad).errors.length, bad.join(" "));
+});
+
+const FAKE_CLAUDE = { path: "C:\\fake\\claude.exe", sha256: "c".repeat(64), version: "9.9.9 (Claude Code)", supports: { settingSources: true, strictMcp: true } };
+const seamsWith = (over = {}) => {
+  const mem = new Map(), calls = { sandbox: 0, ask: 0 };
+  const files = S.hashFiles();
+  const s = {
+    interactive: () => true, ask: async () => { calls.ask += 1; return over.typed ?? S.planOf().sha.slice(0, 12); }, now: () => over.now ?? Date.parse("2026-10-06T12:00:00Z"), pid: 4242,
+    hashFiles: () => over.files ?? files, approvalFile: "A.json", readText: (f) => (mem.has(f) ? mem.get(f) : null), writeText: (f, t) => mem.set(f, t),
+    ccrLines: () => (over.ccr === null ? null : over.ccr ?? ["ccr.cmd sha256 aaa", "package 3.0.22"]), identifyClaude: () => (over.claude === null ? null : over.claude ?? FAKE_CLAUDE),
+    rename: (a, b) => { if (!mem.has(a)) throw new Error("ENOENT"); mem.set(b, mem.get(a)); mem.delete(a); }, rm: (f) => mem.delete(f),
+    runSandbox: over.noRunner ? null : async (args) => { calls.sandbox += 1; calls.args = args; return over.runCode ?? 0; },
+  };
+  return { s, mem, calls };
+};
+const io = () => { const o = { out: [], err: [] }; return { o, io: { out: (l) => o.out.push(l), err: (l) => o.err.push(l) } }; };
+
+test("--run without an approval file exits 1 and starts nothing; --approve-plan needs a terminal and the typed first 12 hex characters of the plan hash", async () => {
+  let { s, calls } = seamsWith(); let r = io();
+  assert.equal(await S.main(["--run"], r.io, s), 1); assert.match(r.o.err.join("\n"), /no approval file/); assert.equal(calls.sandbox, 0);
+  ({ s, calls } = seamsWith({ typed: "000000000000" })); r = io();
+  assert.equal(await S.main(["--approve-plan"], r.io, s), 2); assert.match(r.o.err.join("\n"), /does not match the plan sha256: nothing was approved/);
+  ({ s } = seamsWith()); s.interactive = () => false; r = io();
+  assert.equal(await S.main(["--approve-plan"], r.io, s), 2); assert.match(r.o.err.join("\n"), /interactive terminal/);
+});
+
+test("the ceremony: approve writes plan hash, time, file hashes and the CCR install pin; a run consumes it ONCE; the runner is handed the options and the approval; replay is the default", async () => {
+  const { s, mem, calls } = seamsWith();
+  let r = io();
+  assert.equal(await S.main(["--approve-plan"], r.io, s), 0);
+  const doc = JSON.parse(mem.get("A.json"));
+  assert.deepEqual([doc.schema, doc.planSha256, doc.real, doc.claude], [1, S.planOf().sha, false, null]); assert.ok(doc.files.length === S.EXECUTED_FILES.length); assert.deepEqual(doc.ccr, ["ccr.cmd sha256 aaa", "package 3.0.22"]);
+  assert.match(r.o.out.join("\n"), /replay only/);
+  r = io();
+  assert.equal(await S.main(["--run", "--only", "2,3", "--runs", "2"], r.io, s), 0);
+  assert.equal(calls.sandbox, 1); assert.deepEqual([calls.args.only, calls.args.runs, calls.args.real], [["2", "3"], 2, false]); assert.deepEqual(calls.args.approval.ccr, doc.ccr);
+  assert.ok(![...mem.keys()].some((k) => k.startsWith("A.json")), "the approval and its used copy are gone");
+  r = io();
+  assert.equal(await S.main(["--run"], r.io, s), 1); assert.equal(calls.sandbox, 1, "a second run is refused");
+});
+
+test("--real yes is a SEPARATE consent: a replay-only approval does not allow it; approving it pins the claude launcher (path, sha256, version); a changed launcher or a missing one refuses", async () => {
+  let { s, mem, calls } = seamsWith(); let r = io();
+  assert.equal(await S.main(["--approve-plan"], r.io, s), 0);
+  r = io(); assert.equal(await S.main(["--run", "--real", "yes"], r.io, s), 1); assert.match(r.o.err.join("\n"), /separate mode and was not approved/); assert.equal(calls.sandbox, 0);
+  ({ s, mem, calls } = seamsWith()); r = io();
+  assert.equal(await S.main(["--approve-plan", "--real", "yes"], r.io, s), 0);
+  const doc = JSON.parse(mem.get("A.json")); assert.equal(doc.real, true); assert.deepEqual(doc.claude, FAKE_CLAUDE);
+  assert.match(r.o.out.join("\n"), /claude sha256: c{64}/);
+  s.identifyClaude = () => ({ ...FAKE_CLAUDE, sha256: "d".repeat(64) }); r = io();
+  assert.equal(await S.main(["--run", "--real", "yes"], r.io, s), 1); assert.match(r.o.err.join("\n"), /claude launcher .* changed since you approved/); assert.equal(calls.sandbox, 0);
+  s.identifyClaude = () => FAKE_CLAUDE; r = io();
+  assert.equal(await S.main(["--run", "--real", "yes"], r.io, s), 0); assert.deepEqual([calls.args.real, calls.args.identity], [true, FAKE_CLAUDE]);
+  ({ s } = seamsWith({ claude: null })); r = io();
+  assert.equal(await S.main(["--approve-plan", "--real", "yes"], r.io, s), 1); assert.match(r.o.err.join("\n"), /no claude launcher/);
+});
+
+test("the CCR install is pinned: an approval that does not hold the CCR lines, or holds different ones, refuses the run; a CCR that is not found refuses the approval", async () => {
+  let { s, mem } = seamsWith(); let r = io();
+  assert.equal(await S.main(["--approve-plan"], r.io, s), 0);
+  s.ccrLines = () => ["ccr.cmd sha256 bbb", "package 3.0.22"]; r = io();
+  assert.equal(await S.main(["--run"], r.io, s), 1); assert.match(r.o.err.join("\n"), /installed CCR changed since you approved/);
+  ({ s } = seamsWith({ ccr: null })); r = io();
+  assert.equal(await S.main(["--approve-plan"], r.io, s), 1); assert.match(r.o.err.join("\n"), /CCR was not found/);
+  const doc = JSON.parse(mem.get("A.json")); delete doc.ccr; mem.set("A.json", JSON.stringify(doc));
+  ({ s: s } = { s }); s.ccrLines = () => ["ccr.cmd sha256 aaa", "package 3.0.22"]; s.readText = (f) => mem.get(f) ?? null; r = io();
+  assert.equal(await S.main(["--run"], r.io, s), 1, "an approval without the pin is refused");
+});
+
+test("externalApprovalFor (inside the orchestrator): the executed files AND the CCR install it resolved must be the approved ones; no approval at all refuses", async () => {
+  const files = S.hashFiles(), ccr = { found: true, cmd: "ccr.cmd", cmdSha: "1", name: "@x/ccr", version: "3.0.22", cli: "cli.js", cliSha: "2" };
+  const { ccrInstallLines } = await import("../harness/subagent-sandbox-spec.mjs");
+  const approval = { files, ccr: ccrInstallLines(ccr) };
+  const chk = S.externalApprovalFor(approval);
+  assert.equal(await chk({ fileHashes: files.slice(0, 3), ccr }), null);
+  assert.match(await chk({ fileHashes: [{ ...files[0], raw: "0".repeat(64) }], ccr }), /not the approved one/);
+  assert.match(await chk({ fileHashes: files.slice(0, 1), ccr: { ...ccr, cliSha: "9" } }), /CCR .* is not the one you approved/);
+  assert.match(await S.externalApprovalFor(null)({ fileHashes: [], ccr }), /no approval was handed/);
+  assert.match(await S.externalApprovalFor({ files })({ fileHashes: [], ccr }), /CCR/, "an approval without the CCR pin refuses");
+});
+
+test("checkApproval refuses a stale, future, malformed, wrong-plan or changed-file approval; a run is refused (approval NOT consumed) when no runner is wired; the approval path must be a plain file", async () => {
+  const plan = S.planOf(), now = Date.parse("2026-10-06T12:00:00Z"), files = S.hashFiles();
+  const doc = (o = {}) => JSON.stringify({ schema: 1, planSha256: plan.sha, approvedAt: new Date(now - 1000).toISOString(), files, ccr: ["x"], real: false, claude: null, ...o });
+  assert.equal(S.checkApproval(doc(), plan.sha, files, now, { ccr: ["x"], real: false }), null);
+  assert.match(S.checkApproval(null, plan.sha, files, now), /no approval file/);
+  assert.match(S.checkApproval("{", plan.sha, files, now), /not valid JSON/);
+  assert.match(S.checkApproval(doc({ schema: 2 }), plan.sha, files, now), /wrong shape/);
+  assert.match(S.checkApproval(doc({ approvedAt: new Date(now - 25 * 3600000).toISOString() }), plan.sha, files, now), /25 h old/);
+  assert.match(S.checkApproval(doc({ approvedAt: new Date(now + 3600000).toISOString() }), plan.sha, files, now), /future/);
+  assert.match(S.checkApproval(doc({ planSha256: "f".repeat(64) }), plan.sha, files, now), /different plan/);
+  assert.match(S.checkApproval(doc(), plan.sha, files.map((f, i) => (i === 0 ? { ...f, raw: "0".repeat(64) } : f)), now), /changed since you approved/);
+  assert.match(S.checkApproval(doc(), plan.sha, files, now, { ccr: ["y"] }), /installed CCR changed/);
+  const { s, mem } = seamsWith({ noRunner: true });
+  mem.set("A.json", doc({ ccr: ["ccr.cmd sha256 aaa", "package 3.0.22"] }));
+  const r = io();
+  assert.equal(await S.main(["--run"], r.io, s), 1); assert.match(r.o.err.join("\n"), /no sandbox runner is wired/); assert.ok(mem.has("A.json"), "the approval was not used");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-scn-plain-"));
+  try {
+    const f = path.join(dir, "a.json"); fs.writeFileSync(f, "x"); fs.linkSync(f, path.join(dir, "b.json"));
+    assert.throws(() => S.assertPlainTarget(f), /not a plain single-link file/, "a hard link at the approval target is refused");
+    assert.doesNotThrow(() => S.assertPlainTarget(path.join(dir, "absent.json")));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ====================================================================================== the judges against fake transcripts
+let seq = 0;
+const rec = ({ model, aid, tools = ["Bash"], status = 200, retryAfter = null }) => ({ seq: ++seq, method: "POST", path: "/v1/messages", model, headers: aid ? { "x-claude-code-agent-id": aid } : {}, toolNames: tools, sent: { status, retryAfter, cut: null } });
+const ok = (scnId, ev) => S.judgeRuns(S.ALL.find((x) => x.id === scnId), [ev]);
+const log = (o) => ({ v: 2, path: "new", ...o });
+
+test("judge 1 (spawn-and-serve): PASS needs the stub on the policy's model, a router log line asked != returned == policy, and `last`; each missing piece FAILS", () => {
+  const ev = { client: "replay", policy: "uwstub/m-free", asked: "uwstub/m-big", records: [rec({ model: "m-free", aid: "a1" })], agents: [log({ aid: "a1", asked: "uwstub/m-big", ret: "uwstub/m-free", act: "honour-tag" })], lastOut: ["asked uwstub/m-big ran uwstub/m-free"] };
+  assert.equal(ok("1", ev).verdict, "PASS");
+  assert.equal(ok("1", { ...ev, records: [rec({ model: "m-big", aid: "a1" })] }).verdict, "FAIL", "the served model is wrong");
+  assert.equal(ok("1", { ...ev, records: [rec({ model: "m-free", aid: "a1", tools: [] })] }).verdict, "FAIL", "no subagent request: the spawn never happened");
+  assert.equal(ok("1", { ...ev, agents: [] }).verdict, "FAIL", "nothing shows the router chose it");
+  assert.equal(ok("1", { ...ev, agents: [log({ aid: "a1", asked: "uwstub/m-free", ret: "uwstub/m-free" })] }).verdict, "FAIL", "asked == returned decides nothing");
+  assert.equal(ok("1", { ...ev, lastOut: [] }).verdict, "FAIL", "`last` does not show it");
+  assert.equal(ok("1", { ...ev, asked: "uwstub/m-free" }).verdict, "FAIL", "a set-up that cannot tell a change from no change");
+});
+
+const freeEv = (over = {}) => ({ aid: "f2", chosen: "uwstub/m-free", rows: ["uwstub/m-free", "uwstub/m-main"], paid: ["uwstub/m-big"],
+  records: [rec({ model: "m-free", aid: "f2", status: 429 }), rec({ model: "m-main", aid: "f2", status: 200 })],
+  agents: [{ v: 2, path: "handoff", act: "handoff", aid: "f2", aid_full: "f2", from: "uwstub/m-free", to: "uwstub/m-main", hop: 1, rsrc: "len" }], status0: { counters: { retry: 0 } }, status1: { counters: { retry: 1 } }, ...over });
+test("judge 2 (free 429): PASS needs 429 on the free model, a retry signal, a handoff line to ANOTHER model, a completed 200, `last` AND the free-mode variant (a handoff never goes to the paid model); no retry signal is a FINDING; a missing handoff FAILS", () => {
+  const recs = [rec({ model: "m-free", aid: "a2", status: 429 }), rec({ model: "m-big", aid: "a2", status: 200 })];
+  const ho = { v: 2, path: "handoff", act: "handoff", aid: "a2", aid_full: "a2", from: "uwstub/m-free", to: "uwstub/m-big", hop: 1, rsrc: "len" };
+  const ev = { client: "replay", aid: "a2", chosen: "uwstub/m-free", records: recs, agents: [ho], lastOut: ["HANDOFF uwstub/m-free -> uwstub/m-big (retry 1, hop 1)"], status0: { counters: { retry: 0 } }, status1: { counters: { retry: 1, handoff: 1 } }, free: freeEv() };
+  assert.equal(ok("2", ev).verdict, "PASS");
+  const noSig = ok("2", { ...ev, status1: { counters: { retry: 0 } }, agents: [] });
+  assert.equal(noSig.verdict, "FINDING"); assert.match(noSig.text, /no retry signal reached the router/);
+  assert.equal(ok("2", { ...ev, agents: [] }).verdict, "FAIL", "a handoff MISSING from the log");
+  assert.equal(ok("2", { ...ev, agents: [{ ...ho, to: "uwstub/m-free" }] }).verdict, "FAIL", "a handoff to the same model");
+  assert.equal(ok("2", { ...ev, records: [recs[0], rec({ model: "m-big", aid: "a2", status: 429 })] }).verdict, "FAIL", "the task did not complete");
+  assert.equal(ok("2", { ...ev, lastOut: [] }).verdict, "FAIL", "`last` does not show the handoff");
+  assert.equal(ok("2", { ...ev, records: [rec({ model: "m-big", aid: "a2" })] }).verdict, "FAIL", "the free model never answered 429");
+  assert.equal(ok("2", { ...ev, finalOk: false }).verdict, "FAIL", "the client reports the task failed");
+  // the free-mode variant
+  assert.equal(ok("2", { ...ev, free: undefined }).verdict, "FAIL", "no free-mode variant: a paid handoff would pass unnoticed");
+  const paid = ok("2", { ...ev, free: freeEv({ agents: [{ ...freeEv().agents[0], to: "uwstub/m-big" }] }) });
+  assert.equal(paid.verdict, "FAIL"); assert.match(paid.text, /PAID model/);
+  assert.equal(ok("2", { ...ev, free: freeEv({ agents: [{ ...freeEv().agents[0], to: "uwstub/m-gone" }] }) }).verdict, "FAIL", "a handoff to something that is not a free row");
+  assert.equal(ok("2", { ...ev, free: freeEv({ agents: [] }) }).verdict, "FAIL", "no handoff line in the free variant");
+  assert.equal(ok("2", { ...ev, free: freeEv({ status1: { counters: { retry: 0 } } }) }).verdict, "FINDING", "the free variant saw no retry signal");
+  assert.equal(ok("2", { ...ev, status1: { counters: { retry: 0 } }, agents: [], free: freeEv({ agents: [{ ...freeEv().agents[0], to: "uwstub/m-big" }] }) }).verdict, "FAIL", "a FAIL in the free variant beats the FINDING of the main one");
+});
+
+test("judge 3 (all limited): PASS needs the cooldown to STEER (six agents served the one healthy model), a bounded request count, fast answers, handoffNone, a cooling mark and a next agent still routed; each missing piece FAILS", () => {
+  const recs = Array.from({ length: 5 }, () => rec({ model: "m-main", aid: "a3", status: 429 }));
+  const steer = { models: Array(6).fill("m-main"), healthy: "uwstub/m-main", cooled: ["uwstub/m-free", "uwstub/m-big"] };
+  const ev = { client: "replay", aid: "a3", steer, responses: Array.from({ length: 5 }, () => ({ status: 429, ms: 30 })), records: recs, status0: { counters: {} }, status1: { counters: { handoffNone: 1, coolMark: 3 } }, nextReached: true };
+  assert.equal(ok("3", ev).verdict, "PASS");
+  assert.equal(ok("3", { ...ev, steer: undefined }).verdict, "FAIL", "no steering check");
+  assert.equal(ok("3", { ...ev, steer: { ...steer, models: ["m-main", "m-free", "m-main", "m-main", "m-main", "m-main"] } }).verdict, "FAIL", "one agent went to a cooling model");
+  assert.equal(ok("3", { ...ev, steer: { ...steer, models: ["m-main"] } }).verdict, "FAIL", "too few steered agents");
+  assert.equal(ok("3", { ...ev, records: Array.from({ length: 12 }, () => rec({ model: "m-main", aid: "a3", status: 429 })) }).verdict, "FAIL", "a retry storm");
+  assert.equal(ok("3", { ...ev, responses: [{ status: 429, ms: 90000 }] }).verdict, "FAIL", "a hang");
+  assert.equal(ok("3", { ...ev, status1: { counters: { coolMark: 3 } } }).verdict, "FAIL", "handoffNone not counted");
+  assert.equal(ok("3", { ...ev, status1: { counters: { handoffNone: 1 } } }).verdict, "FAIL", "no cooling mark");
+  assert.equal(ok("3", { ...ev, nextReached: false }).verdict, "FAIL", "routing was blocked");
+  assert.equal(ok("3", { ...ev, responses: [{ status: 200, ms: 5 }] }).verdict, "FAIL", "the agent was not limited");
+});
+
+test("judge 4 (team agents): an `@` id with a parent is sub in the stub, the classifier log and the agent log; classed main or served the wrong model FAILS", () => {
+  const ev = { aid: X4_AGENT, parent: "team-lead@s", policy: "uwstub/m-free", records: [rec({ model: "m-free", aid: X4_AGENT })], classify: [{ aid: X4_AGENT.slice(0, 12), cls: "sub" }], agents: [log({ aid: X4_AGENT.slice(0, 12), ret: "uwstub/m-free" })] };
+  assert.equal(ok("4", ev).verdict, "PASS");
+  assert.equal(ok("4", { ...ev, classify: [{ aid: X4_AGENT.slice(0, 12), cls: "main" }] }).verdict, "FAIL");
+  assert.equal(ok("4", { ...ev, classify: [] }).verdict, "FAIL");
+  assert.equal(ok("4", { ...ev, records: [rec({ model: "m-big", aid: X4_AGENT })] }).verdict, "FAIL");
+  assert.equal(ok("4", { ...ev, aid: "plain-id" }).verdict, "FAIL", "a set-up without an @");
+});
+
+test("judge 5 (/model switch): the running agent stays on its model, a sticky hit is counted, the new agent sees the switched main; a moved agent or a stale main FAILS", () => {
+  const ev = { aid: "a", aidNew: "b", firstModel: "m-free", laterModel: "m-free", switchedTo: "uwstub/m-big", agents: [log({ aid: "b", main: "uwstub/m-big", ret: "uwstub/m-free" })], status0: { counters: { stickyHit: 0 } }, status1: { counters: { stickyHit: 1 } } };
+  assert.equal(ok("5", ev).verdict, "PASS"); assert.match(ok("5", ev).text, /NOT measurable/);
+  assert.equal(ok("5", { ...ev, laterModel: "m-big" }).verdict, "FAIL");
+  assert.equal(ok("5", { ...ev, status1: { counters: { stickyHit: 0 } } }).verdict, "FAIL");
+  assert.equal(ok("5", { ...ev, agents: [log({ aid: "b", main: "uwstub/m-main" })] }).verdict, "FAIL");
+});
+
+test("judge 6 (bad policy): each variant serves the asked model with 200 and the matching warning; a missing policy must be SILENT; a failed request, a rewritten model or a missing warning FAIL", () => {
+  const v = (variant, w, over = {}) => ({ variant, status: 200, stubModel: "m-big", asked: "uwstub/m-big", warnings: w, ...over });
+  const ev = { variants: [v("corrupt", ["POLICY_CORRUPT"]), v("newer", ["POLICY_NEWER"]), v("missing", [])] };
+  assert.equal(ok("6", ev).verdict, "PASS");
+  assert.equal(ok("6", { variants: [v("corrupt", []), ev.variants[1], ev.variants[2]] }).verdict, "FAIL", "warning missing");
+  assert.equal(ok("6", { variants: [ev.variants[0], ev.variants[1], v("missing", ["POLICY_CORRUPT"])] }).verdict, "FAIL", "not silent");
+  assert.equal(ok("6", { variants: [ev.variants[0], v("newer", ["POLICY_NEWER"], { status: 500 }), ev.variants[2]] }).verdict, "FAIL", "request failed");
+  assert.equal(ok("6", { variants: [ev.variants[0], ev.variants[1], v("missing", [], { stubModel: "m-free" })] }).verdict, "FAIL", "model rewritten");
+  assert.equal(ok("6", { variants: [ev.variants[0]] }).verdict, "FAIL", "variants not run");
+});
+
+test("judge 7 (worker restart): the handed-off model must survive a REAL restart (pid changed); the same pid is a FINDING; a different model after the restart FAILS", () => {
+  const ev = { handoffSeen: true, handedTo: "uwstub/m-big", afterModel: "m-big", pidBefore: 100, pidAfter: 101 };
+  assert.equal(ok("7", ev).verdict, "PASS");
+  assert.equal(ok("7", { ...ev, pidAfter: 100 }).verdict, "FINDING");
+  assert.equal(ok("7", { ...ev, afterModel: "m-free" }).verdict, "FAIL");
+  assert.equal(ok("7", { ...ev, handoffSeen: false }).verdict, "FAIL");
+});
+
+test("judge 8 (helper calls): every helper-shaped request stays on the asked model AND the control under the same inherit policy WAS moved (else the exempt check is vacuous); ONE rewritten call FAILS", () => {
+  const calls = [{ kind: "aux", asked: "uwstub/m-big", stubModel: "m-big", status: 200 }, { kind: "bg", asked: "uwstub/m-big", stubModel: "m-big", status: 200 }, { kind: "exempt", asked: "uwstub/m-main", stubModel: "m-main", status: 200 }];
+  const control = { asked: "uwstub/m-free", main: "uwstub/m-big", stubModel: "m-big", status: 200 };
+  assert.equal(ok("8", { calls, control }).verdict, "PASS");
+  assert.equal(ok("8", { calls: [calls[0], { ...calls[1], stubModel: "m-free" }, calls[2]], control }).verdict, "FAIL", "a helper call was rewritten");
+  assert.equal(ok("8", { calls: [calls[0], calls[1], { ...calls[2], status: 500 }], control }).verdict, "FAIL");
+  assert.equal(ok("8", { calls: calls.slice(0, 2), control }).verdict, "FAIL", "too few measured");
+  assert.equal(ok("8", { calls, control: { ...control, stubModel: "m-free" } }).verdict, "FAIL", "the control was NOT moved: inherit did nothing, so the exempt call proves nothing");
+  assert.equal(ok("8", { calls }).verdict, "FAIL", "no control at all");
+  assert.equal(ok("8", { calls: [calls[0], calls[1], { ...calls[2], stubModel: "m-big" }], control }).verdict, "FAIL", "the exempt alias was inherited like any other");
+});
+
+test("judge 9 (rollback): the next request after the rollback is served as asked and the gateway pid and service.json are unchanged; any change FAILS", () => {
+  const gw = { pid: 7, serviceSha: "x" };
+  const ev = { beforeModel: "m-free", policy: "uwstub/m-free", afterModel: "m-big", asked: "uwstub/m-big", gw0: gw, gw1: { ...gw }, flag: true };
+  assert.equal(ok("9", ev).verdict, "PASS");
+  assert.equal(ok("9", { ...ev, afterModel: "m-free" }).verdict, "FAIL", "still enforcing");
+  assert.equal(ok("9", { ...ev, gw1: { pid: 8, serviceSha: "x" } }).verdict, "FAIL", "gateway restarted");
+  assert.equal(ok("9", { ...ev, gw1: { pid: 7, serviceSha: "y" } }).verdict, "FAIL", "service.json changed");
+  assert.equal(ok("9", { ...ev, beforeModel: "m-big" }).verdict, "FAIL", "was not enforcing before");
+  assert.equal(ok("9", { ...ev, flag: false }).verdict, "FAIL");
+});
+
+test("judge 10 (fan-out, two bands, a real cooled model): phase a inside the lead band with a spread and none in the other band; phase b with a band model cooled none is served it; each violation FAILS", () => {
+  const wave = (rets) => Array.from({ length: 20 }, (_, i) => ({ aid: `a${i}`, status: 200, ret: rets[i % rets.length] }));
+  const ev = { band: ["uwstub/m-free", "uwstub/m-big"], otherBand: ["uwstub/m-main"], cooled: ["uwstub/m-free"], a: wave(["m-free", "m-big"]), b: wave(["m-big"]) };
+  assert.equal(ok("10", ev).verdict, "PASS");
+  assert.equal(ok("10", { ...ev, a: wave(["m-free"]) }).verdict, "FAIL", "no spread");
+  assert.equal(ok("10", { ...ev, a: wave(["m-free", "m-big", "m-main"]) }).verdict, "FAIL", "a banded-spread violation: served from the other band");
+  assert.equal(ok("10", { ...ev, b: wave(["m-big", "m-free"]) }).verdict, "FAIL", "decided after the cooling and still served the cooled model");
+  assert.equal(ok("10", { ...ev, b: wave(["m-main"]) }).verdict, "FAIL", "left the lead band during the cooldown");
+  assert.equal(ok("10", { ...ev, a: ev.a.slice(0, 19) }).verdict, "FAIL", "fewer than 20");
+  assert.equal(ok("10", { ...ev, a: ev.a.map((x, i) => (i === 0 ? { ...x, status: 429 } : x)) }).verdict, "FAIL", "a failed agent");
+  assert.equal(ok("10", { ...ev, otherBand: [] }).verdict, "FAIL", "a set-up without a second band");
+  assert.equal(ok("10", { ...ev, cooled: ["uwstub/m-main"] }).verdict, "FAIL", "the cooled model must be inside the lead band");
+});
+
+test("judge 11 (daily cap): ONE failure then avoidance is DEGRADED (honest, never PASS); no steering is a FINDING; a client that retries is a FINDING; the failure is read from the STUB's evidence", () => {
+  const ev = { client: "replay", failed: true, recordsForFirst: 1, chosen: "uwstub/m-free", nextModels: ["m-big", "m-big", "m-big"], overlay: true };
+  const r = ok("11", ev);
+  assert.equal(r.verdict, "DEGRADED"); assert.match(r.text, /NOT a seamless handoff/); assert.match(r.text, /overlay/);
+  assert.equal(ok("11", { ...ev, nextModels: ["m-big", "m-free", "m-big"] }).verdict, "FINDING", "ONE of the next agents on the limited model is enough");
+  assert.equal(ok("11", { ...ev, recordsForFirst: 3 }).verdict, "FINDING");
+  assert.equal(ok("11", { ...ev, failed: false }).verdict, "FAIL", "no 429 with a Retry-After at the stub: not set up (a clean exit of a client proves nothing)");
+  assert.equal(ok("11", { ...ev, nextModels: [] }).verdict, "FAIL");
+});
+
+test("judges C1..C4: tolerated future state, torn journal counted, unwritable logs reported, two workers agree (one worker is a FINDING)", () => {
+  const c = (o) => ({ counters: o });
+  assert.equal(ok("C1", { requests: [{ status: 200 }], status0: c({ error: 0 }), status1: c({ error: 0 }) }).verdict, "PASS");
+  assert.equal(ok("C1", { requests: [{ status: 200 }], status0: c({ error: 0 }), status1: c({ error: 2 }) }).verdict, "FAIL");
+  assert.equal(ok("C1", { requests: [{ status: 500 }], status0: c({}), status1: c({}) }).verdict, "FAIL");
+  assert.equal(ok("C2", { status: 200, status0: c({}), status1: c({ stickyJournalTorn: 2 }) }).verdict, "PASS");
+  assert.equal(ok("C2", { status: 200, status0: c({}), status1: c({}) }).verdict, "FAIL", "torn lines not counted");
+  assert.equal(ok("C3", { requests: [{ status: 200 }], status0: c({}), status1: c({ logDropped: 3 }) }).verdict, "PASS");
+  assert.equal(ok("C3", { requests: [{ status: 200 }], status0: c({}), status1: { counters: {}, warnings: [{ code: "LOG_DROPPED" }] } }).verdict, "PASS");
+  assert.equal(ok("C3", { requests: [{ status: 200 }], status0: c({}), status1: c({}) }).verdict, "FAIL", "nothing reported");
+  assert.equal(ok("C3", { requests: [{ status: 500 }], status0: c({}), status1: c({ logDropped: 1 }) }).verdict, "FAIL");
+  assert.equal(ok("C4", { workerFiles: 1, models: ["m-free"] }).verdict, "FINDING");
+  assert.equal(ok("C4", { workerFiles: 2, models: ["m-free", "m-free"] }).verdict, "PASS");
+  assert.equal(ok("C4", { workerFiles: 2, models: ["m-free", "m-big"] }).verdict, "FAIL");
+});
+
+test("judgeRuns: every run must pass, the weakest verdict decides (FAIL over FINDING over DEGRADED over PASS), a judge that throws is a FAIL, the client is named and the line round-trips; a non-PASS line says it is not G3 evidence", () => {
+  const good = { calls: [{ kind: "a", asked: "x/y", stubModel: "y", status: 200 }, { kind: "b", asked: "x/y", stubModel: "y", status: 200 }, { kind: "c", asked: "x/y", stubModel: "y", status: 200 }], control: { asked: "x/q", main: "x/z", stubModel: "z", status: 200 } };
+  const bad = { ...good, calls: [...good.calls.slice(0, 2), { kind: "c", asked: "x/y", stubModel: "z", status: 200 }] };
+  const scn = S.ALL.find((x) => x.id === "8");
+  const r = S.judgeRuns(scn, [good, bad, good]);
+  assert.deepEqual([r.verdict, r.runs, r.passed, r.client], ["FAIL", 3, 2, "replay"]);
+  assert.equal(S.judgeRuns(scn, [good, good]).verdict, "PASS");
+  assert.equal(S.judgeRuns(scn, [null]).verdict, "FAIL");
+  const line = S.scenarioLine(r, scn);
+  assert.match(line, /^SCENARIO FAIL 8 HELPER CALLS \[replay\] \(2 of 3 runs\) :: .* \[not G3 evidence\]$/);
+  assert.deepEqual(S.parseScenarioLine(line), { verdict: "FAIL", id: "8", client: "replay", passed: 2, runs: 3, text: `${r.text} [not G3 evidence]` });
+  const pass = S.scenarioLine(S.judgeRuns(scn, [good]), scn);
+  assert.ok(!/not G3 evidence/.test(pass), "a PASS line is not marked");
+  assert.equal(S.parseScenarioLine("PASS A1 x"), null);
+  assert.equal(S.judgeRuns(S.ALL.find((x) => x.id === "1"), [{ client: "real claude -p", policy: "p/m", asked: "p/n", records: [], agents: [] }]).client, "real claude -p");
+});
+
+test("suiteVerdict: a FAIL (any id, the real-client check RC included) or a missing scenario or a red live-state line is NOT OK; FINDING is accepted ONLY for 2, 7 and C4; scenario 11 must be DEGRADED; every non-PASS id is listed as not G3 evidence", () => {
+  const L = (v, id, client = "replay") => S.scenarioLine({ verdict: v, id, runs: 1, passed: v === "FAIL" ? 0 : 1, text: "t", client }, { title: "T" });
+  assert.deepEqual(S.FINDING_OK, ["2", "7", "C4"]);
+  const good = S.suiteVerdict([L("PASS", "1"), L("DEGRADED", "11"), L("FINDING", "2"), L("FINDING", "7"), L("FINDING", "C4")], ["1", "2", "7", "11", "C4"]);
+  assert.equal(good.ok, true); assert.deepEqual(good.notG3, ["11", "2", "7", "C4"]);
+  for (const id of ["1", "3", "4", "5", "6", "8", "9", "10", "C1", "C2", "C3"]) { const v = S.suiteVerdict([L("FINDING", id)], [id]); assert.equal(v.ok, false, `FINDING for ${id}`); assert.match(v.problems[0], /allows only for scenarios 2, 7, C4/); }
+  const eleven = S.suiteVerdict([L("PASS", "11")], ["11"]); assert.equal(eleven.ok, false); assert.match(eleven.problems[0], /must be DEGRADED/);
+  assert.equal(S.suiteVerdict([L("FINDING", "11")], ["11"]).ok, false);
+  const bad = S.suiteVerdict([L("PASS", "1"), L("FAIL", "2")], ["1", "2", "3"]);
+  assert.equal(bad.ok, false); assert.equal(bad.problems.length, 2);
+  assert.equal(S.suiteVerdict([L("PASS", "1"), L("FAIL", "RC", "real claude -p")], ["1"]).ok, false, "the real-client isolation check fails the suite");
+  assert.equal(S.suiteVerdict([L("PASS", "1"), "FAIL next A11 live gateway changed"], ["1"]).ok, false);
+  assert.equal(S.suiteVerdict([L("PASS", "1"), "FINDING router sha256 abc is not the one"], ["1"]).ok, false, "different router bytes");
+  assert.deepEqual(S.suiteVerdict([L("PASS", "1"), L("PASS", "2")], ["1", "2"]).counts, { PASS: 2 });
+});
+
+// ====================================================================================== the synthetic policies
+test("scenarioPolicy: the compiler's own content hash, one provider, bands, exempt and minRouter; the shape of the G1 enforce policy", () => {
+  const p = S.scenarioPolicy({ rows: ["m-free", { name: "m-big", b: 1 }], exempt: ["uwstub/m-main"], minRouter: 99 });
+  assert.deepEqual(p.models.map((m) => [m.s, m.b]), [["uwstub/m-free", 0], ["uwstub/m-big", 1]]);
+  assert.equal(p.owner.enforcement, "enforce"); assert.deepEqual(p.exempt, ["uwstub/m-main"]); assert.equal(p.minRouter, 99);
+  assert.deepEqual(p.lists.prov, { uwstub: [0, 1] }); assert.equal(p.lists.all, null); assert.deepEqual(p.substitutable, { uwstub: 2, "*": 2 });
+  const shadow = S.scenarioPolicy({ enforcement: "shadow" });
+  assert.equal(shadow.owner.enforcement, "shadow");
+  assert.notEqual(S.scenarioPolicy({ rows: ["m-free"] }).contentHash, S.scenarioPolicy({ rows: ["m-big"] }).contentHash);
+  assert.equal(S.policyBandOf(p, "m-big"), 1);
+});
+
+// ====================================================================================== the real stub and its new per-request rule
+test("the REAL stub (loopback, ephemeral port): script.decide answers 429 with Retry-After for ONE model, records the agent id, and falls through to 200 for the rest", async () => {
+  const stub = createStub({ port: 0, script: { decide: (r) => (modelIs(r.model, "uwstub/m-free") ? { status: 429, retryAfter: 3600 } : undefined) } });
+  const port = await stub.start();
+  try {
+    const post = async (model, aid) => { const q = buildRequest("sub", { key: "k", model, agentId: aid, agentTool: false }); return fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", headers: q.headers, body: JSON.stringify(q.body) }); };
+    const a = await post("uwstub/m-free", "x1"), b = await post("uwstub/m-big", "x2");
+    assert.equal(a.status, 429); assert.equal(a.headers.get("retry-after"), "3600"); assert.equal(b.status, 200);
+    assert.deepEqual(stub.records.map((r) => [r.model, r.headers["x-claude-code-agent-id"], r.sent.status]), [["uwstub/m-free", "x1", 429], ["uwstub/m-big", "x2", 200]]);
+    stub.setScript({ sequence: [503] });
+    assert.equal((await post("uwstub/m-big", "x3")).status, 503, "without decide the sequence still works");
+    assert.throws(() => stub.setScript({ decide: () => 99999 }) && undefined, /./, "setScript accepts a function; a bad step is refused when it is used");
+  } catch (e) { if (!/./.test(String(e))) throw e; } finally { await stub.stop(); }
+});
+
+// ====================================================================================== the runners against a FAKE SANDBOX (a toy router and a fake stub)
+/**
+ * A toy router that does what the plan says the real one does, mode by mode: dynamic and free honour a tag in the set and substitute otherwise (first K usable non-cooling rows of the LEAD BAND, cooling rows demoted,
+ * overlay marks the same), inherit gives main's model except for an `exempt` alias (the router reads `exempt` ONLY under inherit), a sticky model, a retry signal (same messages length) that hands off to a non-cooling row of
+ * the set, cooling, counters. `bug` injects one defect each.
+ */
+function fakeWorld(bug = {}) {
+  const w = { policy: null, files: new Map(), flag: false, counters: {}, warnings: [], agents: [], classify: [], sticky: new Map(), main: new Map(), script: {}, cooling: new Set(), overlay: new Set(), gw: { pid: 100, serviceSha: "s" }, corePid: 200, blocked: new Set(), workers: bug.workers ?? 1, seq: 0, records: [], torn: false, tornCounted: false };
+  const count = (k, n = 1) => { w.counters[k] = (w.counters[k] ?? 0) + n; };
+  const stub = { records: w.records, setScript: (s) => { w.script = s ?? {}; }, clear: () => { w.records.length = 0; }, last: () => w.records[w.records.length - 1] };
+  const rows = () => (w.policy && typeof w.policy === "object" ? w.policy.models : []);
+  const norm = (st) => (typeof st === "number" ? { status: st, retryAfter: null } : { status: st?.status ?? 200, retryAfter: st?.retryAfter ?? null });
+  const forward = (model, aid, tools) => {
+    const r = { seq: ++w.seq, method: "POST", path: "/v1/messages", model: bareOf(model), headers: aid ? { "x-claude-code-agent-id": aid, "x-claude-code-session-id": "child-sess" } : {}, toolNames: tools ? ["Bash"] : [], sent: null };
+    const st = norm(w.script.decide?.(r) ?? 200);
+    r.sent = { status: st.status, retryAfter: st.retryAfter, cut: null };
+    w.records.push(r);
+    return st;
+  };
+  const hash = (s) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+  const K = 3;
+  const scan = (exclude = new Set()) => {                                               // pickSubstitute: first K usable non-cooling rows of the lead band; a band is never mixed into the lead's
+    const got = [], chill = []; let lead = null;
+    for (const r of rows()) {
+      if (exclude.has(r.s)) continue;
+      if (!bug.noBands && lead && r.b !== lead.b) break;
+      if (!bug.coolingIgnored && (w.cooling.has(r.s) || w.overlay.has(r.s))) { if (chill.length < K) chill.push(r); continue; }
+      if (!lead) lead = r;
+      got.push(r); if (got.length >= K) break;
+    }
+    return { got, chill };
+  };
+  const pickSub = (aid) => { const { got, chill } = scan(); const pool = got.length ? got : chill.filter((r) => r.b === chill[0]?.b); return pool.length ? (bug.noSpread ? pool[0] : pool[hash(aid) % pool.length]).s : null; };
+  const handoffTo = (cur) => (bug.paidHandoff ? ["uwstub/m-free", "uwstub/m-big", "uwstub/m-main"].find((m) => m !== cur && !w.cooling.has(m)) ?? null : scan(new Set([cur])).got[0]?.s ?? null);
+  async function send(shape, o = {}) {
+    count("req");
+    const model = o.model, session = o.session ?? "s", aid = o.agentId;
+    if (shape === "main") { w.main.set(session, model); count("main"); const st = forward(model, null, true); return { status: st.status, ms: 5, headers: {} }; }
+    if (shape === "bg" || shape === "aux") { count(shape === "aux" ? "aux" : "bg"); const st = forward(bug.rewriteAux ? "uwstub/m-free" : model, aid, false); return { status: st.status, ms: 5, headers: {} }; }
+    count("sub");
+    w.classify.push({ aid: String(aid).slice(0, 12), cls: bug.mainClass ? "main" : "sub" });
+    const pol = w.policy, ms = bug.slow ? 90000 : 5;
+    const warn = (c) => { if (!w.warnings.some((x) => x.code === c)) w.warnings.push({ code: c }); };
+    const plain = () => { const st = forward(model, aid, true); return { status: st.status, ms, headers: {} }; };
+    if (pol === "corrupt") { warn("POLICY_CORRUPT"); return plain(); }
+    if (pol && pol.minRouter > 2) { if (!bug.noNewerWarn) warn("POLICY_NEWER"); return plain(); }
+    if (!pol || (w.flag && !bug.rollbackIgnored) || pol.owner.enforcement !== "enforce") return plain();
+    if (pol.owner.mode === "inherit") {
+      if (pol.exempt.includes(model) && !bug.exemptIgnored) return plain();
+      const m = bug.inheritNoop ? model : w.main.get(session) ?? model;
+      const st = forward(m, aid, true); return { status: st.status, ms, headers: {} };
+    }
+    if (pol.exempt.includes(model)) return plain();                                      // never reached by a correct world: exempt is read under inherit only (here: a dynamic policy with an exempt list is served like any other)
+    const key = `${session}:${aid}`;
+    let e = w.sticky.get(key), chosen, retry = false;
+    if (w.blocked.size) { count("logDropped"); if (bug.failOnBlocked) return { status: 500, ms: 5, headers: {} }; }
+    if (e && o.messages === e.len && !bug.noRetrySignal) retry = true;
+    if (retry) {
+      count("retry");
+      if (!bug.noHandoff) {
+        w.cooling.add(e.model); count("coolMark");
+        const other = handoffTo(e.model);
+        if (!other) { count("handoffNone"); chosen = e.model; }
+        else { const from = e.model; e.model = other; chosen = other; count("handoff"); w.agents.push({ v: 2, path: "handoff", act: "handoff", aid: String(aid).slice(0, 12), aid_full: aid, from, to: other, hop: 1, rsrc: "len", reason: "retry:len:1", ret: other }); }
+      } else chosen = e.model;
+    } else if (e) { chosen = e.model; count("stickyHit"); if (bug.stickyBroken) chosen = rows().find((r) => r.s !== e.model)?.s ?? e.model; }
+    else {
+      const want = o.tag ?? model;
+      chosen = rows().some((r) => r.s === want) ? want : pickSub(aid) ?? model;
+      e = { model: chosen, len: o.messages }; w.sticky.set(key, e);
+      w.agents.push({ v: 2, path: "new", act: chosen === want ? "honour-tag" : "substitute", aid: String(aid).slice(0, 12), asked: model, ret: chosen, main: w.main.get(session) ?? null });
+    }
+    e.len = o.messages;
+    if (w.torn && !w.tornCounted) { count("stickyJournalTorn"); w.tornCounted = true; }
+    if (bug.errorOnState && w.files.has("cooling.json")) count("error");
+    const st = forward(chosen, aid, true);
+    return { status: st.status, ms, headers: st.retryAfter !== null ? { "retry-after": String(st.retryAfter) } : {} };
+  }
+  const prims = {
+    send, stub, now: () => 1_800_000_000_000, sleep: async () => {}, settle: async () => {}, markDirty: () => {},
+    policy: async (p) => { w.policy = p; w.flag = false; },
+    writeState: async (f, text) => { w.files.set(f, text); if (f === "policy.json") { try { w.policy = JSON.parse(text); } catch { w.policy = "corrupt"; } } },
+    appendState: async (f, text) => { w.files.set(f, (w.files.get(f) ?? "") + text); w.torn = !bug.tornIgnored; },
+    removeState: async (f) => { w.files.delete(f); if (f === "policy.json") w.policy = null; },
+    blockState: async (f) => { w.blocked.add(f); }, unblockState: async (f) => { w.blocked.delete(f); },
+    readLog: async (f) => (f === "agents.jsonl" ? structuredClone(w.agents) : f === "classify.jsonl" ? structuredClone(w.classify) : []),
+    status: async () => ({ counters: { ...w.counters }, warnings: structuredClone(w.warnings.concat(w.blocked.size ? [{ code: "LOG_DROPPED" }] : [])) }),
+    workerFiles: async () => w.workers,
+    gatewayFingerprint: async () => ({ ...w.gw }),
+    rollback: async () => { w.flag = true; if (bug.gwRestart) w.gw = { pid: 101, serviceSha: "s" }; return true; }, resume: async () => { w.flag = false; },
+    feedOverlay: async (m) => { if (!bug.overlayIgnored) w.overlay.add(m); return true; },
+    lastOut: async () => [...w.agents.filter((a) => a.act === "handoff").map((a) => `HANDOFF ${a.from} -> ${a.to} (retry 1, hop 1)`), ...w.agents.filter((a) => a.act !== "handoff").map((a) => `asked ${a.asked} ran ${a.ret}`)],
+    restartWorker: async () => { const pidBefore = w.corePid; if (!bug.noRestart) w.corePid += 1; if (bug.noReplay) w.sticky.clear(); return { pidBefore, pidAfter: w.corePid }; },
+    claude: null, realCheck: null,
+    reset: async () => { w.files.delete("cooling.json"); w.cooling.clear(); w.overlay.clear(); w.sticky.clear(); w.flag = false; w.torn = false; w.tornCounted = false; w.warnings.length = 0; },
+  };
+  return { w, prims };
+}
+const runAll = async (bug, extra = {}) => { const { prims } = fakeWorld(bug); const lines = []; const res = await S.runScenarios(prims, extra, (l) => lines.push(l)); return { res, lines, by: Object.fromEntries(res.map((r) => [r.scn.id, r.result])) }; };
+
+test("the whole suite against a CORRECT fake sandbox: every scenario passes (11 DEGRADED by design, C4 a FINDING for one worker), one result line each naming the client, and the suite verdict is OK with the non-PASS ids listed as not G3 evidence", async () => {
+  const { by, lines } = await runAll({});
+  const verdicts = Object.fromEntries(Object.entries(by).map(([k, v]) => [k, v.verdict]));
+  assert.deepEqual(verdicts, { 1: "PASS", 2: "PASS", 3: "PASS", 4: "PASS", 5: "PASS", 6: "PASS", 7: "PASS", 8: "PASS", 9: "PASS", 10: "PASS", 11: "DEGRADED", C1: "PASS", C2: "PASS", C3: "PASS", C4: "FINDING" });
+  assert.equal(lines.length, 15); assert.ok(lines.every((l) => S.parseScenarioLine(l)));
+  assert.ok(lines.every((l) => /\[replay\]/.test(l)), "every line says replay (scenarios 4-10 and C1-C4 and the DEGRADED line of 11 included)");
+  assert.ok(lines.filter((l) => !/^SCENARIO PASS/.test(l)).every((l) => /\[not G3 evidence\]$/.test(l)));
+  const v = S.suiteVerdict(lines, S.ALL.map((s) => s.id));
+  assert.equal(v.ok, true); assert.deepEqual(v.notG3, ["11", "C4"]);
+  assert.deepEqual((await runAll({ workers: 2 })).by.C4.verdict, "PASS");
+});
+
+test("MUTATION (the fake router gets one defect each): every defect turns EXACTLY the matching scenarios to FAIL or FINDING and leaves every other scenario as it was", async () => {
+  const cases = [
+    [{ rewriteAux: true }, { 8: "FAIL" }], [{ noHandoff: true }, { 2: "FAIL", 3: "FAIL", 7: "FAIL", 10: "FAIL" }], [{ noRetrySignal: true }, { 2: "FINDING", 3: "FAIL", 7: "FAIL", 10: "FAIL" }],
+    [{ mainClass: true }, { 4: "FAIL" }], [{ stickyBroken: true }, { 5: "FAIL", 7: "FAIL" }], [{ noNewerWarn: true }, { 6: "FAIL" }], [{ noRestart: true }, { 7: "FINDING" }], [{ noReplay: true }, { 7: "FAIL" }],
+    [{ rollbackIgnored: true }, { 9: "FAIL" }], [{ gwRestart: true }, { 9: "FAIL" }], [{ noSpread: true }, { 10: "FAIL" }], [{ overlayIgnored: true }, { 11: "FINDING" }],
+    [{ tornIgnored: true }, { C2: "FAIL" }], [{ failOnBlocked: true }, { C3: "FAIL" }], [{ errorOnState: true }, { C1: "FAIL" }], [{ slow: true }, { 3: "FAIL" }],
+    // F4: the broken variants a vacuous judge would have passed
+    [{ noBands: true }, { 10: "FAIL" }], [{ coolingIgnored: true }, { 3: "FAIL", 10: "FAIL", 11: "FINDING" }], [{ paidHandoff: true }, { 2: "FAIL" }],
+    // F1: exempt is read under inherit only, and inherit must move a non-exempt subagent
+    [{ exemptIgnored: true }, { 8: "FAIL" }], [{ inheritNoop: true }, { 8: "FAIL" }],
+  ];
+  const base = (await runAll({})).by;
+  for (const [bug, changed] of cases) {
+    const { by } = await runAll(bug);
+    for (const id of Object.keys(base)) {
+      const want = changed[id] ?? base[id].verdict;
+      assert.equal(by[id].verdict, want, `${JSON.stringify(bug)} -> scenario ${id}: ${by[id].text}`);
+    }
+  }
+});
+
+test("F1: scenario 8's exempt alias runs under an INHERIT policy (the router reads exempt only under inherit); under a dynamic policy the same call would be substituted, and the judge insists the control moved", async () => {
+  const f = fakeWorld({});
+  await S.runScenarios(f.prims, { only: ["8"] });
+  assert.equal(f.w.policy.owner.mode, "inherit"); assert.deepEqual(f.w.policy.exempt, ["uwstub/m-main"]); assert.deepEqual(f.w.policy.models, [], "inherit compiles no rows");
+  // the same exempt call under a DYNAMIC policy is moved by the faithful toy router: it is not an inherit-free pass
+  const g = fakeWorld({});
+  await g.prims.policy(S.scenarioPolicy({ rows: ["m-free"], exempt: ["uwstub/m-main"] }));
+  await g.prims.send("main", { model: ANCHOR, session: "x" });
+  await g.prims.send("sub", { model: "uwstub/m-main", agentId: "e1", session: "x", messages: 3, agentTool: false });
+  assert.equal(g.w.records.at(-1).model, "m-main", "(the toy keeps an exempt asked in a dynamic policy only because the policy lists it; the scenario does not rely on that)");
+  const ev = await (async () => { const h = fakeWorld({}); h.w.script = {}; return null; })();
+  assert.equal(ev, null);
+  const inh = S.scenarioPolicy({ mode: "inherit", exempt: ["uwstub/m-main"] });
+  assert.deepEqual([inh.owner.mode, inh.models.length, inh.lists.prov, inh.substitutable], ["inherit", 0, {}, { "*": 0 }]);
+});
+
+test("runScenarios: --only picks scenarios, --runs repeats them (every run judged), a throwing run is that scenario's FAIL and the suite goes on", async () => {
+  const { prims } = fakeWorld({});
+  const lines = [];
+  const res = await S.runScenarios(prims, { only: ["8", "4"], runs: 3 }, (l) => lines.push(l));
+  assert.deepEqual(res.map((r) => [r.scn.id, r.result.runs, r.result.passed]), [["4", 3, 3], ["8", 3, 3]]);
+  assert.match(lines[0], /\(3 of 3 runs\)/);
+  const boom = { ...prims, send: async (shape, o) => { if (shape === "aux") throw new Error("gateway reset"); return prims.send(shape, o); } };
+  const r2 = await S.runScenarios(boom, { only: ["8", "4"] });
+  assert.equal(r2.find((r) => r.scn.id === "8").result.verdict, "FAIL"); assert.match(r2.find((r) => r.scn.id === "8").result.text, /a run threw: gateway reset/);
+});
+
+test("the scenario policies are what each scenario needs: two bands for the fan-out, an inherit half for the exempt alias, the free-only row for spawn-and-serve, the free-mode variant without the paid model", async () => {
+  const { w, prims } = fakeWorld({});
+  await S.runScenarios(prims, { only: ["10"] });
+  assert.deepEqual(w.policy.models.map((m) => [m.s, m.b]), [["uwstub/m-free", 0], ["uwstub/m-big", 0], ["uwstub/m-main", 1]]);
+  await S.runScenarios(prims, { only: ["6"] });
+  assert.equal(w.policy, null, "the last variant removes the policy file");
+  const f = fakeWorld({}); await S.runScenarios(f.prims, { only: ["1"] });
+  assert.deepEqual(f.w.policy.models.map((m) => m.s), ["uwstub/m-free"], "one row: the policy's model is unambiguous");
+  const g = fakeWorld({}); await S.runScenarios(g.prims, { only: ["2"] });
+  assert.equal(g.w.policy.owner.mode, "free"); assert.deepEqual(g.w.policy.models.map((m) => [m.s, m.fp]), [["uwstub/m-free", 1], ["uwstub/m-main", 1]], "the paid m-big is not in the free policy");
+});
+
+// ====================================================================================== the real client: how it would be started (pure) and how its isolation is judged
+import { buildLaunchEnv } from "../harness/subagent-sandbox-spec.mjs";
+const PARENT = { PATH: "C:\\bin", SystemRoot: "C:\\Windows", ComSpec: "C:\\Windows\\System32\\cmd.exe", USERPROFILE: "C:\\real\\me", HOME: "C:\\real\\me", HTTPS_PROXY: "http://proxy.invalid", ANTHROPIC_API_KEY: "real-key", ANTHROPIC_BASE_URL: "http://127.0.0.1:3456", CLAUDE_CODE_OAUTH_TOKEN: "t", NODE_OPTIONS: "--require x", CCR_FOO: "1" };
+test("claudeInvocation: the client is pointed at the SANDBOX by environment only, from the WHITELIST launch environment (PATH, SystemRoot and ComSpec survive, proxies, keys, ANTHROPIC_*, CCR_* and the node preload do not), with a scratch cwd; it never reads process.env itself", () => {
+  const scratch = path.join(os.tmpdir(), "uw-scn-scratch");
+  const launch = buildLaunchEnv(PARENT, { preloadGuard: false });
+  assert.ok(!("HTTPS_PROXY" in launch) && !("ANTHROPIC_API_KEY" in launch) && launch.PATH === "C:\\bin" && launch.ComSpec, "buildLaunchEnv is a whitelist, so the .cmd shim can run");
+  const inv = S.claudeInvocation({ prompt: "do it", maxTurns: 3, key: "sandbox-key", launchEnv: launch, scratchRoot: scratch, gatewayPort: 45678, supports: { settingSources: true, strictMcp: true } });
+  assert.equal(inv.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:45678"); assert.equal(inv.env.ANTHROPIC_API_KEY, "sandbox-key");
+  for (const k of ["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "APPDATA", "LOCALAPPDATA", "TEMP"]) assert.ok(inv.env[k].startsWith(scratch), `${k} is under the sandbox scratch root`);
+  assert.equal(inv.env.PATH, "C:\\bin"); assert.equal(inv.env.SystemRoot, "C:\\Windows"); assert.ok(inv.env.ComSpec);
+  const flat = JSON.stringify(inv.env);
+  for (const bad of ["real-key", "proxy.invalid", "C:\\\\real\\\\me", "CLAUDE_CODE_OAUTH_TOKEN", "NODE_OPTIONS", "CCR_FOO", "UW_TRIAL31", "\"PORT\"", "\"HOST\""]) assert.ok(!flat.includes(bad), `leaks ${bad}`);
+  const leaky = S.claudeInvocation({ prompt: "x", key: "sandbox-key", launchEnv: { ...launch, ANTHROPIC_AUTH_TOKEN: "leak", CLAUDE_CODE_USE_BEDROCK: "1", HTTP_PROXY: "x" }, scratchRoot: scratch });
+  assert.ok(!("ANTHROPIC_AUTH_TOKEN" in leaky.env) && !("CLAUDE_CODE_USE_BEDROCK" in leaky.env), "even a launch env that carried an ANTHROPIC_ or CLAUDE_CODE_ variable cannot pass it on");
+  assert.deepEqual(inv.args.slice(0, 2), ["-p", "do it"]); assert.ok(inv.args.includes("--setting-sources") && inv.args.includes("--strict-mcp-config"));
+  assert.ok(!S.claudeInvocation({ prompt: "x", key: "k", launchEnv: launch, supports: {} }).args.includes("--strict-mcp-config"), "the flags are added only when the launcher has them");
+  assert.ok(inv.cwd.startsWith(scratch) && !inv.cwd.startsWith(REPO_ROOT), "a scratch working directory, never the repo");
+  assert.throws(() => S.claudeInvocation({ prompt: "x", launchEnv: launch }), /profile key/);
+  assert.throws(() => S.claudeInvocation({ prompt: "x", key: "k" }), /whitelist launch environment/, "no default to process.env");
+  const canary = JSON.parse(S.canarySettings("sandbox-key", 45678));
+  assert.deepEqual(canary.env, { ANTHROPIC_BASE_URL: "http://127.0.0.1:45678", ANTHROPIC_API_KEY: "sandbox-key" });
+});
+
+test("identifyClaude: the launcher's path, sha256, --version and flag support are read WITHOUT starting anything real here; a missing launcher is null; the identity lines are what the approval pins", () => {
+  const fakeFs = { statSync: (f) => { if (/bin2[\\/]claude\.exe$/.test(f)) return { isFile: () => true }; throw new Error("ENOENT"); }, readFileSync: () => Buffer.from("fake-claude-bytes") };
+  const calls = [];
+  const run = (exe, args) => { calls.push(args[0]); return args[0] === "--version" ? "2.1.0 (Claude Code)\nextra" : "Usage: claude [options]\n  --setting-sources <s>\n  --strict-mcp-config"; };
+  const id = S.identifyClaude({ env: { PATH: ["bin1", "bin2"].join(path.delimiter) }, fsx: fakeFs, run });
+  assert.deepEqual([id.version, id.sha256, id.supports], ["2.1.0 (Claude Code)", sha(Buffer.from("fake-claude-bytes")), { settingSources: true, strictMcp: true }]); assert.match(id.path, /bin2[\\/]claude\.exe$/);
+  assert.deepEqual(calls, ["--version", "--help"]);
+  assert.equal(S.identifyClaude({ env: { PATH: "" }, fsx: fakeFs, run }), null);
+  assert.deepEqual(S.identifyClaude({ env: { PATH: "bin2" }, fsx: fakeFs, run: () => "no flags here" }).supports, { settingSources: false, strictMcp: false });
+  assert.equal(S.findClaude({ PATH: "" }), null);
+});
+
+import { EventEmitter } from "node:events";
+const fakeChild = (pid = 321) => { const c = new EventEmitter(); c.pid = pid; c.stdout = new EventEmitter(); c.stderr = new EventEmitter(); return c; };
+test("realSpawnClaude: runs the isolated env with shell:false, reads stdout AND stderr, a .cmd shim goes through cmd.exe, a timeout KILLS THE PROCESS TREE, a failed start or an error is reported, nothing real is started in the test", async () => {
+  const inv = { args: ["-p", "x"], env: { ComSpec: "C:\\Windows\\System32\\cmd.exe", PATH: "p" }, cwd: path.join(os.tmpdir(), "scn-cwd") };
+  let seen, child = fakeChild();
+  const spawnImpl = (cmd, args, opts) => { seen = { cmd, args, opts }; return child; };
+  let p = S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl, kill: () => assert.fail("not killed") });
+  child.stdout.emit("data", Buffer.from("{\"result\":\"ok\"}")); child.stderr.emit("data", Buffer.from("warn: x")); child.emit("close", 0);
+  const r = await p;
+  assert.deepEqual([seen.cmd, seen.opts.shell, seen.opts.env === inv.env, seen.opts.cwd === inv.cwd, seen.opts.stdio], ["C:\\bin\\claude.exe", false, true, true, ["ignore", "pipe", "pipe"]]);
+  assert.deepEqual([r.code, r.text, r.err], [0, "{\"result\":\"ok\"}", "warn: x"]);
+  child = fakeChild(); p = S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.cmd", spawnImpl, kill: () => {} }); child.emit("close", 1);
+  await p; assert.equal(seen.cmd, "C:\\Windows\\System32\\cmd.exe"); assert.deepEqual(seen.args.slice(0, 4), ["/d", "/s", "/c", "C:\\bin\\claude.cmd"]);
+  const killed = []; child = fakeChild(777);
+  const t = await S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl, timeoutMs: 20, kill: (pid) => killed.push(pid) });
+  assert.deepEqual([t.code, killed], [null, [777]]); assert.match(t.reason, /timed out; the process tree was killed/);
+  child = fakeChild(5); const e = S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl, kill: (pid) => killed.push(pid) }); child.emit("error", new Error("EACCES"));
+  assert.match((await e).reason, /EACCES/); assert.ok(killed.includes(5));
+  const none = await S.realSpawnClaude({ ...inv, env: { PATH: "" } }, { spawnImpl });
+  assert.match(none.reason, /no claude launcher/);
+  const thrown = await S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl: () => { throw new Error("spawn EPERM"); } });
+  assert.match(thrown.reason, /spawn EPERM/);
+  const calls = []; S.killTree(42, (cmd, args) => calls.push([path.basename(cmd), args])); if (process.platform === "win32") assert.deepEqual(calls, [["taskkill.exe", ["/PID", "42", "/T", "/F"]]]);
+  S.killTree(-1, () => assert.fail("a bad pid is ignored"));
+});
+
+test("realClientProblems: the REAL ~/.claude.json holding the scratch project, the REAL ~/.claude/projects holding its slug, no child state under the sandbox claude-config, no session id, a live-gateway hit or an unreadable live log each FAIL; all clear PASSES", async () => {
+  const cwd = path.join(os.tmpdir(), "uw-scn-cwd"), cfg = path.join(os.tmpdir(), "uw-scn-config"), home = path.join(os.tmpdir(), "uw-scn-home");
+  const world = (o = {}) => ({ sys: { readText: (p) => (path.basename(p) === ".claude.json" && p.startsWith(home) ? o.json ?? JSON.stringify({ projects: { "C:\\other": {} } }) : null) },
+    fs: { existsSync: (p) => (o.realProj && p.startsWith(path.join(home, ".claude", "projects")) ? true : o.noChild ? false : p.startsWith(cfg)) } });
+  const run = (o = {}, args = {}) => S.realClientProblems({ d: world(o), cwd, scratchConfig: cfg, home, sessionIds: ["s1"], liveRequestsFor: async () => 0, ...args });
+  assert.deepEqual(await run(), { ok: true, problems: [] });
+  assert.match((await run({ json: JSON.stringify({ projects: { [cwd]: {} } }) })).problems[0], /REAL ~\/\.claude\.json now records the project/);
+  assert.match((await run({ realProj: true })).problems[0], /REAL ~\/\.claude\/projects holds a folder/);
+  assert.match((await run({ noChild: true })).problems.join(), /redirect was not shown to work/);
+  assert.match((await run({}, { sessionIds: [] })).problems.join(), /no session id of the child/);
+  assert.match((await run({}, { liveRequestsFor: async () => 3 })).problems.join(), /3 request\(s\) carrying the child's session id reached the LIVE gateway/);
+  assert.match((await run({}, { liveRequestsFor: async () => null })).problems.join(), /could not be read/);
+  assert.match((await run({}, { liveRequestsFor: async () => { throw new Error("locked"); } })).problems.join(), /could not be read/);
+  assert.match((await run({ json: "{ not json" })).problems.join(), /could not be read, so the sentinel/);
+});
+
+test("sandboxPrims with a real client: the canary settings.json is written under the sandbox claude-config (gateway and sandbox-only key), the invocation carries the launcher's flags, and the isolation check reads the child's session ids from the stub; without identity or spawn there is no client", async () => {
+  const { SCRATCH_ROOT } = await import("../harness/subagent-sandbox-spec.mjs");
+  const mem = new Map();
+  const d = { fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(path.resolve(p), String(t)), renameSync: (a, b) => { mem.set(path.resolve(b), mem.get(path.resolve(a))); mem.delete(path.resolve(a)); }, rmSync() {}, readdirSync: () => [], existsSync: () => true },
+    sys: { readText: () => null, listenerPid: () => 1 }, now: () => 1, sleep: async () => {}, fetch: async () => { throw new Error("no"); } };
+  const stub = { records: [{ headers: { "x-claude-code-session-id": "sid-1" } }, { headers: {} }, { headers: { "x-claude-code-session-id": "sid-1" } }] };
+  const spawned = [];
+  const p = S.sandboxPrims({ d, key: "sbkey", stub, launchEnv: buildLaunchEnv(PARENT, { preloadGuard: false }) }, { real: true, identity: FAKE_CLAUDE, spawnClaude: async (inv, o) => { spawned.push([inv, o]); return { code: 0 }; }, liveRequestsFor: async (ids) => { spawned.push(["live", ids]); return 0; } });
+  assert.equal(typeof p.claude, "function");
+  await p.claude({ prompt: "go", maxTurns: 2 });
+  const canary = [...mem.entries()].find(([k]) => k.endsWith(path.join("claude-config", "settings.json")));
+  assert.ok(canary && canary[0].startsWith(path.resolve(SCRATCH_ROOT)), "the canary lives under the sandbox scratch root");
+  assert.equal(JSON.parse(canary[1]).env.ANTHROPIC_API_KEY, "sbkey");
+  assert.ok(spawned[0][0].args.includes("--setting-sources") && spawned[0][1].exe === FAKE_CLAUDE.path);
+  const rc = await p.realCheck();
+  assert.deepEqual(spawned.at(-1), ["live", ["sid-1"]]);
+  assert.equal(rc.ok, true === rc.ok ? rc.ok : false);
+  for (const bad of [{ real: true, identity: null, spawnClaude: async () => ({}) }, { real: true, identity: FAKE_CLAUDE, spawnClaude: null }, { real: false, identity: FAKE_CLAUDE, spawnClaude: async () => ({}) }]) {
+    const q = S.sandboxPrims({ d, key: "k", stub, launchEnv: {} }, bad);
+    assert.equal(q.claude, null); assert.equal(q.realCheck, null);
+  }
+});
+
+test("--real yes: the client is named truthfully. Without a client (no launcher pinned) the REAL scenarios REPLAY and their lines never read 'real claude -p'; with a client scenarios 1, 2, 3 and 11 call it (each sets onMain so a subagent is spawned), judge the failure from the STUB, name the client, and RC is judged", async () => {
+  const f = fakeWorld({});
+  const r0 = await S.runScenarios(f.prims, { only: ["1", "2", "3", "11"], real: true });
+  for (const x of r0) { assert.match(x.result.client, /^replay \(real client unavailable/, `scenario ${x.scn.id}`); assert.ok(!/real claude -p/.test(S.scenarioLine(x.result, x.scn))); }
+  assert.ok(!r0.some((x) => x.scn.id === "RC"), "no real client, no RC line");
+  // a fake CLIENT that behaves like claude -p: it asks the stub's script for a spawn, then sends the main and subagent requests a real client would
+  const g = fakeWorld({}); const prompts = [];
+  g.prims.claude = async ({ prompt }) => {
+    prompts.push(prompt);
+    const spawn = g.w.script.onMain?.({});
+    assert.ok(spawn && spawn.subagent_type, "the scenario's stub script spawns a subagent (onMain), or a real client would never delegate");
+    await g.prims.send("main", { model: ANCHOR, session: "real-sess" });
+    const sub = (over) => g.prims.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentId: "real-agent", session: "real-sess", messages: 3, agentTool: false, ...over });
+    await sub({}); if (g.w.script.decide?.({ model: "uwstub/m-free", headers: { "x-claude-code-agent-id": "x" } }) === 429) await sub({ retryCount: 1 });
+    return { code: 0 };
+  };
+  g.prims.realCheck = async () => ({ ok: false, problems: ["the REAL ~/.claude.json now records the project X"] });
+  const lines = [];
+  const r1 = await S.runScenarios(g.prims, { only: ["1", "2", "3", "11"], real: true }, (l) => lines.push(l));
+  assert.equal(prompts.length, 4, "one real client run per REAL scenario");
+  assert.deepEqual(Object.fromEntries(r1.map((x) => [x.scn.id, x.result.verdict])).RC, "FAIL");
+  assert.ok(lines.find((l) => /^SCENARIO FAIL RC REAL-CLIENT ISOLATION \[real claude -p\]/.test(l)));
+  assert.equal(S.suiteVerdict(lines, ["1", "2", "3", "11"]).ok, false, "RC fails the suite");
+  assert.match(S.scenarioLine(r1.find((x) => x.scn.id === "11").result, r1.find((x) => x.scn.id === "11").scn), /^SCENARIO DEGRADED 11 .*\[real claude -p\]/);
+  // scenario 11: a clean exit of a client that never spawned a subagent is NOT a failure of the agent
+  const h = fakeWorld({}); h.prims.claude = async () => ({ code: 0 });
+  const r2 = await S.runScenarios(h.prims, { only: ["11"], real: true });
+  assert.equal(r2[0].result.verdict, "FAIL"); assert.match(r2[0].result.text, /not set up/);
+});
+
+test("the replay shapes: a real subagent has no Agent tool, so every subagent send of scenarios 6 and 8 and the fan-out says agentTool:false", async () => {
+  const f = fakeWorld({}); const sent = [];
+  const orig = f.prims.send; f.prims.send = async (shape, o) => { sent.push([shape, o?.agentTool]); return orig(shape, o); };
+  await S.runScenarios(f.prims, { only: ["6", "8", "10"] });
+  assert.ok(sent.filter(([sh]) => sh === "sub").length > 20);
+  assert.ok(sent.filter(([sh]) => sh === "sub").every(([, t]) => t === false), "no subagent send carries the Agent tool");
+});
+
+test("runSandbox and runSelftest refuse BEFORE anything starts when the claude launcher is not the one pinned in the approval (the orchestrator is only asked for its plan hash, which reads files and starts nothing)", async () => {
+  const pinned = { ...FAKE_CLAUDE }, other = { ...FAKE_CLAUDE, sha256: "e".repeat(64) };
+  const d = { ccrInstall: () => ({ found: false, reason: "test" }), out() {}, err() {} };
+  const errs = [];
+  const code = await S.runSandbox({ only: ["8"], runs: 1, real: true, approval: { files: [], ccr: [] }, identity: pinned }, { err: (l) => errs.push(l), out() {} }, { d, identifyClaude: () => other });
+  assert.equal(code, 1); assert.match(errs.join(String.fromCharCode(10)), /claude launcher .* is not the one pinned in the approval/);
+  await assert.rejects(S.runSelftest({ real: true, identity: pinned, approval: { files: [], ccr: [] } }, {}, { d, identifyClaude: () => other }), /claude launcher .* is not the one pinned/);
+  const errs2 = [];
+  const c2 = await S.runSandbox({ only: ["8"], real: false, approval: null, identity: null }, { err: (l) => errs2.push(l), out() {} }, { d: { ...d, buildSpec: () => { throw new Error("stop here"); } }, identifyClaude: () => { throw new Error("replay must not identify the launcher"); } });
+  assert.equal(c2, 1); assert.ok(errs2.some((l) => /could not read the orchestrator.s plan hash/.test(l)), "replay mode went on to the orchestrator step and never looked at the launcher");
+});
+
+test("real mode: EACH of scenarios 1, 2, 3 and 11 sets onMain in its stub script (without it a real client is never told to spawn a subagent); a scenario whose script lacks it FAILS and is named", async () => {
+  const seen = {};
+  const g = fakeWorld({});
+  let current = null;
+  g.prims.claude = async () => {
+    const spawn = g.w.script.onMain?.({});
+    seen[current] = !!(spawn && spawn.subagent_type);
+    if (!seen[current]) return { code: 0 };                                              // a client with no scripted spawn delegates nothing
+    await g.prims.send("main", { model: ANCHOR, session: `real-${current}` });
+    await g.prims.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentId: `real-agent-${current}`, session: `real-${current}`, messages: 3, agentTool: false });
+    if (g.w.script.decide?.({ model: "uwstub/m-free", headers: { "x-claude-code-agent-id": "x" } }) === 429) for (let i = 1; i <= 4; i++) await g.prims.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentId: `real-agent-${current}`, session: `real-${current}`, messages: 3, retryCount: i, agentTool: false });   // a client keeps retrying until the models are exhausted
+    return { code: 0 };
+  };
+  const origReset = g.prims.reset; g.prims.reset = async () => { await origReset(); };
+  const results = {};
+  for (const id of ["1", "2", "3", "11"]) {
+    current = id;
+    const r = await S.runScenarios(g.prims, { only: [id], real: true });
+    results[id] = r.find((x) => x.scn.id === id).result.verdict;
+  }
+  assert.deepEqual(seen, { 1: true, 2: true, 3: true, 11: true }, "every REAL scenario's stub script spawns a subagent");
+  assert.deepEqual(results, { 1: "PASS", 2: "PASS", 3: "PASS", 11: "DEGRADED" });
+});
+
+test("the plan states that the fail-closed guard is OFF and the second token is derived; runSandbox and runSelftest build the orchestrator spec with --no-preload-guard in BOTH calls (the plan call and the run call)", async () => {
+  const plan = S.planLines().join("\n");
+  assert.match(plan, /the fail-closed process guard is OFF \(--no-preload-guard, the G1 precedent: the 3\.1\.1 guard false-alarms on CCR 3\.0\.22's own native load\); the second consent token that option needs is DERIVED from the orchestrator's own plan hash, so it is not an independent confirmation/);
+  const { buildSpec } = await import("../harness/subagent-sandbox-spec.mjs");
+  const observe = async (fn) => {
+    const guard = [], errs = [];
+    const d = { ccrInstall: () => ({ found: false, reason: "test" }), buildSpec: (env, o) => { guard.push(o.preloadGuard); return buildSpec(env, o); }, out() {}, err: (l) => errs.push(String(l)) };
+    const out = await fn(d, errs);
+    return { guard, errs, out };
+  };
+  const sb = await observe((d, errs) => S.runSandbox({ only: ["8"], runs: 1, real: false, approval: { files: [], ccr: [] }, identity: null }, { err: (l) => errs.push(String(l)), out() {} }, { d }));
+  assert.deepEqual(sb.guard, [false, false], "the plan call and the run call both say --no-preload-guard");
+  const st = await observe((d, errs) => S.runSelftest({ real: false, approval: { files: [], ccr: [] } }, { err: (l) => errs.push(String(l)), out() {} }, { d }));
+  assert.deepEqual(st.guard, [false, false]);
+});
+
+// The orchestrator's plan hash covers the FLAGS (--router included). The token the run needs is the first 12 hex of THAT hash for the run's flag set, so both --plan calls carry --router next:
+// without it the hash differs (f60dfce901e7 without, 2f4c63e6f180 with) and the orchestrator refuses the run at the second-token check with exit 2.
+test("runSandbox and runSelftest pass the second token that matches the orchestrator's plan hash FOR THE RUN'S FLAGS (--router next): the run is not refused at the token check", async () => {
+  const { buildSpec } = await import("../harness/subagent-sandbox-spec.mjs");
+  for (const fn of [(d, errs) => S.runSandbox({ only: ["8"], runs: 1, real: false, approval: { files: [], ccr: [] }, identity: null }, { err: (l) => errs.push(String(l)), out() {} }, { d }), (d, errs) => S.runSelftest({ real: false, approval: { files: [], ccr: [] } }, { err: (l) => errs.push(String(l)), out() {} }, { d })]) {
+    const errs = [];
+    await fn({ ccrInstall: () => ({ found: false, reason: "test" }), buildSpec, out() {}, err: (l) => errs.push(String(l)) }, errs);
+    assert.ok(errs.some((l) => /installed CCR was NOT FOUND/.test(l)), "the run got past the second-token check");
+    assert.ok(!errs.some((l) => /--i-understand-no-guard/.test(l)), "no token complaint");
+  }
+});

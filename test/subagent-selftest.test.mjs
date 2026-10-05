@@ -48,7 +48,7 @@ const rec = (shape, model, over = {}) => ({ seq: 1, method: "POST", path: "/v1/m
   toolNames: shape === "sub" || shape === "main" ? ["Agent", "Bash"] : [], ...over });
 const GOOD = [rec("main", "uwstub/m-main"), rec("sub", st.EXPECT.policy), rec("aux", st.EXPECT.helperAsked)];
 const LOG = [{ v: 2, aid: "uws0-agent-1", asked: st.EXPECT.asked, ret: st.EXPECT.policy, pol: "enforce", act: "substitute", path: "new" }];
-const seams = (s, over = {}) => ({ approvalFile: s.approval, interactive: () => true, ask: async () => typed12, now: () => NOW, pid: 4242, hashFiles: () => FILES, runnerPresent: () => true, run: async () => ({ records: GOOD, agentLog: LOG }), ...over });
+const seams = (s, over = {}) => ({ approvalFile: s.approval, interactive: () => true, ask: async () => typed12, now: () => NOW, pid: 4242, hashFiles: () => FILES, runnerPresent: () => true, ccrLines: async () => ["ccr.cmd sha256 aaa"], identifyClaude: async () => null, run: async () => ({ records: GOOD, agentLog: LOG, code: 0 }), ...over });
 /** The flags of a real approve or run: --live yes always (no fixture flag exists for this command); the approval file is the injected fixture one. */
 const ST = (s, args, over) => run(["selftest", ...args, "--live", "yes"], { selftest: seams(s, over) });
 
@@ -93,7 +93,13 @@ test("selftest --plan yes: prints what a run would do and its plan hash; in a CO
   assert.equal(lines[blank + 1], `plan sha256: ${PLAN.sha}`);
   assert.equal(sha(lines.slice(0, blank).join("\n") + "\n"), PLAN.sha, "the printed hash is the sha256 of exactly the printed plan text");
   const text = lines.join("\n");
-  assert.match(lines[0], /^NOT YET RUNNABLE: the sandbox runner harness\/subagent-scenarios\.mjs is not delivered, so a run is refused and an approval cannot be written yet\.$/);
+  assert.match(lines[0], /^== subagent-policy selftest PLAN /, "the runner is delivered: no NOT YET RUNNABLE line");
+  assert.doesNotMatch(text, /NOT YET RUNNABLE/);
+  assert.match(text, /DEFAULT = REPLAY: send the request shapes a real Claude Code sends/);
+  assert.match(text, /\(a SEPARATE, riskier mode with its own consent at --approve-plan/);
+  assert.match(text, /The fail-closed process guard is OFF \(--no-preload-guard, the G1 precedent; its second consent token is derived from the orchestrator's own plan hash/);
+  assert.match(text, /The installed CCR \(ccr\.cmd, package version, dist\/main\/cli\.js\) is pinned in the approval/);
+  assert.match(text, /OK only when BOTH checks pass AND the sandbox run itself exited 0/);
   assert.match(text, /`selftest --plan yes` prints this text and its hash; it reads no data file and starts no process \(loading the program itself is not counted\)/);
   assert.match(text, /spawn +the subagent's request reached the stub on the model the policy chose \(uwstub\/m-free\), not on the one the subagent asked for \(uwstub\/m-big\), AND the sandbox router's agent log shows/);
   assert.match(text, /helper +a helper call .* was left on the model it asked for \(uwstub\/m-big\)/);
@@ -115,8 +121,10 @@ test("selftest: the plan pins the whole set the harness's own plan pins, plus th
   const a = st.planOf(), b = { sha: sha([...a.lines, "one more line"].join("\n") + "\n") };
   assert.notEqual(a.sha, b.sha);
   assert.match(a.sha, /^[0-9a-f]{64}$/);
-  assert.equal(st.RUNNER_DELIVERED, false);
-  assert.ok(a.lines[0].startsWith("NOT YET RUNNABLE"));
+  assert.equal(st.RUNNER_DELIVERED, true);
+  assert.ok(!a.lines[0].startsWith("NOT YET RUNNABLE"));
+  assert.equal(typeof st.realSeams().run, "function", "the default seam is wired to the scenario suite's runner (not called here)");
+  assert.equal(st.realSeams().runnerPresent(), true, "the runner file exists");
 });
 
 // =====================================================================================================================
@@ -157,7 +165,7 @@ test("selftest --run yes with no approval file exits 1 E_PRECONDITION, tells how
   const s = setup(); fs.mkdirSync(path.dirname(s.approval));
   const before = dirHash(s.dir);
   let ran = 0;
-  const r = await ST(s, ["--run", "yes"], { run: async () => { ran += 1; return { records: GOOD, agentLog: LOG }; } });
+  const r = await ST(s, ["--run", "yes"], { run: async () => { ran += 1; return { records: GOOD, agentLog: LOG, code: 0 }; } });
   assert.equal(r.status, 1);
   assert.match(r.first, /^E_PRECONDITION: refusing to run: no approval file: run `node keysync\/key\.mjs subagent-policy selftest --plan yes`, read it, then `selftest --approve-plan yes --live yes` in a terminal \(an owner act\)$/);
   assert.equal(ran, 0);
@@ -171,7 +179,7 @@ test("selftest: a forged approval placed where a fixture --state-dir used to cho
   fs.writeFileSync(forged, JSON.stringify({ schema: 1, planSha256: PLAN.sha, approvedAt: new Date(NOW).toISOString(), files: FILES }));
   fs.mkdirSync(path.dirname(s.approval));
   let ran = 0;
-  const r = await ST(s, ["--run", "yes"], { run: async () => { ran += 1; return { records: GOOD, agentLog: LOG }; } });
+  const r = await ST(s, ["--run", "yes"], { run: async () => { ran += 1; return { records: GOOD, agentLog: LOG, code: 0 }; } });
   assert.equal(r.status, 1); assert.match(r.first, /refusing to run: no approval file/); assert.equal(ran, 0);
   const viaFlag = await run(["selftest", "--run", "yes", "--live", "yes", "--state-dir", path.join(s.dir, "state")], { selftest: seams(s) });
   assert.equal(viaFlag.status, 1); assert.match(viaFlag.first, /^E_USAGE: unknown or not applicable flag --state-dir for selftest$/);
@@ -200,7 +208,8 @@ test("selftest --approve-plan yes: needs a terminal, a delivered runner, and the
   assert.match(ok.out, new RegExp(`^approving the plan whose sha256 begins ${typed12}; read it first with `, "m"));
   assert.match(ok.out, new RegExp(`approval written: .*selftest-approval\\.json \\(plan sha256 ${PLAN.sha}; ONE-USE, valid 24 h; run it with `));
   const doc = JSON.parse(fs.readFileSync(s.approval, "utf8"));
-  assert.deepEqual(Object.keys(doc), ["schema", "planSha256", "approvedAt", "files"]);
+  assert.deepEqual(Object.keys(doc), ["schema", "planSha256", "approvedAt", "files", "ccr", "real", "claude"]);
+  assert.deepEqual([doc.ccr, doc.real, doc.claude], [["ccr.cmd sha256 aaa"], false, null]);
   assert.equal(doc.planSha256, PLAN.sha); assert.equal(doc.approvedAt, new Date(NOW).toISOString()); assert.deepEqual(doc.files, FILES);
   assert.deepEqual(fs.readdirSync(path.dirname(s.approval)), ["selftest-approval.json"], "written atomically: no temp file is left");
 });
@@ -225,7 +234,9 @@ test("selftest real seams: hashFiles pins every executed file by raw AND line-en
   const bytes = fs.readFileSync(path.join(ROOT, "router", "uw-router.next.cjs"));
   assert.equal(router.raw, sha(bytes), "the router is pinned by its raw bytes (what is installed verbatim)");
   assert.equal(router.lf, sha(Buffer.from(bytes.toString("latin1").replace(/\r\n/g, "\n"), "latin1")));
-  assert.deepEqual(hashed.find((h) => h.file === "harness/subagent-scenarios.mjs"), { file: "harness/subagent-scenarios.mjs", raw: "(absent)", lf: "(absent)" }, "the missing runner is pinned as absent, never skipped");
+  const runnerBytes = fs.readFileSync(path.join(ROOT, "harness", "subagent-scenarios.mjs"));
+  assert.equal(hashed.find((h) => h.file === "harness/subagent-scenarios.mjs").raw, sha(runnerBytes), "the delivered runner is pinned by its raw bytes (an edit after approval voids it)");
+  assert.deepEqual(d.hashFiles().find((h) => h.file === "keysync/subagent-selftest.mjs").file, "keysync/subagent-selftest.mjs");
   for (const h of hashed.filter((x) => x.raw !== "(absent)")) { assert.match(h.raw, /^[0-9a-f]{64}$/); assert.match(h.lf, /^[0-9a-f]{64}$/); }
   const dir = tmp(), f = path.join(dir, "sub", "a.json");
   d.writeText(f, "one"); assert.equal(d.readText(f), "one");
@@ -260,13 +271,15 @@ const approve = async (s, over = {}) => { fs.mkdirSync(path.dirname(s.approval),
 test("selftest --run yes with a valid approval: consumes it (ONE use), calls the runner once with the plan and the expected models, prints PASS lines and exits 0; a second run is refused", async () => {
   const s = setup(); await approve(s);
   const calls = [];
-  const r = await ST(s, ["--run", "yes"], { run: async (a) => { calls.push(a); return { records: GOOD, agentLog: LOG }; } });
+  const r = await ST(s, ["--run", "yes"], { run: async (a, io) => { calls.push([a, io]); return { records: GOOD, agentLog: LOG, code: 0 }; } });
   assert.equal(r.status, 0, r.err);
-  assert.equal(calls.length, 1); assert.equal(calls[0].plan.sha, PLAN.sha); assert.deepEqual(calls[0].expect, st.EXPECT);
+  assert.equal(calls.length, 1); assert.equal(calls[0][0].plan.sha, PLAN.sha); assert.deepEqual(calls[0][0].expect, st.EXPECT);
+  assert.deepEqual([calls[0][0].real, calls[0][0].identity], [false, null], "replay is the default"); assert.deepEqual(calls[0][0].approval.ccr, ["ccr.cmd sha256 aaa"], "the runner gets the approval with the CCR pin");
+  assert.equal(typeof calls[0][1].out, "function", "the runner is handed the io, so the orchestrator's lines are not dropped");
   assert.match(r.out, new RegExp(`^approval consumed \\(plan sha256 ${PLAN.sha}\\); starting the sandbox self-test$`, "m"));
   assert.match(r.out, /^PASS spawn all 1 subagent request reached the stub on the policy's model uwstub\/m-free, and the router's agent log shows 1 of 1 line for it asking uwstub\/m-big and returned uwstub\/m-free$/m);
   assert.match(r.out, /^PASS helper all 1 helper request stayed on the model asked for, uwstub\/m-big$/m);
-  assert.match(r.out, /^self-test: 2 of 2 checks passed; OK$/m);
+  assert.match(r.out, /^self-test: 2 of 2 checks passed, sandbox run clean; OK$/m);
   assert.doesNotMatch(r.out, INTERNAL_ID);
   assert.deepEqual(fs.readdirSync(path.dirname(s.approval)), [], "the approval and its used copy are gone");
   const again = await ST(s, ["--run", "yes"], { run: async () => { throw new Error("must not run twice"); } });
@@ -275,13 +288,13 @@ test("selftest --run yes with a valid approval: consumes it (ONE use), calls the
 
 test("selftest --run yes: a runner whose transcript or agent log fails an assertion exits 1 NOT OK with the FAIL line", async () => {
   const s = setup(); await approve(s);
-  const r = await ST(s, ["--run", "yes"], { run: async () => ({ records: [rec("sub", st.EXPECT.asked), rec("aux", st.EXPECT.helperAsked)], agentLog: LOG }) });
+  const r = await ST(s, ["--run", "yes"], { run: async () => ({ records: [rec("sub", st.EXPECT.asked), rec("aux", st.EXPECT.helperAsked)], agentLog: LOG, code: 0 }) });
   assert.equal(r.status, 1);
   assert.match(r.out, /^FAIL spawn 1 of 1 subagent requests did not reach the policy's model uwstub\/m-free \(the stub received: uwstub\/m-big\)$/m);
   assert.match(r.out, /^PASS helper /m);
-  assert.match(r.out, /^self-test: 1 of 2 checks passed; NOT OK$/m);
+  assert.match(r.out, /^self-test: 1 of 2 checks passed, sandbox run clean; NOT OK$/m);
   const s2 = setup(); await approve(s2);
-  const noLog = await ST(s2, ["--run", "yes"], { run: async () => ({ records: GOOD }) });
+  const noLog = await ST(s2, ["--run", "yes"], { run: async () => ({ records: GOOD, code: 0 }) });
   assert.equal(noLog.status, 1); assert.match(noLog.out, /^FAIL spawn the stub received the policy's model uwstub\/m-free, but the router's agent log has 0 lines/m);
 });
 
@@ -289,7 +302,7 @@ test("selftest --run yes: every way an approval can be wrong refuses BEFORE it i
   const s = setup(); await approve(s);
   const good = fs.readFileSync(s.approval, "utf8");
   let ran = 0;
-  const run_ = async () => { ran += 1; return { records: GOOD, agentLog: LOG }; };
+  const run_ = async () => { ran += 1; return { records: GOOD, agentLog: LOG, code: 0 }; };
   const doc = JSON.parse(good);
   const cases = [
     ["a different plan", () => fs.writeFileSync(s.approval, JSON.stringify({ ...doc, planSha256: "0".repeat(64) })), {}, /the approval is for a different plan \(approved 000000000000, current /],
@@ -317,7 +330,7 @@ test("selftest --run yes: every way an approval can be wrong refuses BEFORE it i
 test("selftest --run yes: if the approval cannot be consumed (a racing run took it, or it is a link) or the consumed bytes are not the ones checked, nothing runs", async () => {
   const s = setup(); await approve(s);
   let ran = 0;
-  const go = async () => { ran += 1; return { records: GOOD, agentLog: LOG }; };
+  const go = async () => { ran += 1; return { records: GOOD, agentLog: LOG, code: 0 }; };
   const raced = await ST(s, ["--run", "yes"], { run: go, rename: () => { throw new Error("gone"); } });
   assert.equal(raced.status, 1); assert.match(raced.first, /the approval could not be consumed \(another run may have used it first/);
   const swapped = await ST(s, ["--run", "yes"], { run: go, readText: (f) => (f.includes(".used-") ? "{}" : fs.readFileSync(f, "utf8")) });
@@ -368,4 +381,37 @@ test("assertSelftest: PASS only when a subagent request carried the policy's mod
   const hostile = st.assertSelftest([rec("sub", "evil\u001b[31m\u202e"), rec("aux", st.EXPECT.helperAsked)], st.EXPECT, LOG);
   assert.ok(!/[\u0000-\u001f\u007f-\uffff]/.test(hostile.lines[0]));
   assert.deepEqual(["sub", "aux", "main", "other"], [st.shapeOf(rec("sub", "m")), st.shapeOf(rec("aux", "m")), st.shapeOf(rec("main", "m")), st.shapeOf({ headers: {}, toolNames: [] })]);
+});
+
+test("selftest --run yes: a sandbox run that did NOT exit 0 (a live-state change, an incomplete teardown, a refusal) is NOT OK even when both checks pass; a missing exit code counts the same", async () => {
+  for (const [res, text] of [[{ records: GOOD, agentLog: LOG, code: 1 }, /sandbox run exited 1/], [{ records: GOOD, agentLog: LOG }, /exited with no exit code/], [{ records: GOOD, agentLog: LOG, code: 2 }, /exited 2/]]) {
+    const s = setup(); await approve(s);
+    const r = await ST(s, ["--run", "yes"], { run: async () => res });
+    assert.equal(r.status, 1, JSON.stringify(res.code)); assert.match(r.out, /^PASS spawn /m); assert.match(r.out, /^PASS helper /m); assert.match(r.out, text);
+    assert.match(r.out, /^self-test: 2 of 2 checks passed, sandbox run NOT clean; NOT OK$/m);
+  }
+});
+
+test("selftest: --real yes is a SEPARATE consent (the flag exists only for the approve and run steps), approving it pins the claude launcher, a run without that approval or with a changed launcher is refused BEFORE the approval is consumed, and the CCR pin is compared", async () => {
+  const CL = { path: "C:\\fake\\claude.exe", sha256: "c".repeat(64), version: "9.9.9", supports: { settingSources: true, strictMcp: true } };
+  const s = setup(); await approve(s);
+  const before = fs.readFileSync(s.approval, "utf8");
+  let ran = 0;
+  const r1 = await ST(s, ["--run", "yes", "--real", "yes"], { identifyClaude: async () => CL, run: async () => { ran += 1; return { records: GOOD, agentLog: LOG, code: 0 }; } });
+  assert.equal(r1.status, 1); assert.match(r1.first, /--real yes is a separate mode and was not approved/); assert.equal(ran, 0); assert.equal(fs.readFileSync(s.approval, "utf8"), before, "not consumed");
+  const s2 = setup(); fs.mkdirSync(path.dirname(s2.approval), { recursive: true });
+  assert.equal((await ST(s2, ["--approve-plan", "yes", "--real", "yes"], { identifyClaude: async () => CL })).status, 0);
+  const doc = JSON.parse(fs.readFileSync(s2.approval, "utf8")); assert.deepEqual([doc.real, doc.claude], [true, CL]);
+  const r2 = await ST(s2, ["--run", "yes", "--real", "yes"], { identifyClaude: async () => ({ ...CL, sha256: "d".repeat(64) }), run: async () => { ran += 1; return {}; } });
+  assert.equal(r2.status, 1); assert.match(r2.first, /claude launcher .* changed since you approved/); assert.equal(ran, 0);
+  const calls = [];
+  const r3 = await ST(s2, ["--run", "yes", "--real", "yes"], { identifyClaude: async () => CL, run: async (a) => { calls.push(a); return { records: GOOD, agentLog: LOG, code: 0 }; } });
+  assert.equal(r3.status, 0, r3.err); assert.deepEqual([calls[0].real, calls[0].identity], [true, CL]);
+  const s3 = setup(); await approve(s3);
+  const r4 = await ST(s3, ["--run", "yes"], { ccrLines: async () => ["ccr.cmd sha256 bbb"], run: async () => { ran += 1; return {}; } });
+  assert.equal(r4.status, 1); assert.match(r4.first, /installed CCR changed since you approved/); assert.equal(ran, 0);
+  const none = await ST(setup(), ["--approve-plan", "yes", "--real", "yes"], { identifyClaude: async () => null });
+  assert.equal(none.status, 1); assert.match(none.first, /no claude launcher was found/);
+  const noccr = await ST(setup(), ["--approve-plan", "yes"], { ccrLines: async () => null });
+  assert.equal(noccr.status, 1); assert.match(noccr.first, /CCR was not found/);
 });

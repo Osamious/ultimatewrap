@@ -18,8 +18,8 @@ import { PolicyError, SELFTEST_APPROVAL_FILE } from "./subagent-policy.mjs";
 
 export const APPROVAL_MAX_AGE_MS = 24 * 3600 * 1000;
 export const RUNNER_FILE = "harness/subagent-scenarios.mjs";
-/** Flip to true in the change that delivers the runner and wires it in (`opts.selftest.run`); until then the plan says so on its first line. ceiling: a constant, not a probe, because the plan text takes no I/O. */
-export const RUNNER_DELIVERED = false;
+/** True since the runner is delivered and wired in: `realSeams().run` imports `runSelftest` of harness/subagent-scenarios.mjs on demand (nothing is imported or run until `--run` consumes an approval). ceiling: a constant, not a probe, because the plan text takes no I/O. */
+export const RUNNER_DELIVERED = true;
 const rel = (f) => path.relative(REPO_ROOT, f).replace(/\\/g, "/");
 const OWN_FILES = [RUNNER_FILE, "keysync/subagent-policy.mjs", "keysync/subagent-selftest.mjs"];
 /** The files a run executes or loads: the whole set the harness's own plan pins (the orchestrator and what it imports, the probe router, the bootstrap, the guard and the exact router bytes), the runner, and the two modules of this command. */
@@ -42,10 +42,10 @@ export function planLines() {
     "  1. refuse unless the approval file holds THIS plan's hash, is under 24 hours old and every file listed at the end is byte-identical to when you approved",
     "  2. consume the approval (it is one-use; a second run needs a fresh approval)",
     "  3. start the sandbox gateway beside the live one on its own ports and its own data folders; the live gateway is not touched or restarted",
-    "  4. run the isolation checks and refuse to send a request if any is red; the sandbox runs under a tripwire that watches the real Claude settings",
+    "  4. run the isolation checks and refuse to send a request if any is red; the sandbox runs under a tripwire that watches the real Claude settings. The fail-closed process guard is OFF (--no-preload-guard, the G1 precedent; its second consent token is derived from the orchestrator's own plan hash, so it is not an independent confirmation). The installed CCR (ccr.cmd, package version, dist/main/cli.js) is pinned in the approval and compared at the start of the run",
     "  5. start the stub model server, point the sandbox at it, install the exact router bytes below and a synthetic enforcing policy that maps the subagent's model to the stub's free model",
-    "  6. run Claude Code headless (claude -p) once against the sandbox so that it spawns one subagent, and send one helper-shaped request",
-    "  7. check spawn and helper on the stub's records and the router's agent log, print PASS or FAIL for each, tear the sandbox down and print whether the live gateway and files are identical before and after",
+    "  6. DEFAULT = REPLAY: send the request shapes a real Claude Code sends (a main request, a subagent request that carries the policy's tag, one helper-shaped request); no client is started. With `selftest --run yes --live yes --real yes` (a SEPARATE, riskier mode with its own consent at --approve-plan, which also pins the claude launcher's path, sha256 and version) a real headless Claude Code (claude -p) is started instead for the spawn, pointed at the sandbox by environment only, and its isolation is checked afterwards",
+    "  7. check spawn and helper on the stub's records and the router's agent log, print PASS or FAIL for each, tear the sandbox down and print whether the live gateway and files are identical before and after; the self-test is OK only when BOTH checks pass AND the sandbox run itself exited 0 (a red live-state comparison, an incomplete teardown or a refused run is NOT OK whatever the checks said)",
     "  8. keep redacted evidence outside the sandbox only when the run is refused, throws or the tripwire fires",
     `the sandbox runner is ${RUNNER_FILE}; an approval is refused, and a run is refused (before the approval is used), while that file is absent.`,
     "never touched: the live gateway and its ports, your key vault, the real policy files, the real Claude settings, the live router file, your catalogue and bench data.",
@@ -130,12 +130,14 @@ export function realSeams() {
     readText: (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } },
     writeText: (f, text) => { assertPlainTarget(f); fs.mkdirSync(path.dirname(f), { recursive: true }); writeAtomic(f, text); },
     rename: (a, b) => { assertPlainTarget(a); fs.renameSync(a, b); }, rm: (f) => fs.rmSync(f, { force: true }),
-    run: null,
+    ccrLines: async () => { const m = await import("../harness/subagent-scenarios.mjs"); return m.defaultSeams().ccrLines(); },
+    identifyClaude: async () => { const m = await import("../harness/subagent-scenarios.mjs"); return m.identifyClaude(); },
+    run: (args, io) => import("../harness/subagent-scenarios.mjs").then((m) => m.runSelftest(args, io)),     // lazy: loading this module imports nothing of the sandbox harness's runner until a run is approved and consumed
   };
 }
 
 /** Why an approval does not hold, or null when it does. Pure. Each file is pinned by its raw bytes AND its line-ending-folded bytes, as the harness's own approval does. */
-export function checkApproval(text, planSha, files, nowMs) {
+export function checkApproval(text, planSha, files, nowMs, pin = {}) {
   if (text == null) return `no approval file: ${how}`;
   let a;
   try { a = JSON.parse(text); } catch { return `the approval file is not valid JSON: ${how}`; }
@@ -148,6 +150,9 @@ export function checkApproval(text, planSha, files, nowMs) {
   if (a.planSha256 !== planSha) return `the approval is for a different plan (approved ${a.planSha256.slice(0, 12)}, current ${planSha.slice(0, 12)}): ${how}`;
   const changed = files.filter((f) => { const o = Array.isArray(a.files) ? a.files.find((x) => x && x.file === f.file) : null; return !o || o.raw !== f.raw || o.lf !== f.lf || f.raw === "(absent)"; }).map((f) => f.file);
   if (changed.length) return `a file the run executes changed since you approved (${changed.join(", ")}): ${how}`;
+  if (pin.ccr !== undefined && (!Array.isArray(a.ccr) || a.ccr.join("\n") !== pin.ccr.join("\n"))) return `the installed CCR changed since you approved (or the approval does not pin it): ${how}`;
+  if (pin.real && a.real !== true) return `--real yes is a separate mode and was not approved: run --approve-plan yes --live yes --real yes first`;
+  if (pin.real && JSON.stringify(a.claude ?? null) !== JSON.stringify(pin.claude ?? null)) return `the claude launcher (path, sha256 or version) changed since you approved: ${how}`;
   return null;
 }
 
@@ -170,11 +175,17 @@ export async function cmdSelftest(p, flags, io, opts = {}) {
     io.out(`approving the plan whose sha256 begins ${want}; read it first with \`selftest --plan yes\``);
     const typed = String(await d.ask(`type the first 12 hex characters of the plan sha256 (${want}) to approve, anything else cancels: `)).replace(/[\r\n]+$/, "");
     if (typed !== want) throw refuse("the typed confirmation does not match the plan sha256: nothing was approved", 1);
-    d.writeText(file, JSON.stringify({ schema: 1, planSha256: plan.sha, approvedAt: new Date(d.now()).toISOString(), files }, null, 2) + "\n");
+    const ccr = d.ccrLines ? await d.ccrLines() : null;
+    if (d.ccrLines && !ccr) throw refuse("refusing to approve: the installed CCR was not found, so it cannot be pinned");
+    const claude = flags.real && d.identifyClaude ? await d.identifyClaude() : null;
+    if (flags.real && !claude) throw refuse("refusing to approve --real yes: no claude launcher was found on PATH, so none can be pinned");
+    d.writeText(file, JSON.stringify({ schema: 1, planSha256: plan.sha, approvedAt: new Date(d.now()).toISOString(), files, ...(ccr ? { ccr } : {}), real: !!flags.real, claude }, null, 2) + "\n");
     io.out(`approval written: ${file} (plan sha256 ${plan.sha}; ONE-USE, valid 24 h; run it with \`selftest --run yes --live yes\`)`);
     return 0;
   }
-  const text = d.readText(file), bad = checkApproval(text, plan.sha, files, d.now());
+  const text = d.readText(file);
+  const pin = { ...(d.ccrLines ? { ccr: (await d.ccrLines()) ?? ["(CCR not found)"] } : {}), real: !!flags.real, claude: flags.real && d.identifyClaude ? await d.identifyClaude() : null };
+  const bad = checkApproval(text, plan.sha, files, d.now(), pin);
   if (bad) throw refuse(`refusing to run: ${bad}`);
   if (typeof d.run !== "function" || !d.runnerPresent?.()) throw refuse(`refusing to run: the sandbox runner ${RUNNER_FILE} is not delivered yet, so there is nothing to start; your approval was not used`);
   const used = `${file}.used-${d.pid}-${d.now()}`;
@@ -182,9 +193,12 @@ export async function cmdSelftest(p, flags, io, opts = {}) {
   if (d.readText(used) !== text) throw refuse("the consumed approval is not the file that was checked: a run needs a fresh --approve-plan");
   try { d.rm(used); } catch { /* the used copy is inert */ }
   io.out(`approval consumed (plan sha256 ${plan.sha}); starting the sandbox self-test`);
-  const res = await d.run({ plan, expect: EXPECT });
+  const res = await d.run({ plan, expect: EXPECT, approval: JSON.parse(text), real: !!flags.real, identity: pin.claude }, io);
   const verdict = assertSelftest(res?.records, EXPECT, res?.agentLog);
   for (const l of verdict.lines) io.out(l);
-  io.out(`self-test: ${verdict.checks.filter((c) => c.ok).length} of ${verdict.checks.length} checks passed; ${verdict.ok ? "OK" : "NOT OK"}`);
-  return verdict.ok ? 0 : 1;
+  const sandboxOk = res?.code === 0;                              // the orchestrator's own exit: a live-state change after the run, an incomplete teardown or a refusal must never read OK
+  if (!sandboxOk) io.out(`FAIL sandbox the sandbox run exited ${res?.code === undefined ? "with no exit code" : res.code}: a live-state change, an incomplete teardown or a refusal is not OK whatever the checks said`);
+  const ok = verdict.ok && sandboxOk;
+  io.out(`self-test: ${verdict.checks.filter((c) => c.ok).length} of ${verdict.checks.length} checks passed, sandbox run ${sandboxOk ? "clean" : "NOT clean"}; ${ok ? "OK" : "NOT OK"}`);
+  return ok ? 0 : 1;
 }

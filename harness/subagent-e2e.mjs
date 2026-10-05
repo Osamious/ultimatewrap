@@ -839,10 +839,10 @@ export function planOf(spec, opts = {}) {
 
 // ---------------------------------------------------------------- the flow
 const refuse = (m) => { throw new RefusalError(`REFUSED: ${m}`); };
-const logObj = (text) => (text ?? "").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+export const logObj = (text) => (text ?? "").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 export const assertGatewayUrl = (u) => { const x = new URL(u); if (x.hostname !== "127.0.0.1" || Number(x.port) !== SANDBOX_PORTS.gateway) refuse(`request URL ${u} is not the sandbox gateway`); };
 
-function writeSafe(d, file, data) {
+export function writeSafe(d, file, data) {
   const abs = safeWritePath(file);
   d.fs.mkdirSync(path.dirname(abs), { recursive: true });
   const tmp = `${abs}.tmp-${process.pid}`;
@@ -851,7 +851,7 @@ function writeSafe(d, file, data) {
   return abs;
 }
 /** Removal goes through safeWritePath (a target that resolves through a junction to anywhere outside the scratch root is refused). Node's recursive rm unlinks a link inside the tree, it does not follow it (pinned by a real-fs test). */
-function rmSafe(d, target) { d.fs.rmSync(safeWritePath(target), { recursive: true, force: true }); }
+export function rmSafe(d, target) { d.fs.rmSync(safeWritePath(target), { recursive: true, force: true }); }
 /** The retained-evidence write: exact evidence root or approval file only, tmp + rename in the same directory. */
 function writeEvidence(d, file, data) {
   const abs = safeEvidencePath(file);
@@ -867,7 +867,7 @@ function writeEvidence(d, file, data) {
  * checkout writes CRLF into the working tree, so the sha256 of router/uw-router.next.cjs differs between checkouts and from `git show`'s LF bytes.
  * The run hashes the WORKING-TREE file it copies (never a git blob) and prints that hash in full, plus the LF-normalised hash so it can be compared with a blob.
  */
-function installRouter(d, which, approved, { keepState = false } = {}) {
+export function installRouter(d, which, approved, { keepState = false } = {}) {
   const src = which === "probe" ? PROBE_ROUTER_SRC : NEXT_ROUTER_SRC;
   const bytes = d.fs.readFileSync(src);
   // read at its point of use, minutes after the approved re-hash: the bytes about to be copied must still be the APPROVED bytes (the source-vs-copy comparison below cannot see an edit made before the copy)
@@ -882,7 +882,7 @@ function installRouter(d, which, approved, { keepState = false } = {}) {
   return { sha: want, lfSha: sha(Buffer.from(String(Buffer.from(bytes).toString("utf8")).replace(/\r\n/g, "\n"))), src };
 }
 
-async function waitFor(d, pred, ms = 8000) {
+export async function waitFor(d, pred, ms = 8000) {
   const end = d.now() + ms;
   for (;;) { const v = pred(); if (v) return v; if (d.now() >= end) return undefined; await d.sleep(50); }
 }
@@ -921,7 +921,7 @@ const REQUEST_CEILING_MS = 150000;                                              
 const KEPT_RESPONSE_HEADERS = (k) => k === "retry-after" || k.startsWith("x-ccr-");        // everything else a response carries is dropped, never stored
 
 /** One synthetic request to the SANDBOX gateway. Returns {status, headers (retry-after and x-ccr-* only, redacted), ms (the injectable clock), hashes (sha256 of messages and tools as sent), req}; status null on a transport error. */
-async function send(d, key, shape, over = {}) {
+export async function send(d, key, shape, over = {}) {
   const url = `http://127.0.0.1:${SANDBOX_PORTS.gateway}/v1/messages`;
   assertGatewayUrl(url);
   const req = buildRequest(shape, { key, ...over });
@@ -943,7 +943,7 @@ const isFatal = (e) => e instanceof RefusalError || e instanceof RpcTimeoutError
  * sent (Router.fallback mode off|retry|model-chain with chain models only uwstub/*, no enabled Router.rules, CUSTOM_ROUTER_PATH the scratch copy), the persisted result passes
  * assertIsolatedConfig, and the tripwire runs after it. assertRouterClean is NOT used for a swap (it refuses every fallback mode but off by design); it is used for the RESTORE.
  */
-async function editSandboxConfig(c, label, mutate) {
+export async function editSandboxConfig(c, label, mutate) {
   const { d } = c, g = d.guard;
   const cfg = structuredClone(await d.rpc("getConfig"));
   mutate(cfg);
@@ -960,7 +960,7 @@ async function editSandboxConfig(c, label, mutate) {
   c.tripwire?.assert(`e2e:after-${label}`);
   return saved;
 }
-async function restoreFallback(c) {
+export async function restoreFallback(c) {
   const saved = await editSandboxConfig(c, "x9-restore", (cfg) => { cfg.Router = { ...cfg.Router, fallback: structuredClone(c.fallback ?? fallbackFor("off")) }; });
   c.d.guard.assertRouterClean(saved);                              // the ECHO saveConfig returned (CCR 3.0.22 returns the normalised object, not a database read): necessary, not sufficient
   c.d.guard.assertRouterClean(await c.d.rpc("getConfig"));         // what the daemon PERSISTED: mode off, no chain models, no rules, read fresh (the proof reads it fresh again at every later stage)
@@ -1376,15 +1376,21 @@ export async function runE2e(argv, io = {}) {
   if (!ccr.found) { d.err(`refusing: the installed CCR was NOT FOUND (${oneLine(ccr.reason, 160)}): nothing can be said about the code the run would execute`); return 1; }
   const proxied = proxyVarsSet(d.env);                             // BEFORE the approval is consumed: this orchestrator's own fetch and RPC must not be able to leave through a proxy (the daemon env already drops them)
   if (proxied.length) { d.err(`refusing: ${proxied.join(", ")} ${proxied.length === 1 ? "is" : "are"} set in this shell, which could send the sandbox gateway and web RPC traffic through a proxy. Unset ${proxied.length === 1 ? "it" : "them"} (NO_PROXY alone is fine) and run again; nothing was started and the approval was not consumed`); return 1; }
-  const approvalText = d.sys.readText(APPROVAL_FILE);
-  const approvalErr = checkApproval(d, approvalText, plan.sha, fileHashes);
+  // `d.externalApproval` (the scenario suite and the self-test, harness/subagent-scenarios.mjs): THEIR OWN typed-approval ceremony has already been checked and consumed by the caller, so this run's file
+  // is not read; it returns null, or the text of a refusal. Without it nothing changes: the approval file below is checked and consumed here.
+  const ext = d.externalApproval ? await d.externalApproval({ plan, fileHashes, ccr }) : null;
+  if (ext) { d.err(`refusing: ${ext}`); return 2; }
+  const approvalText = d.externalApproval ? null : d.sys.readText(APPROVAL_FILE);
+  const approvalErr = d.externalApproval ? null : checkApproval(d, approvalText, plan.sha, fileHashes);
   if (approvalErr) { d.err(`refusing: --g1-approved alone is not enough. ${approvalErr}`); return 2; }
   // ONE-USE, and race-free: the approval is consumed by an ATOMIC RENAME to a unique name before anything else happens. Of two runs that both passed the check above only the one whose rename
   // succeeds proceeds (a rename of a file that is already gone fails); a refusal later (or a crash) still needs a fresh approval for the next run. The renamed file must hold the bytes that were checked.
   const used = approvalUsedFile(d.sys.selfPid, d.now());
+  if (!d.externalApproval) {
   try { d.fs.renameSync(safeEvidencePath(APPROVAL_FILE), safeEvidencePath(used)); } catch (e) { d.err(`refusing: the approval file could not be consumed (${oneLine(e.code ?? e.message, 120)}): another run may have consumed it first; a run needs a fresh --approve-plan`); return 2; }
   if (d.sys.readText(used) !== approvalText) { d.err(`refusing: the consumed approval (${path.basename(used)}) is not the file that was checked; a run needs a fresh --approve-plan`); return 2; }
   try { d.fs.rmSync(safeEvidencePath(used), { force: true }); } catch { /* best effort: harness/g1-* is gitignored and the file is inert */ }
+  }
   d.out(`approval consumed (plan sha256 ${plan.sha}); executed files:`);
   for (const f of fileHashes) d.out(`  ${f.file}  raw ${f.raw}  lf ${f.lf}`);
   const routers = opts.router === "both" ? ["probe", "next"] : [opts.router];
@@ -1447,7 +1453,12 @@ export async function runE2e(argv, io = {}) {
     if (k.error) { emit(L("FAIL", routers[0], "A0", `${k.error}: the enricher gate cannot be satisfied`)); throw new RefusalError(`REFUSED: ${k.error}`); }
     await prove(tripwire, "post-provider", "after-provider-save");
     const ctx = { d, key: k.key, stub, out: say, emit, approved, tripwire, fallback: k.fallback, shared };
-    for (const r of routers) {
+    if (d.sessionPhases) {                                          // the scenario suite: its phases run on the SAME sandbox, after the same proofs, and end with the same isolation proof
+      const res = await d.sessionPhases(ctx);
+      emit(evalA11("next", baseline, baselineOf(d.sys)));
+      await prove(tripwire, "post-provider", "after-scenarios");
+      if (res?.abort) shared.aborted = true;
+    } else for (const r of routers) {
       const res = r === "probe" ? await runProbePhase(ctx) : await runNextPhase(ctx);
       emit(evalA11(r, baseline, baselineOf(d.sys)));
       await prove(tripwire, "post-provider", `after-${r}-run`);
@@ -1476,7 +1487,7 @@ export async function runE2e(argv, io = {}) {
     if (evidence?.violations.length) d.err(`violations.log (${evidence.violations.length} line${evidence.violations.length === 1 ? "" : "s"}, redacted): ${evidence.violations.slice(0, 10).map((v) => oneLine(v, 200)).join(" | ")}`);
     return 1;
   }
-  const verdict = evaluateRun(lines, routers);
+  const verdict = d.sessionVerdict ? d.sessionVerdict(lines) : evaluateRun(lines, routers);
   for (const p of verdict.problems) d.err(`PROBLEM: ${p}`);
   if (evidence?.violations.length) d.err(`violations.log (${evidence.violations.length} lines, redacted): ${evidence.violations.slice(0, 10).map((v) => oneLine(v, 200)).join(" | ")}`);
   const good = verdict.ok && drift.length === 0 && (!td || td.ok);

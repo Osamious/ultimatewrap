@@ -116,6 +116,7 @@ function sseEvents(model, blocks, stop) {
  *   script.status         -> HTTP status to answer instead (default 200); used to rehearse upstream failures
  *   script.sequence       -> per-request steps, consumed in order, one per /v1/messages request (each a status number or {status, retryAfter (seconds), cut}); when it is empty the
  *                            answer is script.status or 200. Steps: 200, 429 with and without retryAfter, 503, 529, 400, 413, 502, {cut: "after-message_start"}
+ *   script.decide         -> (rec) => a step (a status number or {status, retryAfter, cut}) for THIS request, or undefined to fall through to the sequence and the default; scripts the failure of one model
  *   script.markers        -> strings (at most 8, each at most 64 characters) whose presence in the request's SYSTEM is recorded as rec.markers[<marker>] (true/false); the marker text is the
  *                            harness's own, the system text is never stored
  */
@@ -178,7 +179,11 @@ export function createStub({ port = STUB_PORT, script = {}, labelsFile, host = S
       const isMessages = req.method === "POST" && /^\/v1\/messages(\?|$)/.test(String(req.url));
       if (!isMessages) { res.writeHead(404, { "content-type": "application/json" }); res.end('{"error":"stub: unknown route"}'); return; }
       if (!body) { res.writeHead(400, { "content-type": "application/json" }); res.end('{"error":"stub: body is not JSON"}'); return; }
-      const step = pending.length ? pending.shift() : null;
+      // script.decide(rec): a per-request rule (for example a 429 for ONE model); a step it returns is used first, undefined or null falls through to the sequence
+      let decided = null;
+      try { decided = typeof current.decide === "function" ? current.decide(rec) : null; } catch { decided = null; }       // a throwing rule must never crash the stub: it falls through to the sequence
+      let step;
+      try { step = decided ? normaliseStep(decided) : pending.length ? pending.shift() : null; } catch { step = pending.length ? pending.shift() : null; }       // a bad step is ignored, not thrown
       if (step && step.cut) {                                       // a stream cut: message_start only, then the socket is destroyed
         rec.sent = { status: 200, retryAfter: null, cut: step.cut };
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
