@@ -183,7 +183,7 @@ test("the heartbeat names a provider that is paused (rate or canary) so a long s
   e.deps.heartbeatMs = 15;
   const r = await run(["--live", "--per-provider", "1", ...SMALL, "--timeout-small", "1", "--timeout-max-small", "2"], e.deps);
   const beats = r.out.split("\n").filter((l) => l.includes("[heartbeat"));
-  assert.ok(beats.some((l) => /paused: fa \(pay\)/.test(l)), beats.join("\n"));
+  assert.ok(beats.some((l) => /paused: pay 1/.test(l)), beats.join("\n"));
 });
 
 test("SIGINT flushes the finished records to the file BEFORE anything else happens (not only at the end)", async () => {

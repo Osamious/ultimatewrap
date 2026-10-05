@@ -34,7 +34,7 @@ function env(w, answer, depsExtra = {}) {
   const dir = freshDir();
   const f = fakeFetch(answer ?? goodModel);
   const deps = { snapshot: { ok: true, snap: w.snap }, bench: w.bench, tiers: w.tiers, policy: { schema: 1, models: [], tiers: w.tiers }, presetKeys: null, outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"),
-    gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW, isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1, ...depsExtra };
+    gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW, isAlive: () => false, findRunning: () => [], rateBackoffMs: 1, sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1, ...depsExtra };
   return { dir, deps, f, out: deps.outFile };
 }
 async function run(argv, deps) {
@@ -176,7 +176,7 @@ test("the rule cannot be lifted by an environment variable, a config file, or th
 });
 
 test("CANARY: a provider whose first answer is a dead key, an empty balance or a missing model costs ZERO further requests; its models stay pending with the reason; other providers go on", async () => {
-  for (const [status, why] of [[401, "auth"], [402, "pay"], [404, "gone"]]) {
+  for (const [status, why] of [[401, "auth"], [402, "pay"]]) {
     const e = env(world(), (c) => (c.body.model.startsWith("fa/") ? http(status, "nope") : goodModel(c)));
     const r = await run(["--live"], e.deps);
     assert.equal(byProvider(e.f).fa.length, 1, `${why}: one request to fa, then nothing`);
@@ -192,11 +192,11 @@ test("CANARY: a provider whose first answer is a dead key, an empty balance or a
   assert.ok(byProvider(ok.f).fa.length > 2, "a 5xx is not a canary verdict: the provider is tried on");
 });
 
-test("RATE PAUSE: three rate limits in a row pause the provider for the rest of the run (its models stay pending: rate) and the scheduler moves on", async () => {
+test("RATE PAUSE: three rate limits in a row make the provider WAIT and be tried again in the same run; a second such episode leaves it alone for the rest of the run (its models stay pending: rate) and the scheduler moves on", async () => {
   const e = env(world(), (c) => (c.body.model.startsWith("fa/") ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)));
   const r = await run(["--live"], e.deps);
   const fa = byProvider(e.f).fa;
-  assert.ok(fa.length <= 4, `fa was asked ${fa.length} times, not for every model and retry`);
+  assert.ok(fa.length >= 6 && fa.length <= 12, `fa was asked ${fa.length} times: three, a wait, three more, then left alone`);
   assert.match(r.out, /left alone for the rest of this run, their models stay pending: fa \(rate-limited\)/);
   const st = loadFidelity(e.out);
   assert.equal(st.pending["fa/a3"].r, "rate");

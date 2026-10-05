@@ -254,7 +254,9 @@ test("TWO STRIKES end to end: a first failure is provisional and asked again by 
   e.f.calls.length = 0;
   const third = await run(["--live", "--only", "fa"], e.deps);
   assert.match(third.out, /nothing to probe/, "a confirmed failure is not asked again by an ordinary run");
-  const next = await run(["--live", "--only", "pb"], { ...e.deps, fetch: fakeFetch(goodModel) });
+  const held = await run(["--live", "--only", "pb"], { ...e.deps, fetch: fakeFetch(goodModel) });
+  assert.match(held.out, /held providers .*: 1 provider\(s\)/, "pb's account state is a HOLD: the very next run does not ask it at all");
+  const next = await run(["--live", "--only", "pb", "--retry-accounts"], { ...e.deps, fetch: fakeFetch(goodModel) });
   assert.equal(next.code, 0, next.err);
   assert.ok(loadFidelity(e.out).models["pb/b1"], "the next run picks the two up and records them");
 });

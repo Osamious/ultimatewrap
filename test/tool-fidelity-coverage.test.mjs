@@ -174,7 +174,7 @@ test("the ledger PARTITIONS a mixed universe: tested (tier and evidence), pendin
   const pending = { "p/rate": { r: "rate", n: 4, at: NOW.toISOString() }, "p/waiting": { r: "cap", n: 1, at: NOW.toISOString() } };
   const universe = U("p/v", "p/t", "p/x", "p/strike", "p/old", "p/cap", "p/rate", "p/waiting", "p/fresh", ["p/relay", "relay-by-provenance"], ["p/dead", "not-probe-ok"], ["p/bad id", "invalid-id"]);
   const l12 = coverage(universe, store, { level: "l12", pending });
-  assert.deepEqual(l12.counts, { total: 12, tested: 5, pending: 4, excluded: 3, byTier: { v: 2, t: 2, x: 1 }, byPending: { "first-strike": 1, rate: 1, cap: 1, "not-run": 1 }, byExcluded: { "relay-by-provenance": 1, "not-probe-ok": 1, "invalid-id": 1 } }, "L1+L2: p/cap passed L1+L2 (tier t)");
+  assert.deepEqual(l12.counts, { total: 12, tested: 5, pending: 4, excluded: 3, held: 0, byHeld: {}, byTier: { v: 2, t: 2, x: 1 }, byPending: { "first-strike": 1, rate: 1, cap: 1, "not-run": 1 }, byExcluded: { "relay-by-provenance": 1, "not-probe-ok": 1, "invalid-id": 1 } }, "L1+L2: p/cap passed L1+L2 (tier t)");
   assert.equal(l12.tested.length + l12.pending.length + l12.excluded.length, universe.length);
   const keys = [...l12.tested, ...l12.pending, ...l12.excluded].map((e) => e.key).sort();
   assert.deepEqual(keys, universe.map((u) => u.key).sort(), "every model exactly once");

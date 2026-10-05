@@ -155,7 +155,7 @@ export function loadFidelity(file = REAL_FILE) {
   try {
     if (fs.statSync(file).size > MAX_READ_BYTES) return { ok: false, reason: "too-large" };
     text = fs.readFileSync(file, "utf8").replace(/^﻿/, "");
-  } catch (e) { return e?.code === "ENOENT" ? { ok: true, absent: true, models: {}, rejected: {}, pending: {}, generatedAt: null, dropped: 0 } : { ok: false, reason: "unreadable" }; }
+  } catch (e) { return e?.code === "ENOENT" ? { ok: true, absent: true, models: {}, rejected: {}, pending: {}, held: {}, generatedAt: null, dropped: 0 } : { ok: false, reason: "unreadable" }; }
   let raw;
   try { raw = JSON.parse(text); } catch { return { ok: false, reason: "corrupt" }; }
   if (!raw || raw.kind !== KIND || raw.schema !== SCHEMA || !raw.models || typeof raw.models !== "object" || Array.isArray(raw.models)) return { ok: false, reason: "schema" };
@@ -166,7 +166,7 @@ export function loadFidelity(file = REAL_FILE) {
     if (rec) models[k] = rec;
     else { dropped += 1; if (keyOk(k)) rejected[k] = v; }
   }
-  return { ok: true, models, rejected, pending: cleanPending(raw.pending), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
+  return { ok: true, models, rejected, pending: cleanPending(raw.pending), held: cleanHeld(raw.held), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
 }
 
 // ------------------------------------------------------------------ writing
@@ -189,24 +189,48 @@ export function cleanPending(raw) {
   }
   return out;
 }
+/**
+ * The HELD providers: a provider whose last canary was an account state (pay, auth) or two distinct models gone is not asked at all for a while (`--hold-hours`, default 6) and not even
+ * canaried again until the window ends (`--retry-accounts` forces it). Stored as an additive top-level `held` object: `{provider: {r: "pay" | "auth" | "gone", at: ISO}}`, at most `HELD_MAX`.
+ */
+export const HELD_MAX = 500;
+export const HELD_STATES = Object.freeze(["pay", "auth", "gone"]);
+const providerOk = (p) => typeof p === "string" && /^[A-Za-z0-9._@+-]{1,60}$/.test(p);
+export function cleanHeld(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [p, v] of Object.entries(raw)) {
+    if (!providerOk(p) || !v || typeof v !== "object" || !HELD_STATES.includes(v.r) || typeof v.at !== "string" || !Number.isFinite(Date.parse(v.at))) continue;
+    out[p] = { r: v.r, at: v.at };
+    if (Object.keys(out).length >= HELD_MAX) break;
+  }
+  return out;
+}
+/** The holds still in force at `nowMs`: `{provider: {r, at, until}}`. */
+export function activeHolds(held, nowMs, holdHours = 6) {
+  const out = {};
+  for (const [p, v] of Object.entries(held ?? {})) { const until = Date.parse(v.at) + holdHours * 3600000; if (until > nowMs) out[p] = { ...v, until }; }
+  return out;
+}
+const heldText = (held) => (held && Object.keys(held).length ? `"held":${JSON.stringify(held)},` : "");
 const pendingText = (pending) => (pending && Object.keys(pending).length ? `"pending":${JSON.stringify(pending)},` : "");
-const head = (now, pending) => `{"schema":${SCHEMA},"kind":${JSON.stringify(KIND)},"generatedAt":${JSON.stringify(now.toISOString())},${pendingText(pending)}"models":{`;
+const head = (now, pending, held = null) => `{"schema":${SCHEMA},"kind":${JSON.stringify(KIND)},"generatedAt":${JSON.stringify(now.toISOString())},${pendingText(pending)}${heldText(held)}"models":{`;
 const lineOf = (k, v) => `${JSON.stringify(k)}:${JSON.stringify(v)}`;
 /** The file text: one record per line. The size cap is measured on exactly this string. */
-export function renderFile(entries, now = new Date(), pending = null) {
+export function renderFile(entries, now = new Date(), pending = null, held = null) {
   const lines = entries.map(([k, v]) => lineOf(k, v));
-  return `${head(now, pending)}${lines.length ? `\n${lines.join(",\n")}\n` : ""}}}\n`;
+  return `${head(now, pending, held)}${lines.length ? `\n${lines.join(",\n")}\n` : ""}}}\n`;
 }
-const bytesOf = (sizes, now, pending) => Buffer.byteLength(head(now, pending)) + (sizes.length ? 2 + sizes.reduce((a, b) => a + b, 0) + 2 * (sizes.length - 1) : 0) + 3;
+const bytesOf = (sizes, now, pending, held = null) => Buffer.byteLength(head(now, pending, held)) + (sizes.length ? 2 + sizes.reduce((a, b) => a + b, 0) + 2 * (sizes.length - 1) : 0) + 3;
 
 /**
  * Capacity, not expiry: when the FILE AS WRITTEN would pass `maxBytes`, records of models that have left the catalogue go first, then the oldest;
  * records this reader did not understand (`preserve`) go last of all. Returns the kept `models` and `preserve` and the `dropped` keys.
  */
-export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, preserve = {}, now = new Date(), pending = null } = {}) {
+export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, preserve = {}, now = new Date(), pending = null, held = null } = {}) {
   const all = [...Object.entries(models).map(([k, v]) => ({ k, v, own: true })), ...Object.entries(preserve).filter(([k]) => !(k in models)).map(([k, v]) => ({ k, v, own: false }))];
   const size = new Map(all.map((e) => [e.k, Buffer.byteLength(lineOf(e.k, e.v))]));
-  let total = bytesOf([...size.values()], now, pending);
+  let total = bytesOf([...size.values()], now, pending, held);
   const at = (e) => (e.own ? Date.parse(e.v.at) : Infinity);
   const order = [...all].sort((a, b) => {
     const ga = (a.own ? 0 : 2) + (keep && !keep.has(a.k) ? 0 : 1), gb = (b.own ? 0 : 2) + (keep && !keep.has(b.k) ? 0 : 1);
@@ -241,7 +265,7 @@ function canon(file) {
  *   - an existing file that is not this file (no `kind` marker, another schema, unreadable, too large) is never overwritten.
  * `preserve` holds raw records this reader did not understand: they are written back unchanged unless a valid record replaces them.
  */
-export function saveFidelity(file, models, { live = false, now = new Date(), keep = null, retries = 5, retryMs = 40, writeImpl = writeAtomic, realFile = REAL_FILE, preserve = {}, pending = {} } = {}) {
+export function saveFidelity(file, models, { live = false, now = new Date(), keep = null, retries = 5, retryMs = 40, writeImpl = writeAtomic, realFile = REAL_FILE, preserve = {}, pending = {}, held } = {}) {
   const target = path.resolve(file);
   if (path.basename(target) !== FILE_NAME) throw new Error(`refused: the tool-fidelity writer only writes a file named ${FILE_NAME}, not ${path.basename(target)}`);
   if (canon(target) === canon(realFile) && !live) throw new Error("refused: the real state file is written only by a --live run");
@@ -250,9 +274,10 @@ export function saveFidelity(file, models, { live = false, now = new Date(), kee
   const good = Object.fromEntries(Object.entries(models).filter(([k]) => keyOk(k)));
   const keepRaw = Object.fromEntries(Object.entries(preserve).filter(([k]) => keyOk(k) && !(k in good)));
   const pend = cleanPending(pending);
-  const capped = capRecords(good, { keep, preserve: keepRaw, now, pending: pend });
+  const hold = held === undefined ? cur.held : cleanHeld(held);                  // a writer that does not mention the holds keeps the ones in the file
+  const capped = capRecords(good, { keep, preserve: keepRaw, now, pending: pend, held: hold });
   const entries = [...Object.entries(capped.models), ...Object.entries(capped.preserve)].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  const text = renderFile(entries, now, pend);
+  const text = renderFile(entries, now, pend, hold);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   for (let i = 0; ; i++) {
     try { writeImpl(target, text); break; }
@@ -884,11 +909,11 @@ export function envelope(rated, cap = DEFAULT_TOKENS_PER_PROVIDER) {
  * is about. THROWS when a model is in two states, in none, appears twice, or is not in the universe: a model dropped by a bug is a loud failure, never a
  * quietly smaller denominator.
  */
-export function assertPartition(universe, { tested, pending, excluded }) {
+export function assertPartition(universe, { tested, pending, excluded, held = [] }) {
   const keys = universe.map((u) => u.key);
   if (new Set(keys).size !== keys.length) throw new Error("coverage: a model appears twice in the universe");
   const seen = new Map();
-  for (const [state, list] of [["tested", tested], ["pending", pending], ["excluded", excluded]]) {
+  for (const [state, list] of [["tested", tested], ["pending", pending], ["excluded", excluded], ["held", held]]) {
     for (const e of list) {
       if (seen.has(e.key)) throw new Error(`coverage: ${e.key} is in two states (${seen.get(e.key)} and ${state})`);
       seen.set(e.key, state);
@@ -898,7 +923,7 @@ export function assertPartition(universe, { tested, pending, excluded }) {
   if (missing.length) throw new Error(`coverage: ${missing.length} model(s) are in no state, first ${missing[0]}`);
   const extra = [...seen.keys()].filter((k) => !keys.includes(k));
   if (extra.length) throw new Error(`coverage: ${extra[0]} is in a state but not in the universe`);
-  if (tested.length + pending.length + excluded.length !== keys.length) throw new Error("coverage: the three states do not add up to the universe");
+  if (tested.length + pending.length + excluded.length + held.length !== keys.length) throw new Error("coverage: the states do not add up to the universe");
 }
 
 /**
@@ -911,8 +936,9 @@ export function assertPartition(universe, { tested, pending, excluded }) {
  * `provisional` models that failed once (a first strike is never reported as a failure), `stuck` models pending in `stuckRuns` or more runs in a row, and
  * `outdated` tested models whose record is against an older fixture (a `*`: re-sweep recommended, never automatic).
  */
-export function coverage(universe, store, { level = "l12", pending = {}, plan = {}, fixtureId = FIXTURE_ID, stuckRuns = 3, listCap = 10, deepOk = () => true } = {}) {
-  const tested = [], waiting = [], excluded = [], provisional = [], stuck = [], outdated = [];
+export const HELD_PLAN = "held";
+export function coverage(universe, store, { level = "l12", pending = {}, plan = {}, fixtureId = FIXTURE_ID, stuckRuns = 3, listCap = 10, deepOk = () => true, heldWhy = {} } = {}) {
+  const tested = [], waiting = [], excluded = [], provisional = [], stuck = [], outdated = [], held = [];
   const optional = { l4: 0, big: 0, sp: 0, er: 0 };
   for (const u of universe) {
     if (u.excluded) { excluded.push({ key: u.key, reason: u.excluded }); continue; }
@@ -934,15 +960,16 @@ export function coverage(universe, store, { level = "l12", pending = {}, plan = 
       continue;
     }
     const p = pending[u.key];
+    if (plan[u.key] === HELD_PLAN) { held.push({ key: u.key, reason: heldWhy[u.key.slice(0, u.key.indexOf("/"))] ?? "held" }); continue; }          // its provider is held: not waiting, not 'pending too long'
     waiting.push({ key: u.key, reason: strike ? "first-strike" : plan[u.key] ?? p?.r ?? "not-run", runs: p?.n ?? 0 });
     if (p && p.n >= stuckRuns) stuck.push({ key: u.key, reason: p.r, runs: p.n });
   }
-  assertPartition(universe, { tested, pending: waiting, excluded });
+  assertPartition(universe, { tested, pending: waiting, excluded, held });
   const tally = (list, f) => { const o = {}; for (const e of list) o[f(e)] = (o[f(e)] ?? 0) + 1; return o; };
   const cap = (l) => ({ n: l.length, list: l.slice(0, listCap) });
   return {
-    level, total: universe.length, tested, pending: waiting, excluded,
-    counts: { total: universe.length, tested: tested.length, pending: waiting.length, excluded: excluded.length,
+    level, total: universe.length, tested, pending: waiting, excluded, held,
+    counts: { total: universe.length, tested: tested.length, pending: waiting.length, excluded: excluded.length, held: held.length, byHeld: tally(held, (e) => e.reason),
               byTier: tally(tested, (e) => e.tier), byPending: tally(waiting, (e) => e.reason), byExcluded: tally(excluded, (e) => e.reason) },
     provisional: cap(provisional), stuck: cap(stuck), outdated: cap(outdated), optional,
   };
@@ -951,7 +978,7 @@ export function coverage(universe, store, { level = "l12", pending = {}, plan = 
 /** The ledger as printed lines (dry run and sweep report); every figure names its denominator. */
 export function coverageLines(cov, label) {
   const c = cov.counts, fmt = (o) => Object.entries(o).sort(([, a], [, b]) => b - a).map(([k, n]) => `${k} ${n}`).join(", ") || "none";
-  const L = [`coverage ${label}: ${c.total} model(s) = tested ${c.tested} (${fmt(c.byTier)}) + pending ${c.pending} (${fmt(c.byPending)}) + excluded ${c.excluded} (${fmt(c.byExcluded)})`];
+  const L = [`coverage ${label}: ${c.total} model(s) = tested ${c.tested} (${fmt(c.byTier)}) + pending ${c.pending} (${fmt(c.byPending)}) + excluded ${c.excluded} (${fmt(c.byExcluded)})${c.held ? ` + held ${c.held} (${fmt(c.byHeld)}: a provider with an account state, not asked for a while)` : ""}`];
   const list = (name, l, f) => { if (l.n) L.push(`  ${name} ${l.n} of ${c.total}: ${l.list.map(f).join(", ")}${l.n > l.list.length ? `, and ${l.n - l.list.length} more` : ""}`); };
   list("failed once (provisional, asked again, not yet x)", cov.provisional, (e) => `${e.key} L${e.level}`);
   list("pending too long", cov.stuck, (e) => `${e.key} ${e.reason} x${e.runs}`);
@@ -1020,6 +1047,32 @@ export function migrateStrikes(store) {
     out[key] = { ...rest, t, ok: t === "v" || t === "t" };
   }
   return { store: out, cleared };
+}
+
+// ------------------------------------------------------------------ canary migration
+
+/**
+ * The old canary logic paused a WHOLE provider on one 'gone' answer and recorded `canary-gone` for every model behind it, and kept asking the providers with an account state every run. Now a gone
+ * canary is judged on two distinct models and an account state is a HOLD. This clears the `canary-gone` entries (to be re-evaluated) and turns the `pay` / `auth` / `canary-pay` / `canary-auth` entries
+ * into holds (at their own timestamp) for providers with no newer record. Pure: `{pending, held, goneCleared: [key], goneProviders: [provider], seeded: [{provider, r, at}]}`.
+ */
+export function migrateCanary(store, pending, held) {
+  const out = { ...(pending ?? {}) }, hold = { ...(held ?? {}) }, goneCleared = [], seeded = [];
+  const newest = {};
+  for (const [k, r] of Object.entries(store ?? {})) { const p = k.slice(0, k.indexOf("/")); const t = Date.parse(r?.at); if (Number.isFinite(t)) newest[p] = Math.max(newest[p] ?? 0, t); }
+  const seed = {};
+  for (const [k, v] of Object.entries(pending ?? {})) {
+    const p = k.slice(0, k.indexOf("/"));
+    if (v.r === "canary-gone") { delete out[k]; goneCleared.push(k); continue; }
+    const st = /^(?:canary-)?(pay|auth)$/.exec(v.r)?.[1];
+    if (!st) continue;
+    const t = Date.parse(v.at);
+    if (!providerOk(p) || !Number.isFinite(t) || (newest[p] ?? 0) > t) continue;
+    if (!seed[p] || t > Date.parse(seed[p].at)) seed[p] = { r: st, at: v.at };
+  }
+  for (const [p, v] of Object.entries(seed)) { if (hold[p] && Date.parse(hold[p].at) >= Date.parse(v.at)) continue; hold[p] = v; seeded.push({ provider: p, ...v }); }
+  const goneProviders = [...new Set(goneCleared.map((k) => k.slice(0, k.indexOf("/"))))];
+  return { pending: out, held: hold, goneCleared, goneProviders, seeded };
 }
 
 // ------------------------------------------------------------------ gateway-compat insights and the transient migration

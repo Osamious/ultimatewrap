@@ -52,7 +52,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, activeHolds, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -62,7 +62,7 @@ const NUMERIC = {
   "--max-tokens": ["maxTokens", true], "--concurrency": ["concurrency", true], "--per-provider": ["perProvider", true], "--timeout": ["timeoutSec", false],
   "--max-minutes": ["maxMinutes", false], "--pending-runs": ["pendingRuns", true],
   "--timeout-small": ["timeoutSmall", false], "--timeout-157": ["timeout157", false], "--timeout-big": ["timeoutBig", false],
-  "--timeout-max-small": ["timeoutMaxSmall", false], "--timeout-max-157": ["timeoutMax157", false], "--timeout-max-big": ["timeoutMaxBig", false],
+  "--hold-hours": ["holdHours", false], "--timeout-max-small": ["timeoutMaxSmall", false], "--timeout-max-157": ["timeoutMax157", false], "--timeout-max-big": ["timeoutMaxBig", false],
 };
 export const LIFT_PREVIEW = "  lifting would cost, per tier (computed as if --live were given):";
 const PRICED_OVER_ROW = "priced-over-row-cap";   // a model on a free-tier key whose listing has a price above the row ceiling: pending, never an error
@@ -85,7 +85,7 @@ export function parseLevels(text) {
 
 /** Parses argv into options, or `{ error }`. */
 export function parseArgs(argv) {
-  const o = { ...DEFAULTS, maxTokens: null, order: "l3-first", timeoutSmall: TIMEOUTS_MS.small / 1000, timeout157: TIMEOUTS_MS["157"] / 1000, timeoutBig: TIMEOUTS_MS.big / 1000, timeoutMaxSmall: TIMEOUT_CAPS_MS.small / 1000, timeoutMax157: TIMEOUT_CAPS_MS["157"] / 1000, timeoutMaxBig: TIMEOUT_CAPS_MS.big / 1000, tfMaxTokens: DEFAULT_TOKENS_PER_PROVIDER, levels: [...DEFAULT_LEVELS], live: false, force: false, retryFailed: false, l3: false, only: null, limit: null, economy: false,
+  const o = { ...DEFAULTS, maxTokens: null, order: "l3-first", timeoutSmall: TIMEOUTS_MS.small / 1000, timeout157: TIMEOUTS_MS["157"] / 1000, timeoutBig: TIMEOUTS_MS.big / 1000, holdHours: 6, timeoutMaxSmall: TIMEOUT_CAPS_MS.small / 1000, timeoutMax157: TIMEOUT_CAPS_MS["157"] / 1000, timeoutMaxBig: TIMEOUT_CAPS_MS.big / 1000, tfMaxTokens: DEFAULT_TOKENS_PER_PROVIDER, levels: [...DEFAULT_LEVELS], live: false, force: false, retryFailed: false, l3: false, only: null, limit: null, economy: false,
     candidates: false, policyFile: null, tiersFile: null, includeTiers: [], allow: [], pendingRuns: 3, levelsExplicit: false, sample: 0, seed: "1" };
   const explicit = new Set();
   for (let i = 0; i < argv.length; i++) {
@@ -97,6 +97,8 @@ export function parseArgs(argv) {
     else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
     else if (a === "--reset-transient") o.resetTransient = true;
     else if (a === "--only-gateway") o.onlyGateway = true;
+    else if (a === "--retry-accounts") o.retryAccounts = true;
+    else if (a === "--reset-canary") o.resetCanary = true;
     else if (a === "--l3") { if (argv[++i] !== "yes") return { error: "--l3 needs the word yes (it allows the 157 KB level 3 and level 4 requests and the 400 KB big step)" }; o.l3 = true; }
     else if (a === "--levels") {
       const l = parseLevels(argv[++i]);
@@ -155,7 +157,7 @@ export function parseArgs(argv) {
 }
 
 /** The plan of one invocation, with every figure computed and nothing sent. Pure over its inputs. */
-export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers = null, presetKeys = null, presetNote = null, printed = false, tierMeta = null, nowMs = Date.now() }) {
+export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers = null, presetKeys = null, presetNote = null, printed = false, tierMeta = null, nowMs = Date.now(), held = {} }) {
   const fullSet = probeSet(snap, bench);
   // candidates: every probe-ok free-tier model, in priority order; otherwise the whole probe set in its own order
   // deep levels (above L2) are for tier `free` only: a lift needs --include-tier AND an explicit --levels AND --live AND an explicit --max-spend AND this printed estimate
@@ -185,10 +187,20 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const tierOf = (e) => e.tier ?? tiers?.[e.provider] ?? null;
   const tiered = asked.map((e) => ({ ...e, tier: tierOf(e) }));
   const cl = clampDeep(tiered, { lift: liftCap });
-  const queued = limitEntries(selectOnly(cl.entries, o.only), o.limit);
+  const queuedAll = limitEntries(selectOnly(cl.entries, o.only), o.limit);
   const fallback = paidFallback(fullSet.models);                      // the whole set, so a narrowed run is charged like a full one
+  // HELD providers (an account state or two models gone, within the hold window): out of the queue BEFORE the per-provider cap, zero requests, not even a canary. --retry-accounts forces them back in.
+  const heldNow = o.retryAccounts ? {} : activeHolds(held, nowMs, o.holdHours);
+  const heldEntries = queuedAll.filter((e) => heldNow[e.provider]);
+  const queued = queuedAll.filter((e) => !heldNow[e.provider]);
+  const heldTok = {};
+  for (const e of estimate(heldEntries, { maxTokens: o.maxTokens, fallback }).entries) { const x = (heldTok[e.provider] ??= { models: 0, tokens: 0 }); x.models += 1; x.tokens += e.tin; }
+  const heldInfo = Object.entries(heldNow).map(([provider, h]) => ({ provider, r: h.r, at: h.at, until: h.until, models: heldTok[provider]?.models ?? 0, tokens: heldTok[provider]?.tokens ?? 0 })).sort((a, b) => b.models - a.models || (a.provider < b.provider ? -1 : 1));
+  // the cap of the providers that are held is not spent on them: their share is split among the providers that can run (at most twice the cap)
+  const provsAll = new Set(queuedAll.map((e) => e.provider)).size, provsRun = new Set(queued.map((e) => e.provider)).size;
+  const capEff = heldEntries.length && provsRun ? Math.min(o.tfMaxTokens * 2, Math.round(o.tfMaxTokens * provsAll / provsRun)) : o.tfMaxTokens;
   const est = estimate(queued, { maxTokens: o.maxTokens, fallback });
-  const { kept, waiting, tooBig, needed } = applyProviderCap(est.entries, o.tfMaxTokens);
+  const { kept, waiting, tooBig, needed } = applyProviderCap(est.entries, capEff);
   const run = estimate(kept, { maxTokens: o.maxTokens, fallback });
   // free-tier keys whose listing carries a price are costed at it: how many, what they cost at full depth, and which are over the row ceiling (they stay pending: priced-over-row-cap)
   const pricedOnFree = estimate(queued.filter((e) => e.pricedOnFree).map((e) => ({ ...e, todo: [1, 2, 3, 5, 6, 7] })), { maxTokens: o.maxTokens, fallback });
@@ -206,10 +218,12 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   }
   const planned = (levels) => Object.fromEntries([...kept.map((e) => [e.key, overRow.has(e.key) ? PRICED_OVER_ROW : "queued"]), ...waiting.map((e) => [e.key, "cap"]), ...tooBig.map((e) => [e.key, "cap"])]
     .filter(([k]) => [...kept, ...waiting, ...tooBig].find((e) => e.key === k).todo.some((l) => levels.includes(l))));
+  const heldWhy = Object.fromEntries(Object.entries(heldNow).map(([p, h]) => [p, h.r]));
+  const heldPlan = Object.fromEntries(set.models.filter((e) => heldNow[e.provider]).map((e) => [e.key, HELD_PLAN]));
   const universes = ledgerUniverses({ set, cand });
   const deepOk = (key) => deepAllowed(tiers?.[key.slice(0, key.indexOf("/"))] ?? null, liftCap);
-  const ledger = { l12: coverage(universes.l12, store, { level: "l12", pending, plan: planned([1, 2]), stuckRuns: o.pendingRuns ?? 3, deepOk }),
-                   l3: universes.l3 ? coverage(universes.l3, store, { level: "l3", pending, plan: planned([3]), stuckRuns: o.pendingRuns ?? 3, deepOk }) : null };
+  const ledger = { l12: coverage(universes.l12, store, { level: "l12", pending, plan: { ...planned([1, 2]), ...heldPlan }, stuckRuns: o.pendingRuns ?? 3, deepOk, heldWhy }),
+                   l3: universes.l3 ? coverage(universes.l3, store, { level: "l3", pending, plan: { ...planned([3]), ...heldPlan }, stuckRuns: o.pendingRuns ?? 3, deepOk, heldWhy }) : null };
   const ttfts = queued.map((e) => bench?.get?.(e.key)?.t).filter((x) => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
   const latencyMs = ttfts.length ? ttfts[Math.floor(ttfts.length / 2)] : 3000;
   const heavy = kept.some((e) => e.kinds.some((k) => kindSize(k).bytes >= 100000));
@@ -218,7 +232,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const smalls = kept.map((e) => timeoutsFor(bench?.get?.(e.key), { small: floorS, "157": o.timeout157 * 1000, big: o.timeoutBig * 1000 }, { small: capS, "157": o.timeoutMax157 * 1000, big: o.timeoutMaxBig * 1000 }).small).sort((a, b) => a - b);
   const timeoutStats = smalls.length ? `${Math.round(smalls[0] / 1000)} s at the least, ${Math.round(smalls[Math.floor(smalls.length / 2)] / 1000)} s median, ${Math.round(smalls.at(-1) / 1000)} s at the most` : null;
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
-  return { gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
+  return { heldInfo, capEff, queuedAllCount: queuedAll.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
 /** Where the provider tiers came from, how old they are and which providers they do not cover (printed in the plan and in the report). */
@@ -341,6 +355,46 @@ async function resetTransient(o, outFile, deps) {
   finally { got.release(); }
 }
 
+/** The held-providers block (dry run and report): who is held, why, since when, until when, and what that frees. */
+export function heldLines(p, o) {
+  const h = p.heldInfo ?? [];
+  if (!h.length) return [];
+  const hh = (t) => new Date(t).toISOString().slice(11, 16);
+  const models = h.reduce((a, x) => a + x.models, 0), tokens = h.reduce((a, x) => a + x.tokens, 0);
+  const L = [`  held providers (an account state or two models gone, within the ${o.holdHours}-hour hold; zero requests, not even a canary; --retry-accounts forces them in): ${num(h.length)} provider(s), ${num(models)} queued model(s) left out of the queue, ~${tok(tokens)} input tokens of cap freed`];
+  for (const x of h.slice(0, 15)) L.push(show(`    ${x.provider}: ${x.r} since ${x.at.slice(0, 16).replace("T", " ")}, retry after ${hh(x.until)} UTC: ${num(x.models)} model(s) freed`, 200));
+  if (h.length > 15) L.push(`    ... and ${h.length - 15} more`);
+  if (p.capEff !== o.tfMaxTokens) L.push(`  per-provider cap re-split: ${num(o.tfMaxTokens)} -> ${num(p.capEff)} input tokens for the providers that can run (the share of the held ones, at most twice the cap)`);
+  return L;
+}
+
+/**
+ * `--reset-canary`: the old canary logic paused a whole provider on one gone answer (`canary-gone`) and kept asking providers with an account state every run. This clears the `canary-gone` entries so
+ * the two-model logic judges them again, and turns `pay` / `auth` entries into holds. Dry by default; `--live` applies it under the lock, atomically.
+ */
+async function resetCanary(o, outFile, deps) {
+  const cur = loadFidelity(outFile);
+  if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was changed`); return 1; }
+  const m1 = migrateCanary(cur.models, cur.pending, cur.held);
+  const st = {};
+  for (const x of m1.seeded) st[x.r] = (st[x.r] ?? 0) + 1;
+  console.log(`tool-fidelity: ${num(m1.goneCleared.length)} canary-gone entr${m1.goneCleared.length === 1 ? "y" : "ies"} of ${num(m1.goneProviders.length)} provider(s) would be cleared (the two-model logic judges them again); ${num(m1.seeded.length)} provider(s) would become holds (${Object.entries(st).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none"}), ${num(Object.keys(cur.held ?? {}).length)} already held`);
+  if (m1.goneProviders.length) console.log(show(`  gone providers: ${m1.goneProviders.slice(0, 12).join(", ")}${m1.goneProviders.length > 12 ? ", ..." : ""}`, 300));
+  if (!o.live) { console.log("nothing was written. Re-run with --reset-canary --live to apply it."); return 0; }
+  if (!m1.goneCleared.length && !m1.seeded.length) { console.log("tool-fidelity: nothing to change"); return 0; }
+  const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
+  if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  try {
+    const fresh = loadFidelity(outFile);
+    if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
+    const m = migrateCanary(fresh.models, fresh.pending, fresh.held);
+    (deps.saveImpl ?? saveFidelity)(outFile, fresh.models, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending: m.pending, held: m.held });
+    console.log(`tool-fidelity: ${num(m.goneCleared.length)} canary-gone entr${m.goneCleared.length === 1 ? "y" : "ies"} cleared and ${num(m.seeded.length)} provider(s) held in ${path.basename(outFile)}`);
+    return 0;
+  } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
+  finally { got.release(); }
+}
+
 /** The insights block: the failures caused by the gateway's own request translation (fixable there), by provider, with the provider's words. */
 export function gatewayLines(g) {
   if (!g.length) return [];
@@ -389,6 +443,7 @@ export function printPlan(p, o) {
   L.push(`  free tier ${num(free)} model(s): no money; paid tier ${num(paid)} model(s): estimate ${usd(p.run.usd)} (input and output priced, cap ${usd(o.maxSpend)}, row ceiling ${usd(o.maxRowCost)}; an unlisted price is charged at the highest listed paid price of the whole probe set)`);
   L.push(...tierLines(p));
   L.push(...gatewayLines(p.gateway ?? []));
+  L.push(...heldLines(p, o));
   if (!p.tierInfo) L.push("  no provider tier data (no compiled policy and no --tiers-file): no provider counts as free, so nothing is probed (default-deny)");
   if (p.pricedOnFree?.entries.length) L.push(`  free-tier keys with a LISTED price: ${num(p.pricedOnFree.entries.length)} of ${num(p.queued.length)} queued model(s) are costed at the listed price, not as free: ${usd(p.pricedOnFree.usd)} at full depth (input and output priced); ${num(p.overRowAll)} of them are over the ${usd(o.maxRowCost)} row ceiling at the levels asked (${num(p.overRow)} of those within this run's cap) and stay pending: ${PRICED_OVER_ROW} (raise --max-row-cost to probe them)`);
   if (p.cand && p.envelope.models) {
@@ -437,7 +492,7 @@ export function liveRefusal(o, p) {
  * well as in the engine: every level a probe COMPLETED is charged, also when a later level errors (the engine charges only what a finished result
  * reports), so the report and the budget of the next phase count it.
  */
-function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench = null, stats = { started: new Set(), active: new Map() } }) {
+function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench = null, stats = { started: new Set(), active: new Map() }, rateBackoffMs = null }) {
   // Spend is charged per REQUEST that was sent and billed, from what the answer reported (or the estimate when it did not): a level that was only part way, an answer that was all thinking
   // (and the larger-budget request asked again after it) count; a rate limit, a dead key, a server error and a TIME-OUT (no complete answer: nothing was delivered) cost nothing.
   const BILLED = new Set(["empty"]);
@@ -454,7 +509,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
   return async (t, ctx) => {
     t.done ??= {};
     // a provider whose first answer was a dead key, an empty balance or a missing model costs nothing more; one that keeps rate-limiting is left for the next run
-    const ps = (prov[t.provider] ??= { rateStreak: 0, paused: false, blocked: null, answered: false });
+    const ps = (prov[t.provider] ??= { rateStreak: 0, paused: false, blocked: null, answered: false, goneModels: new Set(), episodes: 0 });
     if (ps.blocked) return { s: "skip", w: `canary-${ps.blocked}` };
     if (ps.paused) return { s: "skip", w: "rate-paused" };
     const tele = [];
@@ -471,8 +526,25 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     if (r.aborted) return { aborted: true };
     for (const l of r.clamped ?? []) clampedKeys.add(t.key);
     const sx = r.inconclusive?.s;
-    if (sx === "rate") { if (++ps.rateStreak >= RATE_PAUSE_AFTER) ps.paused = true; } else ps.rateStreak = 0;
-    if (!ps.answered) { if (sx === "auth" || sx === "pay" || sx === "gone") ps.blocked = sx; else if (!r.inconclusive) ps.answered = true; }
+    // a rate limit on one request is the moment's, not the provider's: after RATE_PAUSE_AFTER in a row the provider waits out the Retry-After (at most a minute) and is tried again in this same run; only a
+    // second such episode leaves it alone for the rest of the run
+    if (sx === "rate") {
+      if (++ps.rateStreak >= RATE_PAUSE_AFTER) {
+        ps.rateStreak = 0;
+        if (ps.episodes < 1) {
+          ps.episodes += 1;
+          const ms = rateBackoffMs ?? Math.min(60000, Math.max(5000, r.inconclusive.ra ?? 0));
+          await new Promise((res) => { const tm = setTimeout(res, ms); ac.signal.addEventListener("abort", () => { clearTimeout(tm); res(); }, { once: true }); });
+        } else ps.paused = true;
+      }
+    } else ps.rateStreak = 0;
+    // The canary: pay and auth are the ACCOUNT's state, so the first answer decides for the provider. A GONE answer is about one model: the provider is paused only when two DISTINCT models are gone and
+    // none of its models has answered; the gone model alone is pending gone.
+    if (!ps.answered) {
+      if (sx === "auth" || sx === "pay") ps.blocked = sx;
+      else if (sx === "gone") { ps.goneModels.add(t.key); if (ps.goneModels.size >= 2) ps.blocked = "gone"; }
+      else if (!r.inconclusive) ps.answered = true;
+    }
     if (r.inconclusive?.reason === "route-shape" || r.inconclusive?.reason === "upstream-unavailable") return { s: "skip", w: r.inconclusive.reason, ...(r.inconclusive.hint ? { hint: r.inconclusive.hint } : {}) };
     if (r.inconclusive) return { s: r.inconclusive.s, ...(r.inconclusive.escalated ? { escalated: true } : {}), ...(r.inconclusive.reason ? { reason: r.inconclusive.reason } : {}), ...(r.inconclusive.secs !== undefined ? { secs: r.inconclusive.secs } : {}), ...(r.inconclusive.ra !== undefined ? { ra: r.inconclusive.ra } : {}), ...(r.inconclusive.http ? { http: r.inconclusive.http } : {}), p: r.inconclusive.why, m: r.inconclusive.why };
     return { s: "ok", tf: { done: t.done }, ...(r.escalated ? { escalated: true } : {}) };
@@ -531,6 +603,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (o.mergeUnsaved) return mergeUnsaved(o, outFile, deps);
   if (o.resetAwkwardJson) return resetAwkward(o, outFile, deps);
   if (o.resetTransient) return resetTransient(o, outFile, deps);
+  if (o.resetCanary) return resetCanary(o, outFile, deps);
   const loaded = deps.snapshot ?? loadSnapshot();
   if (!loaded.ok) { console.error(`tool-fidelity: no usable snapshot (${loaded.reason}) -- run: node menu/snapshot.mjs --build`); return 1; }
   const stored = loadFidelity(outFile);
@@ -558,7 +631,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const ctxOf = { tiers, tierMeta, nowMs: (deps.now?.() ?? new Date()).getTime(), presetKeys: presets.keys, presetNote: presets.note };
   // The lift needs the per-tier cost estimate to have been PRINTED in this invocation. The plan is made on the expectation that it will be, and what was actually shown is checked:
   // when the preview line is not in the text, the plan is made again without it (the paid tier stays clamped) and that is what is shown and run.
-  const planWith = (printed) => plan({ snap: loaded.snap, bench, store: stored.models, o, policy, pending: stored.pending, ...ctxOf, printed });
+  const planWith = (printed) => plan({ snap: loaded.snap, bench, store: stored.models, o, policy, pending: stored.pending, held: stored.held, ...ctxOf, printed });
   let printed = o.includeTiers.length > 0;
   let p = planWith(printed);
   let text = printPlan(p, { ...o, live: o.live });
@@ -583,7 +656,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // The plan above was made before the lock: another run may have written results while this one waited, and writing a stale store back would erase them.
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was sent`); return 1; }
-    const p2 = plan({ snap: loaded.snap, bench, store: fresh.models, o, policy, pending: fresh.pending, ...ctxOf, printed });
+    const p2 = plan({ snap: loaded.snap, bench, store: fresh.models, o, policy, pending: fresh.pending, held: fresh.held, ...ctxOf, printed });
     const again = liveRefusal(o, p2);
     if (again) { console.error(`tool-fidelity: refused: ${again}`); return 2; }
     if (!p2.kept.length) { console.log("tool-fidelity: nothing to probe (another run finished the work while this one waited for the lock)."); return 0; }
@@ -602,8 +675,18 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const onSigint = () => { try { periodic(); } catch { /* the final save retries */ } if (++interrupts > 1) process.exit(130); console.error("\ntool-fidelity: stopping -- probes in flight are dropped (not recorded) and what finished is saved (Ctrl-C again to force)"); ac.abort(); };
   process.on("SIGINT", onSigint);
   let pending = { ...(stored.pending ?? {}) };
+  // the holds: a provider whose canary was an account state (pay, auth) or two models gone is written down with the time, so the next runs leave it alone for the hold window; a provider that answered is released
+  const held = { ...(stored.held ?? {}) }, heldStamped = new Set();
+  const syncHeld = () => {
+    const nowIso = now().toISOString(), old = now().getTime() - 14 * 86400000;
+    for (const [pv, x] of Object.entries(prov)) {
+      if (x.blocked && HELD_STATES.includes(x.blocked) && !heldStamped.has(pv)) { held[pv] = { r: x.blocked, at: nowIso }; heldStamped.add(pv); }
+      else if (x.answered && held[pv] && !x.blocked) delete held[pv];
+    }
+    for (const [pv, h] of Object.entries(held)) if (Date.parse(h.at) < old) delete held[pv];
+  };
   let capDropped = [];                                           // records the file's size cap pushed out in the last save
-  const writeOnce = () => { const w = save(outFile, store, { live: true, now: now(), keep, preserve: stored.rejected ?? {}, pending }); capDropped = Array.isArray(w?.dropped) ? w.dropped : []; };
+  const writeOnce = () => { syncHeld(); const w = save(outFile, store, { live: true, now: now(), keep, preserve: stored.rejected ?? {}, pending, held }); capDropped = Array.isArray(w?.dropped) ? w.dropped : []; };
   // A failed periodic save never stops the run: the records stay in memory and the next save (or the final one) carries them.
   const periodic = () => { try { writeOnce(); sinceSave = 0; } catch (e) { if (!saveWarned) { saveWarned = true; console.error(`tool-fidelity: warning: could not save (${e?.message ?? e}); the records are kept and the save is retried`); } } };
   const tally = { t: 0, v: 0, x: 0, u: 0, pending: 0 }, other = {}, why = new Map(), got = new Set(), escalated = new Set(), clampedKeys = new Set(), telemetry = makeTelemetry(), prov = {};
@@ -625,7 +708,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     if (++sinceSave >= SAVE_EVERY) periodic();
   };
   const lift = p.lift.ok ? p.lift.lift : null;
-  const probe = makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench, stats });
+  const probe = makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench, stats, rateBackoffMs: deps.rateBackoffMs ?? null });
   const opts = { ...sweepOptions(o), perProvider: p.perProvider, ...(deps.sweep ?? {}) };
   const phases = [["free tier", p.kept.filter((e) => e.free)], ["paid tier", p.kept.filter((e) => !e.free)]].filter(([, l]) => l.length);
   const started = Date.now();
@@ -636,7 +719,9 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const heartbeat = () => {
     const tot = telemetry.total(), el = (Date.now() - started) / 1000;
     const act = [...stats.active].filter(([, n]) => n > 0).map(([k, n]) => `${show(k, 14)} ${n}`).join(", ") || "none";
-    const stopped = Object.entries(prov).filter(([, x]) => x.paused || x.blocked).map(([k, x]) => `${show(k, 14)} (${x.blocked ?? "rate"})`).join(", ") || "none";
+    const sc = {};
+    for (const x of Object.values(prov)) if (x.paused || x.blocked) { const k = x.blocked ?? "rate"; sc[k] = (sc[k] ?? 0) + 1; }
+    const stopped = Object.entries(sc).map(([k, n]) => `${k} ${n}`).join(", ") || "none";          // counts only: the names are in the report and in the held block, not repeated every minute
     const toks = tot.usage ? `${tok(tot.inTok)} in / ${tok(tot.outTok)} out reported so far (estimate for the run ~${tok(p.run.inTokens)} in)` : `no usage reported yet (estimate for the run ~${tok(p.run.inTokens)} in)`;
     let remain = 0, known = tot.n > 0;
     for (const [k, n] of Object.entries(planned)) { const r = telemetry.kinds.get(k), left = Math.max(0, n - (r?.n ?? 0)); remain += left * ((r?.n ? r.ms / r.n : tot.n ? tot.ms / tot.n : 0) / 1000); }
@@ -664,15 +749,16 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     process.removeListener("SIGINT", onSigint);
     // The final save is retried, and when it still fails the records go to a side file: a finished probe is never thrown away.
     const queue = [...p.kept, ...p.waiting, ...p.tooBig];
-    const before = JSON.stringify(pending);
+    const before = JSON.stringify(pending), heldBefore = JSON.stringify(stored.held ?? {});
+    syncHeld();
     pending = updatePending(pending, { queue, recorded: got, store, now: now(), keepKeys: new Set([...p.set.models.map((m) => m.key), ...p.set.relay]),
       reasonOf: (k) => (p.waiting.some((e) => e.key === k) || p.tooBig.some((e) => e.key === k) ? "cap" : why.get(k) ?? "not-run") });
-    if (recorded || JSON.stringify(pending) !== before) {
+    if (recorded || JSON.stringify(pending) !== before || JSON.stringify(held) !== heldBefore) {
       saved = false;
       for (let i = 0; i < 3 && !saved; i++) { try { writeOnce(); saved = true; } catch (e) { if (i < 2) await sleep(deps.retryDelayMs ?? 500); else saveWarned = e?.message ?? String(e); } }
       if (!saved) {
         const side = path.join(path.dirname(outFile), "tool-fidelity.unsaved.json");
-        try { writeAtomic(side, JSON.stringify({ schema: SCHEMA, kind: KIND, generatedAt: now().toISOString(), models: store, pending })); console.error(`tool-fidelity: ERROR: could not save ${path.basename(outFile)} (${saveWarned}); ${recorded} new record(s) were written to ${side} instead`); }
+        try { writeAtomic(side, JSON.stringify({ schema: SCHEMA, kind: KIND, generatedAt: now().toISOString(), models: store, pending, held })); console.error(`tool-fidelity: ERROR: could not save ${path.basename(outFile)} (${saveWarned}); ${recorded} new record(s) were written to ${side} instead`); }
         catch (e) { console.error(`tool-fidelity: ERROR: could not save (${saveWarned}) and could not write the side file (${e?.message ?? e}); ${recorded} record(s) are lost`); }
         code = Math.max(code, 1);
       }
@@ -718,7 +804,8 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     console.log("  providers needing attention (an account state, not a verdict on any model; fix the account, then run again; nothing was retried in this run):");
     for (const [k, x] of attention) {
       const n = [...why].filter(([key, r]) => key.slice(0, key.indexOf("/")) === k && (r === x.blocked || r === `canary-${x.blocked}`)).length;
-      console.log(show(`    ${k}: ${x.blocked} (${WHAT[x.blocked] ?? "account state"}) -- ${n} model(s) skipped`, 200));
+      const until = held[k] ? ` -- held until ${new Date(Date.parse(held[k].at) + o.holdHours * 3600000).toISOString().slice(11, 16)} UTC (--retry-accounts forces it)` : "";
+      console.log(show(`    ${k}: ${x.blocked} (${WHAT[x.blocked] ?? "account state"}) -- ${n} model(s) skipped${until}`, 260));
     }
   }
   if (clampedKeys.size) console.log(`  ${NOT_FREE_REASON}: ${num(clampedKeys.size)} model(s) were refused by the engine itself (no request sent)`);

@@ -242,7 +242,7 @@ test("requeueL3Failures: a provider's L3 failures (and a pending L3 strike) go b
 
 test("loadFidelity: absent is untested (never failed); corrupt, foreign and oversized files are reasons; bad records are rejected, kept raw and counted", () => {
   const d = freshDir(), f = path.join(d, FILE_NAME);
-  assert.deepEqual(loadFidelity(f), { ok: true, absent: true, models: {}, rejected: {}, pending: {}, generatedAt: null, dropped: 0 });
+  assert.deepEqual(loadFidelity(f), { ok: true, absent: true, models: {}, rejected: {}, pending: {}, held: {}, generatedAt: null, dropped: 0 });
   fs.writeFileSync(f, "{not json");
   assert.deepEqual(loadFidelity(f), { ok: false, reason: "corrupt" });
   fs.writeFileSync(f, JSON.stringify({ schema: 1, models: {} }));
