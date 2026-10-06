@@ -2085,9 +2085,42 @@ test("tripwire: an unlisted-price row on a free-labelled key whose response REPO
   assert.match(r.out, /1 unlisted-free model\(s\) reported a cost: \$[\d.]+ \(pa 1\)/);
   assert.match(r.out, /NOTE: spend tripwire: 1 unlisted-free model\(s\) reported a cost/, "and the verdict says so");
   const st = loadFidelity(e.out);
-  assert.deepEqual(["pa/u1", "pa/u2", "pa/u3"].map((k) => st.pending[k]?.r), ["spend", "spend", "spend"]);
+  assert.deepEqual(["pa/u1", "pa/u2", "pa/u3"].map((k) => st.pending[k]?.r), ["spend-tripwire", "spend-tripwire", "spend-tripwire"], "the provider's other models are pending spend-tripwire (NEEDS-OWNER)");
   assert.ok(st.models["pa/u0"] && st.models["pb/v0"] && st.models["pb/v1"], "the model that reported the cost keeps its result");
-  assert.equal(r.out.includes("DONE: nothing recoverable left"), false, "the spend-pending models are recoverable: no DONE");
+  assert.match(r.out, /NEEDS-OWNER 3|3 need the owner/, "the three are the owner's to lift");
+  // it PERSISTS: the next normal run does not ask that provider again; only the owner's lifts do
+  const nextKeys = (argv) => keys(planOf(e, argv, { store: st.models, pending: st.pending }));
+  assert.deepEqual(nextKeys([]), [], "pb has its records, pa is tripped: nothing to ask");
+  assert.deepEqual(nextKeys(["--retry-accounts"]), [], "--retry-accounts is about account states: it does not lift the tripwire");
+  assert.deepEqual(nextKeys(["--recheck-hard", "pay"]), []);
+  assert.deepEqual(nextKeys(["--recheck-hard", "spend-tripwire"]), ["pa/u1", "pa/u2", "pa/u3"]);
+  assert.deepEqual(nextKeys(["--recheck-hard", "spend-tripwire,pb"]), [], "scoped to another provider");
+  assert.deepEqual(nextKeys(["--recheck-hard", "owner"]), ["pa/u1", "pa/u2", "pa/u3"]);
+  assert.deepEqual(nextKeys(["--only", "pa/u2"]), ["pa/u2"], "a named model is a manual lift");
+  // and the end-to-end: a second live run sends nothing to pa
+  const before = asked("pa").length;
+  await run(["--live", "--concurrency", "1", "--per-provider", "1", "--max-spend", "5"], e.deps);
+  assert.equal(asked("pa").length, before, "pa was not asked again");
+});
+
+test("tripwire: a reported cost is clamped to --max-spend (1e308 never reaches the figure; a non-finite or negative one is ignored)", async () => {
+  const rows = [{ provider: "pa", keyId: "k.pa.free", models: Array.from({ length: 2 }, (_, i) => m("u" + i, { badge: null, pin: null, pout: null })) }];
+  const e = cliEnv(rows, { answer: withCost("1e308") });
+  const r = await run(["--live", "--concurrency", "1", "--per-provider", "1", "--max-spend", "5"], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  const n = calls(e.f).length, spent = Number(/est\. spend \$([\d.]+) of the/.exec(r.out)[1]);
+  assert.ok(Number.isFinite(spent) && Math.abs(spent - 5 * n) < 1e-6, "each request is charged at most the cap: " + spent + " for " + n + " requests");
+  const neg = cliEnv(rows, { answer: withCost("-1") });
+  const q = await run(["--live", "--concurrency", "1", "--per-provider", "1", "--max-spend", "5"], neg.deps);
+  assert.equal(/reported a cost/.test(q.out), false, "a negative cost is not a cost");
+});
+
+test("tripwire: the dry run says it is inactive through CCR 3.0.22 and why, only when unlisted-price models on free-labelled keys are in the run", async () => {
+  const unl = cliEnv([{ provider: "pa", keyId: "k.pa.free", models: [m("u0", { badge: null, pin: null, pout: null })] }]);
+  const d = await run([], unl.deps);
+  assert.match(d.out, /spend tripwire: inactive through CCR 3\.0\.22 \(the gateway does not forward usage\.cost\); unlisted-price models on free-labelled keys are trusted to be free by the key-tier label/);
+  const none = cliEnv([many("pa", 2)]);
+  assert.equal(/spend tripwire: inactive/.test((await run([], none.deps)).out), false, "no unlisted-price model in the run: nothing to say");
 });
 
 test("tripwire: a row tagged free that reports a cost is NOT an unlisted-free row: no tripwire, the provider goes on", async () => {
@@ -2144,21 +2177,23 @@ test("migrateAvailabilityPay: a sentence at the clip length (a money word after 
 test("payHoldsOnBareEvidence: a pay hold with no money-word sentence among its pay entries is named; one with a money sentence, or an auth hold, is not", () => {
   const held = { anymodel: { r: "pay", at: hoursAgo(2) }, other: { r: "pay", at: hoursAgo(2) }, authp: { r: "auth", at: hoursAgo(2) } };
   const pending = { "anymodel/a": { r: "pay", n: 2, at: hoursAgo(1) }, "other/a": { r: "pay", n: 2, at: hoursAgo(1), why: "Your wallet balance is insufficient" }, "anymodel/b": { r: "pay", n: 2, at: hoursAgo(1), why: "Upstream request failed." } };
-  assert.deepEqual(payHoldsOnBareEvidence(held, pending), ["anymodel"]);
+  assert.deepEqual(payHoldsOnBareEvidence(held, pending), [{ provider: "anymodel", entries: 2, availabilityOnly: 1, otherSentence: 0, noSentence: 1 }], "the evidence is split: one entry with no sentence, one with an availability-only sentence");
+  const other = payHoldsOnBareEvidence({ p: { r: "pay", at: hoursAgo(1) }, q: { r: "pay", at: hoursAgo(1) } }, { "p/a": { r: "pay", n: 1, at: hoursAgo(1), why: "Forbidden" } });
+  assert.deepEqual(other.map((x) => [x.provider, x.entries, x.availabilityOnly, x.otherSentence, x.noSentence]), [["p", 1, 0, 1, 0], ["q", 0, 0, 0, 0]], "another sentence with no money word; a hold with no pay entry at all");
   assert.deepEqual(payHoldsOnBareEvidence({}, pending), []);
   assert.deepEqual(payHoldsOnBareEvidence(null, null), []);
 });
 
 test("--reset-transient names the providers STILL held on pay with no money sentence, in the dry run and after applying", async () => {
-  const pending = { "anymodel/m0": { r: "pay", n: 12, at: hoursAgo(3), why: "anymodel: Upstream request failed." }, "anymodel/m1": { r: "pay", n: 7, at: hoursAgo(30) }, "good/m0": { r: "pay", n: 3, at: hoursAgo(3), why: "Payment required" } };
-  const e = cliEnv([many("anymodel", 3), many("good", 2)], { pending, held: { anymodel: { r: "pay", at: hoursAgo(3) }, good: { r: "pay", at: hoursAgo(3) } } });
+  const pending = { "anymodel/m0": { r: "pay", n: 12, at: hoursAgo(3), why: "anymodel: Upstream request failed." }, "anymodel/m1": { r: "pay", n: 7, at: hoursAgo(30) }, "good/m0": { r: "pay", n: 3, at: hoursAgo(3), why: "Payment required" }, "cutp/m0": { r: "pay", n: 3, at: hoursAgo(3), why: ("Upstream request failed. " + "x".repeat(200)).slice(0, PENDING_WHY_CHARS) } };
+  const e = cliEnv([many("anymodel", 3), many("good", 2), many("cutp", 1)], { pending, held: { anymodel: { r: "pay", at: hoursAgo(3) }, good: { r: "pay", at: hoursAgo(3) }, cutp: { r: "pay", at: hoursAgo(3) } } });
   const dry = await run(["--reset-transient"], e.deps);
   const line = dry.out.split("\n").find((l) => l.includes("STILL held")) ?? "";
-  assert.match(line, /STILL held on pay with no sentence of money words on record .*: anymodel; /);
+  assert.match(line, /STILL held on pay with no sentence of money words on record .*: anymodel \(1 pay entry: 1 no sentence stored\); cutp \(1 pay entry: 1 availability-only sentence stored\); `--release-holds/);
   assert.equal(/\bgood\b/.test(line), false, "a hold with a money sentence is not named");
   const live = await run(["--reset-transient", "--live"], e.deps);
   assert.equal(live.code, 0, live.err);
-  assert.match(live.out, /STILL held on pay with no sentence of money words on record: anymodel /);
+  assert.match(live.out, /STILL held on pay with no sentence of money words on record: anymodel \(1 pay entry: 1 no sentence stored\); cutp \(1 pay entry: 1 availability-only sentence stored\) /);
 });
 
 // ---------------------------------------------------------------- 4: a NEEDS-OWNER reason of a model this run QUEUES reads not-run
@@ -2187,7 +2222,11 @@ test("exit code: toolSweepExit is 0 for records written or nothing sent, 0 for C
   assert.equal(toolSweepExit({ requests: 0, records: 0 }), 0, "nothing queueable");
   assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 9 } }), 0, "all rate limited: saturation");
   assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { quota: 4, pay: 3, auth: 2 } }), 0, "quota and account states are reported, not an outage");
-  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 8, error: 1 } }), 3, "zero records and one unexplained failure");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 8, error: 1 } }), 0, "one failure among eight rate limits: saturation, not an outage");
+  assert.equal(toolSweepExit({ requests: 99, records: 0, outcomes: { rate: 98, timeout: 1 } }), 0, "one timeout among 99 rate limits");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 4, error: 3, timeout: 1 } }), 3, "unexplained failures are half of the models that ended without a result");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 3, error: 1, timeout: 2 } }), 3, "half or more");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 4, error: 1, timeout: 2 } }), 0, "under half");
   assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { timeout: 1 } }), 3);
   assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { error: 9 }, signal: true }), 0, "Ctrl-C is the user's decision");
   assert.equal(toolSweepExit({ gaveUp: true, requests: 9, records: 5 }), 4);
@@ -2206,4 +2245,24 @@ test("exit code, live: a run that wrote records exits 0 though no probe counts a
   const b = await run(["--live"], bad.deps);
   assert.equal(b.code, 3, b.err + b.out);
   assert.deepEqual(Object.keys(loadFidelity(bad.out).models), [], "nothing worked: no record");
+});
+
+test("exit code: a failed save is exit 1 even when no record was written and the models errored (it outranks the 3); the same run with a working save is 3", async () => {
+  const bad = cliEnv([many("pa", 3)], { answer: () => http(500, "internal boom") });
+  assert.equal((await run(["--live"], bad.deps)).code, 3, "no record, every model errored, saved fine: 3");
+  const lost = cliEnv([many("pa", 3)], { answer: () => http(500, "internal boom") });
+  lost.deps.saveImpl = () => { throw new Error("read-only volume"); };
+  const r = await run(["--live"], lost.deps);
+  assert.equal(r.code, 1, r.err + r.out);
+  assert.match(r.err, /could not save/);
+});
+
+test("tripwire: the models of the provider that WAIT for the per-provider cap are pending spend-tripwire too, not cap (a later normal run must not ask them)", async () => {
+  const rows = [{ provider: "pa", keyId: "k.pa.free", models: Array.from({ length: 4 }, (_, i) => m("u" + i, { badge: null, pin: null, pout: null })) }];
+  const e = cliEnv(rows, { answer: withCost(0.002) });
+  const r = await run(["--live", "--concurrency", "1", "--per-provider", "1", "--max-spend", "5", ...CAP], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  const st = loadFidelity(e.out);
+  assert.deepEqual(["pa/u1", "pa/u2", "pa/u3"].map((k) => st.pending[k]?.r), ["spend-tripwire", "spend-tripwire", "spend-tripwire"], "u3 waited for the cap: still spend-tripwire");
+  assert.deepEqual(keys(planOf(e, [], { store: st.models, pending: st.pending })), []);
 });

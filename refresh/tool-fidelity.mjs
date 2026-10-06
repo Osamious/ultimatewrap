@@ -1205,9 +1205,9 @@ export function untestedTable(cov) {
 // ------------------------------------------------------------------ the sweep verdict: what a re-run can still change
 
 /** Pending reasons that a re-run alone cannot change: the owner has to change a flag or the route (a row-cost ceiling, a route shape). Not recoverable, not an account state. */
-export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-shape", "cap-too-big"]);
+export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-shape", "cap-too-big", "spend-tripwire"]);
 /** The owner reasons a normal run does not queue: `route-shape` is not queued while it is the stored reason; `row-cost` and `priced-over-row-cap` are not queued while the model is still over the row ceiling (raise --max-row-cost and they run). `cap-too-big` is worked out from the cap each run (raise --tf-max-tokens-per-provider). A named model or `--recheck-hard owner` asks them. */
-export const OWNER_STICKY = new Set(["route-shape"]);
+export const OWNER_STICKY = new Set(["route-shape", "spend-tripwire"]);
 export const OWNER_COST = new Set(["row-cost", "priced-over-row-cap"]);
 /** A soft reason that has been the answer this many runs in a row is STILL recoverable, but counted apart as stuck: only these reasons (a rate limit or a cap says nothing about the model). */
 export const STUCK_REASONS = new Set(["error", "timeout", "empty", "slow", "quota", "optional-flaky"]);
@@ -1447,12 +1447,19 @@ export function migrateAvailabilityPay(pending) {
 }
 /**
  * Providers HELD on `pay` whose pending pay entries carry no sentence with a money word (none stored, cut at the clip length, or availability-only): the hold may rest on an HTTP 402 alone. A hold keeps
- * every model of the provider out of the queue, so dropping the model entries does not ask them again while it stands (`--release-holds <provider> --live` lifts it). Pure: sorted provider names.
+ * every model of the provider out of the queue, so dropping the model entries does not ask them again while it stands (`--release-holds <provider> --live` lifts it). Pure: one row per such provider, sorted, saying what its pay entries hold: `availabilityOnly` (a stored availability sentence, no money word), `otherSentence` (a stored sentence with no money word that is not an availability one), `noSentence` (nothing stored).
  */
 export function payHoldsOnBareEvidence(held, pending) {
-  const money = new Set();
-  for (const [key, v] of Object.entries(pending ?? {})) if (v?.r === "pay" && typeof v.why === "string" && hasMoneyWords(v.why)) money.add(key.slice(0, key.indexOf("/")));
-  return Object.entries(held ?? {}).filter(([p, h]) => h?.r === "pay" && !money.has(p)).map(([p]) => p).sort();
+  const by = {};
+  for (const [key, v] of Object.entries(pending ?? {})) {
+    if (v?.r !== "pay") continue;
+    const p = key.slice(0, key.indexOf("/")), x = (by[p] ??= { money: 0, avail: 0, other: 0, none: 0 });
+    if (typeof v.why !== "string" || !v.why.trim()) x.none += 1;
+    else if (hasMoneyWords(v.why)) x.money += 1;
+    else if (isAvailabilityText(v.why)) x.avail += 1;
+    else x.other += 1;
+  }
+  return Object.entries(held ?? {}).filter(([p, h]) => h?.r === "pay" && !by[p]?.money).map(([p]) => ({ provider: p, entries: (by[p]?.avail ?? 0) + (by[p]?.other ?? 0) + (by[p]?.none ?? 0), availabilityOnly: by[p]?.avail ?? 0, otherSentence: by[p]?.other ?? 0, noSentence: by[p]?.none ?? 0 })).sort((a, b) => (a.provider < b.provider ? -1 : 1));
 }
 export const STALE_AFW = /^(file_path: (newline|backslash)|replace_all: missing|start_line: missing)/;
 export function migrateTransient(store) {
