@@ -14,7 +14,7 @@ import { runSweep } from "../refresh/bench.mjs";
 import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
 import { strikeCommand } from "../refresh/tool-fidelity-cli.mjs";
 import { statedLimit, STATED_BYTES_PER_TOKEN } from "../refresh/tool-fidelity-probe.mjs";
-import { classOf, cleanFidelity, provenBytes, migrateStatedLimits, capBelowFor, SCHEMA, KIND, ACCOUNT_STATE_MIN_PASSED, buildRecord, zeroCallL4, cellOf } from "../refresh/tool-fidelity.mjs";
+import { archiveFidelity, classOf, cleanFidelity, provenBytes, migrateStatedLimits, capBelowFor, SCHEMA, KIND, ACCOUNT_STATE_MIN_PASSED, buildRecord, zeroCallL4, cellOf } from "../refresh/tool-fidelity.mjs";
 import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, migrateAvailabilityPay, payHoldsOnBareEvidence, PENDING_WHY_CHARS, appendHistory, historyOf, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
@@ -2536,4 +2536,123 @@ test("the printed first-strike command names the EXACT provider/model ids: its p
   for (const c of cmds) assert.ok(c.split("--only ")[1].split(" ")[0].split(",").length <= 10 && c.length < 1200, c.length);
   assert.match(out.at(-1), /\.\.\. and 5 more model\(s\): repeat with the next 10 ids/);
   assert.match(out.find((l) => l.includes("ask them with")), /4 commands of at most 10 ids \(no --only-file exists\)/);
+});
+
+// ================================================================ issue #156: rotating, redacted history of the store
+
+const HNAME = /^tool-fidelity-\d{8}T\d{6}Z(_\d{2})?\.json$/;
+const hdir = (e) => path.join(e.dir, "tool-fidelity-history");
+const hfiles = (e) => (fs.existsSync(hdir(e)) ? fs.readdirSync(hdir(e)).sort() : []);
+const writeStore = (file, models, extra = {}) => fs.writeFileSync(file, JSON.stringify({ schema: SCHEMA, kind: KIND, generatedAt: NOW.toISOString(), models, ...extra }));
+const at = (s) => () => new Date(Date.parse("2026-10-06T12:00:00.000Z") + s * 1000);
+
+test("archiveFidelity: a dated, redacted, atomic copy beside the store; skipped when identical to the newest; a changed store makes a second copy; the same second gets a _02 suffix; the copy has the store's mode", () => {
+  const e = cliEnv([many("pa", 2)]);
+  const key = "sk-" + "a".repeat(32);                                                  // built at runtime: no secret-looking literal in the file
+  writeStore(e.out, { "pa/m0": { ...record("ppnn"), why: "HTTP 401: bad key " + key + " for x" } }, { pending: { "pa/m1": { r: "rate", n: 2, at: hoursAgo(1), why: "slow " + key } } });
+  const r1 = archiveFidelity({ file: e.out, now: at(0) });
+  assert.equal(path.basename(r1.archived), "tool-fidelity-20261006T120000Z.json");
+  assert.deepEqual([r1.pruned, r1.kept, r1.of], [0, 1, 1]);
+  assert.equal(path.dirname(r1.archived), hdir(e));
+  const copy = JSON.parse(fs.readFileSync(r1.archived, "utf8"));
+  assert.equal(copy.models["pa/m0"].why.includes(key), false, "the copy is redacted");
+  assert.equal(copy.pending["pa/m1"].why.includes(key), false, "pending sentences too");
+  assert.match(copy.models["pa/m0"].why, /\[key\]/);
+  assert.equal(fs.statSync(r1.archived).mode & 0o777, fs.statSync(e.out).mode & 0o777, "the mode of the store");
+  assert.deepEqual(fs.readdirSync(e.dir).filter((n) => n.includes(".tmp-")), [], "atomic: no debris");
+  const same = archiveFidelity({ file: e.out, now: at(5) });
+  assert.deepEqual([same.archived, same.unchanged], [null, "tool-fidelity-20261006T120000Z.json"], "identical to the newest copy: skipped");
+  assert.equal(hfiles(e).length, 1);
+  writeStore(e.out, { "pa/m0": record("ppnn"), "pa/m1": record("ppnn") });
+  const r2 = archiveFidelity({ file: e.out, now: at(0) });                                // the same second as the first copy
+  assert.equal(path.basename(r2.archived), "tool-fidelity-20261006T120000Z_02.json");
+  assert.deepEqual(hfiles(e), ["tool-fidelity-20261006T120000Z.json", "tool-fidelity-20261006T120000Z_02.json"]);
+});
+
+test("archiveFidelity: the newest N copies are kept, the new one always survives (also with a clock behind an existing stamp); only the rotation's own names are ever deleted: manual before-* copies and other files stay", () => {
+  const e = cliEnv([many("pa", 2)]);
+  const manual = path.join(e.dir, "tool-fidelity.before-sweep.json");
+  fs.writeFileSync(manual, "manual copy");
+  fs.mkdirSync(hdir(e), { recursive: true });
+  fs.writeFileSync(path.join(hdir(e), "tool-fidelity.before-x.json"), "not mine");
+  fs.writeFileSync(path.join(hdir(e), "notes.txt"), "not mine either");
+  fs.writeFileSync(path.join(hdir(e), "tool-fidelity-20261006T110000Z.json.tmp-123"), "debris of an interrupted write");
+  for (let i = 0; i < 5; i++) { writeStore(e.out, { "pa/m0": record("ppnn", { why: "run " + i }) }); archiveFidelity({ file: e.out, keep: 3, now: at(i * 10) }); }
+  const mine = hfiles(e).filter((n) => HNAME.test(n));
+  assert.deepEqual(mine, ["tool-fidelity-20261006T120020Z.json", "tool-fidelity-20261006T120030Z.json", "tool-fidelity-20261006T120040Z.json"], "the newest three");
+  assert.deepEqual(hfiles(e).filter((n) => !HNAME.test(n)), ["notes.txt", "tool-fidelity.before-x.json"], "foreign files untouched; own tmp debris removed");
+  assert.equal(fs.readFileSync(manual, "utf8"), "manual copy");
+  // keep 1: only the new copy remains
+  writeStore(e.out, { "pa/m0": record("ppnn", { why: "run 9" }) });
+  const one = archiveFidelity({ file: e.out, keep: 1, now: at(100) });
+  assert.deepEqual([hfiles(e).filter((n) => HNAME.test(n)), one.pruned], [["tool-fidelity-20261006T120140Z.json"], 3]);
+  // a clock behind the newest stamp: the new copy still survives
+  writeStore(e.out, { "pa/m0": record("ppnn", { why: "run 10" }) });
+  const back = archiveFidelity({ file: e.out, keep: 1, now: at(-3600) });
+  assert.ok(back.archived && fs.existsSync(back.archived), "the copy just written is never a prune candidate");
+  assert.equal(hfiles(e).filter((n) => HNAME.test(n)).includes(back.name), true);
+});
+
+test("archiveFidelity never throws: no store, an empty one, a corrupt one, another file kind and an unwritable history directory are reasons, not failures", () => {
+  const e = cliEnv([many("pa", 1)]);
+  assert.match(archiveFidelity({ file: e.out }).reason, /no tool-fidelity\.json yet/);
+  fs.writeFileSync(e.out, "   ");
+  assert.equal(archiveFidelity({ file: e.out }).skipped, true);
+  fs.writeFileSync(e.out, "{ not json");
+  assert.match(archiveFidelity({ file: e.out }).reason, /corrupt or not a tool-fidelity file/);
+  fs.writeFileSync(e.out, JSON.stringify({ schema: 1, kind: "bench", models: {} }));
+  assert.match(archiveFidelity({ file: e.out }).reason, /corrupt or not a tool-fidelity file/);
+  writeStore(e.out, { "pa/m0": record("ppnn") });
+  const blocker = path.join(e.dir, "blocked");
+  fs.writeFileSync(blocker, "a file where a directory should be");
+  const r = archiveFidelity({ file: e.out, historyDir: path.join(blocker, "sub") });
+  assert.equal(r.archived, null);
+  assert.ok(typeof r.reason === "string" && r.reason.length > 0, JSON.stringify(r));
+});
+
+test("history through the CLI: every live write (a live run, --reset-transient, --reclass-l4, --stated-limits, --release-holds) copies the PRE-write store first; a dry run copies nothing; --keep-history is validated; a failed copy only warns", async () => {
+  const mk = (extra = {}) => cliEnv([many("pa", 3)], extra);
+  // a dry run: no history directory
+  const d = mk({ store: { "pa/m0": record("ppnn") } });
+  await run([], d.deps);
+  assert.equal(fs.existsSync(hdir(d)), false, "a dry run writes nothing, history included");
+  // a live run
+  const e = mk({ store: { "pa/m0": record("ppnn") } });
+  const before = JSON.parse(fs.readFileSync(e.out, "utf8"));
+  const r = await runDef(["--live", "--levels", "12", "--only", "pa"], e.deps);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /history saved -> tool-fidelity-history\/tool-fidelity-\d{8}T\d{6}Z\.json \(kept 1 of 1\)/);
+  const first = JSON.parse(fs.readFileSync(path.join(hdir(e), hfiles(e)[0]), "utf8"));
+  assert.deepEqual(Object.keys(first.models), Object.keys(before.models), "the copy holds the store as it was BEFORE the run");
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(e.out, "utf8")).models).length > 1, true, "and the run wrote its results");
+  // the migrations and releases
+  const legacy = { ...record("pppf", { l4w: "0 call of 2" }), t: "v" };
+  const m = mk(); writeStore(m.out, { "pa/m0": legacy });
+  assert.equal((await runDef(["--reclass-l4", "--live"], m.deps)).code, 0);
+  assert.equal(hfiles(m).length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(hdir(m), hfiles(m)[0]), "utf8")).models["pa/m0"].t, "v", "the copy keeps the old stored class");
+  const why = 'L3: [3b] HTTP 400: {"error":{"message":"nvidia: This model\'s maximum context length is 32768 tokens. However, you requested 47046 tokens (46790 in the messages,';
+  const s = mk({ store: { "pa/m0": record("ppfn", { why, capBelow: 150000, d3: "b" }) } });
+  assert.equal((await runDef(["--stated-limits", "--live"], s.deps)).code, 0);
+  assert.equal(hfiles(s).length, 1);
+  const pending = { "pa/m1": { r: "pay", n: 3, at: hoursAgo(2), since: hoursAgo(2), why: "Upstream request failed." } };
+  const t = mk({ pending });
+  assert.equal((await runDef(["--reset-transient", "--live"], t.deps)).code, 0);
+  assert.equal(hfiles(t).length, 1, "--reset-transient --live");
+  const rel = mk({ pending: { "pa/m1": { r: "pay", n: 3, at: hoursAgo(2), since: hoursAgo(2) } } });
+  assert.equal((await runDef(["--release-holds", "pa", "--live"], rel.deps)).code, 0);
+  assert.equal(hfiles(rel).length, 1, "--release-holds --live");
+  // --keep-history: validated and applied
+  assert.equal((await runDef(["--keep-history", "0"], e.deps)).code, 2);
+  assert.match((await runDef(["--keep-history", "x"], e.deps)).err, /--keep-history needs an integer of at least 1/);
+  assert.equal(parseArgs(["--keep-history", "5"]).keepHistory, 5);
+  const k = mk({ store: { "pa/m0": record("ppnn") } });
+  for (let i = 0; i < 4; i++) { writeStore(k.out, { "pa/m0": { ...record("pppf", { l4w: "0 call of 2", why: "v" + i }), t: "v" } }); await runDef(["--reclass-l4", "--live", "--keep-history", "2"], { ...k.deps, now: at(i * 7) }); }
+  assert.ok(hfiles(k).length <= 2, hfiles(k).join(", "));
+  // a failed copy only warns
+  const w = mk({ store: { "pa/m0": record("ppnn") } });
+  const blocker = path.join(w.dir, "blocked"); fs.writeFileSync(blocker, "x");
+  const ww = await runDef(["--live", "--levels", "12", "--only", "pa"], { ...w.deps, historyDir: path.join(blocker, "sub") });
+  assert.equal(ww.code, 0, ww.err);
+  assert.match(ww.err, /warning: history not saved \(.+\); continuing/);
 });

@@ -187,6 +187,62 @@ export function loadFidelity(file = REAL_FILE) {
   return { ok: true, models, rejected, reclassed, pending: cleanPending(raw.pending), held: cleanHeld(raw.held), meta: cleanMeta(raw.meta), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
 }
 
+// ------------------------------------------------------------------ dated history (issue #156)
+
+// A history name is exactly this shape; nothing else in the directory is read, compared or deleted (the manual copies `tool-fidelity.before-*.json` live elsewhere and never match).
+const HISTORY_NAME = /^tool-fidelity-\d{8}T\d{6}Z(_\d{2})?\.json$/;
+const HISTORY_TMP = /^tool-fidelity-\d{8}T\d{6}Z(_\d{2})?\.json\.tmp-\d+$/;      // debris of an interrupted writeAtomic
+export const DEFAULT_KEEP_HISTORY = 30;
+/**
+ * Safety net, like the response sweep's bench-history: `state/tool-fidelity.json` holds one record per model and every run rewrites it. Before a run or a migration WRITES it, the current file is copied to
+ * `<historyDir>/tool-fidelity-<UTC>.json` (`state/tool-fidelity-history/` beside the file), atomically, with the store's own mode. The copy is always REDACTED: every `why` (records and pending entries) goes through
+ * `redactClip` again, so a copy never holds less-redacted text than the file; it is re-serialised as compact JSON. Skipped when the newest copy has identical content. After a write at most `keep` (>= 1) copies remain:
+ * the one just written is never a prune candidate and the newest `keep - 1` others survive with it; only files of the rotation's own name (and `.tmp-*` debris of exactly that name) are ever deleted. NEVER throws:
+ * a failure is `{archived: null, reason}`; nothing to copy yet (no file, blank) is `{archived: null, skipped: true, reason}`. Returns `{archived, name?, unchanged?, skipped?, reason?, pruned, kept, of}`.
+ */
+export function archiveFidelity({ file = REAL_FILE, historyDir = path.join(path.dirname(file), "tool-fidelity-history"), keep = DEFAULT_KEEP_HISTORY, now = () => new Date() } = {}) {
+  try {
+    let text;
+    try { text = fs.readFileSync(file, "utf8"); }
+    catch (e) {
+      if (e?.code === "ENOENT") return { archived: null, skipped: true, reason: `no ${path.basename(file)} yet`, pruned: 0 };
+      return { archived: null, reason: `cannot read ${path.basename(file)}: ${e?.code ?? e?.message ?? e}`, pruned: 0 };
+    }
+    if (!text.trim()) return { archived: null, skipped: true, reason: `${path.basename(file)} is empty`, pruned: 0 };
+    let raw = null;
+    try { raw = JSON.parse(text.replace(/^\uFEFF/, "")); } catch { /* reported below */ }
+    if (!raw || raw.kind !== KIND || raw.schema !== SCHEMA || !raw.models || typeof raw.models !== "object" || Array.isArray(raw.models)) return { archived: null, reason: `${path.basename(file)} is corrupt or not a tool-fidelity file`, pruned: 0 };
+    const redactWhy = (v) => (v && typeof v === "object" && typeof v.why === "string" ? { ...v, why: redactClip(v.why, 400) } : v);
+    const out = JSON.stringify({ ...raw, models: Object.fromEntries(Object.entries(raw.models).map(([k, v]) => [k, redactWhy(v)])), ...(raw.pending && typeof raw.pending === "object" ? { pending: Object.fromEntries(Object.entries(raw.pending).map(([k, v]) => [k, redactWhy(v)])) } : {}) });
+    fs.mkdirSync(historyDir, { recursive: true });
+    const entries = fs.readdirSync(historyDir, { withFileTypes: true });
+    const taken = new Set(entries.map((e) => e.name));                     // any entry, of any type, blocks a name
+    const files = entries.filter((e) => e.isFile() && HISTORY_NAME.test(e.name)).map((e) => e.name).sort();
+    for (const e of entries) if (e.isFile() && HISTORY_TMP.test(e.name)) fs.rmSync(path.join(historyDir, e.name), { force: true });
+    const newest = files[files.length - 1];
+    if (newest) {
+      let prev = null;
+      try { prev = fs.readFileSync(path.join(historyDir, newest), "utf8"); } catch { /* unreadable: archive anew */ }
+      if (prev === out) return { archived: null, unchanged: newest, reason: `identical to ${newest}`, pruned: 0, kept: files.length, of: files.length };
+    }
+    const stamp = now().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    let name = `tool-fidelity-${stamp}.json`;
+    for (let i = 2; taken.has(name) && i < 100; i++) name = `tool-fidelity-${stamp}_${String(i).padStart(2, "0")}.json`;
+    if (taken.has(name)) return { archived: null, reason: "no free history name in this second", pruned: 0 };
+    const dest = path.join(historyDir, name);
+    writeAtomic(dest, out);
+    try { fs.chmodSync(dest, fs.statSync(file).mode & 0o777); } catch { /* the mode of the copy is a courtesy */ }
+    const room = Math.max(1, Math.floor(keep) || 1) - 1;
+    let pruned = 0;
+    for (const old of files.slice(0, Math.max(0, files.length - room))) {
+      try { fs.rmSync(path.join(historyDir, old)); pruned += 1; } catch { /* left for the next run */ }
+    }
+    return { archived: dest, name, pruned, kept: files.length + 1 - pruned, of: files.length + 1 };
+  } catch (e) {
+    return { archived: null, reason: e?.code ?? e?.message ?? String(e), pruned: 0 };
+  }
+}
+
 // ------------------------------------------------------------------ writing
 
 /**

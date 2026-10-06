@@ -13,6 +13,10 @@
 //                                                              L3 and the big step for every model the router could ever pick (see CANDIDATES)
 //   node refresh/tool-fidelity-cli.mjs --live --recheck-hard pay,openrouter   the MANUAL lift of hard blockers (pay, auth, gone: sticky, never re-asked by a normal run)
 //
+// HISTORY. Before any live run or migration that WRITES state/tool-fidelity.json (--live, --reclass-l4 --live, --stated-limits --live, --reset-*, --release-holds --live, --recheck-hard, --merge-unsaved) the store is copied
+// (redacted, atomically) to state/tool-fidelity-history/tool-fidelity-<UTC>.json, skipped when identical to the newest copy; the newest --keep-history N copies are kept (default 30, minimum 1). A failure only warns.
+// There is deliberately no --no-history. Copies named tool-fidelity.before-*.json (made by hand) are never touched.
+//
 // THE LOOP. Run passes, stop at saturation, resume for what is recoverable. Every run ends with `sweep verdict: RECOVERABLE ... | HARD-BLOCKED ... | TESTED ...` and a final
 // machine-readable `SATURATION saturated=<yes|no|unknown> recoverable=<n> hard=<m> new_results=<k> requests=<n> reason=<...> deepen_blocked=<n> account_state=<m>` line (split it on spaces, read the fields by name: docs/runbook.md 6g).
 //
@@ -60,6 +64,7 @@ import {
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
   presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, migrateAvailabilityPay, payHoldsOnBareEvidence, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
   migrateStatedLimits, ACCOUNT_STATE_MIN_PASSED, ACCOUNT_STATE_SHARE, ACCOUNT_STATE_MIN_GONE,
+  archiveFidelity, DEFAULT_KEEP_HISTORY,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -107,6 +112,11 @@ export function parseArgs(argv) {
     else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
     else if (a === "--reset-transient") o.resetTransient = true;
     else if (a === "--reclass-l4") o.reclassL4 = true;
+    else if (a === "--keep-history") {
+      const v = Number(argv[++i]);
+      if (!Number.isInteger(v) || v < 1) return { error: "--keep-history needs an integer of at least 1 (how many dated copies of tool-fidelity.json to keep; history is saved before every write and is not optional)" };
+      o.keepHistory = v;
+    }
     else if (a === "--stated-limits") o.statedLimits = true;
     else if (a === "--only-gateway") o.onlyGateway = true;
     else if (a === "--retry-accounts") o.retryAccounts = true;
@@ -386,6 +396,7 @@ async function mergeUnsaved(o, outFile, deps) {
   if (!take.length && !takePend.length && !takeHeld.length) { console.log("tool-fidelity: nothing newer to merge; the side file is left where it is"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was merged`); return 1; }
@@ -451,6 +462,7 @@ async function resetAwkward(o, outFile, deps) {
   if (!plan1.cleared.length) { console.log("tool-fidelity: nothing to clear"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
@@ -491,6 +503,7 @@ async function resetTransient(o, outFile, deps) {
   if (!m1.cleared.length && !m1.tagged.length && !m1.afReset.length && !pa1.cleared.length) { console.log("tool-fidelity: nothing to change"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
@@ -524,6 +537,7 @@ async function reclassL4Cmd(o, outFile, deps) {
   if (!list.length) { console.log("tool-fidelity: nothing to change"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
@@ -549,6 +563,7 @@ async function statedLimitsCmd(o, outFile, deps) {
   if (!m.changed.length) { console.log("tool-fidelity: nothing to change"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
@@ -576,6 +591,16 @@ export function strikeCommand(v) {
     `  ask them with (the exact ids: --only <provider> would also queue L3 for every tested model of that provider)${batches.length > 1 ? `, ${batches.length} commands of at most 10 ids (no --only-file exists)` : ""}: ${show(cmd(shown[0]), 900)}`,
     ...shown.slice(1).map((b) => `  ask them with (next ${b.length}): ${show(cmd(b), 900)}`),
     ...(left > 0 ? [`  ... and ${num(left)} more model(s): repeat with the next 10 ids (sorted by id) after these`] : [])];
+}
+
+/** One history copy of the store before a live write (see `archiveFidelity`); prints one line and never fails the run. */
+function saveHistory(outFile, o, deps) {
+  const dir = path.basename(deps.historyDir ?? path.join(path.dirname(outFile), "tool-fidelity-history"));
+  const r = archiveFidelity({ file: outFile, keep: o.keepHistory ?? DEFAULT_KEEP_HISTORY, ...(deps.historyDir ? { historyDir: deps.historyDir } : {}), ...(deps.now ? { now: () => deps.now() } : {}) });
+  if (r.archived) console.log(`tool-fidelity: history saved -> ${dir}/${r.name} (kept ${r.kept} of ${r.of}${r.pruned ? `; pruned ${r.pruned}` : ""})`);
+  else if (r.unchanged) console.log(`tool-fidelity: history unchanged (identical to ${r.unchanged})`);
+  else if (r.skipped) console.log(`tool-fidelity: history skipped (${r.reason})`);
+  else console.error(`tool-fidelity: warning: history not saved (${r.reason}); continuing`);
 }
 
 /** The held-providers block (dry run and report): who is held, why, since when, until when, and what that frees. */
@@ -679,6 +704,7 @@ async function resetCanary(o, outFile, deps) {
   if (!m1.goneCleared.length && !m1.seeded.length) { console.log("tool-fidelity: nothing to change"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
@@ -705,6 +731,7 @@ async function releaseCommand(o, outFile, deps) {
   if (!r1.released.length && !r1.cleared.length) { console.log("tool-fidelity: nothing to release"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
@@ -1025,6 +1052,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}),
     mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  saveHistory(outFile, o, deps);
   try {
     await deps.afterLock?.();
     // The plan above was made before the lock: another run may have written results while this one waited, and writing a stale store back would erase them.
