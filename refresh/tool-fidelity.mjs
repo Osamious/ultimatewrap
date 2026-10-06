@@ -241,13 +241,24 @@ export const recheckCovers = (recheck, state, provider) => !!recheck && recheck.
 /**
  * The META block (additive): what the last live run left behind for the next one. `recoverable` is the verdict's recoverable count at the END of that run, so the next run can tell whether the recoverable
  * set shrank (a loop must not spin forever on soft-but-stuck models); `scope` is a stable hash of the flags that decide WHICH models the count is about (candidates, sample, --only, --include-tier, levels): only an
- * equal scope is compared; `at` is when.
+ * equal scope is compared; `at` is when. `history` (additive, optional, at most 5) is one small record per recorded run of ONE scope: `{at, scope, asked, newTested, deepened, rateShare, testedTotal, recoverable}`.
  */
 export function cleanMeta(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (!Number.isInteger(raw.recoverable) || raw.recoverable < 0 || raw.recoverable > 10000000 || typeof raw.at !== "string" || !Number.isFinite(Date.parse(raw.at))) return null;
   if (typeof raw.scope !== "string" || !/^[0-9a-f]{6,40}$/.test(raw.scope)) return null;                 // a count without its scope compares with nothing: it reads as no previous count
-  return { recoverable: raw.recoverable, scope: raw.scope, at: raw.at };
+  const history = Array.isArray(raw.history) ? raw.history.map(cleanRun).filter(Boolean).slice(-HISTORY_MAX) : [];
+  return { recoverable: raw.recoverable, scope: raw.scope, at: raw.at, ...(history.length ? { history } : {}) };
+}
+/** The last runs of one scope, for the diminishing-returns rule: one small record per run (see `saturation`). Anything malformed is dropped, not repaired. */
+export const HISTORY_MAX = 5;
+function cleanRun(h) {
+  if (!h || typeof h !== "object" || Array.isArray(h)) return null;
+  if (typeof h.at !== "string" || !Number.isFinite(Date.parse(h.at)) || typeof h.scope !== "string" || !/^[0-9a-f]{6,40}$/.test(h.scope)) return null;
+  const ints = ["asked", "newTested", "deepened", "testedTotal", "recoverable"];
+  if (ints.some((k) => !Number.isInteger(h[k]) || h[k] < 0 || h[k] > 10000000)) return null;
+  if (typeof h.rateShare !== "number" || !(h.rateShare >= 0 && h.rateShare <= 1)) return null;
+  return { at: h.at, scope: h.scope, asked: h.asked, newTested: h.newTested, deepened: h.deepened, rateShare: Math.round(h.rateShare * 1000) / 1000, testedTotal: h.testedTotal, recoverable: h.recoverable };
 }
 const metaText = (meta) => (meta ? `"meta":${JSON.stringify(meta)},` : "");
 const heldText = (held) => (held && Object.keys(held).length ? `"held":${JSON.stringify(held)},` : "");
@@ -1262,18 +1273,54 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
 }
 
 /**
- * The loop's stop signal for ONE run: `requests` it sent, how many ended `rate` and how many ended `rate`, `error` or `timeout` (`failing`), the `newResults` it recorded, the verdict's `recoverable` and
- * `prevRecoverable` (the recoverable count the PREVIOUS run left in the file's meta block, or null when unknown, or when this run was a manual lift that legitimately grew the set).
- * Saturated when nothing is recoverable any more, or the run recorded zero new results, or at least 80% of its requests ended rate / error / timeout, or the recoverable set did NOT SHRINK
- * against the previous run's (a loop must not spin forever on soft-but-stuck models). A run that sent nothing has zero new results, so it is saturated. Pure.
+ * What one run ADDED, from the records before and after it: `newTested` models that went from not tested to tested (any class, x included; a provisional first strike is not tested, resolving one is; a
+ * model saved only as a PARTIAL record, `partial`, is not counted) and `deepened` tested models that gained a level the run asked for (`levels`: 3 to 7). Pure over the two stores.
+ */
+export const testedState = (r) => !!r && r.lvr?.[0] !== "n" && r.strikes !== 1;
+const gained = (b, a, l) => (l === 3 ? b.lvr?.[2] === "n" && a.lvr?.[2] !== "n" : l === 4 ? b.lvr?.[3] === "n" && a.lvr?.[3] !== "n" : l === 5 ? b.big === undefined && a.big !== undefined
+  : l === 6 ? b.sp === undefined && a.sp !== undefined : l === 7 ? b.er === undefined && a.er !== undefined : false);
+export function runGain(before, after, { levels = [], partial = null } = {}) {
+  let newTested = 0, deepened = 0;
+  for (const [k, r] of Object.entries(after ?? {})) {
+    const was = before?.[k];
+    if (r === was) continue;
+    if (!testedState(was)) { if (testedState(r) && !partial?.has(k)) newTested += 1; continue; }
+    if (levels.some((l) => gained(was, r, l))) deepened += 1;
+  }
+  return { newTested, deepened };
+}
+
+/**
+ * The loop's stop signal for ONE run. Saturation is DIMINISHING RETURNS, not "everything is blocked": the tested total converges and each pass adds little. `saturated` is true, with its `reason`, when
+ * (a) `done`: nothing is recoverable any more; (b) `zero-new`: the run recorded no new result (a run that sent nothing included); (c) `failing`: at least 80% of its requests ended rate, error, timeout or quota;
+ * (d) `diminishing`: the last `runs` runs of THIS scope (this one included) each added newly tested models under `gain` percent of their tested total AND (newly tested + deepened) under `yieldPct` percent of the
+ * models they asked: `history` is the earlier runs of this scope (the caller filters by scope; null when this run is not a recorded one: a lift, a named model, a forced or retried pass), `thisRun` this run's
+ * record `{asked, newTested, deepened, testedTotal}`; fewer entries than `runs` is simply not saturated; (e) `no-shrink`, ONLY as a fallback while the scope has no history at all: the recoverable set did not
+ * shrink against `prevRecoverable`, the count the previous run left in the meta block (null for a lift or another scope). Pure.
  */
 export const SATURATION_FAIL_SHARE = 0.8;
-export function saturation({ requests = 0, rate = 0, failing = 0, newResults = 0, recoverable = 0, prevRecoverable = null }) {
+export const SATURATE_GAIN = 1, SATURATE_YIELD = 5, SATURATE_RUNS = 2;
+const pct1 = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
+export function diminishingReturns({ history = null, thisRun = null, runs = SATURATE_RUNS, gain = SATURATE_GAIN, yieldPct = SATURATE_YIELD } = {}) {
+  const n = Math.max(1, Math.min(HISTORY_MAX, runs));
+  if (!thisRun || !Array.isArray(history) || history.length < n - 1) return null;
+  const set = [...(n > 1 ? history.slice(-(n - 1)) : []), thisRun];
+  const low = (e) => e.testedTotal > 0 && (e.newTested * 100) / e.testedTotal < gain && (e.asked > 0 ? ((e.newTested + e.deepened) * 100) / e.asked < yieldPct : true);
+  if (!set.every(low)) return null;
+  return `diminishing returns over the last ${n} run(s): newly tested ${set.map((e) => `+${e.newTested}`).join(", ")} of ${set.map((e) => e.testedTotal).join("/")} tested (each under ${gain}%), and (new + deepened) of the models asked ${set.map((e) => `${pct1(e.newTested + e.deepened, e.asked) ?? 0}%`).join(", ")} (each under ${yieldPct}%)`;
+}
+export function saturation({ requests = 0, rate = 0, failing = 0, newResults = 0, recoverable = 0, prevRecoverable = null, history = null, thisRun = null, runs = SATURATE_RUNS, gain = SATURATE_GAIN, yieldPct = SATURATE_YIELD }) {
   const failShare = requests ? failing / requests : 0, rateShare = requests ? rate / requests : 0;
-  const notShrunk = prevRecoverable !== null && prevRecoverable !== undefined && recoverable >= prevRecoverable;
-  const why = recoverable === 0 ? "nothing recoverable left" : newResults === 0 ? "no new result in this run" : requests && failShare >= SATURATION_FAIL_SHARE ? `${Math.round(failShare * 100)}% of the requests ended rate, error or timeout`
-    : notShrunk ? `the recoverable set did not shrink: ${recoverable} now, ${prevRecoverable} at the end of the previous run` : null;
-  return { saturated: why !== null, why, requests, rate, failing, failShare, rateShare, newResults, recoverable, prevRecoverable: prevRecoverable ?? null };
+  let reason = null, why = null;
+  if (recoverable === 0) { reason = "done"; why = "nothing recoverable left"; }
+  else if (newResults === 0) { reason = "zero-new"; why = "no new result in this run"; }
+  else if (requests && failShare >= SATURATION_FAIL_SHARE) { reason = "failing"; why = `${Math.round(failShare * 100)}% of the requests ended rate, error, timeout or quota`; }
+  else {
+    const d = diminishingReturns({ history, thisRun, runs, gain, yieldPct });
+    if (d) { reason = "diminishing"; why = d; }
+    else if (!history?.length && prevRecoverable !== null && prevRecoverable !== undefined && recoverable >= prevRecoverable) { reason = "no-shrink"; why = `the recoverable set did not shrink: ${recoverable} now, ${prevRecoverable} at the end of the previous run (fallback: this scope has no run history yet)`; }
+  }
+  return { saturated: reason !== null, reason, why, requests, rate, failing, failShare, rateShare, newResults, recoverable, prevRecoverable: prevRecoverable ?? null };
 }
 
 // ------------------------------------------------------------------ canary migration
