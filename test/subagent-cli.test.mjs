@@ -303,7 +303,7 @@ test("show: 'policy off' with no files; with a policy it prints owner, compiled 
   assert.equal(on.status, 0, on.err);
   assert.match(on.out, /^policy: mode free \(free providers\), source all-providers, ctx any, enforcement shadow$/m);
   assert.match(on.out, /^ {2}owner file .*subagent-policy\.json: unverified=allow-warn allow=0 inject=off setAt=\d{4}-/m);
-  assert.match(on.out, /^ {2}compiled \d{4}-\S+, contentHash [0-9a-f]{12}, compiler 2, providersLive false$/m);
+  assert.match(on.out, /^ {2}compiled \d{4}-\S+, contentHash [0-9a-f]{12}, compiler 3, providersLive false$/m);
   assert.match(on.out, /free models \.+ 5 on 3 providers/); assert.match(on.out, /free providers \+ deposit \.+ 9 on 4 providers/);
   assert.match(on.out, /^7 of 7 eligible models are not tool-tested/m);
   assert.match(on.out, /^ {2}providers with no usable stand-in: fx-free-b \(1 of 2\); thin, fewer than 3 usable: none \(0 of 2\)$/m);
@@ -1111,7 +1111,7 @@ test("R13: explain describes the REAL rule: the lead rank band, its band id, the
   assert.equal(e.status, 0, e.err);
   assert.match(e.out, /^band: \d+ \(equal tool tier, health, ctx preference and price class/m);
   assert.match(e.out, /^fallback: a cooling model .*demoted, never removed.*LOWER tool tier only if it is tested \(v, then t\), never an untested u/m);
-  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx preference \(band\)=0, price class 2b \(band\)=\d, first strike=0, big step \(v only\)=\d, L4 \(v only\)=\d, ttft quantile bucket=\d, ctx class=\d, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d/);
+  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx preference \(band\)=0, price class 2b \(band\)=\d, first strike=0, sweep demotion \(blocked by the sweep, never excluded\)=\d, big step \(v only\)=\d, L4 \(v only\)=\d, forced-choice only \(fc\)=\d, argument fidelity failed \(af\)=\d, tool_result use failed \(er, br\)=\d, ttft quantile bucket=\d, ctx class=\d, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d, spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)=\d/);
   const low = cli(["explain", "fx-free-a/fxa-big:free", ...s.F]);
   assert.match(low.out, /would be chosen as the substitute never, for any provider in the set/, "an unverified row behind a verified band: never");
   assert.equal(SET(s, "--banded", "no").status, 0);

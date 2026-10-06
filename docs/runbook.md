@@ -257,14 +257,15 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   the 128k stand-in floor on the context of a same-name sibling (shown `c?`, never used for a higher
   floor); safety, guard, embed, rerank, OCR, LoRA, moderation and under-4B models are never
   candidates. A model that failed once in a tool test ranks below a clean one of its class. Inside
-  a rank band models are then ordered by the tool-test steps (big request, then L4), speed
+  a rank band models are then ordered by the tool sweep's own blocked states (see below: they rank a model below clean ones, never out), the tool-test steps (big request, then L4), the tool-test markers (each clean above flagged, strongest flag first: forced-choice only, argument fidelity failed, tool_result use failed), speed
   quartile (of the rows in your set), context class (1M, 512k, 256k, 200k, 128k), price, and only
   then by how recently the model was probed (live within 7 days, probe within 14 days, older: this
   depends on the calendar, so it only breaks ties and never outranks speed or context); a hash of
+  a failed spawn call (it matters only for a model acting as a main agent) breaks ties just before that, and the hash of
   the model id breaks the last ties, so no provider is favoured by its name. Models with a known tool failure (a filed issue) stay
   out until a real tool test says otherwise; free models dropped on a rate-limit, timeout, empty or
   network status of an old test are listed as waiting for a re-probe, not treated as dead
-  (`show --detail yes` names them). Also
+  (`show --detail yes` names them). The tool sweep's result is the model's LATEST state, whatever the age of its speed test. A hard answer (gone, pay or auth, which the sweep never asks again, so a count of attempts means nothing for it) acts at once: gone leaves a model out as `unreachable` unless it has an earlier confirmed pass (then it only ranks lower), pay and auth rank a model lower. A soft answer (rate limit, quota, upstream unavailable, slow, timeout or error) ranks a model lower after 3 runs in a row with the same reason, and `error` never leaves a model out; the scheduling and budget states (cap, spend, not-run, empty and the like) are not used at all. A confirmed pass NEWER than the sweep's answer wins; an unreadable date makes the answer unusable (nothing happens). A held provider counts the same way, except that a held gone or pay is ignored for a provider that has any confirmed result (the sweep's own rule: it answered, so it was never gone or out of credit as a whole); a held auth always applies. When most of one provider's models carry the same soft or hard sweep state the report prints ONE line for the provider (for example "cleanapis: 32 of 32 bench-ok rows pending error") because the provider, not the models, is probably the cause. Every count says what it is of ("1 of 5 bench-ok model left out"). Your `--allow` pin does NOT override `unreachable` or `gateway-compat` (the model cannot be reached, or fails through the gateway); it still overrides a tool-tier verdict. A free model dropped on an old transient bench status that the sweep found gone is named in a list (re-probe skipped), never silently dropped. A model whose tool test failed in the gateway's own request translation (tagged `xw: gateway`) is left out as `gateway-compat` and is tested again only when CCR changes (a new CCR build re-queues it). Image-generation, translation and search models (`image`, `imagen`, `translate`, `search`, `deepsearch` as a word of the id) are never candidates. Rows whose 128k rests on a sibling's context are counted as `ctx unproven` in every preview (a context fact, on its own line, not a sweep fact): the only measured proof is the 400 KB big step (about 100k tokens), so the router's per-request fit check decides. Also
   `--banded yes|no`, `--handoff-notice yes|no`, `--enforce shadow|enforce`, `--inject off|on`
   and `--allow provider/model`. The presets: `follow-main` (mode inherit), `any` (dynamic, all
   providers), `free` (free, all providers, free scope models: only models tagged free), `free-wide`
@@ -350,8 +351,19 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   maximum over the n subagents with two or more counted requests; it measures the headroom a model
   needs and changes nothing. `report` and `status` also say how many eligible models have no known
   request-size limit, so the size check does nothing for them until a tool test records one.
-  `--json yes` prints one JSON object whose shape is frozen (`schema` 2, a fixed key order, pinned
-  by a test); `last --json yes` keeps its own shape.
+  Traffic shares come from the same classifier log and count CLIENT requests only: the requests that
+  carry no session id (logged as `nosessio`) are the UW tooling's own probe traffic (the keysync and
+  refresh probe profiles, machine-paced), not a client session and not a subagent bypass, so `report`,
+  `status` and `show` print them as their own line ("non-client probe traffic (N of M classified
+  requests), excluded: they carry no session id") and leave them out of every main, sub and aux
+  share; each share names its denominator (client requests with a session id). A second line splits
+  the agent-shaped client requests into teammates (an agent id without the billing flag) and
+  built-in subagents (the billing flag), and says how often the two detectors disagree: that
+  disagreement is made of teammates. The router's own lifetime counters (`req`, `main`, `sub`) are
+  per router, not per session, so they still include the probe traffic; the lines above are the
+  client view. Any classifier-accuracy matrix must use these client-only denominators.
+  `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
+  `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves
   helper calls alone, on a real headless Claude Code inside the isolated sandbox. `selftest --plan
   yes` prints what a run would do and its plan hash; it reads no data file and starts no process.

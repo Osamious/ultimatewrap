@@ -10,7 +10,8 @@ import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { fixtureFlagMap } from "./fixtures/subagent-flags.mjs";
 import * as lib from "../keysync/subagent-policy.mjs";
-import { funnel, FREE_TAG, fnv1a32, priceText, priceSum, isPremium, emptyStage, SELECTOR_RE, toolEligible, nonAgentReason, knownIssueOf, knownIssueText } from "../menu/subagent-funnel.mjs";
+import { funnel, FREE_TAG, fnv1a32, priceText, priceSum, isPremium, emptyStage, SELECTOR_RE, toolEligible, nonAgentReason, knownIssueOf, knownIssueText, RANK_LABELS, SUBSTITUTE_FLOOR, CTX_VALUES, hintCapOf, ctxSpec } from "../menu/subagent-funnel.mjs";
+import { sweepLines, ctxUnprovenLines } from "../keysync/subagent-policy.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { TIERS, isTier, tierList, RELAY_KEY_ID, RELAY_TIER, freeScopeOf, isExcludedTier, isProvenanceVerified } from "../menu/tiers.mjs";
 
@@ -216,15 +217,15 @@ test("Q6 rank key 2b: class 0 (price 0, free-tier row) above class 0t (ft row) a
   const k = (x) => r.groups.get(x).rk;
   const [alpha, fxd, fxp] = ["fx-free-a/fxa-alpha", "fx-dep/fxd-model:free", "fx-paid/fxp/free/x"];
   assert.deepEqual([fxd, fxp].map((x) => k(x).slice(0, 3)), [k(alpha).slice(0, 3), k(alpha).slice(0, 3)], "keys 1 to 3 (tool tier, health, ctx class) are EQUAL for the rows under test");
-  assert.ok(k(fxd)[8] <= k(alpha)[8] && k(fxp)[8] <= k(alpha)[8], "the ctx CLASS key (rank key 9) never disfavours the 0t rows (more context)");
-  assert.ok(k(fxd)[7] < k(alpha)[7] && k(fxp)[7] < k(alpha)[7], "the TTFT QUANTILE key (rank key 8) favours the 0t rows (100 ms against 5,000 ms)");
+  assert.ok(k(fxd)[13] <= k(alpha)[13] && k(fxp)[13] <= k(alpha)[13], "the ctx CLASS key (rank key 14) never disfavours the 0t rows (more context)");
+  assert.ok(k(fxd)[12] < k(alpha)[12] && k(fxp)[12] < k(alpha)[12], "the TTFT QUANTILE key (rank key 13) favours the 0t rows (100 ms against 5,000 ms)");
   assert.deepEqual([alpha, fxd, fxp, "fx-free-a/fxa-gamma", "fx-free-a/fxa-beta"].map((x) => k(x)[3]), [0, 1, 1, 2, 3], "classes: 0, 0t, 0t, U, P");
   assert.deepEqual(sels(r), Q6_NEW, "class 0 first, then the ft rows, then unknown price, then positive price");
   assert.deepEqual([alpha, fxd, fxp].map((x) => cell(r, x).fp + "/" + cell(r, x).ft), ["1/0", "0/1", "0/1"], "the classes are the fp and ft flags of the compiled rows");
   // D1: AGE is no longer a band key and no longer outranks the price class: a stale probe on alpha leaves it in price class 0, above the fresh 0t rows (recency only orders INSIDE a band)
   const stale = await fx((d) => { q6Mutate(d); const b = rd(path.join(d, "bench.json")); b.models[alpha].a = NOW / 1000 - 20 * 86400; wr(path.join(d, "bench.json"), b); });
   const rs = run(stale.g, { mode: "free", freeScope: "providers+deposit", source: "all-providers" });
-  assert.equal(rs.groups.get(alpha).rk[10], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
+  assert.equal(rs.groups.get(alpha).rk[14], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
   assert.equal(rs.groups.get(alpha).rk[1], 0, "and health (the latest status is ok) is yes: age is ignored");
   assert.ok(sels(rs).indexOf(alpha) < sels(rs).indexOf(fxd), "the price class (band key) beats recency (ordering key): an older class 0 row still ranks above a fresh 0t row");
 });
@@ -627,7 +628,7 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; the LAST ordering
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 2 * day + 3600, l: 1 } } });   // newer than the probe: the overlay wins (a tie is the probe's)
   });
   const r = run(g, { mode: "dynamic" });
-  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[10];
+  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[14];
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map(k2), [0, 1, 2], "recency class: live and fresh, fresh, older");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).rk[1]), [0, 0, 0], "health (latest status ok) is yes for all three: age is ignored");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).b), [r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b], "and the three rows share ONE band");
@@ -641,7 +642,7 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; the LAST ordering
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 8 * day + 3600, l: 1 } } });
   });
   const e = run(edge.g, { mode: "dynamic" });
-  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[10]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
+  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[14]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
 });
 
 test("D-bh: the TTFT bucket is a QUANTILE of the eligible set (fast, ok, slow, very slow), ahead of the ctx class; a missing TTFT is bucket 4, last", async () => {
@@ -664,11 +665,11 @@ test("D-bh: the TTFT bucket is a QUANTILE of the eligible set (fast, ok, slow, v
   assert.ok(r.models.every((m) => m.h >= 0 && m.h <= 3), "every row of this fixture has a TTFT, so buckets 0 to 3");
   // the rank key: TTFT bucket (index 9) is ahead of the ctx class (index 10)
   const keys = r.groups.get("fx-free-a/fxa-alpha").rk;
-  assert.equal(keys[7], h("fx-free-a/fxa-alpha")); assert.equal(keys[8], 3, "alpha has 200k: ctx class 3 (>= 200k)");
+  assert.equal(keys[11], h("fx-free-a/fxa-alpha")); assert.equal(keys[12], 3, "alpha has 200k: ctx class 3 (>= 200k)");
   const none = await fx((d) => { const b = rd(path.join(d, "bench.json")); delete b.models["fx-free-a/fxa-alpha"].t; wr(path.join(d, "bench.json"), b); });
   const rn = run(none.g, { mode: "dynamic" });
   assert.equal(cell(rn, "fx-free-a/fxa-alpha").h, 4, "a missing TTFT is bucket 4: no TTFT recorded");
-  assert.deepEqual(rn.groups.get("fx-free-a/fxa-alpha").rk.slice(7, 10).length, 3);
+  assert.deepEqual(rn.groups.get("fx-free-a/fxa-alpha").rk.slice(11, 14).length, 3);
 });
 
 test("F9: a saved owner file always loads again: the allow list is bounded in count and length and saveOwner checks the serialized size", () => {
@@ -1057,10 +1058,10 @@ test("D-bg: the asked model's own context never raises the floor: every ctxHint 
 });
 
 test("D-bh: ctx CLASSES (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below) replace raw ctx: two rows in one class tie on the class key whatever their raw ctx", () => {
-  const cls = (c) => funnel(syn({ pa: [{ id: "x", ctx: c }] }), T()).groups.get("pa/x").rk[8];
+  const cls = (c) => funnel(syn({ pa: [{ id: "x", ctx: c }] }), T()).groups.get("pa/x").rk[12];
   assert.deepEqual([2000000, 1000000, 999999, 524288, 512000, 511999, 262144, 256000, 255999, 200000, 199999, 131072, 128000, 127999, 64000].map(cls), [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5]);
   const r = funnel(syn({ pa: [{ id: "a", ctx: 1000000, t: 500 }, { id: "b", ctx: 1500000, t: 500 }] }), T());
-  assert.equal(r.groups.get("pa/a").rk[8], r.groups.get("pa/b").rk[8], "1M and 1.5M are the same class");
+  assert.equal(r.groups.get("pa/a").rk[12], r.groups.get("pa/b").rk[12], "1M and 1.5M are the same class");
   assert.equal(r.groups.get("pa/a").g, r.groups.get("pa/b").g, "so they are one tie group (raw ctx is no longer a rank key)");
 });
 
@@ -1088,7 +1089,7 @@ test("D-bi: an unknown ctx with a same-name sibling of known ctx >= 128k gets an
   assert.equal(row("pb/lonely").ci, undefined, "no sibling, no inference");
   assert.equal(row("pb/model-w:free").ci, undefined, "siblings of 1M and 64k: the SMALLEST decides, so nothing is inferred");
   assert.equal(row("pa/model-x").ci, undefined, "a measured row is never flagged");
-  assert.equal(r.groups.get("pb/model-x:free").rk[8], 4, "never a ranking class above >= 128k");
+  assert.equal(r.groups.get("pb/model-x:free").rk[12], 4, "never a ranking class above >= 128k");
   assert.equal(r.counts.ctxInferred, 2); assert.equal(r.ctxStats.inferred, 2);
   assert.equal(r.substitutable["*"], 6, "known or inferred 128k+: pa x, y and w, pc y, and the two inferred pb rows (model-z 64k, pc w 64k, z@eu, lonely and w:free are not)");
   assert.deepEqual(sels(funnel(inp, T({ ctx: "128k" }))).filter((s) => s.startsWith("pb/")), [], "a hard 128k floor tests the MEASURED ctx: the inferred rows are left out (the inferred prior serves only the default substitute floor)");
@@ -1205,9 +1206,9 @@ test("rank order: an OLDER-probe ok model with better TTFT outranks a FRESHER-pr
   const bench = { "pa/old-fast": { a: NOW / 1000 - 20 * day }, "pa/new-slow": { a: NOW / 1000 - 3600 }, "pa/mid1": { a: NOW / 1000 - 3600 }, "pa/mid2": { a: NOW / 1000 - 3600 } };
   const r = funnel(syn(spec, { bench }), T());
   const g = (id) => r.groups.get(`pa/${id}`);
-  assert.equal(g("old-fast").rk.length, 12, "twelve keys");
-  assert.deepEqual([g("old-fast").rk[10], g("new-slow").rk[10]], [2, 1], "old-fast is recency class 2 (older than 14 days), new-slow class 1");
-  assert.ok(g("old-fast").rk[7] < g("new-slow").rk[7], "and its TTFT bucket (key 8) is better");
+  assert.equal(g("old-fast").rk.length, 17, "seventeen keys");
+  assert.deepEqual([g("old-fast").rk[14], g("new-slow").rk[14]], [2, 1], "old-fast is recency class 2 (older than 14 days), new-slow class 1");
+  assert.ok(g("old-fast").rk[11] < g("new-slow").rk[11], "and its TTFT bucket (key 8) is better");
   assert.equal(r.models[0].s, "pa/old-fast", "the older probe wins on latency");
   assert.equal(r.models[r.models.length - 1].s, "pa/new-slow");
   assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "all one band: health is calendar-independent and recency is no band key");
@@ -1217,7 +1218,7 @@ test("rank order: an OLDER-probe ok model with better TTFT outranks a FRESHER-pr
   // recency is still an ordering key: with every earlier key equal, the fresher probe leads
   const e = funnel(syn({ pa: [{ id: "a", ctx: 200000, t: 500 }, { id: "b", ctx: 200000, t: 500 }] }, { bench: { "pa/a": { a: NOW / 1000 - 20 * day }, "pa/b": { a: NOW / 1000 - 60 } } }), T());
   assert.equal(e.models[0].s, "pa/b", "recency decides only when TTFT, ctx class and price tie");
-  assert.deepEqual(r.groups.get("pa/mid1").rk.slice(7, 9), [r.groups.get("pa/mid1").rk[7], 3], "key layout: [.. 7 TTFT bucket, 8 ctx class, 9 price value, 10 recency, 11 alias]");
+  assert.deepEqual(r.groups.get("pa/mid1").rk.slice(11, 13), [r.groups.get("pa/mid1").rk[11], 3], "key layout: [.. 11 TTFT bucket, 12 ctx class, 13 price value, 14 recency, 15 alias, 16 spawn marker]");
 });
 
 test("final tie-break: rows equal on every key are ordered by a hash of the id (deterministic, independent of input order), not alphabetically", () => {
@@ -1329,4 +1330,333 @@ test("F7: the denylist catches embedding families (embeddinggemma, -embedding-, 
   for (const id of ["claude-sonnet-5-5", "gpt-oss-120b", "gemini-3.8-flash", "qwen3-coder-480b", "deepseek-v4-flash", "llama-3.3-70b-instruct", "glm-5.1", "kimi-k2.5", "mistral-large-2512", "command-a", "grok-4", "gemma-3-27b-it", "nemotron-3-super-120b", "devstral-medium", "coding-glm-5.1-free", "minimax-m2.5", "step-3.5-flash", "ernie-5.0", "hunyuan-turbo", "o3-pro"]) assert.equal(nonAgentReason(id), null, id);
   const r = funnel(syn({ pa: [{ id: "embeddinggemma-300m", ctx: 200000 }, { id: "real-agent", ctx: 200000 }] }), T());
   assert.deepEqual(sels(r), ["pa/real-agent"]); assert.equal(r.dropped.get("pa/embeddinggemma-300m"), "non-agent-model");
+});
+
+
+// =====================================================================================================================
+// Compile fixes from sanity pass 2 and review cr-policy-compile: the tool sweep's latest state (B1), the H2 marker rank keys, gateway-compat (M2), the non-agent additions (M3), ctx unproven (M1)
+// =====================================================================================================================
+const AT = (daysAgo) => new Date(NOW - daysAgo * 86400000).toISOString();
+const pend = (r, n, daysAgo = 1, extra = {}) => ({ r, n, at: AT(daysAgo), rn: n, ...extra });                 // a current entry: n runs, rn of them with THIS reason
+const legacy = (r, n, daysAgo = 1) => ({ r, n, at: AT(daysAgo) });                                       // an entry written before rn existed: n counts every run, whatever the reason
+const swSpec = () => ({ pa: [{ id: "clean", ctx: 200000, t: 900 }, { id: "bad", ctx: 200000, t: 100 }, { id: "ok2", ctx: 200000, t: 950 }] });
+const swTf = (extra = {}) => ({ models: { "pa/clean": { t: "t", lvr: "ppnn", at: AT(3) }, "pa/bad": { t: "t", lvr: "ppnn", at: AT(3) }, "pa/ok2": { t: "t", lvr: "ppnn", at: AT(3) } }, ...extra });
+/** the tool-fidelity inputs where `pa/bad` has NO confirmed pass (only a failure record) and everyone else passed: the shape a hard `gone` excludes */
+const noPass = (pending, extra = {}) => ({ models: { ...swTf().models, "pa/bad": { t: "x", lvr: "pfnn", at: AT(3) } }, pending, ...extra });
+const stageOf = (r, s) => r.groups.get(s)?.stage;
+
+test("B1 rule 2+3: a HARD `gone` (any count, even 1) EXCLUDES a row that has no confirmed t or v record (unreachable: left out, listed, counted, warned) and only DEMOTES one that has an earlier confirmed pass; a NEWER pass wins", () => {
+  for (const n of [1, 2, 3, 9999]) {
+    const r = funnel(syn(swSpec(), { tf: noPass({ "pa/bad": pend("gone", n) }) }), T());
+    assert.deepEqual(r.models.map((m) => m.s).sort(), ["pa/clean", "pa/ok2"], `n=${n}`);
+    assert.equal(stageOf(r, "pa/bad"), "unreachable");
+    assert.deepEqual(r.unreachable, [{ s: "pa/bad", r: "gone", n: null, at: AT(1), source: "pending" }]);
+    assert.equal(r.counts.unreachable, 1); assert.equal(r.counts.toolsPass, 2, "it never reached the tools stage"); assert.ok(r.groups.get("pa/bad").ok, "its bench status is ok: six days old is no defence");
+  }
+  const w = funnel(syn(swSpec(), { tf: noPass({ "pa/bad": pend("gone", 1) }) }), T()).warnings.find((x) => x.code === "UNREACHABLE").text;
+  assert.match(w, /^UNREACHABLE: 1 of 3 bench-ok model left out: the tool sweep found it gone and no confirmed pass exists/);
+  assert.ok(!/3\+|attempts/.test(w), "a hard answer is not a count of attempts");
+  const withPass = funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend("gone", 1, 1) } }) }), T());     // the record passed 3 days ago, the gone answer is a day old
+  assert.equal(withPass.models.length, 3, "an earlier confirmed pass: demoted, never excluded"); assert.equal(withPass.counts.unreachable, 0);
+  assert.deepEqual(withPass.demoted.map((x) => [x.s, x.r, x.hard]), [["pa/bad", "gone", true]]); assert.equal(withPass.models.at(-1).s, "pa/bad");
+  const newer = funnel(syn(swSpec(), { tf: { models: { ...swTf().models, "pa/bad": { t: "t", lvr: "ppnn", at: AT(0.5) } }, pending: { "pa/bad": pend("gone", 1, 1) } } }), T());
+  assert.deepEqual([newer.counts.unreachable, newer.counts.demoted], [0, 0], "a pass half a day ago beats a gone answer a day ago");
+});
+
+test("B1 rule 2: `error` NEVER excludes: it demotes at 3 runs in a row (two do nothing), whatever the count; `rn` drives the threshold, a legacy entry without it counts as one run", () => {
+  for (const n of [3, 9, 9999]) {
+    const r = funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend("error", n) } }) }), T());
+    assert.equal(r.models.length, 3, `error x${n}: never excluded`); assert.equal(r.counts.unreachable, 0);
+    assert.deepEqual(r.demoted.map((x) => [x.s, x.r, x.n, x.hard]), [["pa/bad", "error", n, false]]);
+  }
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend("error", 2) } }) }), T()).counts.demoted, 0, "two runs demote nothing");
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend("rate", 9, 1, { rn: 1 }) } }) }), T()).counts.demoted, 0, "rn wins: nine runs but one with THIS reason");
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend("rate", 4, 1, { rn: 3 }) } }) }), T()).counts.demoted, 1, "rn 3 is enough");
+  // R1: a legacy entry (no rn) counts as ONE run: its n counts every run whatever the reason (cap, then error, ...), so it demotes nothing until a live sweep writes rn
+  for (const [r, n] of [["rate", 3], ["error", 9999], ["upstream-unavailable", 8], ["timeout", 3], ["quota", 5]]) assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": legacy(r, n) } }) }), T()).counts.demoted, 0, `legacy ${r} x${n}: rn reads 1`);
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": { ...legacy("error", 3), rn: 3 } } }) }), T()).counts.demoted, 1, "the same entry once the sweep wrote rn = 3 (healed): demoted");
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": { ...legacy("error", 3), rn: 1 } } }) }), T()).counts.demoted, 0, "cap, then error: n 3 but rn 1");
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": legacy("gone", 1) } }) }), T()).counts.demoted, 1, "a legacy HARD entry still acts (hard reasons ignore counts): gone with an earlier pass demotes");
+});
+
+test("B1 rule 3: pay and auth at MODEL level are hard: they demote at ANY count (a hard state is never re-asked, so n freezes at 1 or 2); canary-* follow the sweep's hardState: canary-gone and canary-pay of a provider with confirmed results are ignored, canary-auth is not", () => {
+  for (const r of ["pay", "auth"]) for (const n of [1, 2, 9]) {
+    const res = funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend(r, n) } }) }), T());
+    assert.equal(res.models.length, 3, `${r} x${n}: never excluded`);
+    assert.deepEqual(res.demoted.map((x) => [x.r, x.hard]), [[r, true]], `${r} x${n}`);
+    assert.equal(res.models.at(-1).s, "pa/bad");
+  }
+  const confirmed = swTf();                                                                     // provider pa HAS confirmed results
+  for (const [r, effect] of [["canary-gone", 0], ["canary-pay", 0], ["canary-auth", 1]]) {
+    const res = funnel(syn(swSpec(), { tf: { ...confirmed, pending: { "pa/bad": pend(r, 1) } } }), T());
+    assert.equal(res.counts.demoted + res.counts.unreachable, effect, `${r} with a confirmed provider`);
+  }
+  const none = { models: {}, pending: { "pa/bad": pend("canary-gone", 1), "pa/ok2": pend("canary-pay", 1) } };      // provider pa has NO confirmed result
+  const r2 = funnel(syn(swSpec(), { tf: none }), T());
+  assert.deepEqual([r2.counts.unreachable, r2.counts.demoted], [1, 1], "canary-gone excludes, canary-pay demotes when the provider never answered");
+});
+
+test("B1 soft reasons: rate, upstream-unavailable, slow, timeout, error and quota demote at 3 runs in a row (never exclude, shown, one band); every scheduling or budget reason is never used", () => {
+  for (const r of ["rate", "upstream-unavailable", "slow", "timeout", "error", "quota"]) {
+    const res = funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend(r, 3) } }) }), T());
+    assert.equal(res.models.length, 3, `${r}: never excluded`); assert.equal(res.models.at(-1).s, "pa/bad", `${r}: last although it has the best TTFT`);
+    assert.equal(res.groups.get("pa/bad").rk[5], 1); assert.equal(res.groups.get("pa/clean").rk[5], 0);
+    assert.deepEqual(res.demoted, [{ s: "pa/bad", r, n: 3, at: AT(1), source: "pending", hard: false }]);
+    assert.equal(new Set(res.models.map((m) => m.b)).size, 1, `${r}: an ordering key inside ONE band, not a band of its own`);
+    const w = res.warnings.find((x) => x.code === "DEMOTED").text;
+    assert.match(w, /^DEMOTED: 1 of 3 allowed model ranks below clean rows because the tool sweep is blocked on it \(rate, upstream-unavailable, slow, timeout, error or quota for 3\+ runs in a row; pay, auth, or a gone answer with an earlier pass at once\)/);
+    assert.ok(/auth/.test(w), "the text names auth");
+  }
+  for (const r of ["empty", "cap", "spend", "not-run", "request-cap", "priced-over-row-cap", "reasoning-budget", "route-shape", "row-cost", "first-strike"]) {
+    const res = funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": pend(r, 9999, 1, { rn: 9999 }) } }) }), T());
+    assert.equal(res.models.length, 3, r); assert.equal(res.counts.demoted + res.counts.unreachable, 0, `${r}: pending is used for nothing else`); assert.equal(res.models[0].s, "pa/bad");
+  }
+});
+
+test("B1 reader tolerance: pending entries with since, rn and why (additive), a top-level `meta` key, a non-object pending or held, and unknown fields change nothing but what the rules say; a malformed entry is ignored", () => {
+  const e = { r: "rate", n: 4, at: AT(1), since: AT(5), rn: 4, why: "the provider's own sentence" };
+  const withMeta = swTf({ pending: { "pa/bad": e }, held: {}, meta: { recoverable: 12, scope: "abc", at: AT(0) }, future: [1, 2] });
+  const r = funnel(syn(swSpec(), { tf: withMeta }), T());
+  assert.deepEqual(r.demoted.map((x) => [x.s, x.r, x.n]), [["pa/bad", "rate", 4]]);
+  assert.deepEqual(funnel(syn(swSpec(), { tf: { ...withMeta, pending: { "pa/bad": { ...e, since: "garbage", why: 12, rn: "x" } } } }), T()).counts.demoted, 0, "a garbled rn is ignored: the entry reads as legacy (rn = 1), so nothing happens");
+  for (const bad of [null, "x", 5, [], { r: 7, n: 3, at: AT(1) }, { r: "gone", n: 3 }]) assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: { "pa/bad": bad } }) }), T()).models.length, 3, JSON.stringify(bad));
+  assert.equal(funnel(syn(swSpec(), { tf: swTf({ pending: ["x"], held: "y" }) }), T()).models.length, 3);
+});
+
+test("B1 rule 4: a garbled `at` on a pending entry, on the record it is compared with, or on a hold makes the entry UNUSABLE: nothing happens (fail open), in both directions", () => {
+  assert.equal(funnel(syn(swSpec(), { tf: noPass({ "pa/bad": { r: "gone", n: 5, at: "not a date" } }) }), T()).counts.unreachable, 0, "a garbled pending `at`");
+  assert.equal(funnel(syn(swSpec(), { tf: { models: { ...swTf().models, "pa/bad": { t: "t", lvr: "ppnn", at: "not a date" } }, pending: { "pa/bad": pend("gone", 5) } } }), T()).counts.unreachable + 0, 0, "a garbled record `at`: it cannot be compared with the entry");
+  const garbledPass = funnel(syn(swSpec(), { tf: { models: { ...swTf().models, "pa/bad": { t: "t", lvr: "ppnn", at: "not a date" } }, pending: { "pa/bad": pend("gone", 5) } } }), T());
+  assert.deepEqual([garbledPass.counts.unreachable, garbledPass.counts.demoted], [0, 0], "not even a demotion: a record whose time cannot be read is never compared");
+  for (const r of ["pay", "auth", "rate"]) assert.equal(funnel(syn(swSpec(), { tf: { models: { ...swTf().models, "pa/bad": { t: "t", lvr: "ppnn", at: "garbage" } }, pending: { "pa/bad": pend(r, 5) } } }), T()).counts.demoted, 0, `${r}: a garbled record time makes the entry unusable`);
+  assert.equal(funnel(syn(swSpec(), { tf: { models: { ...swTf().models, "pa/bad": { t: "x", lvr: "pfnn", at: "garbage" } }, pending: { "pa/bad": pend("pay", 5) } } }), T()).counts.demoted, 0, "even a failure record with a garbled `at`");
+  assert.equal(funnel(syn(swSpec(), { tf: { models: {}, held: { pa: { r: "gone", at: "nope" } } } }), T()).counts.unreachable, 0, "a garbled hold");
+  // R3: a garbled record time neutralises a HOLD too (auth, pay, gone), for that row only
+  const garbledRow = { "pa/clean": { t: "t", lvr: "ppnn", at: "garbage" }, "pa/ok2": { t: "x", lvr: "pfnn", at: "garbage" } };
+  for (const r of ["auth", "pay", "gone"]) {
+    const res = funnel(syn(swSpec(), { tf: { models: { ...garbledRow, "pa/bad": { t: "x", lvr: "pfnn", at: AT(3) } }, held: { pa: { r, at: AT(1) } } } }), T());
+    assert.equal(res.groups.get("pa/clean").demoted ?? null, null, `held ${r}: the row with a garbled record time is left alone`);
+    assert.equal(res.groups.get("pa/ok2").stage === "unreachable", false, `held ${r}: even a failure record with a garbled time`);
+  }
+  const ctl = funnel(syn(swSpec(), { tf: { models: { "pa/bad": { t: "t", lvr: "ppnn", at: AT(3) } }, held: { pa: { r: "auth", at: AT(1) } } } }), T());
+  assert.ok(ctl.groups.get("pa/clean").demoted && ctl.groups.get("pa/ok2").demoted, "the same hold on rows with no garbled time does demote (control)");
+  assert.equal(funnel(syn(swSpec(), { tf: noPass({ "pa/bad": pend("gone", 1) }) }), T()).counts.unreachable, 1, "the same entry with good dates does exclude");
+});
+
+test("B1 calendar independent: the pending `at` is when the failure HAPPENED, not an expiry, so the verdict is the same whatever nowMs says", () => {
+  const inputs = syn(swSpec(), { tf: { models: { ...swTf().models, "pa/bad": { t: "x", lvr: "pfnn", at: AT(40) } }, pending: { "pa/bad": pend("gone", 1, 30) } } });
+  const a = funnel(inputs, T()), b = funnel({ ...inputs, nowMs: NOW + 400 * 86400000 }, T()), c = funnel({ ...inputs, nowMs: NOW - 400 * 86400000 }, T());
+  assert.deepEqual([a, b, c].map((r) => r.unreachable.length), [1, 1, 1]);
+});
+
+test("B1 held providers (rule 1): a held gone or pay applies ONLY when the provider has NO confirmed t or v record (the sweep's holdIsWrong); held auth always applies (a newer pass of the row wins); held gone excludes, held pay and auth demote", () => {
+  const spec = { pa: [{ id: "a", ctx: 200000, t: 300 }, { id: "b", ctx: 200000, t: 400 }], pb: [{ id: "c", ctx: 200000, t: 500 }] };
+  const failed = (at) => ({ t: "x", lvr: "pfnn", at });
+  // pa has NO confirmed record (only failures): the holds apply
+  const none = { models: { "pa/a": failed(AT(3)), "pa/b": failed(AT(3)), "pb/c": { t: "t", lvr: "ppnn", at: AT(3) } } };
+  const gone = funnel(syn(spec, { tf: { ...none, held: { pa: { r: "gone", at: AT(1) } } } }), T());
+  assert.deepEqual(gone.unreachable.map((x) => [x.s, x.source, x.n]), [["pa/a", "held", null], ["pa/b", "held", null]]);
+  const w = gone.warnings.find((x) => x.code === "UNREACHABLE").text;
+  assert.match(w, /^UNREACHABLE: 2 of 3 bench-ok models left out: the tool sweep found them gone/); assert.ok(!/3\+|attempts/.test(w), "a hold is not a count of attempts");
+  const untested = { models: { "pb/c": { t: "t", lvr: "ppnn", at: AT(3) } } };                  // pa's rows were never tool-tested (tier u): a failure record would exclude them by its own tier
+  for (const r of ["pay", "auth"]) { const d = funnel(syn(spec, { tf: { ...untested, held: { pa: { r, at: AT(1) } } } }), T()); assert.deepEqual([d.models.length, d.demoted.map((x) => x.s)], [3, ["pa/a", "pa/b"]], r); assert.ok(d.demoted.every((x) => x.hard && x.source === "held")); }
+  // pa HAS a confirmed record (pa/b passed): a held gone or pay is WRONG and ignored, for every row of the provider; a held auth still applies
+  const some = { models: { ...untested.models, "pa/b": { t: "t", lvr: "ppnn", at: AT(3) } } };
+  for (const r of ["gone", "pay"]) { const x = funnel(syn(spec, { tf: { ...some, held: { pa: { r, at: AT(1) } } } }), T()); assert.deepEqual([x.counts.unreachable, x.counts.demoted], [0, 0], `held ${r} on a provider that answered`); }
+  const auth = funnel(syn(spec, { tf: { ...some, held: { pa: { r: "auth", at: AT(1) } } } }), T());
+  assert.deepEqual(auth.demoted.map((x) => x.s), ["pa/a", "pa/b"], "held auth applies whatever the provider answered, but a row's own newer pass wins:");
+  const newer = funnel(syn(spec, { tf: { models: { ...some.models, "pa/b": { t: "t", lvr: "ppnn", at: AT(0.2) } }, held: { pa: { r: "auth", at: AT(1) } } } }), T());
+  assert.deepEqual(newer.demoted.map((x) => x.s), ["pa/a"], "pa/b passed after the hold");
+  assert.equal(funnel(syn(spec, { tf: { ...none, held: { pa: { r: "weird", at: AT(1) } } } }), T()).counts.unreachable, 0, "an unknown hold reason is ignored");
+});
+
+test("the funnel's confirmedByProvider and holdIsWrong are the sweep's own (refresh/tool-fidelity.mjs): the two agree on every case", async () => {
+  const sweep = await import("../refresh/tool-fidelity.mjs");
+  const { confirmedByProvider, holdIsWrong } = await import("../menu/subagent-funnel.mjs");
+  const store = { "pa/a": { t: "t" }, "pa/b": { t: "x" }, "pa/c": { t: "v" }, "pb/d": { t: "u" }, "pc/e/f": { t: "t" }, "pd/g": null };
+  assert.deepEqual({ ...confirmedByProvider(store) }, sweep.confirmedProviders(store));
+  const conf = sweep.confirmedProviders(store);
+  for (const h of [null, { r: "gone" }, { r: "pay" }, { r: "auth" }, { r: "weird" }]) for (const p of ["pa", "pb", "pc", "pd", "pz"]) assert.equal(holdIsWrong(h, conf, p), sweep.holdIsWrong(h, conf, p), `${JSON.stringify(h)} ${p}`);
+});
+
+test("B1 provider-level pattern: the same pending reason on at least 3 and at least half of a provider's bench-ok rows is one PATTERN line (not a wall of single exclusions); nothing is excluded for it", () => {
+  const rows = Array.from({ length: 6 }, (_, i) => ({ id: `m${i}`, ctx: 200000, t: 100 + i }));
+  const spec = { cleanapis: rows, other: [{ id: "x", ctx: 200000 }] };
+  const pending = Object.fromEntries(rows.map((r) => [`cleanapis/${r.id}`, pend("error", 11)]));
+  const tf = { models: Object.fromEntries([...rows.map((r) => [`cleanapis/${r.id}`, { t: "t", lvr: "ppnn", at: AT(9) }]), ["other/x", { t: "t", lvr: "ppnn", at: AT(9) }]]), pending };
+  const r = funnel(syn(spec, { tf }), T());
+  assert.deepEqual(r.providerPatterns, [{ provider: "cleanapis", reason: "error", rows: 6, of: 6 }]); assert.equal(r.counts.providerPatterns, 1);
+  assert.equal(r.models.length, 7, "error never excludes: every row is still allowed, demoted"); assert.equal(r.counts.demoted, 6); assert.equal(r.models[0].s, "other/x");
+  assert.match(r.warnings.find((x) => x.code === "PROVIDER_PATTERN").text, /^PROVIDER_PATTERN: cleanapis: 6 of 6 bench-ok rows pending error:/);
+  const att = lib.attentionLines(r, synG(syn(spec, { tf })), { ...lib.OWNER_DEFAULTS, source: "all-providers", mode: "dynamic" }, 3).map((x) => x.text);
+  assert.ok(att.includes("cleanapis: 6 of 6 bench-ok rows pending error: a provider-level pattern, so the provider (not the models) is probably the cause"), att.join("\n"));
+  const rep = lib.formatReport({ owner: { ...lib.OWNER_DEFAULTS, source: "all-providers", mode: "dynamic", enforcement: "shadow", inject: "off" }, res: r, g: synG(syn(spec, { tf })), dry: true, minSet: 3 });
+  assert.match(rep, /provider pattern \(sweep\) \.+ cleanapis: 6 of 6 bench-ok rows pending error: the provider, not the models, is probably the cause; rows are demoted or left out one by one, never the provider as a whole/);
+  const few = funnel(syn(spec, { tf: { ...tf, pending: Object.fromEntries(rows.slice(0, 2).map((x) => [`cleanapis/${x.id}`, pend("error", 11)])) } }), T());
+  assert.deepEqual(few.providerPatterns, [], "2 of 6 is not a pattern"); assert.ok(!few.warnings.some((x) => x.code === "PROVIDER_PATTERN"));
+  const half = funnel(syn(spec, { tf: { ...tf, pending: Object.fromEntries(rows.slice(0, 3).map((x) => [`cleanapis/${x.id}`, pend("rate", 4)])) } }), T());
+  assert.deepEqual(half.providerPatterns, [{ provider: "cleanapis", reason: "rate", rows: 3, of: 6 }], "3 of 6 is the threshold");
+  const eight = Array.from({ length: 8 }, (_, i) => ({ id: `n${i}`, ctx: 200000, t: 100 + i }));
+  const tf8 = { models: Object.fromEntries(eight.map((x) => [`cleanapis/${x.id}`, { t: "t", lvr: "ppnn", at: AT(9) }])), pending: Object.fromEntries(eight.slice(0, 3).map((x) => [`cleanapis/${x.id}`, pend("error", 11)])) };
+  assert.deepEqual(funnel(syn({ cleanapis: eight }, { tf: tf8 }), T()).providerPatterns, [], "3 of 8 is under half: no pattern, however many rows share the state");
+});
+
+test("B1 interplay with the re-probe list (decision 6): a free row dropped on an old transient bench status that the sweep found GONE is named in `reprobeSkipped` (never silent, never in the re-probe list); one the sweep found out of credit is account state; one with an earlier confirmed pass falls back to the normal path", () => {
+  const spec = { pa: [{ id: "gonefree:free", ctx: 200000 }, { id: "payfree:free", ctx: 200000 }, { id: "plainfree:free", ctx: 200000 }, { id: "passfree:free", ctx: 200000 }, { id: "keep", ctx: 200000 }] };
+  const old = NOW / 1000 - 10 * 86400;
+  const bench = Object.fromEntries(["gonefree:free", "payfree:free", "plainfree:free", "passfree:free"].map((m) => [`pa/${m}`, { s: "rate", a: old }]));
+  const tf = { models: { "pa/passfree:free": { t: "t", lvr: "ppnn", at: AT(20) } }, pending: { "pa/gonefree:free": pend("gone", 1), "pa/payfree:free": pend("pay", 1), "pa/passfree:free": pend("gone", 1) } };
+  const r = funnel(syn(spec, { bench, tf }), T());
+  assert.deepEqual(r.reprobeSkipped.map((x) => [x.s, x.r, x.source]), [["pa/gonefree:free", "gone", "pending"]]); assert.equal(r.counts.reprobeSkipped, 1);
+  assert.deepEqual(r.reprobe.map((x) => x.s).sort(), ["pa/passfree:free", "pa/plainfree:free"], "no sweep evidence, or a gone answer after an earlier pass: still waiting for a re-probe");
+  assert.deepEqual(r.accountRows.map((x) => [x.s, x.why]), [["pa/payfree:free", "pay"]]);
+  assert.ok(!r.reprobe.some((x) => x.s === "pa/gonefree:free"));
+});
+
+test("rank (decision 5): the demotion key sits BETWEEN the strike key and the big-step key, and the spawn marker is the LAST key (a tie-breaker after TTFT, ctx, price, recency and alias)", () => {
+  const spec = { pa: [{ id: "a-clean-bigp", ctx: 200000, t: 500 }, { id: "b-clean-bigf", ctx: 200000, t: 500 }, { id: "c-demoted-bigp", ctx: 200000, t: 500 }, { id: "d-struck-bigp", ctx: 200000, t: 500 }] };
+  const v = (extra) => ({ t: "v", lvr: "pppp", at: AT(3), ...extra });
+  const tf = { models: { "pa/a-clean-bigp": v({ big: "p" }), "pa/b-clean-bigf": v({ big: "f" }), "pa/c-demoted-bigp": v({ big: "p" }), "pa/d-struck-bigp": v({ big: "p", strikes: 1, sl: 3 }) }, pending: { "pa/c-demoted-bigp": pend("rate", 3) } };
+  const r = funnel(syn(spec, { tf }), T());
+  assert.deepEqual(r.models.map((m) => m.s), ["pa/a-clean-bigp", "pa/b-clean-bigf", "pa/c-demoted-bigp", "pa/d-struck-bigp"], "strike outranks demotion (struck last), demotion outranks the big step (b before c), and the big step orders the rest");
+  assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "all one band");
+  assert.deepEqual(r.models.map((m) => [m.s.slice(3, 4), r.groups.get(m.s).rk[4], r.groups.get(m.s).rk[5], r.groups.get(m.s).rk[6]]), [["a", 0, 0, 0], ["b", 0, 0, 2], ["c", 0, 1, 0], ["d", 1, 0, 0]]);
+  assert.deepEqual(RANK_LABELS.slice(4, 8), ["first strike", "sweep demotion (blocked by the sweep, never excluded)", "big step (v only)", "L4 (v only)"]);
+  assert.match(RANK_LABELS.at(-1), /^spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)$/); assert.equal(RANK_LABELS.length, 17);
+  // the spawn marker: a row that failed the spawn call but has the better TTFT outranks a clean row with the worse TTFT; at equal everything else the clean row is first
+  const spec2 = { pa: [{ id: "clean-slow", ctx: 200000, t: 900 }, { id: "sp-fast", ctx: 200000, t: 100 }, { id: "clean-fast2", ctx: 200000, t: 100 }] };
+  const base = { t: "t", lvr: "ppnn", at: AT(3) };
+  const r2 = funnel(syn(spec2, { tf: { models: { "pa/clean-slow": base, "pa/sp-fast": { ...base, sp: "f" }, "pa/clean-fast2": base } } }), T());
+  assert.equal(r2.groups.get("pa/sp-fast").rk.at(-1), 1); assert.equal(r2.groups.get("pa/clean-slow").rk.at(-1), 0);
+  assert.equal(r2.models.at(-1).s, "pa/clean-slow", "TTFT decides before the spawn marker does: the slow clean row is last");
+  assert.ok(r2.models.findIndex((m) => m.s === "pa/clean-fast2") < r2.models.findIndex((m) => m.s === "pa/sp-fast"), "equal TTFT: the clean row first");
+});
+
+test("H2 markers are rank keys after L4 and before TTFT, each `clean above flagged`: fc p heaviest, then af f, then er or br f; sp f is the weakest flag and the LAST key; none is a band key and none excludes", () => {
+  const spec = { pa: ["clean", "fc", "af", "erbr", "br", "sp", "afsp"].map((id) => ({ id, ctx: 200000, t: 100 })) };
+  const base = { t: "t", lvr: "ppnn", at: AT(3) };
+  const tf = { models: { "pa/clean": base, "pa/fc": { ...base, fc: "p" }, "pa/af": { ...base, af: "f" }, "pa/erbr": { ...base, er: "f" }, "pa/br": { ...base, br: "f" }, "pa/sp": { ...base, sp: "f" }, "pa/afsp": { ...base, af: "f", sp: "f" } } };
+  const r = funnel(syn(spec, { tf }), T());
+  assert.equal(r.models.length, 7, "nothing is excluded"); assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "no marker is a band key");
+  const k = (id) => r.groups.get(`pa/${id}`).rk;
+  assert.deepEqual(k("clean").slice(8, 11).concat(k("clean").at(-1)), [0, 0, 0, 0]);
+  assert.deepEqual([k("fc"), k("af"), k("erbr"), k("br"), k("sp"), k("afsp")].map((x) => x.slice(8, 11).concat(x.at(-1))), [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 0], [0, 0, 0, 1], [0, 1, 0, 1]]);
+  const order = r.models.map((m) => m.s.slice(3));
+  assert.equal(order[0], "clean"); assert.equal(order[1], "sp", "the weakest flag"); assert.equal(order.at(-1), "fc", "forced-choice-only is the heaviest flag");
+  assert.ok(Math.max(order.indexOf("erbr"), order.indexOf("br")) < order.indexOf("af") && order.indexOf("af") < order.indexOf("afsp") && order.indexOf("afsp") < order.indexOf("fc"), order.join(" "));
+  const spec2 = { aihubmix: [{ id: "coding-minimax-m3-free", ctx: 200000, t: 200 }, { id: "z-clean", ctx: 200000, t: 800 }], tokenharbor: [{ id: "mimo-v2.6-flash:free", ctx: 200000, t: 200 }], routewayai: [{ id: "gemma-4-26b-a4b-it-musica:free", ctx: 200000, t: 200 }] };
+  const tf2 = { models: { "aihubmix/coding-minimax-m3-free": { ...base, af: "f" }, "aihubmix/z-clean": base, "tokenharbor/mimo-v2.6-flash:free": { ...base, sp: "f" }, "routewayai/gemma-4-26b-a4b-it-musica:free": { ...base, fc: "p" } } };
+  assert.deepEqual(funnel(syn(spec2, { tf: tf2 }), T()).models.map((m) => m.s), ["tokenharbor/mimo-v2.6-flash:free", "aihubmix/z-clean", "aihubmix/coding-minimax-m3-free", "routewayai/gemma-4-26b-a4b-it-musica:free"],
+    "the spawn marker is a tie-breaker only: the fast spawn-failed row leads the slow clean one; af f, then fc p, rank below both");
+});
+
+test("M2 a record tagged xw:gateway is left out as gateway-compat (a visible reason, counted, warned), whatever its tier; a row without the tag fails as before; a newer record without the tag is not gateway-compat; an --allow pin does NOT override it (nor an unreachable row)", () => {
+  const spec = { pa: [{ id: "gw", ctx: 200000 }, { id: "plain", ctx: 200000 }, { id: "keep", ctx: 200000 }] };
+  const base = { lvr: "pfnn", at: AT(3) };
+  const tf = { models: { "pa/gw": { ...base, t: "x", xw: "gateway" }, "pa/plain": { ...base, t: "x" }, "pa/keep": { t: "t", lvr: "ppnn", at: AT(3) } } };
+  const r = funnel(syn(spec, { tf }), T());
+  assert.equal(r.groups.get("pa/gw").stage, "gateway-compat"); assert.equal(r.groups.get("pa/plain").stage, "tools-failed");
+  assert.deepEqual(r.gatewayCompat, ["pa/gw"]); assert.equal(r.counts.gatewayCompat, 1);
+  assert.match(r.warnings.find((x) => x.code === "GATEWAY_COMPAT").text, /^GATEWAY_COMPAT: 1 of 3 bench-ok model left out because the tool test failed in the gateway's own request translation/);
+  assert.deepEqual(r.models.map((m) => m.s), ["pa/keep"]);
+  const fixed = funnel(syn(spec, { tf: { models: { ...tf.models, "pa/gw": { t: "t", lvr: "ppnn", at: AT(1) } } } }), T());
+  assert.equal(fixed.counts.gatewayCompat, 0); assert.ok(fixed.models.some((m) => m.s === "pa/gw"));
+  assert.equal(funnel(syn(spec, { tf: { models: { ...tf.models, "pa/gw": { ...base, t: "x", xw: "other" } } } }), T()).groups.get("pa/gw").stage, "tools-failed", "only the value gateway counts");
+  // decision 7: the owner's allow pin overrides a tool-tier verdict (pin-only), never an unreachable or a gateway-compat row
+  const pinned = funnel(syn(spec, { tf: { ...tf, models: { ...tf.models, "pa/plain": { ...base, t: "x", xw: "gateway" } } } }), T({ allow: ["pa/gw", "pa/plain"] }));
+  assert.deepEqual(pinned.models.map((m) => m.s), ["pa/keep"], "gateway-compat rows stay out although pinned");
+  assert.deepEqual([pinned.groups.get("pa/gw").stage, pinned.groups.get("pa/plain").stage], ["gateway-compat", "gateway-compat"]);
+  const unreach = funnel(syn(swSpec(), { tf: noPass({ "pa/bad": pend("gone", 1) }) }), T({ allow: ["pa/bad"], unverified: "pin-only" }));
+  assert.equal(unreach.groups.get("pa/bad").stage, "unreachable"); assert.ok(!unreach.models.some((m) => m.s === "pa/bad"), "an unreachable row stays out although pinned");
+});
+
+const M3_IDS = ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview", "gemini-3.1-flash-lite-image", "gemini-3-flash-preview-search", "gemini-3.1-pro-preview-search", "relace/relace-search", "relace-search",
+  "command-a-translate-08-2025", "cohere/command-a-translate", "gpt-image-2", "imagen-4.0-ultra-generate-001", "gpt-4o-search-preview", "sonar-pro-search", "riva-translate-4b-instruct-v2", "qwen-image-edit-plus", "jina-deepsearch-v1", "aihubmix/jina-deepsearch-v1"];
+test("M3 the non-agent denylist also catches image generators, translators and search models (the critic's leaks and jina-deepsearch), as a WORD of the id; a keep-list of agent ids that merely contain the letters stays unmatched; a denylisted row is dropped with its reason", () => {
+  for (const id of M3_IDS) assert.equal(nonAgentReason(id), "non-agent-model", id);
+  const KEEP = ["claude-sonnet-5-5", "deepseek-v4-flash", "kimi-k2.5", "gpt-5-codex", "qwen3-coder-480b", "glm-4.6", "minimax-m3", "grok-code-fast-1", "gemini-3-pro", "gemini-3.1-pro-preview", "nemotron-3-super-120b", "deepseek-r1-0528", "kimi-researcher", "sonar-deep-research",
+    "mistral-small-3.2-24b", "devstral-small", "llama-4-maverick", "gpt-oss-120b", "step-3.5-flash", "mimo-v2.6-flash:free", "coding-minimax-m3-free", "gemma-4-26b-a4b-it-musica:free", "hy3-preview", "searcher-7b-agent", "imaginative-writer-70b", "translator-agent-70b", "deepsearcher-70b-agent"];
+  for (const id of KEEP) assert.equal(nonAgentReason(id), null, id);
+  const r = funnel(syn({ pa: [{ id: "gemini-3.1-flash-image", ctx: 200000 }, { id: "good", ctx: 200000 }] }), T());
+  assert.equal(r.dropped.get("pa/gemini-3.1-flash-image"), "non-agent-model"); assert.equal(r.counts.nonAgent, 1); assert.deepEqual(r.models.map((m) => m.s), ["pa/good"]);
+});
+
+test("M1 ctx unproven: every row that rests on an INFERRED 128k is counted (counts.ctxUnproven equals the inferred rows) and warned with what was measured (no hard-coded request median); it has its own line, not the SWEEP line; eligibility is unchanged", () => {
+  const spec = { pa: [{ id: "model-x", ctx: 262144 }], pb: [{ id: "model-x:free", ctx: null }], pc: [{ id: "known", ctx: 200000 }] };
+  const r = funnel(syn(spec), T());
+  assert.equal(r.counts.ctxUnproven, 1); assert.equal(r.counts.ctxUnproven, r.counts.ctxInferred); assert.equal(r.models.length, 3, "eligibility is unchanged: the router's per-request fit check decides");
+  const w = r.warnings.find((x) => x.code === "CTX_UNPROVEN").text;
+  assert.match(w, /^CTX UNPROVEN: 1 of 3 allowed models rest on an INFERRED 128k context \(a same-name sibling's\); the only measured proof is the 400 KB big step \(about 100k tokens\), so the router's per-request fit check decides, not this flag$/);
+  assert.ok(!/199k|median/.test(w), "no unsourced request-size statistic");
+  assert.deepEqual(sweepLines(r), [], "ctx unproven is not a sweep fact");
+  assert.deepEqual(ctxUnprovenLines(r), ["CTX UNPROVEN: 1 of 3 allowed model rests on an inferred 128k context (a sibling's); the only measured proof is the 400 KB big step (about 100k tokens), so the router's per-request fit check decides"]);
+  assert.deepEqual(ctxUnprovenLines(funnel(syn({ pa: [{ id: "known", ctx: 200000 }] }), T())), []);
+});
+
+test("texts: every 'N models left out' line names its denominator and singular or plural, in the warnings, the SWEEP line, the attention list, the detail report and show; hold-sourced lines never say attempts", async () => {
+  const rows = Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, ctx: 200000, t: 100 + i }));
+  const spec = { pa: rows, pb: [{ id: "x", ctx: 200000 }] };
+  const rec = (id) => ({ t: "t", lvr: "ppnn", at: AT(9) });
+  const tf = { models: { ...Object.fromEntries(rows.map((x) => [`pa/${x.id}`, rec()])), "pb/x": rec() }, pending: { "pa/m0": pend("gone", 1, 1), "pa/m1": pend("rate", 3), "pa/m2": pend("rate", 3), "pa/m3": pend("rate", 3) } };
+  tf.models["pa/m0"] = { t: "x", lvr: "pfnn", at: AT(9) };
+  const inp = syn(spec, { tf }), res = funnel(inp, T()), g = synG(inp);
+  assert.deepEqual(sweepLines(res), ["SWEEP: 1 of 5 bench-ok model left out (the sweep found it gone and no confirmed pass exists); 3 of 4 allowed ranked below clean rows (the sweep is blocked on them; none excluded)"]);
+  const owner = { ...lib.OWNER_DEFAULTS, source: "all-providers", mode: "dynamic" };
+  const att = lib.attentionLines(res, g, owner, 3).map((x) => x.text);
+  assert.ok(att.some((x) => /^1 of 5 bench-ok model left out: the tool sweep found it gone and no confirmed pass exists \(listed by --detail yes; an --allow pin does not override it\)$/.test(x)), att.join("\n"));
+  assert.ok(att.some((x) => /^3 of 4 eligible models rank below clean rows: the tool sweep is blocked on them \(never excluded\)$/.test(x)), att.join("\n"));
+  const rep = lib.formatReport({ owner: { ...owner, enforcement: "shadow", inject: "off" }, res, g, dry: true, minSet: 3 });
+  assert.match(rep, /unreachable \(sweep\) \.+ 1 of 5 probe-ok selector left out: the tool sweep found it gone and no confirmed pass exists \(an --allow pin does not override this\): pa\/m0 \(gone, hard answer\)/);
+  assert.match(rep, /sweep demoted \.+ 3 of 4 allowed selectors rank below clean rows \(the tool sweep is blocked on them; never excluded\): pa\/m1 \(rate x3\), pa\/m2 \(rate x3\), pa\/m3 \(rate x3\)/);
+  assert.match(rep, /^SWEEP: 1 of 5 bench-ok model left out/m);
+  // show (describeCompiled) over a compiled copy
+  const { compiled } = lib.compile(g, { ...owner, enforcement: "shadow", inject: "off" }, { now: () => new Date("2026-10-03T00:00:00Z") });
+  const quiet = lib.describeCompiled(compiled, "1h", false).join("\n"), loud = lib.describeCompiled(compiled, "1h", true).join("\n");
+  assert.match(quiet, /^ {2}1 of 5 bench-ok model left out: the tool sweep found it gone and no confirmed pass exists \(an --allow pin does not override it\) \(--detail yes names them\)$/m);
+  assert.match(quiet, /^ {2}3 of 4 eligible models rank below clean rows \(the tool sweep is blocked on them; never excluded\) \(--detail yes names them\)$/m);
+  assert.match(loud, /left out: the tool sweep found it gone .*: pa\/m0 \(gone, hard answer\)/); assert.match(loud, /rank below clean rows .*: pa\/m1 \(rate x3\), pa\/m2 \(rate x3\), pa\/m3 \(rate x3\)/);
+  assert.deepEqual(compiled.unreachable.map((x) => x.s), ["pa/m0"]); assert.equal(compiled.counts.unreachable, 1); assert.equal(compiled.counts.benchOk, 5); assert.ok(Array.isArray(compiled.providerPatterns) && Array.isArray(compiled.reprobeSkipped));
+  assert.equal(compiled.contentHash, lib.hashOf(compiled), "the lists sit outside the routing hash");
+  // a held provider: no count of attempts anywhere in its text
+  const held = funnel(syn({ pa: rows }, { tf: { models: Object.fromEntries(rows.map((x) => [`pa/${x.id}`, { t: "x", lvr: "pfnn", at: AT(9) }])), held: { pa: { r: "gone", at: AT(1) } } } }), T());
+  const hw = held.warnings.find((x) => x.code === "UNREACHABLE").text;
+  assert.match(hw, /^UNREACHABLE: 4 of 4 bench-ok models left out: the tool sweep found them gone/); assert.ok(!/attempt|3\+/.test(hw));
+  assert.match(lib.formatReport({ owner: { ...owner, enforcement: "shadow", inject: "off" }, res: held, g: synG(syn({ pa: rows })), dry: true }), /pa\/m0 \(gone, provider held\)/);
+});
+
+test("explain lines (sweepExplainLines and STAGE_PLAIN): the demotion (soft, hard, held), the markers (spawn last), a skipped re-probe, a provider pattern, an --allow pin that cannot override, the unreachable and gateway-compat answers", () => {
+  const grp = (over = {}) => ({ selector: "pa/m", provider: "pa", stage: "in-set", status: "ok", ...over });
+  const res = { providerPatterns: [{ provider: "pa", reason: "error", rows: 6, of: 6 }] };
+  const owner = { allow: [] };
+  const lines = (g, o = owner, r = res) => lib.sweepExplainLines(g, r, o);
+  assert.match(lines(grp({ demoted: { r: "rate", n: 4, at: "A", source: "pending", hard: false } }))[0], /^sweep demotion: the tool sweep is blocked on it \(rate, 4 runs in a row\), last at A, with no newer confirmed pass: it ranks below clean rows of its band, never excluded$/);
+  assert.match(lines(grp({ demoted: { r: "pay", n: null, at: "A", source: "pending", hard: true } }))[0], /got a hard answer for it \(pay\)/);
+  assert.match(lines(grp({ demoted: { r: "gone", n: null, at: "A", source: "pending", hard: true } }))[0], /\(gone, but an earlier confirmed pass exists\)/);
+  assert.match(lines(grp({ demoted: { r: "auth", n: null, at: "A", source: "held", hard: true } }))[0], /holds its provider auth/);
+  assert.match(lines(grp({ reprobeSkipped: { source: "pending" } }))[0], /^re-probe skipped: its bench status is ok on a sample older than 2 days, but the tool sweep found it gone \(a hard answer\)/);
+  assert.ok(lines(grp()).some((x) => /^provider pattern: pa: 6 of 6 bench-ok rows pending error: the provider, not this model, is probably the cause$/.test(x)));
+  assert.ok(lines(grp(), owner, { providerPatterns: [] }).length === 0, "nothing to say, nothing printed");
+  const mk = lines(grp({ mk: { fc: 1, af: 1, erbr: 0, sp: 1 } })).find((x) => /^tool-test markers/.test(x));
+  assert.match(mk, /fc: the first call passed only when forced; af: argument fidelity failed; sp: launching a subagent failed \(the LAST rank key, a tie-breaker; matters only when this model acts as a MAIN agent\)$/);
+  for (const stage of ["unreachable", "gateway-compat"]) assert.match(lines(grp({ stage }), { allow: ["pa/m"] }).join("\n"), new RegExp(`^allow pin: your --allow pin for pa/m does NOT override ${stage}`, "m"));
+  assert.ok(!lines(grp({ stage: "unreachable" }), { allow: [] }).some((x) => /allow pin/.test(x)), "no pin, no line");
+  assert.match(lib.STAGE_PLAIN(grp({ stage: "unreachable", unreachable: { r: "gone", source: "pending", at: "A" } }), owner), /^the tool sweep found it gone \(a hard answer the sweep does not ask again\), last at A, and no confirmed pass exists.*An --allow pin does not override this$/);
+  assert.match(lib.STAGE_PLAIN(grp({ stage: "unreachable", unreachable: { r: "gone", source: "held", at: "A" } }), owner), /its provider is held gone/);
+  assert.match(lib.STAGE_PLAIN(grp({ stage: "gateway-compat" }), owner), /gateway's own request translation.*An --allow pin does not override this$/);
+});
+
+test("D-bk hint == floor: the compiled ctxHints equal the toggle's own floor (a row above the floor is capped AT it, a row below keeps its own), for every ctx value; the router's hardcoded substitute floor is the funnel's 128000", async () => {
+  const fs2 = await import("node:fs");
+  const router = fs2.readFileSync(new URL("../router/uw-router.next.cjs", import.meta.url), "utf8");
+  assert.match(router, /const SUBSTITUTE_FLOOR = 128000, K = 3;/, "D-bk: the router hardcodes 128000 (the floor it derives is max(ctxHints[asked], 128000))");
+  assert.equal(SUBSTITUTE_FLOOR, 128000);
+  const spec = { pa: [{ id: "k64", ctx: 64000 }, { id: "k128", ctx: 131072 }, { id: "k200", ctx: 200000 }, { id: "k256", ctx: 262144 }, { id: "k512", ctx: 524288 }, { id: "k1m", ctx: 1048576 }] };
+  for (const ctx of CTX_VALUES) {
+    const r = funnel(syn(spec), T({ ctx }));
+    const cap = hintCapOf(ctx), floor = ctxSpec(ctx).hard;
+    for (const row of r.models) assert.equal(r.ctxHints[row.s], Math.min(row.c, cap), `${ctx} ${row.s}`);
+    for (const v of Object.values(r.ctxHints)) assert.ok(v <= cap, `${ctx}: no hint above the toggle floor ${cap}`);
+    if (floor > 0) assert.ok(r.models.filter((m) => m.c >= floor).every((m) => r.ctxHints[m.s] === floor), `${ctx}: a row at or above the hard floor is hinted exactly the floor`);
+    else assert.ok(r.models.filter((m) => m.c >= 128000).every((m) => r.ctxHints[m.s] === 128000), `${ctx}: any and every soft preference hint 128000`);
+  }
 });

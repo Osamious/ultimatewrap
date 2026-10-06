@@ -149,7 +149,7 @@ test("report: a missing snapshot and a missing status are SAID, never silently l
 // =====================================================================================================================
 // the frozen --json shape
 // =====================================================================================================================
-test("report --json yes: the schema is FROZEN (schema 2, a fixed key order at every level, ISO UTC times), pinned byte for byte on a small fixture", async () => {
+test("report --json yes: the schema is FROZEN (schema 3, a fixed key order at every level, ISO UTC times), pinned byte for byte on a small fixture", async () => {
   const s = setup();
   wr(path.join(s.state, "agents.jsonl"), [
     dec("2026-10-05T11:00:00.000Z", "agent-1", OPUS, ALPHA, { tc: 1000000 }),
@@ -159,7 +159,7 @@ test("report --json yes: the schema is FROZEN (schema 2, a fixed key order at ev
   const r = await REPORT(s, "--json", "yes");
   assert.equal(r.status, 0, r.err);
   const j = JSON.parse(r.out);
-  assert.deepEqual(Object.keys(j), ["schema", "kind", "estimateLabel", "window", "denominators", "totals", "counters", "estimate", "outcomes", "agents", "handoffs", "contextGrowth", "payload"]);
+  assert.deepEqual(Object.keys(j), ["schema", "kind", "estimateLabel", "window", "denominators", "totals", "counters", "estimate", "outcomes", "agents", "handoffs", "contextGrowth", "payload", "traffic"]);
   assert.deepEqual(Object.keys(j.window), ["since", "until", "session"]);
   assert.deepEqual(Object.keys(j.denominators), ["agentLines", "decisions", "handoffs", "sessions", "unreadableLines", "filesRead", "agentsListed", "handoffsListed"]);
   assert.deepEqual(Object.keys(j.totals), ["mode", "moved", "unchanged", "noPolicyChoice", "keptButRewritten", "ranOn", "wouldUse"]);
@@ -169,7 +169,7 @@ test("report --json yes: the schema is FROZEN (schema 2, a fixed key order at ev
   assert.deepEqual(Object.keys(j.outcomes), ["requested", "available", "reason", "rowsRead", "truncated", "considered", "matched", "resolvedEqualsRan", "resolvedDiffers", "errorStatus", "unmatched", "joinWindowMs"]);
   for (const a of j.agents) { assert.deepEqual(Object.keys(a), ["t", "sid", "aid", "asked", "ran", "would", "why", "mode", "main", "tokens", "moved", "flags", "costUsd", "outcome"]); assert.match(a.t, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/); }
   for (const h of j.handoffs) assert.deepEqual(Object.keys(h), ["t", "sid", "aid", "text"]);
-  const golden = { schema: 2, kind: "report", estimateLabel: "estimate, input tokens only, snapshot prices",
+  const golden = { schema: 3, kind: "report", estimateLabel: "estimate, input tokens only, snapshot prices",
     window: { since: null, until: "2026-10-05T12:00:00.000Z", session: null },
     denominators: { agentLines: 3, decisions: 2, handoffs: 1, sessions: 1, unreadableLines: 0, filesRead: 1, agentsListed: 2, handoffsListed: 1 },
     totals: { mode: "shadow", moved: 1, unchanged: 0, noPolicyChoice: 1, keptButRewritten: 0, ranOn: [{ provider: "anthropic", n: 2 }], wouldUse: [{ provider: "fx-free-a", n: 1 }] },
@@ -182,10 +182,12 @@ test("report --json yes: the schema is FROZEN (schema 2, a fixed key order at ev
     ],
     handoffs: [{ t: "2026-10-05T11:40:00.000Z", sid: "s1aaaaaa", aid: "agent-2", text: `HANDOFF ${ALPHA} -> ${BETA} (retry 2, hop 1)` }],
     contextGrowth: { label: "estimate", agents: 0, measurable: 0, singleRequest: 0, requests: 0, ratio: null, sizeSample: { requests: 0, over200k: 0, over1m: 0 } },
-    payload: { compiledAvailable: false, allowed: null, unknownLimit: null, gateLine: null } };
+    payload: { compiledAvailable: false, allowed: null, unknownLimit: null, gateLine: null },
+    traffic: { label: "classifier log", denominator: "client requests with a session id", requests: 0, probe: 0, probeAgentShaped: 0, client: 0, main: 0, sub: 0, aux: 0, exempt: 0, other: 0, agentShaped: 0, teammates: 0, builtIn: 0, detectorDisagree: 0 } };
   assert.equal(r.out, JSON.stringify(golden), "byte-for-byte golden");
   assert.equal(JSON.parse(r.out).estimateLabel, rep.ESTIMATE_LABEL);
-  assert.equal(rep.REPORT_SCHEMA, 2);
+  assert.equal(rep.REPORT_SCHEMA, 3);
+  assert.deepEqual(Object.keys(j.traffic), ["label", "denominator", "requests", "probe", "probeAgentShaped", "client", "main", "sub", "aux", "exempt", "other", "agentShaped", "teammates", "builtIn", "detectorDisagree"]);
   assert.deepEqual(Object.keys(j.contextGrowth), ["label", "agents", "measurable", "singleRequest", "requests", "ratio", "sizeSample"]);
   assert.deepEqual(Object.keys(j.payload), ["compiledAvailable", "allowed", "unknownLimit", "gateLine"]);
 });
@@ -470,7 +472,7 @@ test("D-bl context growth: per subagent the largest later token count over its F
     cls("2026-10-05T10:00:55.000Z", "a6", null), cls("2026-10-05T10:09:55.000Z", "a6", 9000),                                                            // no token count on the first: one counted request
   ].join("\n"));
   const j = JSON.parse((await REPORT(s, "--json", "yes")).out);
-  assert.equal(j.schema, 2);
+  assert.equal(j.schema, 3);
   assert.deepEqual(j.contextGrowth, { label: "estimate", agents: 5, measurable: 3, singleRequest: 2, requests: 10, ratio: { median: 3, p90: 5, max: 5 }, sizeSample: { requests: 13, over200k: 0, over1m: 0 } },
     "5 subagents with an id and a token count, 3 with 2+ counted requests: peaks 1.5, 3, 5 (nearest-rank median 3, p90 5)");
   const t = (await REPORT(s)).out;
@@ -503,4 +505,52 @@ test("sa-A1 report: the request-size buckets of the classifier log are counted o
   const j = JSON.parse((await REPORT(s, "--json", "yes")).out);
   assert.deepEqual([j.payload.compiledAvailable, j.payload.allowed, j.payload.unknownLimit], [true, 4, 3]);
   assert.match((await REPORT(s)).out, /payload limits: 3 of 4 eligible models have no known request-size limit, so the size check does nothing for them until a limit is measured/);
+});
+
+// ---- sessionless probe traffic (the UW tooling's own keysync/refresh probes) is its own line and out of every share
+const trow = (t, sid, over = {}) => L({ t, sid, aid: null, pid8: null, cls: "main", ag: 0, bl: 0, nt: 3, ga: 0, sysb: "s2", m: MAIN, rc: null, at: null, bb: "b1", tc: 100, ...over });
+test("traffic: rows with no session id (nosessio, nosession, none) are PROBE traffic: counted as their own line, excluded from every share; each share names its denominator (client requests with a session id); teammates and built-in are counted apart", async () => {
+  const s = setup(); writeLog(s);
+  const rows = [];
+  for (let i = 0; i < 6; i++) rows.push(trow("2026-10-05T10:0" + i + ":00.000Z", "nosessio", { nt: [1, 3, 44, 104][i % 4] }));      // probe profiles of different tool counts
+  rows.push(trow("2026-10-05T10:07:00.000Z", "nosession"), trow("2026-10-05T10:08:00.000Z", ""));
+  rows.push(trow("2026-10-05T10:09:00.000Z", "nosessio", { cls: "sub", ag: 1, bl: 0, aid: "pt" }), trow("2026-10-05T10:09:30.000Z", "", { cls: "sub", ag: 0, bl: 1 }));      // agent-shaped probe rows: excluded like the others, but counted
+  rows.push(trow("2026-10-05T11:00:00.000Z", "s1aaaaaa", { ga: 1 }), trow("2026-10-05T11:01:00.000Z", "s1aaaaaa", { ga: 1 }), trow("2026-10-05T11:02:00.000Z", "s1aaaaaa"));                       // 3 main
+  rows.push(trow("2026-10-05T11:03:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, bl: 0, aid: "tm1" }), trow("2026-10-05T11:04:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, bl: 0, aid: "tm2" }));    // 2 teammates
+  rows.push(trow("2026-10-05T11:05:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, bl: 1, aid: "bi1" }), trow("2026-10-05T11:05:30.000Z", "s1aaaaaa", { cls: "sub", ag: 0, bl: 1 }));                  // built-in, and a billing-only subagent (no agent id)
+  rows.push(trow("2026-10-05T11:06:00.000Z", "s1aaaaaa", { cls: "aux", ag: 1, bl: 1, aid: "bi1" }), trow("2026-10-05T11:07:00.000Z", "s1aaaaaa", { cls: "aux" }));                          // 2 aux
+  wr(path.join(s.state, "classify.jsonl"), rows.join("\n"));
+  const j = JSON.parse((await REPORT(s, "--json", "yes")).out);
+  assert.deepEqual(j.traffic, { label: "classifier log", denominator: "client requests with a session id", requests: 19, probe: 10, probeAgentShaped: 2, client: 9, main: 3, sub: 4, aux: 2, exempt: 0, other: 0, agentShaped: 5, teammates: 2, builtIn: 3, detectorDisagree: 3 });
+  const t = (await REPORT(s)).out;
+  assert.match(t, /^non-client probe traffic \(10 of 19 classified requests, 2 of them agent-shaped\), excluded: they carry no session id$/m);
+  assert.match(t, /^client requests \(with a session id; every share below is of these 9\): main 3 \(33%\), sub 4 \(44%\), aux 2 \(22%\)$/m);
+  assert.match(t, /^agent-shaped client requests \(5 of 9\): teammates 2 \(an agent id without the billing flag\), built-in 3 \(the billing flag\); the two detectors disagree on 3 of 5$/m);
+  // a window and a session narrow the same computation
+  const w = JSON.parse((await REPORT(s, "--json", "yes", "--since", "1h")).out).traffic;
+  assert.deepEqual([w.requests, w.probe, w.client], [9, 0, 9], "the probe rows are older than 1 hour of the fixture clock");
+  const se = JSON.parse((await REPORT(s, "--json", "yes", "--session", "s1aaaaaa")).out).traffic;
+  assert.deepEqual([se.requests, se.probe, se.client], [9, 0, 9], "a session filter can never contain probe traffic");
+  for (const sp of ["nosessio", "nosession", "NOSESSION"]) { const x = JSON.parse((await REPORT(s, "--json", "yes", "--session", sp)).out); assert.deepEqual([x.traffic.requests, x.traffic.probe, x.traffic.client, x.denominators.agentLines], [0, 0, 0, 0], "--session " + sp + " never matches a probe row"); }
+  assert.deepEqual([rep.sessionMatches("nosessio", "nosessio"), rep.sessionMatches("nosession", "nosessio"), rep.sessionMatches("s1aaaaaa", "s1aaaaaa"), rep.sessionMatches("s1aaaaaaff", "s1aaaaaa")], [false, false, true, true]);
+  assert.equal(rep.sessionMatches("nosessionxyz", "nosessio"), false, "a longer value that merely STARTS with the logged probe spelling must not match probe rows either");
+  const longer = JSON.parse((await REPORT(s, "--json", "yes", "--session", "nosessionxyz")).out);
+  assert.deepEqual([longer.traffic.requests, longer.traffic.probe], [0, 0]);
+  // probe rows never reach the context growth or size sample either
+  wr(path.join(s.state, "classify.jsonl"), [cls("2026-10-05T10:00:00.000Z", "p1", 1000, { sid: "nosessio" }), cls("2026-10-05T10:05:00.000Z", "p1", 9000, { sid: "nosessio" }), cls("2026-10-05T10:00:00.000Z", "c1", 1000), cls("2026-10-05T10:05:00.000Z", "c1", 2000)].join("\n"));
+  const cg = JSON.parse((await REPORT(s, "--json", "yes")).out).contextGrowth;
+  assert.deepEqual([cg.agents, cg.measurable, cg.ratio.max, cg.sizeSample.requests], [1, 1, 2, 2], "only the client subagent counts");
+});
+
+test("traffic: only probe rows -> no client shares, said plainly; no classifier log -> no traffic lines at all; the pure functions agree", async () => {
+  const s = setup(); writeLog(s);
+  wr(path.join(s.state, "classify.jsonl"), [trow("2026-10-05T10:00:00.000Z", "nosessio"), trow("2026-10-05T10:01:00.000Z", "nosessio")].join("\n"));
+  const t = (await REPORT(s)).out;
+  assert.match(t, /^non-client probe traffic \(2 of 2 classified requests\), excluded: they carry no session id$/m);
+  assert.match(t, /^client requests \(with a session id\): none in the classifier log$/m);
+  const none = setup(); writeLog(none);
+  assert.ok(!/probe traffic/.test((await REPORT(none)).out), "no classifier log: no traffic lines");
+  const lib = await import("../keysync/subagent-policy.mjs");
+  assert.deepEqual([lib.isProbeSid("nosessio"), lib.isProbeSid("NOSESSION"), lib.isProbeSid(""), lib.isProbeSid(undefined), lib.isProbeSid("d2e51e39")], [true, true, true, true, false]);
+  assert.deepEqual(lib.trafficLines(lib.classTraffic([])), []);
 });

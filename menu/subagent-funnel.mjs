@@ -42,7 +42,7 @@ export const ctxLabel = (ctx) => (ctx === "1m" ? "1M" : ctx);
 export const TTFT_BUCKETS = Object.freeze(["fast", "ok", "slow", "very slow"]);
 
 // ---- non-agent ids (D-bi): safety classifiers, guards, embedders, rerankers, OCR, LoRA adapters and tiny (under 4B) models are never candidates, so no inference can make one a substitute
-const NON_AGENT_RE = /(^|[^a-z])(safety|safeguard|(nemo|ass)?guard|embed[a-z]*|rerank|reranker|ocr|lora|moderation|transcribe|nvclip|melotts|sentence-transformers)($|[^a-z])|(^|[^a-z0-9])(asr|tts|whisper|clip|colbert|bge|e5)($|[^a-z0-9])/i;   // embed[a-z]* covers embedding, embeddings, embeddinggemma, embedqa, embedcode; asr/tts/whisper are speech, clip/colbert/bge/e5 retrieval models
+const NON_AGENT_RE = /(^|[^a-z])(safety|safeguard|(nemo|ass)?guard|embed[a-z]*|rerank|reranker|ocr|lora|moderation|transcribe|nvclip|melotts|sentence-transformers|image|imagen|translate|translation|search|deepsearch)($|[^a-z])|(^|[^a-z0-9])(asr|tts|whisper|clip|colbert|bge|e5)($|[^a-z0-9])/i;   // embed[a-z]* covers embedding, embeddings, embeddinggemma, embedqa, embedcode; asr/tts/whisper are speech, clip/colbert/bge/e5 retrieval models; image/imagen are image generators, translate/translation are translators, search is a search-grounded or search-agent model (gemini-*-preview-search, relace-search): a WORD of the id, so `research` and `searcher` are not caught
 const TINY_B_RE = /(^|[-_/:@])(\d+(?:\.\d+)?)b($|[-_/:@])/ig;
 export const TINY_MODEL_B = 4;
 /** `non-agent-model` or null, from the BARE id only (untrusted text, never executed). */
@@ -120,6 +120,34 @@ export function resolvable(sel, providers) {
 
 const TOOL_RANK = { v: 0, t: 1, u: 2 };
 
+// ---- the tool sweep's own evidence about a model's CURRENT state (state/tool-fidelity.json top level `pending` {key:{r,n,at,since?,rn?,why?}} and `held` {provider:{r,at}}). The sweep result is the LATEST state of the model:
+// health is the model's current state, calendar independent, so a bench-ok record six days old does not outvote a sweep that is blocked on it. `at` is wall-clock on purpose: it records WHEN the failure happened, it is not
+// an expiry. A confirmed t or v record NEWER than the pending entry (its own `at`) wins and the entry is ignored; a garbled `at` on the entry (or on the record it would be compared with) makes the entry UNUSABLE (fail open:
+// nothing happens). `since`, `rn` and `why` are additive and tolerated; `rn` (the runs in a row with THIS reason) drives the soft threshold; an entry without it is a legacy one and counts as rn = 1 (its `n` counts every run whatever the reason, so it proves nothing about THIS one). Nothing else in `pending` is ever used.
+//   HARD (a hard state is never asked again, so its count freezes at 1 or 2 and is ignored): gone, pay, auth and canary-gone/-pay/-auth. gone EXCLUDES the row (`unreachable`) unless it has a confirmed t or v record (then it
+//   DEMOTES); pay and auth DEMOTE. As in the sweep (hardState) a canary-gone or canary-pay entry of a provider that has confirmed results is no verdict about this model and is ignored; canary-auth stays.
+//   SOFT (recoverable, at least SWEEP_MIN_N runs in a row): rate, upstream-unavailable, slow, timeout, error, quota DEMOTE, never exclude. error NEVER excludes. The scheduling and budget reasons (cap, spend, row-cost, not-run,
+//   request-cap, priced-over-row-cap, reasoning-budget, route-shape, empty) say nothing about the model and are never used.
+//   HELD providers: held gone or pay applies only when the provider has NO confirmed t or v record (the sweep's holdIsWrong: a provider that answered is never gone and never out of credit as a whole); held auth always applies
+//   (the key is the account; a pass NEWER than the hold wins). held gone excludes, held pay and auth demote.
+export const SWEEP_MIN_N = 3;
+export const SWEEP_SOFT = Object.freeze(["rate", "upstream-unavailable", "slow", "timeout", "error", "quota"]);
+export const SWEEP_DEMOTE = SWEEP_SOFT;                                                   // the soft reasons (the name kept for importers): demote at SWEEP_MIN_N runs in a row, never exclude
+export const SWEEP_HARD = Object.freeze(["gone", "pay", "auth"]);
+/** The rank keys, in order (the one list `explain` prints). The first four are the BAND keys; the rest order rows INSIDE a band. Every marker key is `clean above flagged`; the spawn marker is the LAST key, a tie-breaker only. */
+export const RANK_LABELS = Object.freeze(["tool tier (band)", "health: latest status ok (band)", "ctx preference (band)", "price class 2b (band)", "first strike", "sweep demotion (blocked by the sweep, never excluded)",
+  "big step (v only)", "L4 (v only)", "forced-choice only (fc)", "argument fidelity failed (af)", "tool_result use failed (er, br)",
+  "ttft quantile bucket", "ctx class", "price 2b", "recency (order only, calendar-dependent)", "alias", "spawn failed (sp: a last tie-breaker; matters only for a row that acts as a MAIN agent)"]);
+/** Mirror of the sweep module's confirmedProviders and holdIsWrong: a test pins the two to each other. */
+export const confirmedByProvider = (models) => {
+  const out = Object.create(null);
+  for (const [k, r] of Object.entries(models ?? {})) if (r && (r.t === "t" || r.t === "v")) { const p = k.slice(0, k.indexOf("/")); out[p] = (out[p] ?? 0) + 1; }
+  return out;
+};
+export const holdIsWrong = (h, confirmed, provider) => !!h && (h.r === "gone" || h.r === "pay") && (confirmed?.[provider] ?? 0) > 0;
+const atMs = (iso) => { const t = Date.parse(String(iso ?? "")); return Number.isFinite(t) ? t : NaN; };
+const okEntry = (e) => !!e && typeof e === "object" && typeof e.r === "string" && Number.isFinite(atMs(e.at));
+
 /** Eligibility of a tool tier under the owner's `unverified` setting (5.1, 8 stage 4). `x` is never eligible. */
 export function toolEligible(tier, unverified, pinned) {
   if (tier === "x") return false;
@@ -147,7 +175,34 @@ export function funnel(inputs, toggles) {
   const warn = (code, text) => warnings.push({ code, text });
 
   const counts = { universe: 0, chatCapable: 0, routesInProviders: 0, inProviders: 0, idRejected: 0, benchOk: 0, toolsPass: 0,
-    accountState: { pay: 0, auth: 0, rate: 0 }, unverifiedExcluded: 0, oneMSpellingOnly: 0, nonAgent: 0 };
+    accountState: { pay: 0, auth: 0, rate: 0 }, unverifiedExcluded: 0, oneMSpellingOnly: 0, nonAgent: 0, unreachable: 0, gatewayCompat: 0, reprobeSkipped: 0 };
+  const unreachable = [], gatewayCompat = [];
+  const sweepPending = toolFidelity && typeof toolFidelity.pending === "object" && toolFidelity.pending && !Array.isArray(toolFidelity.pending) ? toolFidelity.pending : {};
+  const sweepHeld = toolFidelity && typeof toolFidelity.held === "object" && toolFidelity.held && !Array.isArray(toolFidelity.held) ? toolFidelity.held : {};
+  const confirmedBy = confirmedByProvider(toolFidelity?.models);
+  const passOf = (tf) => !!tf && (tf.t === "v" || tf.t === "t");
+  /** What the tool sweep says about this row's CURRENT state: {kind: "unreachable" | "demote", r, n, at, source, hard} or null (see the rules above). */
+  const sweepFinding = (g, tf) => {
+    const conf = confirmedBy[g.provider] ?? 0, tfAt = tf ? atMs(tf.at) : 0;
+    const newerPass = (at) => passOf(tf) && tfAt > atMs(at);
+    const found = [];
+    const pe = Object.hasOwn(sweepPending, g.selector) ? sweepPending[g.selector] : null;
+    if (okEntry(pe) && !(tf && !Number.isFinite(tfAt)) && !newerPass(pe.at)) {
+      const m = /^(canary-)?(pay|auth|gone)$/.exec(pe.r);
+      const hard = m && !(m[1] && m[2] !== "auth" && conf > 0) ? m[2] : null;
+      const runs = Number.isInteger(pe.rn) && pe.rn >= 1 ? pe.rn : 1;                     // a legacy entry (no rn) counts as ONE run: its n counts every run whatever the reason (cap, then error, ...); it heals when the next live sweep writes rn
+      const n = runs;
+      if (hard === "gone") found.push({ kind: passOf(tf) ? "demote" : "unreachable", r: "gone", n: null, at: pe.at, source: "pending", hard: true });
+      else if (hard) found.push({ kind: "demote", r: hard, n: null, at: pe.at, source: "pending", hard: true });
+      else if (SWEEP_SOFT.includes(pe.r) && runs >= SWEEP_MIN_N) found.push({ kind: "demote", r: pe.r, n, at: pe.at, source: "pending", hard: false });
+    }
+    const he = Object.hasOwn(sweepHeld, g.provider) ? sweepHeld[g.provider] : null;
+    if (okEntry(he) && !(tf && !Number.isFinite(tfAt)) && SWEEP_HARD.includes(he.r) && !holdIsWrong(he, confirmedBy, g.provider) && !(he.r === "auth" && newerPass(he.at))) {
+      found.push({ kind: he.r === "gone" ? "unreachable" : "demote", r: he.r, n: null, at: he.at, source: "held", hard: true });
+    }
+    return found.find((x) => x.kind === "unreachable") ?? found[0] ?? null;
+  };
+  const provOk = Object.create(null), provFind = Object.create(null), reprobeSkipped = [];
   const nonAgent = [];
   const idRejected = [];
   const dropped = new Map();                                    // `provider/bare` -> why a route never became a candidate
@@ -253,16 +308,27 @@ export function funnel(inputs, toggles) {
       // sa-A7: a free-tagged (or free-labelled-provider) row dropped on a transient status of an OLD sample is not dead, it is unknown: it waits for a re-probe and is named, never silently excluded
       if (isTransientDrop(rec) && Number.isFinite(rec.a) && nowMs / 1000 - rec.a > REPROBE_AGE_S && (g.tag || g.badgeFree || freeScopeOf(g.tier) === "providers")) {
         // the stored message can say the ACCOUNT is the reason (a plan, a key, an empty balance: the shell classifies it with the bench `classifyTight`): that is account state, not a model waiting for a re-probe
-        const why = typeof classifyBench === "function" ? classifyBench(rec) : null;
+        // the tool sweep's own repeated evidence wins over a single old bench message: a model the sweep found gone or erroring at its last N attempts is not "waiting for a re-probe", and one it found out of credit is account state
+        const sw = sweepFinding(g, toolFidelity?.models?.[g.selector] ?? null);
+        const why = sw?.kind === "unreachable" ? "gone" : sw?.kind === "demote" && sw.r === "pay" ? "pay" : (typeof classifyBench === "function" ? classifyBench(rec) : null);
         const row = { s: g.selector, status: rec.s, ageDays: Math.floor((nowMs / 1000 - rec.a) / 86400) };
         if (why === "pay" || why === "auth") { g.accountState = why; accountRows.push({ ...row, why }); }
         else if (why !== "gone") { g.reprobe = true; reprobe.push(row); }
+        else if (sw?.kind === "unreachable") { g.reprobeSkipped = sw; counts.reprobeSkipped += 1; reprobeSkipped.push({ ...row, r: sw.r, source: sw.source }); }      // never silent: named in a list (the sweep says it is gone, so it does not wait for a re-probe)
       }
       continue;
     }
     counts.benchOk += 1;
+    provOk[g.provider] = (provOk[g.provider] ?? 0) + 1;
     if (g.alias) aliasProbeOk += 1;
     const tf = toolFidelity?.models?.[g.selector] ?? null;
+    // M2: a record the sweep tagged xw:gateway failed because of the GATEWAY's own request translation, not the model: left out with that reason, and asked again only when CCR changes (a new CCR build re-queues it)
+    if (tf?.xw === "gateway") { g.stage = "gateway-compat"; g.gatewayCompat = true; counts.gatewayCompat += 1; gatewayCompat.push(g.selector); continue; }
+    // B1: the tool sweep's latest state of the model (see sweepFinding): a hard gone without any confirmed pass (or a held gone provider) is UNREACHABLE (left out, listed, never an allow-pin override); everything else only DEMOTES
+    const sf = sweepFinding(g, tf);
+    if (sf && sf.source === "pending") { const byR = (provFind[g.provider] ??= Object.create(null)); byR[sf.r] = (byR[sf.r] ?? 0) + 1; }
+    if (sf?.kind === "unreachable") { g.stage = "unreachable"; g.unreachable = sf; counts.unreachable += 1; unreachable.push({ s: g.selector, r: sf.r, n: sf.n, at: sf.at, source: sf.source }); continue; }
+    if (sf?.kind === "demote") g.demoted = sf;
     let tier, basis;
     // A known-issue seed stays in force until a record carries a REAL result at L3 or the big step (or is a confirmed x): an L1+L2-only record never sends a tool set or a 408 KB body, so it proves nothing about either.
     const ki = knownIssueOf(g.provider, g.bare);
@@ -286,6 +352,8 @@ export function funnel(inputs, toggles) {
     if (seed?.kind === "cap" && basis !== "provenance" && (g.limit === 0 || seed.capBelow < g.limit)) { g.limit = seed.capBelow; g.limitSource = "known-issue"; }
     // sa-T3: a provisional first strike (refresh/tool-fidelity.mjs: strikes 1) is read from ANY record, class or not; it ranks below a clean row of the same class and never excludes
     g.tfStrike = tf && tf.strikes === 1 ? 1 : 0;
+    // H2 markers (never a band key, never an exclusion): clean above flagged. fc p = L1 passed only when the call was forced; af f = argument fidelity failed; er f or br f = the is_error case or the use of a long tool_result failed; sp f = the spawn call failed
+    g.mk = basis === "tool-fidelity" ? { fc: tf.fc === "p" ? 1 : 0, af: tf.af === "f" ? 1 : 0, erbr: tf.er === "f" || tf.br === "f" ? 1 : 0, sp: tf.sp === "f" ? 1 : 0 } : { fc: 0, af: 0, erbr: 0, sp: 0 };
     if (!toolEligible(tier, T.unverified, allow.has(g.selector))) { counts.unverifiedExcluded += 1; g.stage = tier === "x" ? (basis === "known-issue" ? "known-bad" : "tools-failed") : "tools-unverified"; continue; }
     counts.toolsPass += 1;
     g.stage = "tools-pass";
@@ -362,9 +430,11 @@ export function funnel(inputs, toggles) {
 
   // ---- rank (5.3, revised by owner decision D1): the BAND keys come first, in this order: 1 tool tier, 2 HEALTH (the model's latest status is probe-ok: yes or no, AGE IGNORED, so the
   // band never depends on the calendar), 3 context preference class (only under a soft ctx preference prefer-256k, prefer-512k or prefer-1m: rows at or above it first), 4 price class (free
-  // providers under mode free). Then, INSIDE a band only, the ordering keys: 5 strike (a provisional first tool-fidelity strike after a clean row, sa-T3), 6 big step and 7 L4 (class v only),
-  // 8 TTFT QUANTILE bucket (D-bh), 9 ctx CLASS (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below or unknown; an inferred ctx is at most the 128k class), 10 price value, 11 RECENCY class (live within
-  // 7 days, probe within 14 days, older: CALENDAR-DEPENDENT, so it is an ordering key only and the last one before alias: it never outranks latency or context), 12 non-alias first; then a hash of the id (FNV-1a), then the id.
+  // providers under mode free). Then, INSIDE a band only, the ordering keys: 5 strike (a provisional first tool-fidelity strike after a clean row, sa-T3), 6 sweep demotion (the tool sweep failed at its last 3+ attempts for a reason that is not "gone" or "error" and no newer pass
+  // exists: ranked below clean rows, never excluded), 7 big step and 8 L4 (class v only), then the H2 MARKERS, each "clean above flagged" and none a band key: 9 fc (forced-choice only), 10 af (argument fidelity failed),
+  // 11 er or br (the is_error case or the long tool_result failed), then 12 TTFT QUANTILE bucket (D-bh), 13 ctx CLASS (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below or unknown; an inferred ctx is at most the 128k class),
+  // 14 price value, 15 RECENCY class (live within 7 days, probe within 14 days, older: CALENDAR-DEPENDENT, so it is an ordering key only: it never outranks latency or context), 16 non-alias first, and LAST 17 sp (the spawn
+  // call failed: a tie-breaker that matters only for a row that acts as a MAIN agent); then a hash of the id (FNV-1a), then the id. RANK_LABELS names them.
   const price2b = T.mode === "free" && T.freeScope !== "models";
   // TTFT QUANTILE buckets over the eligible set (D-bh): fast / ok / slow / very slow are the quartiles of the TTFTs of the rows in THIS set (nearest rank), so the buckets are equal-sized whatever the data
   // (the old fixed 1 s / 3 s cuts put 97.5% of the rows in one bucket); 4 = no TTFT recorded.
@@ -392,7 +462,7 @@ export function funnel(inputs, toggles) {
     // inside class v (never elsewhere): big step passed, then not run, then failed; then L4 the same way. Constant 0 outside v, so no other row moves.
     const inV = g.toolTier === "v" && g.toolBasis === "tool-fidelity";
     const pnf = { p: 0, n: 1, f: 2 };
-    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxPref, pc, g.tfStrike ? 1 : 0, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, h, ctxClassOf(g.c), pv, recency, g.alias ? 1 : 0];
+    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxPref, pc, g.tfStrike ? 1 : 0, g.demoted ? 1 : 0, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, g.mk.fc, g.mk.af, g.mk.erbr, h, ctxClassOf(g.c), pv, recency, g.alias ? 1 : 0, g.mk.sp];
   };
   for (const g of set) g.rk = keyOf(g);
   const cmpKeys = (a, b) => { for (let i = 0; i < a.rk.length; i++) if (a.rk[i] !== b.rk[i]) return a.rk[i] - b.rk[i]; return 0; };
@@ -456,6 +526,17 @@ export function funnel(inputs, toggles) {
   const ctxStats = { rows: chosenScope.length, unknown: chosenScope.filter((g) => g.cm === 0).length, inferred: chosenScope.filter((g) => g.ci).length,
     ge: Object.fromEntries(Object.entries(CTX_FLOORS).map(([k, v]) => [k, chosenScope.filter((g) => g.cm >= v).length])) };
   counts.ctxInferred = models.filter((r) => r.ci).length;
+  counts.ctxUnproven = counts.ctxInferred;                       // M1: a row whose 128k rests on a sibling's context: the only proof is the ~400 KB big step (about 100k tokens), the router's per-request fit check decides
+  const demoted = set.filter((g) => g.demoted).map((g) => ({ s: g.selector, r: g.demoted.r, n: g.demoted.n, at: g.demoted.at, source: g.demoted.source, hard: g.demoted.hard })).sort((a, b) => (a.s < b.s ? -1 : 1));
+  counts.demoted = demoted.length;
+  // a PATTERN across a provider's bench-ok rows (the same pending reason on at least 3 and at least half of them): the provider, not the models, is probably the cause. Shown instead of a wall of single lines; nothing is excluded for it.
+  const providerPatterns = [];
+  for (const [p, byR] of Object.entries(provFind)) {
+    const [r, k] = Object.entries(byR).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0];
+    if (k >= 3 && 2 * k >= provOk[p]) providerPatterns.push({ provider: p, reason: r, rows: k, of: provOk[p] });
+  }
+  providerPatterns.sort((a, b) => (a.provider < b.provider ? -1 : 1));
+  counts.providerPatterns = providerPatterns.length;
 
   // ---- hints for the router
   const exempt = [];
@@ -493,6 +574,11 @@ export function funnel(inputs, toggles) {
     if (nu > 0) warn("UNVERIFIED", `UNVERIFIED: ${nu} of ${models.length} allowed models have unverified tool support (D-f)`);
     if (premium > 0) warn("PREMIUM", `PREMIUM: ${premium} of ${models.length} allowed models are Opus- or Fable-priced (price shown per row; no cap, D-b)`);
     if (models.length > 0) warn("PAYLOAD", `PAYLOAD: ${payloadRisk} of ${models.length} allowed models have a known payload cap below ${PAYLOAD_RISK_BYTES.toLocaleString("en-US")} bytes; ${payloadUnknown} have no known cap, so the payload gate is inert for them until a cap is measured (live shadow: ${payloadSampleText()})`);
+    if (counts.unreachable > 0) warn("UNREACHABLE", `UNREACHABLE: ${counts.unreachable} of ${counts.benchOk} bench-ok ${counts.unreachable === 1 ? "model" : "models"} left out: the tool sweep found ${counts.unreachable === 1 ? "it" : "them"} gone and no confirmed pass exists (gone is a hard answer the sweep does not ask again; a held provider counts the same); an --allow pin does not override it (listed by show --detail yes and explain)`);
+    if (demoted.length > 0) warn("DEMOTED", `DEMOTED: ${demoted.length} of ${models.length} allowed ${demoted.length === 1 ? "model ranks" : "models rank"} below clean rows because the tool sweep is blocked on ${demoted.length === 1 ? "it" : "them"} (rate, upstream-unavailable, slow, timeout, error or quota for ${SWEEP_MIN_N}+ runs in a row; pay, auth, or a gone answer with an earlier pass at once); none is excluded`);
+    if (counts.gatewayCompat > 0) warn("GATEWAY_COMPAT", `GATEWAY_COMPAT: ${counts.gatewayCompat} of ${counts.benchOk} bench-ok ${counts.gatewayCompat === 1 ? "model" : "models"} left out because the tool test failed in the gateway's own request translation, not in the model; asked again only when CCR changes; an --allow pin does not override it`);
+    if (counts.ctxUnproven > 0) warn("CTX_UNPROVEN", `CTX UNPROVEN: ${counts.ctxUnproven} of ${models.length} allowed models rest on an INFERRED 128k context (a same-name sibling's); the only measured proof is the 400 KB big step (about 100k tokens), so the router's per-request fit check decides, not this flag`);
+    if (providerPatterns.length > 0) warn("PROVIDER_PATTERN", `PROVIDER_PATTERN: ${providerPatterns.slice(0, 6).map((x) => `${x.provider}: ${x.rows} of ${x.of} bench-ok rows pending ${x.reason}`).join("; ")}${providerPatterns.length > 6 ? ` and ${providerPatterns.length - 6} more` : ""}: the same sweep state on most of a provider's rows points at the provider, not the models; the rows are demoted or left out one by one, never the whole provider`);
     if (reprobe.length > 0) warn("REPROBE", `REPROBE: ${reprobe.length} free-tagged or free-provider models were dropped on a transient bench status (rate, empty, timeout, fetch failed) of a sample older than 2 days: not dead, waiting for a re-probe (listed by show --detail)`);
     if (oneMListing > 0) warn("ONE_M_LISTING", `1M basis listing-only for ${oneMListing} of ${models.length} allowed rows (n:1)`);
     if (alias > 0) warn("ALIAS", `ALIAS: ${alias} of ${models.length} allowed rows are pool aliases, flagged ALIAS, never above tier u`);
@@ -530,9 +616,9 @@ export function funnel(inputs, toggles) {
       alias, aliasProbeOk, oneMListing, creditPositive: credit, pricedButBadged,
       depositStrictSkipped: { ...skipped }, freeScopes, substitutable: substitutable["*"],
       chosenScopeN: chosenScope.length, chosenScopeCtx1m: chosenScope.filter((g) => g.oneM).length, reprobe: reprobe.length, accountStateRows: accountRows.length,
-      knownBad: [...groups.values()].filter((g) => g.stage === "known-bad").length },
+      knownBad: [...groups.values()].filter((g) => g.stage === "known-bad").length, unreachable: counts.unreachable, demoted: demoted.length, gatewayCompat: counts.gatewayCompat, ctxUnproven: counts.ctxUnproven, providerPatterns: providerPatterns.length, reprobeSkipped: counts.reprobeSkipped },
     totals, perProvider: own(perProvider), models, lists: { all: lists.all, byProvider: own(lists.byProvider), prov: own(lists.prov) }, substitutable: own(substitutable), emptyProviders, thinProviders, exempt, ctxHints: own(ctxHints), warnings, idRejected, tierMismatch,
-    skippedIds, groups, dropped, ctxStats, ttftCuts, nonAgent, reprobe: reprobe.sort((a, b) => (a.s < b.s ? -1 : 1)), accountRows: accountRows.sort((a, b) => (a.s < b.s ? -1 : 1)),
+    skippedIds, groups, dropped, ctxStats, ttftCuts, nonAgent, providerPatterns, reprobeSkipped: reprobeSkipped.sort((a, b) => (a.s < b.s ? -1 : 1)), unreachable: unreachable.sort((a, b) => (a.s < b.s ? -1 : 1)), demoted, gatewayCompat: gatewayCompat.sort(), reprobe: reprobe.sort((a, b) => (a.s < b.s ? -1 : 1)), accountRows: accountRows.sort((a, b) => (a.s < b.s ? -1 : 1)),
     stages: [
       { stage: "chat-capable", n: counts.chatCapable, of: counts.universe, unit: "routes" },
       { stage: "in-providers", n: counts.inProviders, of: counts.chatCapable, unit: "selectors (routes after the [1m] collapse)" },

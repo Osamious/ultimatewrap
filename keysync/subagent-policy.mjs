@@ -21,7 +21,7 @@ import { filterRegistry, chooseKeys } from "./keysync.mjs";
 import { CONTRACT as CC } from "../menu/cc-contract.mjs";
 import { CONTRACT as CCR, rpc, requestLogsDb, dataDir } from "../menu/ccr-client.mjs";
 import { funnel, emptyStage, FREE_TAG, SCOPE_NAMES, FREE_SCOPES, DEFAULT_MIN_SET, SUBSTITUTE_FLOOR, SUBSTITUTE_K, PREMIUM_RULE,
-  providerOf, stripOneM, CTX_VALUES, CTX_FLOORS, ctxSpec, ctxLabel, ctxClassOf, TTFT_BUCKETS, knownIssueText, payloadSampleText } from "../menu/subagent-funnel.mjs";
+  providerOf, stripOneM, CTX_VALUES, CTX_FLOORS, ctxSpec, ctxLabel, ctxClassOf, TTFT_BUCKETS, knownIssueText, payloadSampleText, RANK_LABELS, SWEEP_MIN_N } from "../menu/subagent-funnel.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { isExcludedTier, freeScopeOf, RELAY_TIER } from "../menu/tiers.mjs";
 import { CLI, CODES, codeRow, KINDS } from "../menu/subagent-codes.mjs";
@@ -29,7 +29,7 @@ import { verdict, verdictLine, savedLine, fixLine, deltaText, ownerDiffers, corr
 import { runWizard, ttyAsker, PRESETS, presetListText, flagsText } from "./subagent-wizard.mjs";
 export { PRESETS };
 
-export const COMPILER_VERSION = 2;                  // 2: revision 11 policy-side fix round (ctx floors, inferred ctx, rank order); the stamp is outside the hash, so `rebuild --if-stale` recompiles an older file and the router (minRouter 2) reads both
+export const COMPILER_VERSION = 3;                  // 3: the compile reads the tool sweep's latest state (unreachable, demoted), the H2 marker rank keys, gateway-compat and non-agent additions, ctx unproven; 2: revision 11 policy-side fix round (ctx floors, inferred ctx, rank order); the stamp is outside the hash, so `rebuild --if-stale` recompiles an older file and the router (minRouter 2) reads both
 /** The oldest router that can read a file this compiler writes (router v2: `lists.prov`, `row.b`, a null `lists.all`, a verified `contentHash`, the `rollout` block). It sits OUTSIDE the hash. */
 export const MIN_ROUTER = 2;
 const LLMKEYS = path.join(os.homedir(), ".llmkeys");
@@ -503,8 +503,10 @@ export function compile(g, owner, { now = () => new Date(), minSet, gate } = {})
       premium: res.counts.premium, payloadRisk: res.counts.payloadRisk, payloadUnknown: res.counts.payloadUnknown, tfAsOf: g.stamps.tfAsOf, alias: res.counts.alias,
       freeScopes: res.counts.freeScopes, depositStrictSkipped: res.counts.depositStrictSkipped, idRejected: res.counts.idRejected,
       nonAgent: res.counts.nonAgent, knownBad: res.counts.knownBad, ctxInferred: res.counts.ctxInferred, reprobe: res.counts.reprobe, accountStateRows: res.counts.accountStateRows, ctxStats: res.ctxStats,
+      unreachable: res.counts.unreachable, demoted: res.counts.demoted, gatewayCompat: res.counts.gatewayCompat, ctxUnproven: res.counts.ctxUnproven, benchOk: res.counts.benchOk, providerPatterns: res.counts.providerPatterns, reprobeSkipped: res.counts.reprobeSkipped,
       funnel: res.stages.map((s) => ({ stage: s.stage, n: s.n })) },
     accountStateRows: res.accountRows.slice(0, REPROBE_LIST_MAX),   // outside the hash: free models whose stored message names the ACCOUNT (plan, key, balance): not dead and not waiting for a re-probe
+    unreachable: res.unreachable.slice(0, REPROBE_LIST_MAX), demoted: res.demoted.slice(0, REPROBE_LIST_MAX), gatewayCompat: res.gatewayCompat.slice(0, REPROBE_LIST_MAX), providerPatterns: res.providerPatterns.slice(0, REPROBE_LIST_MAX), reprobeSkipped: res.reprobeSkipped.slice(0, REPROBE_LIST_MAX),   // outside the hash: what the tool sweep's latest state left out or ranked down (B1), the gateway-compat exclusions (M2), the provider-level patterns and the free rows the sweep found gone (never silent), for show --detail and the ledger
     reprobe: res.reprobe.slice(0, REPROBE_LIST_MAX),       // outside the hash: free-tagged rows dropped on a transient bench status of an old sample, for the re-probe and the ledger (sa-A7)
     models: res.models, lists: { ...res.lists, all: identityList(res.lists.all, res.models.length) ? null : res.lists.all },   // `all` is null when it is the identity 0..n-1 (the router then reads the rows by index)
     main: { ttlSec: MAIN_TTL_MS / 1000 }, sticky: { ttlSec: MAIN_TTL_MS / 1000, maxEntries: 256 },
@@ -718,12 +720,32 @@ export function ctxFloorsLine(st, ctx = "any") {
 /** The honest state of the payload gate (sa-A1): a row with no known request-size limit (pb 0) is never held back for size, so the gate is inert for it until a limit is measured. */
 export const payloadGateLine = (k) => (k && k.payloadUnknown > 0 && k.allowed > 0
   ? `payload limits: ${n(k.payloadUnknown)} of ${n(k.allowed)} eligible models have no known request-size limit, so the size check does nothing for them until a limit is measured (a tool test records one); live shadow: ${payloadSampleText()}` : null);
+const sweepTag = (x) => `${printable(x.r, 24)}${x.source === "held" ? ", provider held" : x.hard !== false ? ", hard answer" : x.n ? ` x${x.n}` : ""}`;
+const nameList = (arr, max, f2) => `${arr.slice(0, max).map(f2).join(", ")}${arr.length > max ? ` and ${arr.length - max} more` : ""}`;
+const patternText = (x) => `${printable(x.provider, 40)}: ${n(x.rows)} of ${n(x.of)} bench-ok rows pending ${printable(x.reason, 24)}`;
+const pl = (k, a, b) => (k === 1 ? a : b);
+/** The tool sweep's latest state of the models and the inferred-context count, in one line (B1, M2, M1): printed only when one of the counts is not zero, so a report without them stays as it was. */
+export function sweepLines(res) {
+  const c = res.counts, a = n(c.allowed), b = n(c.benchOk);
+  if (!(c.unreachable || c.demoted || c.gatewayCompat)) return [];
+  const parts = [];
+  if (c.unreachable) parts.push(`${n(c.unreachable)} of ${b} bench-ok ${pl(c.unreachable, "model", "models")} left out (the sweep found ${pl(c.unreachable, "it", "them")} gone and no confirmed pass exists)`);
+  if (c.demoted) parts.push(`${n(c.demoted)} of ${a} allowed ranked below clean rows (the sweep is blocked on ${pl(c.demoted, "it", "them")}; none excluded)`);
+  if (c.gatewayCompat) parts.push(`${n(c.gatewayCompat)} of ${b} bench-ok ${pl(c.gatewayCompat, "model", "models")} left out as gateway-compat (a CCR change re-queues ${pl(c.gatewayCompat, "it", "them")})`);
+  return [`SWEEP: ${parts.join("; ")}`];
+}
+/** The inferred-context line (a context fact, not a sweep fact): rows whose 128k rests on a sibling's context. Empty when there are none. */
+export function ctxUnprovenLines(res) {
+  const c = res.counts;
+  return c.ctxUnproven ? [`CTX UNPROVEN: ${n(c.ctxUnproven)} of ${n(c.allowed)} allowed ${pl(c.ctxUnproven, "model rests", "models rest")} on an inferred 128k context (a sibling's); the only measured proof is the 400 KB big step (about 100k tokens), so the router's per-request fit check decides`] : [];
+}
+
 /** The two headline count lines of a non-inherit report (the default `set` output keeps exactly these; `--detail yes` adds the whole funnel). */
 function allowedLines(res, minSet) {
   const c = res.counts, T = res.toggles;
   const free = T.mode === "free" ? [freeSetsLine(res)] : [];
   return [`ALLOWED: ${n(c.allowed)} ${c.allowed === 1 ? "model" : "models"} (of ${n(c.chosenScopeN)} in the chosen scope${ctxSpec(T.ctx).hard > 0 ? `, after the ctx ${T.ctx} filter` : ctxSpec(T.ctx).prefer > 0 ? `, ctx ${T.ctx}: rows of at least ${ctxLabel(T.ctx.slice(7))} form the higher band` : ""}; verified ${c.verified}, small ${c.small}, unverified ${c.unverified})`,
-    `SUBSTITUTABLE: ${n(c.substitutable)} of ${n(c.allowed)} allowed (known ctx >= ${n(SUBSTITUTE_FLOOR)}${c.ctxInferred ? `; ${n(c.ctxInferred)} of the ${n(c.allowed)} pass the floor on an inferred ctx` : ""}); providers with substitutable < ${minSet ?? DEFAULT_MIN_SET}: ${Object.keys(res.substitutable).filter((p) => p !== "*" && res.substitutable[p] < (minSet ?? DEFAULT_MIN_SET)).sort().join(", ") || "(none)"}`, ctxFloorsLine(res.ctxStats, T.ctx), ...free];
+    `SUBSTITUTABLE: ${n(c.substitutable)} of ${n(c.allowed)} allowed (known ctx >= ${n(SUBSTITUTE_FLOOR)}${c.ctxInferred ? `; ${n(c.ctxInferred)} of the ${n(c.allowed)} pass the floor on an inferred ctx` : ""}); providers with substitutable < ${minSet ?? DEFAULT_MIN_SET}: ${Object.keys(res.substitutable).filter((p) => p !== "*" && res.substitutable[p] < (minSet ?? DEFAULT_MIN_SET)).sort().join(", ") || "(none)"}`, ctxFloorsLine(res.ctxStats, T.ctx), ...sweepLines(res), ...ctxUnprovenLines(res), ...free];
 }
 
 export function formatReport({ owner, res, g, header, dry, minSet }) {
@@ -739,6 +761,11 @@ export function formatReport({ owner, res, g, header, dry, minSet }) {
   L.push(`  ${dots("bench ok (any age)")} ${n(c.benchOk)} of ${n(c.inProviders)} selectors`);
   L.push(`  ${dots("tools != false")} ${n(c.toolsPass)} of ${n(c.benchOk)} selectors`);
   if (c.knownBad) L.push(`  ${dots("known issue (seed)")} ${n(c.knownBad)} of ${n(c.benchOk)} probe-ok selectors excluded by a known issue until a real tool test says otherwise (explain names it)`);
+  if (c.unreachable) L.push(`  ${dots("unreachable (sweep)")} ${n(c.unreachable)} of ${n(c.benchOk)} probe-ok ${pl(c.unreachable, "selector", "selectors")} left out: the tool sweep found ${pl(c.unreachable, "it", "them")} gone and no confirmed pass exists (an --allow pin does not override this): ${nameList(res.unreachable, 12, (x) => `${printable(x.s, 100)} (${sweepTag(x)})`)}`);
+  if (c.demoted) L.push(`  ${dots("sweep demoted")} ${n(c.demoted)} of ${n(c.allowed)} allowed ${pl(c.demoted, "selector ranks", "selectors rank")} below clean rows (the tool sweep is blocked on ${pl(c.demoted, "it", "them")}; never excluded): ${nameList(res.demoted, 12, (x) => `${printable(x.s, 100)} (${sweepTag(x)})`)}`);
+  if (c.gatewayCompat) L.push(`  ${dots("gateway-compat")} ${n(c.gatewayCompat)} of ${n(c.benchOk)} probe-ok ${pl(c.gatewayCompat, "selector", "selectors")} left out: the tool test failed in the gateway's own request translation (xw), asked again only when CCR changes, an --allow pin does not override it: ${nameList(res.gatewayCompat, 12, (x) => printable(x, 100))}`);
+  if (c.providerPatterns) L.push(`  ${dots("provider pattern (sweep)")} ${nameList(res.providerPatterns, 8, patternText)}: the provider, not the models, is probably the cause; rows are demoted or left out one by one, never the provider as a whole`);
+  if (c.reprobeSkipped) L.push(`  ${dots("re-probe skipped (sweep)")} ${n(c.reprobeSkipped)} of ${n(c.inProviders)} selectors dropped on a transient bench status are NOT waiting for a re-probe: the tool sweep found ${pl(c.reprobeSkipped, "it", "them")} gone: ${nameList(res.reprobeSkipped, 12, (x) => `${printable(x.s, 100)} (${x.status}, ${x.ageDays} d)`)}`);
   if (c.accountStateRows) L.push(`  ${dots("account state")} ${n(c.accountStateRows)} of ${n(c.inProviders)} selectors: free-tagged, dropped on a transient bench status whose stored message names your account (plan, key or balance), so a re-probe will not change it: ${res.accountRows.slice(0, 12).map((x) => `${x.s} (${x.why})`).join(", ")}${res.accountRows.length > 12 ? ` and ${res.accountRows.length - 12} more` : ""}`);
   if (c.reprobe) L.push(`  ${dots("re-probe (not dead)")} ${n(c.reprobe)} of ${n(c.inProviders)} selectors: free-tagged, dropped on a transient bench status of a sample older than 2 days: ${res.reprobe.slice(0, 12).map((x) => `${x.s} (${x.status}, ${x.ageDays} d)`).join(", ")}${res.reprobe.length > 12 ? ` and ${res.reprobe.length - 12} more` : ""}`);
   L.push("  free scopes (probe-ok selectors after the tools stage; tier from the vault registry, D-k):");
@@ -841,7 +868,7 @@ export function attentionLines(res, g, owner, minSet = DEFAULT_MIN_SET) {
   const L = [], c = res.counts, T = res.toggles, inherit = T.mode === "inherit";
   const add = (sev, text) => L.push({ sev, text });
   const codes = new Set([...g.warnings, ...res.warnings].map((w) => w.code));
-  const covered = new Set(["SOURCE_IGNORED", "UNVERIFIED", "PREMIUM", "PAYLOAD", "FRAGILE", "EMPTY_PROVIDERS", "FREE_PROMISE", "CREDIT", "FREE_PROVIDERS", "ACCOUNT_STATE", "INHERIT_PREMIUM_MAIN", "INHERIT_BELOW_CTX"]);
+  const covered = new Set(["SOURCE_IGNORED", "UNVERIFIED", "PREMIUM", "PAYLOAD", "FRAGILE", "EMPTY_PROVIDERS", "FREE_PROMISE", "CREDIT", "FREE_PROVIDERS", "ACCOUNT_STATE", "INHERIT_PREMIUM_MAIN", "INHERIT_BELOW_CTX", "UNREACHABLE", "DEMOTED", "GATEWAY_COMPAT", "CTX_UNPROVEN", "PROVIDER_PATTERN"]);
   if (!inherit) {
     const nm = res.models.length;
     if (c.unverified > 0) add(3, `${c.unverified} of ${nm} eligible models ${isAre(c.unverified)} not tool-tested (a subagent on one may fail when it uses tools)`);
@@ -860,6 +887,12 @@ export function attentionLines(res, g, owner, minSet = DEFAULT_MIN_SET) {
     }
     const dear = res.models.filter((r) => (outPrice(r.i) ?? 0) >= 15).length;
     if (dear > 0) add(2, `${dear} of ${nm} eligible models ${dear === 1 ? "costs" : "cost"} $15+/M output`);
+    if (c.unreachable > 0) add(3, `${c.unreachable} of ${c.benchOk} bench-ok ${pl(c.unreachable, "model", "models")} left out: the tool sweep found ${pl(c.unreachable, "it", "them")} gone and no confirmed pass exists (listed by --detail yes; an --allow pin does not override it)`);
+    if (c.demoted > 0) add(3, `${c.demoted} of ${nm} eligible ${pl(c.demoted, "model ranks", "models rank")} below clean rows: the tool sweep is blocked on ${pl(c.demoted, "it", "them")} (never excluded)`);
+    for (const x of (res.providerPatterns ?? []).slice(0, 3)) add(3, `${patternText(x)}: a provider-level pattern, so the provider (not the models) is probably the cause`);
+    if ((res.providerPatterns ?? []).length > 3) add(3, `${res.providerPatterns.length - 3} more provider-level sweep patterns (--detail yes)`);
+    if (c.gatewayCompat > 0) add(4, `${c.gatewayCompat} of ${c.benchOk} bench-ok ${pl(c.gatewayCompat, "model", "models")} left out as gateway-compat (a CCR change re-queues ${pl(c.gatewayCompat, "it", "them")}; an --allow pin does not override it)`);
+    if (c.ctxUnproven > 0) add(4, `ctx unproven for ${c.ctxUnproven} of ${nm} eligible ${pl(c.ctxUnproven, "model", "models")} (an inferred 128k; the router's per-request fit check decides)`);
     if (c.payloadRisk > 0) add(4, `${c.payloadRisk} of ${nm} eligible models ${c.payloadRisk === 1 ? "refuses" : "refuse"} requests over 1 MB (${c.payloadUnknown} more ${c.payloadUnknown === 1 ? "has" : "have"} no known limit)`);
   } else {
     for (const w of res.warnings) if (w.code === "INHERIT_PREMIUM_MAIN") add(2, "every subagent will run on main's model, and that model costs $15+/M output or is Opus- or Fable-class");
@@ -961,7 +994,7 @@ function routerVersionNote(p, compiled) {
 
 /** `N of M`: how many of the providers behind a compiled copy's models are in a list (the denominator is the providers that have an eligible model). */
 const providersOfCompiled = (c) => new Set((c.models ?? []).map((r) => providerOf(r.s))).size;
-function describeCompiled(c, age, detail = false) {
+export function describeCompiled(c, age, detail = false) {
   const o = c.owner, k = c.counts, a = k.allowed, P = providersOfCompiled(c);
   const lst = (arr) => (arr?.length ? arr.join(", ") : "none");
   const empties = c.emptyProviders ?? [], thin = c.thinProviders ?? [];
@@ -969,7 +1002,12 @@ function describeCompiled(c, age, detail = false) {
     `  providers with no usable stand-in: ${lst(empties)} (${empties.length} of ${P}); thin, fewer than ${DEFAULT_MIN_SET} usable: ${lst(thin)} (${thin.length} of ${P})`,
     ...(k.ctxStats ? [`  ${ctxFloorsLine(k.ctxStats, o.ctx)}`] : []),
     ...(payloadGateLine(k) ? [`  ${payloadGateLine(k)}`] : []),
-    ...(k.ctxInferred ? [`  ${k.ctxInferred} of ${a} eligible models pass the 128k floor on an inferred ctx (c?, a sibling's context)`] : []),
+    ...(k.ctxInferred ? [`  CTX UNPROVEN: ${k.ctxInferred} of ${a} eligible ${pl(k.ctxInferred, "model passes", "models pass")} the 128k floor on an inferred ctx (c?, a sibling's context): the only measured proof is the 400 KB big step (about 100k tokens); the router's per-request fit check decides`] : []),
+    ...(k.unreachable ? [`  ${k.unreachable} of ${k.benchOk ?? "?"} bench-ok ${pl(k.unreachable, "model", "models")} left out: the tool sweep found ${pl(k.unreachable, "it", "them")} gone and no confirmed pass exists (an --allow pin does not override it)${detail && Array.isArray(c.unreachable) ? `: ${nameList(c.unreachable, 20, (x) => `${printable(x.s, 100)} (${sweepTag(x)})`)}` : " (--detail yes names them)"}`] : []),
+    ...(k.demoted ? [`  ${k.demoted} of ${a} eligible ${pl(k.demoted, "model ranks", "models rank")} below clean rows (the tool sweep is blocked on ${pl(k.demoted, "it", "them")}; never excluded)${detail && Array.isArray(c.demoted) ? `: ${nameList(c.demoted, 20, (x) => `${printable(x.s, 100)} (${sweepTag(x)})`)}` : " (--detail yes names them)"}`] : []),
+    ...(k.gatewayCompat ? [`  ${k.gatewayCompat} of ${k.benchOk ?? "?"} bench-ok ${pl(k.gatewayCompat, "model", "models")} left out as gateway-compat (the tool test failed in the gateway's own request translation; asked again only when CCR changes)${detail && Array.isArray(c.gatewayCompat) ? `: ${nameList(c.gatewayCompat, 20, (x) => printable(x, 100))}` : ""}`] : []),
+    ...(k.providerPatterns && Array.isArray(c.providerPatterns) ? [`  provider pattern (tool sweep): ${nameList(c.providerPatterns, 8, patternText)}: the provider, not the models, is probably the cause`] : []),
+    ...(k.reprobeSkipped ? [`  ${k.reprobeSkipped} free ${pl(k.reprobeSkipped, "model", "models")} dropped on a transient bench status ${pl(k.reprobeSkipped, "is", "are")} NOT waiting for a re-probe: the tool sweep found ${pl(k.reprobeSkipped, "it", "them")} gone${detail && Array.isArray(c.reprobeSkipped) ? `: ${nameList(c.reprobeSkipped, 20, (x) => printable(x.s, 100))}` : ""}`] : []),
     ...(k.accountStateRows ? [`  ${k.accountStateRows} free-tagged models show an account state (their stored message names your plan, key or balance), not a pending re-probe${detail && Array.isArray(c.accountStateRows) ? `: ${c.accountStateRows.slice(0, 20).map((x) => `${printable(x.s, 100)} (${printable(x.why, 8)})`).join(", ")}${c.accountStateRows.length > 20 ? ` and ${c.accountStateRows.length - 20} more` : ""}` : " (--detail yes names them)"}`] : []),
     ...(k.reprobe ? [`  ${k.reprobe} free-tagged models wait for a re-probe (dropped on a transient bench status, not dead)${detail && Array.isArray(c.reprobe) ? `: ${c.reprobe.slice(0, 20).map((x) => `${printable(x.s, 100)} (${printable(x.status, 12)})`).join(", ")}${c.reprobe.length > 20 ? ` and ${c.reprobe.length - 20} more` : ""}` : " (--detail yes names them)"}`] : []),
     ...(detail ? [`  compiled ${c.compiledAt}, contentHash ${c.contentHash}, compiler ${c.builtFrom?.compiler}, providersLive ${c.builtFrom?.providersLive}`,
@@ -1047,6 +1085,7 @@ async function cmdShow(p, flags, io, opts = {}) {
     if (isObject(s.policy) && typeof s.policy.headline === "string" && (!compiled || s.policy.enforcement === compiled.owner.enforcement) && printable(s.policy.headline, 200) !== v.sentence) L.push(`  ${printable(s.policy.headline, 200)}`);
     if (Number.isInteger(s.workers) && s.workers > 1) L.push(`  (merged over ${s.workers} router worker status files)`);
     if (flags.detail && isObject(s.policy)) L.push(`  router effective mode: enforcement ${printable(s.policy.enforcement ?? "?", 20)}, inject ${printable(s.policy.inject ?? "?", 20)}${s.policy.rollbackFlag ? ", rollback flag set (acts as shadow)" : ""}; policy ${printable(s.policy.state ?? "?", 20)}`);
+    L.push(...trafficLines(classTraffic(readAgentLog(p.stateDir, CLASS_FILES).lines)).map((x) => `  ${x}`));
     for (const w of Array.isArray(s.warnings) ? s.warnings : []) if (isObject(w)) L.push(`  router warning ${printable(w.code, 40)}${w.detail ? `: ${printable(w.detail)}` : ""}`);
     for (const [sid, m] of Object.entries(isObject(s.mainBySession) ? s.mainBySession : {})) if (isObject(m)) L.push(`  main of session ${printable(sid, 16)}: ${printable(m.model)}`);
   }
@@ -1085,6 +1124,7 @@ async function cmdStatus(p, flags, io, opts = {}) {
     const cn = isObject(status.counters) ? status.counters : {};
     const upd = Date.parse(status.updatedAt ?? "");
     L.push(`router: last seen ${Number.isFinite(upd) ? `${ago(nowMs - upd)} ago` : "at an unknown time"}; ${cn.sub ?? 0} subagent requests of ${cn.req ?? 0} requests since ${printable(status.since ?? "?", 40)}`);
+    L.push(...trafficLines(classTraffic(readAgentLog(p.stateDir, CLASS_FILES).lines)).map((x) => `  ${x}`));
     if (v.state === "WAITING") L.push("  (this report predates your latest save, or comes from a router still on the older copy: the router uses the new one from its next request)");
     L.push(...warningLines(status.warnings, "warning "));
   } else L.push(sr.reason === "missing" ? "router: no status file yet (it has not run with a policy)" : `router: status unreadable right now (${sr.reason})`);
@@ -1097,6 +1137,37 @@ const LOG_FILES = ["agents.3.jsonl", "agents.2.jsonl", "agents.1.jsonl", "agents
 const LOG_READ_MAX = 4 * 1024 * 1024;
 /** Reads the agent decision log and its rotated files; a torn or non-object line is skipped and counted, never fatal. */
 export const CLASS_FILES = ["classify.1.jsonl", "classify.jsonl"];                                // the classifier log (one line per classified request) and its one rotated generation
+/**
+ * TRAFFIC SHARES from the classifier log (one line per classified request: cls main|sub|aux|exempt, ag agent id present, bl billing flag, sid the first 8 characters of the session id). Requests WITHOUT a session id
+ * (the router's fallback spelling "nosession", cut to "nosessio" in this log) are the UW tooling's own probe traffic (keysync and refresh probe profiles), not client sessions and not a subagent bypass: they are
+ * counted as their own line and EXCLUDED from every share, so each share names its denominator (client requests with a session id). `keep` narrows the window (a since or session filter). Pure.
+ * teammates = an agent id without the billing flag, builtIn = the billing flag (the built-in subagent shape); the two detectors disagree exactly when ag differs from bl.
+ */
+export const isProbeSid = (sid) => { const s = String(sid ?? "").toLowerCase(); return s === "" || s === "nosession" || s === "nosessio"; };
+export function classTraffic(classLines, keep = () => true) {
+  const o = { requests: 0, probe: 0, probeAgentShaped: 0, client: 0, main: 0, sub: 0, aux: 0, exempt: 0, other: 0, agentShaped: 0, teammates: 0, builtIn: 0, detectorDisagree: 0 };
+  for (const x of classLines ?? []) {
+    if (!isObject(x) || typeof x.cls !== "string" || !keep(x)) continue;
+    o.requests += 1;
+    if (isProbeSid(x.sid)) { o.probe += 1; if (x.ag === 1 || x.bl === 1) o.probeAgentShaped += 1; continue; }      // an agent-shaped probe row is excluded too, but counted (never silently lost)
+    o.client += 1;
+    if (x.cls === "main" || x.cls === "sub" || x.cls === "aux" || x.cls === "exempt") o[x.cls] += 1; else o.other += 1;
+    const ag = x.ag === 1, bl = x.bl === 1;
+    if (ag || bl) { o.agentShaped += 1; if (ag && !bl) o.teammates += 1; if (bl) o.builtIn += 1; }
+    if (ag !== bl) o.detectorDisagree += 1;
+  }
+  return o;
+}
+const sharePct = (a, b) => (b > 0 ? ` (${Math.round((100 * a) / b)}%)` : "");
+/** The plain lines of the traffic shares: the probe traffic as its own line, then every share over the client requests that carry a session id. */
+export function trafficLines(tr) {
+  if (!tr || !tr.requests) return [];
+  const L = [`non-client probe traffic (${tr.probe} of ${tr.requests} classified requests${tr.probeAgentShaped ? `, ${tr.probeAgentShaped} of them agent-shaped` : ""}), excluded: they carry no session id`];
+  if (!tr.client) { L.push("client requests (with a session id): none in the classifier log"); return L; }
+  L.push(`client requests (with a session id; every share below is of these ${tr.client}): main ${tr.main}${sharePct(tr.main, tr.client)}, sub ${tr.sub}${sharePct(tr.sub, tr.client)}, aux ${tr.aux}${sharePct(tr.aux, tr.client)}${tr.exempt ? `, exempt ${tr.exempt}${sharePct(tr.exempt, tr.client)}` : ""}${tr.other ? `, other ${tr.other}` : ""}`);
+  if (tr.agentShaped) L.push(`agent-shaped client requests (${tr.agentShaped} of ${tr.client}): teammates ${tr.teammates} (an agent id without the billing flag), built-in ${tr.builtIn} (the billing flag); the two detectors disagree on ${tr.detectorDisagree} of ${tr.agentShaped}`);
+  return L;
+}
 export function readAgentLog(stateDir, names = LOG_FILES) {
   const lines = [];
   let unreadable = 0, files = 0;
@@ -1469,13 +1540,26 @@ function substituteLine(res, selector, banded = true) {
 const FALLBACK_RULE = "fallback: a cooling model (the 2 min, 10 min, 60 min, 6 h ladder, per provider key too) or one the observer marks rate within 2 h, pay or auth within 24 h is demoted, never removed; when the whole lead band is demoted the router uses the next band of the SAME tool tier, then a LOWER tool tier only if it is tested (v, then t), never an untested u; when nothing tested remains it uses the demoted lead row, or keeps the current model on a handoff";
 
 /** Plain words for the stage at which a model stopped (the `explain` ANSWER line). */
-const STAGE_PLAIN = (grp, owner) => {
+export const STAGE_PLAIN = (grp, owner) => {
   const st = String(grp.stage ?? "");
   if (st.startsWith("bench-")) return grp.status && grp.status !== "ok" ? `its last speed test was ${grp.status}, not ok` : "it has no speed-test record";
   return ({ "tools-false-claim": "the catalogue says it cannot use tools", "tools-failed": "it failed the tool test", "known-bad": `${grp.knownIssue ? knownIssueText(grp.knownIssue) : "known issue"}, and no real tool test has overridden it`, "tools-unverified": "it is not tool-tested and the unverified setting excludes untested models",
+    "unreachable": grp.unreachable ? `the tool sweep found it gone${grp.unreachable.source === "held" ? " (its provider is held gone)" : " (a hard answer the sweep does not ask again)"}, last at ${grp.unreachable.at}, and no confirmed pass exists: the sweep's result is its latest state. An --allow pin does not override this` : "the tool sweep found it unreachable",
+    "gateway-compat": "its tool test failed in the gateway's own request translation, not in the model; it is asked again only when CCR changes. An --allow pin does not override this",
     "excluded-tier": `its key tier (${grp.tier}) is an excluded tier`, "scope": owner.mode === "free" ? `it is outside ${SCOPE_NAMES[owner.freeScope]}` : "it is outside the chosen scope",
     "ctx": `it has less than ${ctxLabel(owner.ctx)} of known context and the context floor is ${owner.ctx}` })[st] ?? `it stopped at ${st}`;
 };
+
+/** The explain lines that come from the tool sweep and the tool-test markers (pure; the same text `explain` prints): the demotion, a skipped re-probe, a provider-level pattern, an --allow pin that cannot override, the markers. */
+export function sweepExplainLines(grp, res, owner) {
+  const L = [];
+  if (grp.demoted) L.push(`sweep demotion: the tool sweep ${grp.demoted.source === "held" ? `holds its provider ${grp.demoted.r}` : grp.demoted.hard ? `got a hard answer for it (${grp.demoted.r}${grp.demoted.r === "gone" ? ", but an earlier confirmed pass exists" : ""})` : `is blocked on it (${grp.demoted.r}, ${grp.demoted.n} runs in a row)`}, last at ${grp.demoted.at}, with no newer confirmed pass: it ranks below clean rows of its band, never excluded`);
+  if (grp.reprobeSkipped) L.push(`re-probe skipped: its bench status is ${grp.status} on a sample older than 2 days, but the tool sweep found it gone (${grp.reprobeSkipped.source === "held" ? "its provider is held" : "a hard answer"}), so it does not wait for a re-probe`);
+  { const pp = res.providerPatterns.find((x) => x.provider === grp.provider); if (pp) L.push(`provider pattern: ${patternText(pp)}: the provider, not this model, is probably the cause`); }
+  if ((owner.allow ?? []).includes(grp.selector) && (grp.stage === "unreachable" || grp.stage === "gateway-compat")) L.push(`allow pin: your --allow pin for ${grp.selector} does NOT override ${grp.stage}: the model cannot be reached, or fails through the gateway`);
+  if (grp.mk && (grp.mk.fc || grp.mk.af || grp.mk.erbr || grp.mk.sp)) L.push(`tool-test markers (rank keys, clean above flagged): ${[grp.mk.fc ? "fc: the first call passed only when forced" : null, grp.mk.af ? "af: argument fidelity failed" : null, grp.mk.erbr ? "er or br: the is_error case or the long tool_result failed" : null, grp.mk.sp ? "sp: launching a subagent failed (the LAST rank key, a tie-breaker; matters only when this model acts as a MAIN agent)" : null].filter(Boolean).join("; ")}`);
+  return L;
+}
 
 async function cmdExplain(p, flags, io, target) {
   // what-if (plan 7.2 item 4): --source/--mode/--free-scope/--ctx replace the saved toggles FOR THIS ANSWER ONLY; nothing is written
@@ -1510,8 +1594,9 @@ async function cmdExplain(p, flags, io, target) {
   L.push(`price: ${res.models.find((r) => r.s === grp.selector)?.i ?? (grp.pin == null && grp.pout == null ? "$?" : `$${grp.pin}/$${grp.pout}`)}; free verdict: ${grp.pin === 0 && grp.pout === 0 ? "price 0 (free on a free-labelled provider, like a free-tagged row)" : "not price 0"}; premium: ${grp.premium ? `yes (${PREMIUM_RULE.families.join("/")} family or output >= $${PREMIUM_RULE.outUsdPerM}/M)` : "no"}${grp.pricedButBadged ? "; PRICED_BUT_BADGED" : ""}`);
   if (grp.knownIssue) L.push(`${knownIssueText(grp.knownIssue)}${grp.knownIssue.kind === "cap" ? ` (a size cap of about ${sizeCell(grp.knownIssue.capBelow)}, never an x)` : ""}; used only until a real tool-fidelity record exists`);
   if (grp.accountState) L.push(`account state: its bench status is ${grp.status} but the stored message names your account (${grp.accountState}); a re-probe will not change it, so it is not listed as waiting`);
+  L.push(...sweepExplainLines(grp, res, owner));
   if (grp.reprobe) L.push(`re-probe: its bench status is ${grp.status} on a sample older than 2 days; a transient status is not proof it cannot work, so it waits for a re-probe`);
-  L.push(`ctx: ${grp.c > 0 ? n(grp.c) : "unknown"} (${grp.ci ? "INFERRED (c?) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k" : grp.tag1m ? "[1m] sibling" : grp.c > 0 ? "catalogue" : "unknown"}${grp.n ? "; n:1 listing-only, needs the context-1m beta header" : ""}); substitutable: ${grp.c >= SUBSTITUTE_FLOOR ? "yes" : "no (needs a known context of at least 128,000)"}`);
+  L.push(`ctx: ${grp.c > 0 ? n(grp.c) : "unknown"} (${grp.ci ? "INFERRED (c?) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k; ctx UNPROVEN: the only proof is the 400 KB big step (about 100k tokens), the router's per-request fit check decides" : grp.tag1m ? "[1m] sibling" : grp.c > 0 ? "catalogue" : "unknown"}${grp.n ? "; n:1 listing-only, needs the context-1m beta header" : ""}); substitutable: ${grp.c >= SUBSTITUTE_FLOOR ? "yes" : "no (needs a known context of at least 128,000)"}`);
   L.push(`payload cap: ${grp.limit > 0 ? `${sizeCell(grp.limit)} (band ${capBand(grp.limit)}; source ${grp.limitSource ?? "?"})` : "unknown (the size check does nothing for it until a limit is measured)"}`);
   if (grp.in) {
     for (const s of FREE_SCOPES) {
@@ -1525,7 +1610,7 @@ async function cmdExplain(p, flags, io, target) {
   L.push(`toggles: source=${owner.source} mode=${owner.mode} ctx=${owner.ctx}: ${grp.stage === "in-set" ? "IN the allowed set" : `NOT in the allowed set (stopped at ${grp.stage})`}`);
   const idx = res.models.findIndex((r) => r.s === grp.selector);
   if (idx >= 0) {
-    const labels = ["tool tier (band)", "health: latest status ok (band)", "ctx preference (band)", "price class 2b (band)", "first strike", "big step (v only)", "L4 (v only)", "ttft quantile bucket", "ctx class", "price 2b", "recency (order only, calendar-dependent)", "alias"];
+    const labels = RANK_LABELS;
     L.push(`rank: position ${idx + 1} of ${res.models.length} (ordered by reliability then context, NOT by quality or price); keys ${labels.map((l, i) => `${l}=${grp.rk[i]}`).join(", ")}`);
     L.push(`shortlist: ${idx < INJECT_MAX_ENTRIES ? "listed" : "beyond the 20-entry injected shortlist"}; ${substituteLine(res, grp.selector, owner.banded !== false)}`);
     L.push(`band: ${grp.b} (equal tool tier, health, ctx preference and price class; rows in one band are interchangeable for the spread)`, FALLBACK_RULE);

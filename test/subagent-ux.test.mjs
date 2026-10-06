@@ -277,7 +277,7 @@ test("show: verdict first, the last-change delta when an undo generation exists,
   // U5: the technical fields are behind --detail yes, and show and status print `policy:` in the SAME format
   assert.doesNotMatch(r.out, /providersLive|contentHash|compiler 2|inject off/, "no internal field in the default view");
   const det = await SHOW(s, "--detail", "yes");
-  for (const needle of [/providersLive false/, /contentHash [0-9a-f]{12}/, /compiler 2/, /inject off/]) assert.match(det.out, needle);
+  for (const needle of [/providersLive false/, /contentHash [0-9a-f]{12}/, /compiler 3/, /inject off/]) assert.match(det.out, needle);
   const pol = (x) => /^policy: (.*)$/m.exec(x)[1];
   assert.equal(pol(r.out), "mode free (free providers), source all-providers, ctx any, enforcement shadow");
   assert.equal(pol(r.out), pol((await STATUS(s)).out), "show and status say the same policy line");
@@ -1103,7 +1103,7 @@ test("code table (F14, F15): EVERY fix command of EVERY row parses through the r
     if (r.degrades) assert.doesNotMatch(r.fix, /--dry yes|preset( \w[\w-]*)?$/, `${r.code}: a degrading code's fix is a repair, not a preview`);
   }
   assert.ok(parsed >= 50, `parsed ${parsed} subagent-policy fix commands`);
-  assert.equal(CODES.length, 130, "the table holds 130 rows");
+  assert.equal(CODES.length, 135, "the table holds 135 rows");
   // the rows the review named
   assert.equal(codeRow("FREE_PROMISE_BREAK").fix, `${CLI} show --detail yes`);
   assert.equal(codeRow("UNKNOWN_MAIN").fix, `${CLI} status`); assert.match(codeRow("UNKNOWN_MAIN").fixNote, /start a request in the main session first/);
@@ -1264,10 +1264,10 @@ test("explain: an INFERRED ctx is named as such, a seeded known issue is named w
   wr(s.m["bench-file"], bn);
   const e = await run(["explain", "fx-free-b/sib-model:free", ...s.F]);
   assert.equal(e.status, 0, e.err);
-  assert.match(e.out, /^ctx: 128,000 \(INFERRED \(c\?\) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k\)/m);
+  assert.match(e.out, /^ctx: 128,000 \(INFERRED \(c\?\) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k; ctx UNPROVEN: the only proof is the 400 KB big step \(about 100k tokens\), the router's per-request fit check decides\)/m);
   const e256 = await run(["explain", "fx-free-b/sib-model:free", "--ctx", "256k", ...s.F]);
   assert.match(e256.out, /would NOT be allowed under mode dynamic, source all-providers, ctx 256k: it has less than 256k of known context and the context floor is 256k/);
-  assert.match(e.out, /^rank: position \d+ of \d+.*first strike=0, big step \(v only\)=\d, L4 \(v only\)=\d, ttft quantile bucket=\d, ctx class=4, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d/m);
+  assert.match(e.out, /^rank: position \d+ of \d+.*first strike=0, sweep demotion \(blocked by the sweep, never excluded\)=\d, big step \(v only\)=\d, L4 \(v only\)=\d, forced-choice only \(fc\)=\d, argument fidelity failed \(af\)=\d, tool_result use failed \(er, br\)=\d, ttft quantile bucket=\d, ctx class=4, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d, spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)=\d/m);
 });
 
 test("wizard: the context question offers the hard floors and the soft preferences, prints the rows per floor above it, and answer 2 and 3 keep their old meaning (prefer-1m, 1m)", async () => {
@@ -1290,7 +1290,7 @@ test("F1: a policy compiled by an OLDER compiler (stamp 1) is rebuilt by `rebuil
   const s = setup();
   assert.equal((await SET(s, ...DYN)).status, 0);
   const c = rd(s.compiled);
-  assert.equal(c.builtFrom.compiler, lib.COMPILER_VERSION); assert.equal(lib.COMPILER_VERSION, 2);
+  assert.equal(c.builtFrom.compiler, lib.COMPILER_VERSION); assert.equal(lib.COMPILER_VERSION, 3);
   assert.equal((await run(["rebuild", "--if-stale", "yes", ...s.F])).out, "up to date: nothing to rebuild", "a current file is not rebuilt");
   const old = { ...c, builtFrom: { ...c.builtFrom, compiler: 1 } };
   wr(s.compiled, old);
@@ -1299,7 +1299,25 @@ test("F1: a policy compiled by an OLDER compiler (stamp 1) is rebuilt by `rebuil
   assert.equal(r.status, 0, r.err);
   assert.match(r.out, /^rebuilt /m, "the old stamp is stale");
   const fresh = rd(s.compiled);
-  assert.equal(fresh.builtFrom.compiler, 2);
+  assert.equal(fresh.builtFrom.compiler, lib.COMPILER_VERSION);
   assert.deepEqual([fresh.minRouter, fresh.contentHash], [old.minRouter, old.contentHash], "minRouter and the hash are unchanged: only the stamp moved");
   assert.equal((await run(["rebuild", "--if-stale", "yes", ...s.F])).out, "up to date: nothing to rebuild");
+});
+
+test("status and show: the router's lifetime counters stay as they are, and the classifier log's traffic follows them with the sessionless probe traffic on its OWN line, out of every share (denominator: client requests with a session id); no classifier log, no lines", async () => {
+  const s = setup();
+  await SET(s, ...FREE);
+  status(s, {});
+  const none = await STATUS(s);
+  assert.ok(!/probe traffic/.test(none.out), "no classifier log: nothing is printed");
+  const row = (sid, o = {}) => JSON.stringify({ t: "2026-10-05T11:00:00.000Z", sid, aid: null, pid8: null, cls: "main", ag: 0, bl: 0, nt: 3, ga: 0, sysb: "s2", m: "x/y", rc: null, at: null, bb: "b1", tc: 1, ...o });
+  const rows = [...Array(7).fill(0).map(() => row("nosessio", { nt: 44 })), row("d2e51e39"), row("d2e51e39", { cls: "sub", ag: 1, aid: "tm" }), row("d2e51e39", { cls: "sub", ag: 1, bl: 1, aid: "bi" }), row("d2e51e39", { cls: "aux", ag: 1, bl: 1, aid: "bi" })];
+  fs.writeFileSync(path.join(s.state, "classify.jsonl"), rows.join("\n") + "\n");
+  for (const cmd of [STATUS, (x) => run(["show", ...x.F])]) {
+    const r = await cmd(s);
+    assert.equal(r.status, 0, r.err);
+    assert.match(r.out, /^ {0,2}non-client probe traffic \(7 of 11 classified requests\), excluded: they carry no session id$/m);
+    assert.match(r.out, /^ {0,2}client requests \(with a session id; every share below is of these 4\): main 1 \(25%\), sub 2 \(50%\), aux 1 \(25%\)$/m);
+    assert.match(r.out, /^ {0,2}agent-shaped client requests \(3 of 4\): teammates 1 \(an agent id without the billing flag\), built-in 2 \(the billing flag\); the two detectors disagree on 1 of 3$/m);
+  }
 });
