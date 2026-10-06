@@ -30,6 +30,10 @@ test("cleanHeld keeps only well-formed holds (a safe provider name, pay/auth/gon
   assert.equal(act.a.until, Date.parse(hoursAgo(1)) + 6 * 3600000);
   assert.deepEqual(Object.keys(activeHolds(cleanHeld(raw), NOW.getTime(), 12)).sort(), ["a", "b", "c"], "a longer window keeps b");
   assert.deepEqual(Object.keys(activeHolds(cleanHeld(raw), NOW.getTime(), 0.5)), [], "a short one drops all");
+  const sticky = activeHolds(cleanHeld(raw), NOW.getTime());
+  assert.deepEqual(Object.keys(sticky).sort(), ["a", "b", "c"], "no window given: a hard hold never expires by time, whatever its age");
+  assert.equal(sticky.b.until, null);
+  assert.deepEqual(Object.keys(activeHolds(cleanHeld({ old: { r: "pay", at: hoursAgo(24 * 400) } }), NOW.getTime())), ["old"], "400 days old: still held");
 });
 
 test("the held section is stored in the same file (additive): it survives a save and a load, a writer that does not mention it keeps the one in the file, and it counts in the size cap", () => {
@@ -83,9 +87,9 @@ test("held providers leave the queue BEFORE the per-provider cap: zero requests 
   const dry = await run([...CAP], e.deps);
   assert.equal(dry.code, 0, dry.err);
   assert.match(dry.out, /this run: 24 model\(s\) queued of 48; \d+ fit the per-provider cap of 17,100/, "the held providers' models are not in the queue at all");
-  assert.match(dry.out, /held providers \(an account state or two models gone, within the 6-hour hold; zero requests, not even a canary; --retry-accounts forces them in\): 2 provider\(s\), 24 queued model\(s\) left out of the queue, ~\d+k input tokens of cap freed/);
-  assert.match(dry.out, /pb: pay since 2026-10-05 19:00, retry after 01:00 UTC: 12 model\(s\) freed/);
-  assert.match(dry.out, /pc: gone since 2026-10-05 18:00, retry after 00:00 UTC: 12 model\(s\) freed/);
+  assert.match(dry.out, /held providers \(an account state or two models gone; sticky: a hold never expires by time; zero requests, not even a canary; only --recheck-hard, --retry-accounts or --release-holds lifts them\): 2 provider\(s\), 24 queued model\(s\) left out of the queue, ~\d+k input tokens of cap freed/);
+  assert.match(dry.out, /pb: pay since 2026-10-05 19:00, until lifted: 12 model\(s\) freed/);
+  assert.match(dry.out, /pc: gone since 2026-10-05 18:00, until lifted: 12 model\(s\) freed/);
   assert.match(dry.out, /per-provider cap re-split: 17,100 -> 34,200 input tokens for the providers that can run/, "4 providers, 2 can run: twice the cap, which is the bound");
   assert.match(dry.out, /this run: 24 model\(s\) queued of 48; 12 fit/, "twice the cap: six models per runnable provider");
   assert.equal(calls(e.f).length, 0);
@@ -112,7 +116,7 @@ test("--retry-accounts forces held providers back into the queue; --hold-hours c
   assert.match((await run(["--hold-hours", "2"], e.deps)).out, /this run: 8 model\(s\) queued of 8/, "a 2-hour hold from 3 hours ago has ended");
   assert.match((await run(["--hold-hours", "12"], e.deps)).out, /this run: 4 model\(s\) queued of 8/);
   assert.equal(parseArgs(["--hold-hours", "3"]).holdHours, 3);
-  assert.equal(parseArgs([]).holdHours, 6);
+  assert.equal(parseArgs([]).holdHours, null, "no expiry unless --hold-hours asks for one");
   assert.ok(parseArgs(["--hold-hours", "0"]).error);
   assert.equal(parseArgs(["--retry-accounts"]).retryAccounts, true);
 });
@@ -125,7 +129,7 @@ test("a pay or auth canary is written to the file as a HOLD with its time; the n
     const e = cliEnv([many("pa", 3), many("pb", 3)], { answer: (c) => (!open && c.body.model.startsWith("pb/") ? http(status, "nope") : goodModel(c)) });
     const r1 = await run(["--live", "--per-provider", "1"], e.deps);
     assert.deepEqual(loadFidelity(e.out).held, { pb: { r: why, at: NOW.toISOString() } });
-    assert.match(r1.out, new RegExp(`pb: ${why} \\(.*\\) -- 3 model\\(s\\) skipped -- held until 02:00 UTC \\(--retry-accounts forces it\\)`));
+    assert.match(r1.out, new RegExp(`pb: ${why} \\(.*\\) -- 3 model\\(s\\) skipped -- held until lifted \\(sticky; --recheck-hard or --retry-accounts lifts it\\)`));
     e.f.calls.length = 0;
     const r2 = await run(["--live", "--per-provider", "1"], e.deps);
     assert.equal(byProv(e.f).pb, undefined, "the next run: not one request, not even a canary");

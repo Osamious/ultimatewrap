@@ -207,12 +207,32 @@ export function cleanHeld(raw) {
   }
   return out;
 }
-/** The holds still in force at `nowMs`: `{provider: {r, at, until}}`. */
-export function activeHolds(held, nowMs, holdHours = 6) {
-  const out = {};
-  for (const [p, v] of Object.entries(held ?? {})) { const until = Date.parse(v.at) + holdHours * 3600000; if (until > nowMs) out[p] = { ...v, until }; }
+/**
+ * The holds still in force at `nowMs`: `{provider: {r, at, until}}`. Hard reasons are STICKY: with no `holdHours` (the default) a hold never ends by time (`until: null`) and only a manual lift
+ * (`--recheck-hard`, `--retry-accounts`, `--release-holds`) or a provider that answers removes it. `holdHours` (`--hold-hours`) is an opt-in expiry.
+ */
+export function activeHolds(held, nowMs, holdHours = null) {
+  const out = {}, expires = Number.isFinite(holdHours) && holdHours > 0;
+  for (const [p, v] of Object.entries(held ?? {})) {
+    if (!expires) { out[p] = { ...v, until: null }; continue; }
+    const until = Date.parse(v.at) + holdHours * 3600000;
+    if (until > nowMs) out[p] = { ...v, until };
+  }
   return out;
 }
+/**
+ * The HARD state (pay, auth, gone) of a stored pending reason, or null when the reason is recoverable. A model pending `pay`, `auth` or `gone` (or `canary-*` of those: skipped behind a provider's
+ * canary) is not asked again by a normal run. Exception: `canary-pay` / `canary-gone` of a provider that has CONFIRMED results is not hard (the provider answered, so it was never a verdict about those models:
+ * the same reason a pay or gone hold on such a provider is wrong, see `holdIsWrong`).
+ */
+export function hardState(reason, provider, confirmed = {}) {
+  const m = /^(canary-)?(pay|auth|gone)$/.exec(reason ?? "");
+  if (!m) return null;
+  if (m[1] && m[2] !== "auth" && (confirmed?.[provider] ?? 0) > 0) return null;
+  return m[2];
+}
+/** `--recheck-hard pay,auth,gone,<providers>`: does the manual lift `recheck` (`{reasons, providers}`, or null) cover this hard `state` of `provider`? An empty provider list means every provider. */
+export const recheckCovers = (recheck, state, provider) => !!recheck && recheck.reasons.includes(state) && (!recheck.providers.length || recheck.providers.includes(provider));
 const heldText = (held) => (held && Object.keys(held).length ? `"held":${JSON.stringify(held)},` : "");
 const pendingText = (pending) => (pending && Object.keys(pending).length ? `"pending":${JSON.stringify(pending)},` : "");
 const head = (now, pending, held = null) => `{"schema":${SCHEMA},"kind":${JSON.stringify(KIND)},"generatedAt":${JSON.stringify(now.toISOString())},${pendingText(pending)}${heldText(held)}"models":{`;
@@ -1083,8 +1103,9 @@ export function releaseHolds(store, pending, held, { providers = [], wrong = fal
     delete hold[p];
     released.push({ provider: p, r: h.r, confirmed: confirmed[p] ?? 0, named: isNamed });
   }
-  const gone = new Set(released.map((x) => x.provider));
-  for (const k of Object.keys(pend)) if (gone.has(k.slice(0, k.indexOf("/"))) && /^canary-/.test(pend[k].r)) delete pend[k];
+  const gone = new Set(released.map((x) => x.provider)), asked = new Set(released.filter((x) => x.named).map((x) => x.provider));
+  // the owner NAMED the provider: its models pending pay / auth / gone are lifted too (they are sticky otherwise); a hold released as wrong lifts only the canary entries its pause wrote
+  for (const k of Object.keys(pend)) { const pv = k.slice(0, k.indexOf("/")); if ((gone.has(pv) && /^canary-/.test(pend[k].r)) || (asked.has(pv) && /^(canary-)?(pay|auth|gone)$/.test(pend[k].r))) delete pend[k]; }
   return { held: hold, pending: pend, released, missing: providers.filter((p) => !(held && Object.hasOwn(held, p))) };
 }
 
@@ -1102,6 +1123,56 @@ export function untestedTable(cov) {
   for (const e of cov.held) add(e, `held:${e.reason}`);
   for (const r of by.values()) r.runnable = !Object.keys(r.why).some((k) => k.startsWith("held:")) && ((r.why.queued ?? 0) + (r.why.cap ?? 0) > 0);
   return [...by.values()].filter((r) => r.untested > 0).sort((a, b) => b.untested - a.untested || (a.provider < b.provider ? -1 : 1));
+}
+
+// ------------------------------------------------------------------ the sweep verdict: what a re-run can still change
+
+/** Pending reasons that a re-run alone cannot change: the owner has to change a flag or the route (a row-cost ceiling, a route shape). Not recoverable, not an account state. */
+export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-shape"]);
+/**
+ * The one partition the loop reads, over the models of the ledger(s) that are not excluded (a model in both ledgers counts once; the worst state wins: hard, then recoverable, then needs-owner, then tested):
+ *   tested       it has a result for the step: never asked again by a normal run
+ *   recoverable  pending for a reason that a later run can change: rate, error, timeout, cap, spend, request-cap, empty, slow, reasoning-budget, upstream-unavailable, not-run (also `queued`), first-strike, ...
+ *   hard         pay, auth, gone (a provider held for one of them, or a model pending it): non-recoverable by the engine, lifted only by a manual action (--recheck-hard, --retry-accounts, --release-holds)
+ *   owner        row-cost, priced-over-row-cap, route-shape: a re-run changes nothing until the owner changes a flag or a route
+ * `confirmed` is `confirmedProviders(store)` (see `hardState`), `pending` the stored pending map, `store` the records (a first strike is recoverable). Pure: `{total, tested, recoverable, byRecoverable, hard, byHard, owner, byOwner, excluded}`; total = tested + recoverable + hard + owner.
+ */
+export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {} }) {
+  const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4 };
+  const by = new Map();
+  const put = (key, s, reason) => { const cur = by.get(key); if (!cur || RANK[s] > RANK[cur.s]) by.set(key, { s, reason }); };
+  const prov = (k) => k.slice(0, k.indexOf("/"));
+  for (const cov of [l12, l3]) {
+    if (!cov) continue;
+    for (const e of cov.excluded) put(e.key, "excluded", e.reason);
+    // a FIRST STRIKE has a stored result but is provisional: the next run asks it again, so it is recoverable, not tested
+    for (const e of cov.tested) { if (store?.[e.key]?.strikes === 1) put(e.key, "recoverable", "first-strike"); else put(e.key, "tested", null); }
+    for (const e of cov.held) put(e.key, "hard", HELD_STATES.includes(e.reason) ? e.reason : "gone");
+    for (const e of cov.pending) {
+      // this run's plan (`queued`, `cap`) hides why the model was pending before: the stored reason is the one that says what a re-run is up against
+      const reason = (e.reason === "queued" || e.reason === "cap") && pending?.[e.key] ? pending[e.key].r : e.reason;
+      const h = hardState(reason, prov(e.key), confirmed);
+      if (h) put(e.key, "hard", h);
+      else if (OWNER_REASONS.has(reason)) put(e.key, "owner", reason);
+      else put(e.key, "recoverable", reason === "queued" ? "not-run" : reason);
+    }
+  }
+  const tally = (s) => { const o = {}; for (const v of by.values()) if (v.s === s) o[v.reason] = (o[v.reason] ?? 0) + 1; return o; };
+  const count = (s) => [...by.values()].filter((v) => v.s === s).length;
+  const v = { tested: count("tested"), recoverable: count("recoverable"), byRecoverable: tally("recoverable"), hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded") };
+  return { total: v.tested + v.recoverable + v.hard + v.owner, ...v };
+}
+
+/**
+ * The loop's stop signal for ONE run: `requests` it sent, how many ended `rate` and how many ended `rate`, `error` or `timeout` (`failing`), the `newResults` it recorded and the verdict's `recoverable`.
+ * Saturated when the run recorded zero new results, or at least 80% of its requests ended rate / error / timeout, or nothing is recoverable any more (nothing left to ask). A run that sent nothing has
+ * zero new results, so it is saturated. Pure.
+ */
+export const SATURATION_FAIL_SHARE = 0.8;
+export function saturation({ requests = 0, rate = 0, failing = 0, newResults = 0, recoverable = 0 }) {
+  const failShare = requests ? failing / requests : 0, rateShare = requests ? rate / requests : 0;
+  const why = recoverable === 0 ? "nothing recoverable left" : newResults === 0 ? "no new result in this run" : requests && failShare >= SATURATION_FAIL_SHARE ? `${Math.round(failShare * 100)}% of the requests ended rate, error or timeout` : null;
+  return { saturated: why !== null, why, requests, rate, failing, failShare, rateShare, newResults };
 }
 
 // ------------------------------------------------------------------ canary migration

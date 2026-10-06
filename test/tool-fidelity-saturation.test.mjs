@@ -61,13 +61,15 @@ test("STARVATION: models that already failed queue BEHIND the ones never asked, 
   assert.deepEqual(st.held, {}, "a provider that has answered is never held for it");
 });
 
-test("the queue order is stable: among models with the same history the priority queue's own order stands; `cap`, canary and not-run entries do not push a model back", () => {
+test("the queue order is stable: among models with the same history the priority queue's own order stands; `cap` and not-run entries do not push a model back (pay and canary entries are sticky: not queued at all)", () => {
   const rows = [many("pa", 8)];
   const e = cliEnv(rows);
   const pend = (r, n = 2) => ({ r, n, at: hoursAgo(1) });
   const pending = { "pa/m00": pend("pay"), "pa/m01": pend("cap", 9), "pa/m02": pend("canary-pay"), "pa/m03": pend("rate", 1), "pa/m04": pend("not-run", 3) };
   const p = plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs(["--tf-max-tokens-per-provider", "1000000"]), tiers: e.deps.tiers, pending, nowMs: NOW.getTime() });
-  assert.deepEqual(p.queued.map((x) => x.key.slice(3)), ["m01", "m02", "m04", "m05", "m06", "m07", "m03", "m00"], "never asked first (cap, canary and not-run count as never asked), then by how often they failed: m03 once, m00 twice");
+  assert.deepEqual(p.queued.map((x) => x.key.slice(3)), ["m01", "m04", "m05", "m06", "m07", "m03"], "never asked first (cap and not-run count as never asked), then by how often they failed (m03 once); m00 (pay) and m02 (canary-pay) are hard-blocked and not queued");
+  const lifted = plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs(["--tf-max-tokens-per-provider", "1000000", "--recheck-hard", "pay"]), tiers: e.deps.tiers, pending, nowMs: NOW.getTime() });
+  assert.deepEqual(lifted.queued.map((x) => x.key.slice(3)), ["m01", "m02", "m04", "m05", "m06", "m07", "m03", "m00"], "a manual recheck puts them back, in the old order");
 });
 
 // ---------------------------------------------------------------- the hold rule
@@ -187,8 +189,8 @@ test("the table says per provider why models are untested (held:state, paused:st
   const dry = await run(["--tf-max-tokens-per-provider", "5700"], e.deps);
   assert.match(dry.out, /untested because, per provider \(4 provider\(s\) with untested models/);
   assert.match(dry.out, /pb\s+tested\s+0, untested\s+3: held:pay 3 -- not runnable now/);
-  assert.match(dry.out, /pa\s+tested\s+1, untested\s+3: cap 2, queued 1 -- runnable/);
-  assert.match(dry.out, /pd\s+tested\s+0, untested\s+2: .*(error 2|queued 1).* -- runnable/);
+  assert.match(dry.out, /pa\s+tested\s+1, untested\s+3: (queued 2, cap 1|cap 2, queued 1) -- runnable/);
+  assert.match(dry.out, /pd\s+tested\s+0, untested\s+2: .*(error 2|queued [12]).* -- runnable/);
   assert.match(dry.out, /of 10 untested model\(s\), \d+ sit with a provider that can run now/);
   const p = plan({ snap: { rows }, bench: e.deps.bench, store: { "pa/m00": record("ppnn") }, o: parseArgs(["--tf-max-tokens-per-provider", "5700"]), tiers: e.deps.tiers, pending, held: { pb: { r: "pay", at: hoursAgo(1) } }, nowMs: NOW.getTime() });
   const t = p.untested.find((r) => r.provider === "pa");
