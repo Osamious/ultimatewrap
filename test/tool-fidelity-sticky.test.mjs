@@ -8,7 +8,7 @@ import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
 import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, record, kindOf, ev, stream, ok } from "./fixtures/tool-fidelity-helpers.mjs";
-import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf, trendLine } from "../refresh/tool-fidelity-cli.mjs";
+import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf, trendLine, liveRefusal } from "../refresh/tool-fidelity-cli.mjs";
 import { runKind, isQuotaSentence, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { runSweep } from "../refresh/bench.mjs";
 import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
@@ -150,7 +150,7 @@ test("the verdict counts match the ledger partition (tested + pending + held + e
   assert.equal(v.byRecoverable.rate, 1);
   assert.equal(v.byRecoverable.error, 1);
   const text = verdictLines(v);
-  assert.match(text[0], /^sweep verdict: RECOVERABLE \d+ of 14 \(.*\) \| HARD-BLOCKED 6 of 14 \(.*pay 4.*; lift only with --recheck-hard\/--release-holds\) \| TESTED 3 of 14 \(complete for every level it is eligible for 0 of 3; tested but optional levels not run 3 of 3: .*spawn 3.*\) \| NEEDS-OWNER 1 of 14 \(row-cost 1: raise --max-row-cost; a re-run alone changes nothing\)/);
+  assert.match(text[0], /^sweep verdict: RECOVERABLE \d+ of 14 \(.*\) \| HARD-BLOCKED 6 of 14 \(.*pay 4.*; lift only with --recheck-hard\/--release-holds\) \| TESTED 3 of 14 \(complete for every level it is eligible for 0 of 3; tested but optional levels not run: 3 of 3 model\(s\), 6 level gap\(s\) \(a model can have more than one\): .*spawn 3.*\) \| NEEDS-OWNER 1 of 14 \(row-cost 1: raise --max-row-cost; a re-run alone changes nothing\)/);
   assert.match(text[1], /population: 14 model\(s\) of the ledger that are not excluded \(0 more are excluded/);
   assert.ok(!text.some((x) => x.startsWith("DONE")), "something is recoverable");
 });
@@ -524,7 +524,7 @@ test("the verdict says how many TESTED models are complete for every level they 
   assert.deepEqual(v.byMissing, { spawn: 1, "error-result": 2, big: 1, L4: 1 });
   assert.equal(v.complete + v.incomplete, v.tested);
   const line = verdictLines(v)[0];
-  assert.match(line, /TESTED 6 of 6 \(complete for every level it is eligible for 2 of 6; tested but optional levels not run 4 of 6: /);
+  assert.match(line, /TESTED 6 of 6 \(complete for every level it is eligible for 2 of 6; tested but optional levels not run: 4 of 6 model\(s\), \d+ level gap\(s\) \(a model can have more than one\): /);
   assert.match(line, /spawn 1/);
   assert.match(line, /error-result 2/);
 });
@@ -539,7 +539,7 @@ test("completeness goes with the tier: a tested model whose tier does not allow 
 test("dry run: the completeness figures reach the printed verdict with their denominator", async () => {
   const e = cliEnv([many("pa", 3)], { store: { "pa/m0": record("ppnn"), "pa/m1": record("pppp", { big: "p", sp: "p", er: "p" }) } });
   const r = await run([], e.deps);
-  assert.match(r.out, /TESTED 2 of 3 \(complete for every level it is eligible for 1 of 2; tested but optional levels not run 1 of 2: error-result 1, spawn 1\)/);
+  assert.match(r.out, /TESTED 2 of 3 \(complete for every level it is eligible for 1 of 2; tested but optional levels not run: 1 of 2 model\(s\), 2 level gap\(s\) \(a model can have more than one\): error-result 1, spawn 1\)/);
 });
 
 // ================================================================ fix round (review cr-sweep-lifecycle on 184686c + d4d3a82)
@@ -1860,4 +1860,83 @@ test("round 4 / 6: a dry run with a queue but nothing recoverable (--force) is s
   assert.match(forced.out, /nothing is counted recoverable but 3 model\(s\) are queued/);
   assert.equal(saturationLines({ recoverable: 0, hard: 0 }, null, "dry", { queued: 2 }).at(-1), "SATURATION saturated=unknown recoverable=0 hard=0 new_results=0 requests=0 reason=queued");
   assert.equal(saturationLines({ recoverable: 0, hard: 0 }, null, "dry", { queued: 0 }).at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=0 requests=0 reason=done");
+});
+
+// ================================================================ the spend ESTIMATE: an unlisted price on a free-labelled key is $0
+
+test("spend estimate: a mixed fixture: unlisted on a free key $0, LISTED on a free key at its price, free-tagged $0, paid-LIFTED listed at its price and paid-lifted unlisted at the pessimistic fallback", () => {
+  const rows = [
+    { provider: "pa", keyId: "k.pa.free", models: [m("listed", { badge: "PAID", pin: 1, pout: 4 }), m("unlisted", { badge: null, pin: null, pout: null }), m("tagged")] },
+    { provider: "pb", keyId: "k.pb.paid", models: [m("p1", { badge: "PAID", pin: 2, pout: 8 }), m("p2", { badge: null, pin: null, pout: null })] },
+  ];
+  const e = cliEnv(rows);
+  const tiers = { pa: "free", pb: "paid" };
+  const policy = { schema: 1, models: [{ s: "pa/listed", c: 256000 }], tiers };
+  const argv = ["--candidates", "policy", "--include-tier", "paid", "--levels", "12", "--live", "--max-spend", "5", "--max-row-cost", "1"];
+  const p = plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs(argv), policy, tiers, printed: true, nowMs: NOW.getTime() });
+  assert.equal(p.lift.ok, true, "the paid tier is lifted");
+  const by = Object.fromEntries(p.run.entries.map((x) => [x.key, x]));
+  assert.deepEqual([by["pa/unlisted"].cost, by["pa/unlisted"].free, by["pa/unlisted"].unlistedOnFree], [0, true, true], "unlisted on a free-labelled key: $0");
+  assert.equal(by["pa/tagged"].cost, 0);
+  assert.equal(by["pa/listed"].pricedOnFree, true);
+  assert.ok(Math.abs(by["pa/listed"].cost - (by["pa/listed"].tin * 1 + by["pa/listed"].tout * 4) / 1e6) < 1e-12 && by["pa/listed"].cost > 0, "listed on a free key: its listed price");
+  assert.ok(Math.abs(by["pb/p1"].cost - (by["pb/p1"].tin * 2 + by["pb/p1"].tout * 8) / 1e6) < 1e-12, "paid, lifted, listed: its price");
+  // the paid-lifted fallback is the HIGHEST listed paid price of the whole probe set (here 2 in, 8 out from pb/p1), unchanged
+  assert.ok(Math.abs(by["pb/p2"].cost - (by["pb/p2"].tin * 2 + by["pb/p2"].tout * 8) / 1e6) < 1e-12 && by["pb/p2"].cost > 0, "paid, lifted, unlisted: the pessimistic fallback");
+  assert.equal(p.run.paidModels, 3, "listed on the free key, and the two paid ones; the unlisted and the tagged on the free key are free");
+  // the same models on a key that is NOT lifted do not change anything for the free key
+  const plain = plan({ snap: { rows: [rows[0]] }, bench: e.deps.bench, store: {}, o: parseArgs(["--levels", "12"]), tiers: { pa: "free" }, nowMs: NOW.getTime() });
+  assert.deepEqual(plain.run.entries.map((x) => [x.id, x.cost === 0]).sort((a, b) => (a[0] < b[0] ? -1 : 1)), [["listed", false], ["tagged", true], ["unlisted", true]]);
+});
+
+test("spend estimate: a live --levels 6,7 over hundreds of models with no listed price is NOT refused at --max-spend 5 (it was charged at the highest listed price of the whole set); a listed price above the row ceiling still stays pending", async () => {
+  const rows = [
+    { provider: "pa", keyId: "k.pa.free", models: Array.from({ length: 200 }, (_, i) => m(`u${i}`, { badge: null, pin: null, pout: null })) },
+    { provider: "pb", keyId: "k.pb.free", models: [m("big", { badge: "PAID", pin: 500, pout: 500 })] },
+  ];
+  const store = Object.fromEntries([...Array.from({ length: 200 }, (_, i) => `pa/u${i}`), "pb/big"].map((k) => [k, record("ppnn")]));
+  const e = cliEnv(rows, { store });
+  const argv = ["--levels", "67", "--max-spend", "5", "--tf-max-tokens-per-provider", "10000000"];
+  const p = plan({ snap: { rows }, bench: e.deps.bench, store, o: parseArgs(["--live", ...argv]), tiers: e.deps.tiers, nowMs: NOW.getTime() });
+  assert.equal(p.kept.length, 201);
+  assert.ok(p.run.usd < 5, `the estimate is ${p.run.usd}`);
+  assert.equal(liveRefusal(parseArgs(["--live", ...argv]), p), null, "no refusal");
+  const dry = await runRaw(argv, e.deps);
+  assert.match(dry.out, /an unlisted price on a free-labelled key: \$0 \(200 model\(s\) of this run\)/);
+  assert.match(dry.out, /priced-over-row-cap/, "the listed 500/500 model is over the $0.10 row ceiling at levels 6 and 7");
+  const live = await runRaw(["--live", ...argv], e.deps);
+  assert.equal(live.code, 0, live.err + live.out);
+  assert.equal(calls(e.f).some((c) => c.body.model === "pb/big"), false, "the over-ceiling model is not asked");
+  assert.equal(calls(e.f).filter((c) => c.body.model.startsWith("pa/")).length, 400, "L6 and L7 for the 200 models with no listed price");
+  assert.equal(loadFidelity(e.out).pending["pb/big"].r, "priced-over-row-cap");
+  // and a paid-priced total that really is over the cap is still refused
+  const pricey = plan({ snap: { rows }, bench: e.deps.bench, store, o: parseArgs(["--live", ...argv, "--max-row-cost", "100", "--max-spend", "0.05"]), tiers: e.deps.tiers, nowMs: NOW.getTime() });
+  assert.match(liveRefusal(parseArgs(["--live", ...argv, "--max-row-cost", "100", "--max-spend", "0.05"]), pricey) ?? "", /is above the cap/);
+});
+
+// ---------------------------------------------------------------- label oddities
+
+test("verdict labels: a model this run QUEUES is not projected as `cap`, a model that waits for the cap now is `cap`; the optional-gap breakdown says models and level gaps apart", async () => {
+  const rows = [many("pa", 30)];
+  const store = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`pa/m${i}`, record("ppnn")]));
+  const stale = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`pa/m${i}`, pend("cap", 4)]));
+  const e = cliEnv(rows, { store, pending: stale });
+  const run1 = (argv) => plan({ snap: { rows }, bench: e.deps.bench, store, o: parseArgs(argv), tiers: e.deps.tiers, pending: stale, nowMs: NOW.getTime() });
+  const all = run1(["--levels", "67", "--tf-max-tokens-per-provider", "10000000"]);
+  assert.deepEqual([all.kept.length, all.waiting.length], [30, 0], "the plan queues all 30 and nothing waits for the cap");
+  assert.deepEqual(all.verdict.byRecoverable, { "optional-not-run": 30 }, "a stale cap from an earlier run is not projected onto models queued now");
+  const some = run1(["--levels", "67", "--tf-max-tokens-per-provider", "5000"]);
+  assert.ok(some.waiting.length > 0 && some.kept.length > 0);
+  assert.deepEqual(some.verdict.byRecoverable, { "optional-not-run": some.kept.length, cap: some.waiting.length }, "the models that really wait for the cap are cap");
+  const dry = await runRaw(["--levels", "67", "--tf-max-tokens-per-provider", "10000000"], e.deps);
+  assert.match(dry.out, /RECOVERABLE 30 of 30 \(optional-not-run 30\)/);
+  // a stale cap on an UNTESTED model that is queued now: not-run, not cap
+  const fresh = plan({ snap: { rows: [many("pb", 3)] }, bench: cliEnv([many("pb", 3)]).deps.bench, store: {}, o: parseArgs(["--levels", "12"]), tiers: { pb: "free" }, pending: { "pb/m0": pend("cap", 2), "pb/m1": pend("rate", 2) }, nowMs: NOW.getTime() });
+  assert.deepEqual(fresh.verdict.byRecoverable, { "not-run": 2, rate: 1 }, "m0 was cap, is queued now: not-run; m1's rate limit is still what it is up against");
+  // the headline counts models, the breakdown counts level gaps: both are named
+  const gaps = cliEnv([many("pa", 4)], { store: { "pa/m0": record("ppnn"), "pa/m1": record("ppnn", { sp: "p" }), "pa/m2": record("ppnn", { sp: "p", er: "p" }), "pa/m3": record("pppn", { sp: "p", er: "p", big: "p" }) } });
+  const t = await runRaw(["--levels", "12"], gaps.deps);
+  assert.match(t.out, /TESTED 4 of 4 \(complete for every level it is eligible for 1 of 4; tested but optional levels not run: 3 of 4 model\(s\), 4 level gap\(s\) \(a model can have more than one\): /);
+  const sums = /level gap\(s\) \(a model can have more than one\): ([^)]*)\)/.exec(t.out)[1].split(", ").map((x) => Number(x.split(" ").at(-1)));
+  assert.equal(sums.reduce((a, b) => a + b, 0), 4, "the breakdown adds up to the gaps it names");
 });

@@ -23,7 +23,7 @@ const world = () => {
   const rows = [
     { provider: "anthropic", keyId: RELAY_KEY_ID, models: [m("claude-x", { badge: "PLAN", pin: 3, pout: 15 })] },
     { provider: "fa", keyId: "k.fa.free", models: [m("a1"), m("a2"), m("a3", { tools: false }), m("auto")] },
-    { provider: "pb", keyId: "k.pb.paid", models: [m("b1", { badge: "PAID", pin: 1, pout: 4 }), m("b2", { badge: "PAID", pin: 2, pout: 8 }), m("b3", { badge: null, pin: null, pout: null })] },
+    { provider: "pb", keyId: "k.pb.paid", models: [m("b1", { badge: "PAID", pin: 1, pout: 4 }), m("b2", { badge: "PAID", pin: 2, pout: 8 }), m("b3", { badge: null, pin: 3, pout: 12 })] },
   ];
   const good = (a = 1790699779) => ({ s: "ok", t: 400, a });
   const b = Object.fromEntries(["anthropic/claude-x", "fa/a1", "fa/a2", "fa/a3", "fa/auto", "pb/b1", "pb/b2", "pb/b3"].map((k) => [k, good()]));

@@ -131,14 +131,17 @@ test("SPEND counts the levels a probe COMPLETED even when a later level errors: 
   assert.deepEqual(Object.keys(loadFidelity(e.out).models), [], "and nothing was recorded for them");
 });
 
-test("a run narrowed with --only charges an unpriced paid model the highest listed price of the WHOLE probe set, like a full run", () => {
+test("a run narrowed with --only costs a model the same as a full run: an unlisted price on a free-labelled key is $0, a LISTED price keeps its listed cost", () => {
   const e = env([["pb", "priced", { pin: 50, pout: 100 }], ["pb", "unpriced", { pin: 1, pout: 1 }], ["fa", "free1"]]);
   e.deps.snapshot.snap.rows[0].models.find((m) => m.id === "unpriced").pin = null;
   e.deps.snapshot.snap.rows[0].models.find((m) => m.id === "unpriced").pout = null;
-  const price = (only) => plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, tiers: e.deps.tiers, o: { ...parseArgs([]), only } }).run.entries.find((x) => x.key === "pb/unpriced");
-  const narrow = price(["pb/unpriced"]), whole = price(null);
-  assert.ok(narrow.cost > 0 && Math.abs(narrow.cost - whole.cost) < 1e-12, "the same price narrowed or not");
-  assert.ok(Math.abs(narrow.cost - ((narrow.tin * 50 + narrow.tout * 100) / 1e6)) < 1e-12, "the highest listed (50 in, 100 out), not the documented default");
+  const entry = (only, key) => plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, tiers: e.deps.tiers, o: { ...parseArgs([]), only } }).run.entries.find((x) => x.key === key);
+  const narrow = entry(["pb/unpriced"], "pb/unpriced"), whole = entry(null, "pb/unpriced");
+  assert.deepEqual([narrow.cost, whole.cost, narrow.free, narrow.unlistedOnFree], [0, 0, true, true], "no listed price on a key of tier free: costed at $0, narrowed or not");
+  const listedNarrow = entry(["pb/priced"], "pb/priced"), listedWhole = entry(null, "pb/priced");
+  assert.ok(listedNarrow.cost > 0 && Math.abs(listedNarrow.cost - listedWhole.cost) < 1e-12, "a listed price keeps its cost");
+  assert.ok(Math.abs(listedNarrow.cost - ((listedNarrow.tin * 50 + listedNarrow.tout * 100) / 1e6)) < 1e-12, "at its own listed price (50 in, 100 out)");
+  assert.equal(listedNarrow.pricedOnFree, true, "so the row ceiling applies to it");
 });
 
 test("provider names and ids are sanitised in everything printed: an escape sequence in a provider name never reaches the terminal", async () => {

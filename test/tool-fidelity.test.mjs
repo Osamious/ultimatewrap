@@ -891,7 +891,7 @@ test("coverage: OPTIONAL levels do not block `tested` but are counted while they
   const l12 = coverage(U("p/a", "p/b", "p/c", "p/d", "p/x", "p/new"), store, { level: "l12", deepOk: (k) => k !== "p/d" });
   assert.equal(l12.counts.tested, 5, "L1+L2 is the required level there: tested whatever the optional ones say");
   assert.deepEqual(l12.optional, { l4: 1, big: 1, sp: 2, er: 2 }, "b: l4 big sp er; c: sp er (its L3 has not run, so no big); d is not deep-allowed: not counted; x failed: not counted; a is complete");
-  assert.match(coverageLines(l12, "L1+L2").join("\n"), /optional levels not run yet among the 5 tested \(they do not block being tested\): L4 1, big 1, spawn 2, error-result 2/);
+  assert.match(coverageLines(l12, "L1+L2").join("\n"), /optional level gaps not run yet among the 5 tested model\(s\) \(a model can have more than one; they do not block being tested\): L4 1, big 1, spawn 2, error-result 2/);
   assert.equal(coverage(U("p/a"), store, { level: "l12" }).optional.sp, 0);
 });
 

@@ -220,11 +220,11 @@ function askedQueue({ set, cand, o, store }) {
 }
 
 /** The tested models that still lack a level the run asks for (a record, no first strike, a level above L2 left in the queue): `[{key, held}]`; `held` is the state of a provider hold that keeps it from being asked. */
-function optionalOf({ set, cand, o, store, heldNow = {} }) {
+function optionalOf({ set, cand, o, store, heldNow = {}, queuedKeys = null, waitingKeys = null }) {
   if (o.force || o.retryFailed) return [];                              // a forced or retried pass is a manual re-ask, not the loop's baseline
   return askedQueue({ set, cand, o, store }).asked
     .filter((e) => e.prior && e.prior.lvr?.[0] !== "n" && e.prior.strikes !== 1 && e.todo.some((l) => l >= 3))
-    .map((e) => ({ key: e.key, held: heldNow[e.provider]?.r ?? null }));
+    .map((e) => ({ key: e.key, held: heldNow[e.provider]?.r ?? null, plan: queuedKeys?.has(e.key) ? "queued" : waitingKeys?.has(e.key) ? "cap" : null }));
 }
 
 /** The plan of one invocation, with every figure computed and nothing sent. Pure over its inputs. */
@@ -335,7 +335,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const timeoutStats = smalls.length ? `${Math.round(smalls[0] / 1000)} s at the least, ${Math.round(smalls[Math.floor(smalls.length / 2)] / 1000)} s median, ${Math.round(smalls.at(-1) / 1000)} s at the most` : null;
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
   const untested = untestedTable(ledger.l12);
-  const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels, optional: optionalOf({ set, cand, o, store, heldNow }) });
+  const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels, optional: optionalOf({ set, cand, o, store, heldNow, queuedKeys: new Set(kept.map((e) => e.key)), waitingKeys: new Set([...waiting, ...tooBig].map((e) => e.key)) }) });
   return { untested, verdict, namedLifts, hardBlocked: { models: hardEntries.length, by: hardBy }, ownerBlocked: { models: ownerSticky.length + ownerCost.length, by: ownerBy }, ignoredHolds, heldInfo, capEff, queuedAllCount: selected.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
@@ -501,7 +501,7 @@ export function verdictLines(v, { partial = false, queued = 0 } = {}) {
   const fmt = (o) => Object.entries(o).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none";
   const of = `of ${num(v.total)}`;
   const stuck = v.stuck ? `; of which STUCK ${num(v.stuck)} (${fmt(v.byStuck)}; the same soft reason ${STUCK_RUNS} or more runs in a row, still recoverable)` : "";
-  const tested = v.tested ? ` (complete for every level it is eligible for ${num(v.complete)} of ${num(v.tested)}; tested but optional levels not run ${num(v.incomplete)} of ${num(v.tested)}${v.incomplete ? `: ${fmt(v.byMissing)}` : ""})` : "";
+  const tested = v.tested ? ` (complete for every level it is eligible for ${num(v.complete)} of ${num(v.tested)}; tested but optional levels not run: ${num(v.incomplete)} of ${num(v.tested)} model(s)${v.incomplete ? `, ${num(Object.values(v.byMissing).reduce((a, n) => a + n, 0))} level gap(s) (a model can have more than one): ${fmt(v.byMissing)}` : ""})` : "";
   const L = [`sweep verdict: RECOVERABLE ${num(v.recoverable)} ${of} (${fmt(v.byRecoverable)}${stuck}) | HARD-BLOCKED ${num(v.hard)} ${of} (${fmt(v.byHard)}; lift only with --recheck-hard/--release-holds) | TESTED ${num(v.tested)} ${of}${tested}${v.owner ? ` | NEEDS-OWNER ${num(v.owner)} ${of} (${Object.entries(v.byOwner).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}: ${OWNER_ACTION[k] ?? "owner action"}`).join("; ")}; a re-run alone changes nothing)` : ""}`,
     `  population: ${num(v.total)} model(s) of the ledger that are not excluded (${num(v.excluded)} more are excluded: not free, not probe-ok, relay, ...); recoverable + hard-blocked + tested${v.owner ? " + needs-owner" : ""} = ${num(v.total)}`];
   for (const [pv, x] of Object.entries(v.stuckWhy ?? {}).slice(0, 6)) if (x.why) L.push(show(`  stuck on ${pv}: "${x.why}" (${x.n} of its ${x.total} stuck model(s) say so; the provider's own words)`, 260));
@@ -661,7 +661,7 @@ export function printPlan(p, o) {
   if (p.tooBig.length) L.push(`  WARNING: ${num(p.tooBig.length)} queued model(s) cost more than the cap on their own and will never run under it: raise --tf-max-tokens-per-provider to at least ${num(p.needed)}`);
   L.push(`  requests ${num(p.run.requests)}   input tokens ~${tok(p.run.inTokens)}   output tokens up to ~${tok(p.run.outTokens)}   (whole queue, before the cap: ${num(p.est.requests)} requests, ~${tok(p.est.inTokens)} input tokens)`);
   const free = p.run.entries.filter((e) => e.free).length, paid = p.run.paidModels;
-  L.push(`  free tier ${num(free)} model(s): no money; paid tier ${num(paid)} model(s): estimate ${usd(p.run.usd)} (input and output priced, cap ${usd(o.maxSpend)}, row ceiling ${usd(o.maxRowCost)}; an unlisted price is charged at the highest listed paid price of the whole probe set)`);
+  L.push(`  free tier ${num(free)} model(s): no money; paid tier ${num(paid)} model(s): estimate ${usd(p.run.usd)} (input and output priced, cap ${usd(o.maxSpend)}, row ceiling ${usd(o.maxRowCost)}; an unlisted price on a free-labelled key: $0${p.run.entries.some((e) => e.unlistedOnFree) ? ` (${num(p.run.entries.filter((e) => e.unlistedOnFree).length)} model(s) of this run)` : ""}; an unlisted price on a lifted paid tier is charged at the highest listed paid price of the whole probe set)`);
   L.push(...tierLines(p));
   L.push(...gatewayLines(p.gateway ?? []));
   L.push(...heldLines(p, o));

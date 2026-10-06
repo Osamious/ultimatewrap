@@ -819,12 +819,20 @@ export function clampDeep(entries, { tierOf = (e) => e.tier ?? null, lift = null
  * (paid, free-deposit, management and any provider with no tier) are moved to `notFree` with their tier and counted: `byTier` counts the probe-ok models of the whole set by tier
  * (`unlabelled` for no tier), `notFree` is what was left out. The relay keeps its own handling (`relay`). Pure.
  */
+/**
+ * What a model costs on a key of tier `free` (the owner's rule): where the LISTING has no price it is free of charge like the free-tier models ($0, `unlistedOnFree`); a model with a LISTED price keeps its
+ * listed-price cost and the row ceiling applies to it (`pricedOnFree`: over the ceiling it stays pending priced-over-row-cap). Paid tiers are not touched: a lifted run keeps the pessimistic fallback for an unlisted price.
+ */
+const freeKeyCost = (e) => {
+  if (!e.free && (e.pin > 0 || e.pout > 0)) return { ...e, pricedOnFree: true };
+  return e.free ? e : { ...e, free: true, unlistedOnFree: true };
+};
 export function restrictToFree(set, tiers, lift = null) {
   const byTier = {}, notFree = [], models = [];
   for (const e of set.models) {
     const tier = isTier(tiers?.[e.provider]) ? tiers[e.provider] : null;
     byTier[tier ?? "unlabelled"] = (byTier[tier ?? "unlabelled"] ?? 0) + 1;
-    if (deepAllowed(tier, lift)) models.push(e); else notFree.push({ key: e.key, provider: e.provider, tier });
+    if (deepAllowed(tier, lift)) models.push(tier === "free" ? freeKeyCost(e) : e); else notFree.push({ key: e.key, provider: e.provider, tier });
   }
   return { ...set, models, notFree, byTier };
 }
@@ -1068,7 +1076,7 @@ export function coverageLines(cov, label) {
   list("pending too long", cov.stuck, (e) => `${e.key} ${e.reason} x${e.runs}`);
   list("against an older fixture (*, re-sweep recommended)", cov.outdated, (e) => `${e.key} ${e.fx}`);
   const opt = Object.entries(cov.optional ?? {}).filter(([, n]) => n > 0).map(([k, n]) => `${k === "l4" ? "L4" : k === "sp" ? "spawn" : k === "er" ? "error-result" : k} ${n}`);
-  if (opt.length) L.push(`  optional levels not run yet among the ${c.tested} tested (they do not block being tested): ${opt.join(", ")}`);
+  if (opt.length) L.push(`  optional level gaps not run yet among the ${c.tested} tested model(s) (a model can have more than one; they do not block being tested): ${opt.join(", ")}`);
   return L;
 }
 
@@ -1218,6 +1226,7 @@ const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
  * recorded among the models that are not tested (the cool-down a re-run has had). Pure: `{total, tested, complete, incomplete, byMissing, recoverable, byRecoverable, stuck, byStuck, hard, byHard, owner, byOwner, excluded, oldestSince}`;
  * total = tested + recoverable + hard + owner.
  */
+const SCHEDULING_REASONS = new Set(["cap", "cap-too-big", "not-run", "spend"]);
 export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS, levels = null, optional = [] }) {
   const strikeOut = new Set();
   const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4 };
@@ -1239,7 +1248,9 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
     for (const e of cov.pending) {
       // this run's plan (`queued`, `cap`) hides why the model was pending before: the stored reason is the one that says what a re-run is up against
       const st = pending?.[e.key];
-      const reason = (e.reason === "queued" || e.reason === "cap") && st ? st.r : e.reason;
+      // this run's plan hides why the model was pending before: the stored reason says what a re-run is up against, EXCEPT a scheduling reason (cap, spend, not-run): a model this run QUEUES is not waiting for the
+      // cap any more, and one that waits for it now is `cap` whatever it was before
+      const reason = (e.reason === "queued" || e.reason === "cap") && st ? (e.reason === "queued" ? (SCHEDULING_REASONS.has(st.r) ? "not-run" : st.r) : (TRIED_REASONS.has(st.r) ? st.r : "cap")) : e.reason;
       const same = st ? st.r === reason : true;
       const since = same ? (st ? st.since ?? st.at : e.since ?? null) : null, runs = same ? (st ? st.rn ?? st.n : e.runs ?? 0) : 0;        // runs in a row with THIS reason (rn)
       const h = hardState(reason, prov(e.key), confirmed);
@@ -1254,7 +1265,10 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
     const cur = by.get(o.key);
     if (!cur || cur.s !== "tested") continue;
     if (o.held) { put(o.key, "hard", HELD_STATES.includes(o.held) ? o.held : "gone", null); continue; }
-    const st = pending?.[o.key], reason = st ? st.r : "optional-not-run";
+    const st = pending?.[o.key];
+    let reason = st ? st.r : "optional-not-run";
+    if (o.plan === "queued" && st && SCHEDULING_REASONS.has(st.r)) reason = "optional-not-run";               // queued this run: not 'cap'
+    else if (o.plan === "cap" && !(st && TRIED_REASONS.has(st.r))) reason = "cap";
     const since = st ? st.since ?? st.at : null, runs = st ? st.rn ?? st.n : 0;
     const h = hardState(reason, prov(o.key), confirmed);
     if (h) put(o.key, "hard", h, since, runs);
