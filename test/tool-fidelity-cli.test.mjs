@@ -9,7 +9,8 @@ import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
 import { pinL12, SWEEP_FAST, freshDir, fakeFetch, ev, stream, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, parseLevels, plan, printPlan, liveRefusal, runIncremental } from "../refresh/tool-fidelity-cli.mjs";
-import { loadFidelity, saveFidelity, buildRecord, probeSet, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { loadFidelity, saveFidelity, buildRecord, probeSet, cellOf, fidelityCounts, cleanFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { FIXTURE_ID, BIG_FIXTURE_ID } from "../refresh/tool-fidelity-fixture.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);                  // taken BEFORE the real-state guard is installed (the comparison after the run is a hook that runs after the guard's own)
@@ -172,7 +173,7 @@ test("--live L1+L2: every probe-ok model gets a record, the relay does not, noth
   const s = loadFidelity(e.out);
   assert.equal(s.ok, true);
   assert.deepEqual(Object.keys(s.models).sort(), ["fa/a1", "fa/a2", "fa/a3", "fa/auto", "pb/b1", "pb/b2", "pb/b3"]);
-  for (const rec of Object.values(s.models)) assert.deepEqual([rec.lvr, rec.t, rec.ok, rec.fx], ["ppnn", "t", true, "cc-tools-2"]);
+  for (const rec of Object.values(s.models)) assert.deepEqual([rec.lvr, rec.t, rec.ok, rec.fx], ["ppnn", "t", true, FIXTURE_ID]);
   assert.equal(s.models["fa/auto"].alias, true, "a pool alias is marked");
   assert.equal(s.models["fa/a3"].t, "t", "the tools:false model passed and is recorded as it behaved");
   assert.equal(s.generatedAt, NOW.toISOString());
@@ -200,6 +201,49 @@ test("AUTOMATIC INCREMENTAL: a second run probes NOTHING (every model has a reco
   assert.ok(loadFidelity(e.out).models["fa/a-new"]);
 });
 
+test("the fixture ids are cc-tools-3 / cc-tools-big-3 (the path pattern lost its [^\\0] tail); a record measured on cc-tools-2 shows * (outdated), still counts as TESTED, is NOT queued by a normal run at any level, and nothing asks it again by itself", async () => {
+  assert.deepEqual([FIXTURE_ID, BIG_FIXTURE_ID], ["cc-tools-3", "cc-tools-big-3"]);
+  const e = env();
+  const old = buildRecord(null, { 1: { v: "p" }, 2: { v: "p" }, 3: { v: "p", bytes: 150000 }, 4: { v: "p" }, 5: { v: "p", bytes: 400000 }, 6: { v: "p" }, 7: { v: "p" } }, { now: NOW, fixtureId: "cc-tools-2" });       // every level answered, so only the fixture id says "old"
+  assert.equal(old.fx, "cc-tools-2");
+  assert.match(cellOf(old), /\*$/, "the picker cell carries the * of an older fixture");
+  assert.doesNotMatch(cellOf({ ...old, fx: FIXTURE_ID }), /\*$/);
+  const all = Object.fromEntries(probeSet(e.snapshot.snap, e.bench).models.map((m) => [m.key, old]));
+  saveFidelity(e.out, all, { now: NOW });
+  const n = Object.keys(all).length;
+  const c = fidelityCounts(probeSet(e.snapshot.snap, e.bench), all);
+  assert.deepEqual([c.withRecord, c.outdated, c.withRecordCurrent], [n, n, 0], "every record is TESTED (it has a result) and every one is outdated");
+  // a normal run, also one that asks L3, the big step, spawn and the error result: nothing is queued, nothing is sent
+  for (const argv of [[], ["--levels", "123", "--l3", "yes", "--tf-max-tokens-per-provider", "5000000"], ["--levels", "1235", "--l3", "yes", "--max-spend", "5"]]) {
+    const r = await run(["--live", ...argv], e.deps);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /nothing to probe/);
+    assert.match(r.out, /against an older fixture: \d+ \(a recommendation to re-sweep, not queued\)/);
+  }
+  assert.equal(probeCalls(e.f).filter((x) => ["3a", "3b", "5"].includes(kindOf(x))).length, 0, "no L3 or big request was sent for an outdated record");
+  assert.deepEqual(Object.values(loadFidelity(e.out).models).map((x) => x.fx), Array(n).fill("cc-tools-2"), "and the records stayed as they were");
+});
+
+test("a record that carries the LEGACY pt field (written by the removed pattern re-ask) stays readable, round-trips through the file, and changes neither the class nor the queue nor the verdict", async () => {
+  const e = env();
+  const base = buildRecord(null, { 1: { v: "p" }, 2: { v: "p" }, 3: { v: "p", bytes: 150000 }, 4: { v: "p" } }, { now: NOW, fixtureId: "cc-tools-2" });
+  const withPt = { ...base, pt: "f" };
+  assert.deepEqual([withPt.t, cleanFidelity(withPt).t, cleanFidelity(withPt).pt], [base.t, base.t, "f"], "readable, preserved, same class");
+  assert.equal(cleanFidelity({ ...base, pt: "x" }), null, "a pt that is not p or f is still not a record");
+  assert.equal(cellOf(withPt), cellOf(base), "the picker cell does not show it");
+  const keys = probeSet(e.snapshot.snap, e.bench).models.map((m) => m.key);
+  saveFidelity(e.out, Object.fromEntries(keys.map((k, j) => [k, j === 0 ? withPt : base])), { now: NOW });
+  const back = loadFidelity(e.out);
+  assert.equal(back.models[keys[0]].pt, "f", "the file round-trips it");
+  assert.equal(back.models[keys[1]].pt, undefined);
+  const r = await run(["--live", "--levels", "123", "--l3", "yes", "--max-spend", "5"], e.deps);
+  assert.match(r.out, /nothing to probe/, "it is not queued");
+  assert.equal(loadFidelity(e.out).models[keys[0]].pt, "f", "and a run does not drop it");
+  // a probe that touches the record (L6/L7 asked) keeps the legacy field as it was
+  const kept = buildRecord(withPt, { 6: { v: "p" } }, { now: NOW });
+  assert.deepEqual([kept.pt, kept.t, kept.lvr], ["f", base.t, base.lvr]);
+});
+
 test("a record against an OUTDATED fixture is NOT re-queued by a run (its `*` is a recommendation); --force re-asks it", async () => {
   const e = env();
   const old = buildRecord(null, { 1: { v: "p" }, 2: { v: "p" } }, { now: NOW, fixtureId: "cc-tools-0" });
@@ -211,7 +255,7 @@ test("a record against an OUTDATED fixture is NOT re-queued by a run (its `*` is
   const f = await run(["--live", "--force", "--only", "fa/a1"], e.deps);
   assert.equal(f.code, 0, f.err);
   assert.equal(probeCalls(e.f).length, 3, "L1, argument fidelity, L2");
-  assert.equal(loadFidelity(e.out).models["fa/a1"].fx, "cc-tools-2", "re-swept: now against the current fixture");
+  assert.equal(loadFidelity(e.out).models["fa/a1"].fx, FIXTURE_ID, "re-swept: now against the current fixture");
   assert.equal(loadFidelity(e.out).models["fa/a2"].fx, "cc-tools-0", "the others keep their older record");
 });
 

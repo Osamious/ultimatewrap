@@ -12,12 +12,14 @@
 
 import crypto from "node:crypto";
 
-export const FIXTURE_ID = "cc-tools-2";
+// cc-tools-3 (2026-10-06): the path pattern of the long tool and of every bigTool no longer ends in [^\0]+ but in .+ (the lookaheads stay): through the gateway that one construct made the answer EMPTY
+// (stop end_turn, 0 output tokens) on codecraftapi, and 33 models were recorded x or first-struck for it. Results measured on cc-tools-2 are shown with a `*` and are NOT asked again by themselves.
+export const FIXTURE_ID = "cc-tools-3";
 export const TARGET_BYTES = 157000;          // the request body the L3 step sends, about 40,000 input tokens
 export const SYSTEM_BYTES = 9000;
 
 // The BIG step (about 400 KB, about 100,000 input tokens): run only for models that passed the 157 KB level. Same construction, more tools.
-export const BIG_FIXTURE_ID = "cc-tools-big-2";
+export const BIG_FIXTURE_ID = "cc-tools-big-3";
 export const BIG_TARGET_BYTES = 400000;
 
 /** The tool the L2, L3 and big requests ask the model to call. */
@@ -102,7 +104,7 @@ export function constructsTools() {
     name: LONG_TOOL, description: "A tool with a long MCP-style name and a schema that uses the constructs some providers reject.",
     input_schema: { type: "object", properties: {
       mode: { const: "demo", description: "fixed mode" }, limit: { type: "integer", minimum: 0, maximum: 9007199254740991 },
-      offset: { anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }] }, path: { type: "string", pattern: "^(?=.{1,512}$)(?!.*\\.\\.)[^\\0]+$" },
+      offset: { anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }] }, path: { type: "string", pattern: "^(?=.{1,512}$)(?!.*\\.\\.).+$" },
       flags: { type: "array", items: { type: "string", enum: ["a", "b", "c", "d"] }, minItems: 0, maxItems: 16, uniqueItems: true },
       options: { type: "object", additionalProperties: false, properties: { recursive: { type: "boolean" }, depth: { type: "integer", minimum: 1, maximum: 64 } } } },
       required: ["mode"], additionalProperties: false },
@@ -118,7 +120,7 @@ const KINDS = ["read", "write", "edit", "search", "list", "run", "fetch", "plan"
 function bigTool(i, descLen) {
   const kind = KINDS[i % KINDS.length];
   const props = {
-    path: { type: "string", description: filler(i, 160), pattern: "^(?=.{1,512}$)(?!.*\\.\\.)[^\\0]+$" },
+    path: { type: "string", description: filler(i, 160), pattern: "^(?=.{1,512}$)(?!.*\\.\\.).+$" },
     mode: { const: kind, description: "fixed mode of this tool" },
     limit: { type: "integer", minimum: 0, maximum: 9007199254740991, description: filler(i + 1, 140) },
     offset: { anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }], description: filler(i + 2, 120) },

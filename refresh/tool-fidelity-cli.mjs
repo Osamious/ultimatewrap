@@ -9,7 +9,6 @@
 //   node refresh/tool-fidelity-cli.mjs --levels 5 --l3 yes --live --only groq     the ~400 KB step, only for models that passed L3
 //   node refresh/tool-fidelity-cli.mjs --live --force --only groq   ask the requested levels again for models that have a record
 //   node refresh/tool-fidelity-cli.mjs --live --retry-failed    ask again ONLY the models of class x, at the levels that failed
-//   node refresh/tool-fidelity-cli.mjs --live --l3 yes --recheck-pattern   ask L3 again, patterns ON, of the models whose stored pt is f (a pass writes pt p; a re-confirmed failure keeps pt f)
 //   node refresh/tool-fidelity-cli.mjs --candidates policy --l3 yes --live --tf-max-tokens-per-provider 600000
 //                                                              L3 and the big step for every model the router could ever pick (see CANDIDATES)
 //   node refresh/tool-fidelity-cli.mjs --live --recheck-hard pay,openrouter   the MANUAL lift of hard blockers (pay, auth, gone: sticky, never re-asked by a normal run)
@@ -103,7 +102,6 @@ export function parseArgs(argv) {
     if (a === "--live") o.live = true;
     else if (a === "--force") o.force = true;
     else if (a === "--retry-failed") o.retryFailed = true;
-    else if (a === "--recheck-pattern") o.recheckPattern = true;
     else if (a === "--merge-unsaved") o.mergeUnsaved = true;
     else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
     else if (a === "--reset-transient") o.resetTransient = true;
@@ -171,7 +169,6 @@ export function parseArgs(argv) {
   if (o.keyChoicesFile && !o.tiersFile) return { error: "--key-choices-file goes with --tiers-file (the vault registry): a compiled policy already holds the compiler's key choice" };
   if (o.candidates && !o.levelsExplicit) o.levels = [1, 2, 3, 4, 5, 6, 7];   // L1+L2 for the ones with no result, then L3 (with L4 inside it), the big step, spawn and the error result
   if (o.onlyGateway && !o.retryFailed) return { error: "--only-gateway goes with --retry-failed: it asks again only the models whose failure was the gateway's request translation (xw gateway)" };
-  if (o.recheckPattern && (o.retryFailed || o.force || o.candidates)) return { error: "--recheck-pattern is a pass of its own (L3 again, patterns on, only the models whose stored pt is f): not with --retry-failed, --force or --candidates (--force on an L3 run also sends the patterns)" };
   if (o.retryFailed && o.force) return { error: "--retry-failed and --force contradict each other (retry-failed asks again only the failed levels of failed models)" };
   for (const [lo, hi, name] of [["timeoutSmall", "timeoutMaxSmall", "small"], ["timeout157", "timeoutMax157", "157"], ["timeoutBig", "timeoutMaxBig", "big"]]) {
     if (o[lo] > o[hi]) return { error: `the ${name} timeout floor (${o[lo]} s) is above its cap (${o[hi]} s): raise --timeout-max-${name} or lower --timeout-${name}` };
@@ -213,7 +210,7 @@ function askedQueue({ set, cand, o, store }) {
   const base = cand ? { ...set, models: [...cand.entries, ...smallOnly] } : set;
   let bigSkipped = 0;
   const SMALL_LEVELS = new Set([1, 2, 6, 7]);
-  const asked = queueFor(base, store, o.levels, { force: o.force, retryFailed: o.retryFailed, recheckPattern: o.recheckPattern }).map((e) => (e.smallOnly ? { ...e, todo: e.todo.filter((l) => SMALL_LEVELS.has(l)) } : e)).filter((e) => e.todo.length).map((e) => {
+  const asked = queueFor(base, store, o.levels, { force: o.force, retryFailed: o.retryFailed }).map((e) => (e.smallOnly ? { ...e, todo: e.todo.filter((l) => SMALL_LEVELS.has(l)) } : e)).filter((e) => e.todo.length).map((e) => {
     if (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX)) return e;
     bigSkipped += 1;
     return { ...e, todo: e.todo.filter((l) => l !== 5) };
@@ -224,7 +221,7 @@ function askedQueue({ set, cand, o, store }) {
 
 /** The tested models that still lack a level the run asks for (a record, no first strike, a level above L2 left in the queue): `[{key, held}]`; `held` is the state of a provider hold that keeps it from being asked. */
 function optionalOf({ set, cand, o, store, heldNow = {}, queuedKeys = null, waitingKeys = null }) {
-  if (o.force || o.retryFailed || o.recheckPattern) return [];          // a forced or retried pass is a manual re-ask, not the loop's baseline
+  if (o.force || o.retryFailed) return [];                              // a forced or retried pass is a manual re-ask, not the loop's baseline
   return askedQueue({ set, cand, o, store }).asked
     .filter((e) => e.prior && e.prior.lvr?.[0] !== "n" && e.prior.strikes !== 1 && e.todo.some((l) => l >= 3))
     .map((e) => ({ key: e.key, held: heldNow[e.provider]?.r ?? null, plan: queuedKeys?.has(e.key) ? "queued" : waitingKeys?.has(e.key) ? "cap" : null }));
@@ -323,7 +320,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
     const wantSet = { ...fullSet, models: fullSet.models.filter((e) => want.includes(tiers?.[e.provider])) };
     const prev = selectCandidates({ set: wantSet, policy, tiers: tiers ?? {}, includeTiers: want, requestedTiers: [], pins: o.allow ?? [], presetKeys, maxTokens: o.maxTokens });
     const rows = prev.entries.filter((e) => want.includes(e.tier));
-    const asked2 = queueFor({ ...wantSet, models: rows }, store, o.levels, { force: o.force, retryFailed: o.retryFailed, recheckPattern: o.recheckPattern }).map((e) => (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX) ? e : { ...e, todo: e.todo.filter((l) => l !== 5) })).filter((e) => e.todo.length);
+    const asked2 = queueFor({ ...wantSet, models: rows }, store, o.levels, { force: o.force, retryFailed: o.retryFailed }).map((e) => (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX) ? e : { ...e, todo: e.todo.filter((l) => l !== 5) })).filter((e) => e.todo.length);
     liftPreview = Object.fromEntries(want.map((t) => { const x = estimate(asked2.filter((e) => e.tier === t), { maxTokens: o.maxTokens, fallback }); return [t, { models: x.entries.length, requests: x.requests, inTokens: x.inTokens, usd: x.usd }]; }));
   }
   const planned = (levels) => Object.fromEntries([...kept.map((e) => [e.key, overRow.has(e.key) ? (e.pricedOnFree ? PRICED_OVER_ROW : "row-cost") : "queued"]), ...waiting.map((e) => [e.key, "cap"]), ...tooBig.map((e) => [e.key, "cap-too-big"])]
@@ -667,8 +664,8 @@ export function gatewayLines(g) {
 export function printPlan(p, o) {
   const c = p.counts, L = [];
   const big = p.queued.some((e) => e.todo.some(isBigLevel));
-  const lv = o.recheckPattern ? "L3 (and the big step) of the models whose stored pt is f" : o.retryFailed ? "the failed levels of failed models" : o.levels.map((l) => (l === 5 ? "big" : `L${l}`)).join("+");
-  L.push(`tool-fidelity: ${o.live ? "LIVE" : "DRY RUN, nothing is sent"}  fixture ${FIXTURE_ID}  levels ${lv}  ${o.force ? "force (asks again)" : o.retryFailed ? "retry-failed" : o.recheckPattern ? "recheck-pattern (patterns on)" : "incremental (only what has no result yet)"}`);
+  const lv = o.retryFailed ? "the failed levels of failed models" : o.levels.map((l) => (l === 5 ? "big" : `L${l}`)).join("+");
+  L.push(`tool-fidelity: ${o.live ? "LIVE" : "DRY RUN, nothing is sent"}  fixture ${FIXTURE_ID}  levels ${lv}  ${o.force ? "force (asks again)" : o.retryFailed ? "retry-failed" : "incremental (only what has no result yet)"}`);
   const tierOrder = ["free", "free-deposit", "paid", "management", "subscription", "unlabelled"];
   const byTier = c.byTier ? Object.entries(c.byTier).sort((a, b) => tierOrder.indexOf(a[0]) - tierOrder.indexOf(b[0])).map(([t, n]) => `${t} ${num(n)}`).join(", ") : "";
   const nf = {};
@@ -797,7 +794,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     const timeouts = timeoutsFor(bench?.get?.(t.key), floors, caps);                       // adaptive: 3 x this model's bench time, between the floor and the cap of each request class
     let r;
     try {
-    r = await probeModel({ recheckPattern: !!o.recheckPattern || (!!o.force && t.entry.todo.includes(3)), levels: t.entry.todo, prior: t.entry.prior?.lvr ?? "nnnn", flags: t.entry.prior, done: t.done, state: (t.pstate ??= {}), tier: t.entry.tier ?? null, lift, order: o.order, ctx: t.entry.ctx ?? 0, tele,
+    r = await probeModel({ levels: t.entry.todo, prior: t.entry.prior?.lvr ?? "nnnn", flags: t.entry.prior, done: t.done, state: (t.pstate ??= {}), tier: t.entry.tier ?? null, lift, order: o.order, ctx: t.entry.ctx ?? 0, tele,
       fetchImpl, url: `${gw.base}/v1/messages`, key: gw.key, model: t.key, ...(o.maxTokens ? { maxTokens: o.maxTokens } : {}), timeouts, signal: ctx?.signal ? AbortSignal.any([ac.signal, ctx.signal]) : ac.signal });
     } finally { stats.active.set(t.provider, Math.max(0, (stats.active.get(t.provider) ?? 1) - 1)); }
     for (const x of tele) telemetry.add(t.provider, x);
@@ -1107,7 +1104,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     buildLedger();
     if (verdict && !ac.signal.aborted && !stoppedEarly) {
       // The run's record for the diminishing-returns rule. A lift, a named model, a forced or retried pass is a different population: it is not recorded and does not touch the history.
-      recordable = !(o.retryAccounts || o.recheckHard || p.namedLifts?.length || o.force || o.retryFailed || o.recheckPattern);
+      recordable = !(o.retryAccounts || o.recheckHard || p.namedLifts?.length || o.force || o.retryFailed);
       const g = runGain(stored.models, store, { levels: o.levels }), tot0 = telemetry.total(), st0 = telemetry.statuses;
       // the models this run asked that produced no record at all (and why): a run that learns little because the answers did not come is STARVED, not converged
       const askedKeys = [...stats.started], noRec = askedKeys.filter((k) => store[k] === stored.models[k]);

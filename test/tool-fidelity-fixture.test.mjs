@@ -12,8 +12,8 @@ guardRealState(after, assert);
 
 // Changing a fixture changes its digest. Bump FIXTURE_ID (BIG_FIXTURE_ID for the 400 KB set) in refresh/tool-fidelity-fixture.mjs, THEN update the pins below:
 // stored results name the fixture they were measured against, and an old id is what earns a record its `*`.
-const PINNED = { id: "cc-tools-2", digest: "22ec737ad613", small: "116e5f692b6c" };
-const PINNED_BIG = { id: "cc-tools-big-2", digest: "bde1981556e4" };
+const PINNED = { id: "cc-tools-3", digest: "7086c45e63f5", small: "aee3bab8d0f0" };
+const PINNED_BIG = { id: "cc-tools-big-3", digest: "60cf3401609a" };
 
 test("the fixtures are pinned: each digest matches the id it carries (an edit without an id bump fails here)", () => {
   assert.equal(FIXTURE_ID, PINNED.id);
