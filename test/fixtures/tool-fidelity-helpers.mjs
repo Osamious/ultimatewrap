@@ -56,6 +56,14 @@ export const stream = (...parts) => [ev.start(), ...parts].join("");
 export const streamWith = (inTok, ...parts) => [ev.start(inTok), ...parts].join("");
 
 /**
+ * The sweep seam of every CLI test: backoffs of 1 to 2 ms and a gap of 1 ms, and a BOUNDED wake timer. The engine (refresh/bench.mjs runSweep) parks on a wake timer when every provider is paused or
+ * busy; when a provider's pause ends between the engine's launch pass and its wake-time reading (a 1 ms backoff makes that likely: about 1 run in 50 with a rate-limited model) it computes no short
+ * timer, and the only wake left is the max-minutes backstop (150 min): the run, and the suite, hang. The wake timer is therefore cut to 50 ms here, which turns a missed wake into a 50 ms delay: the loop
+ * simply looks again. (Only the wake timer and the outage poll go through `timers`; a spurious early wake is harmless to the engine.)
+ */
+export const SWEEP_FAST = Object.freeze({ backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1, timers: Object.freeze({ set: (fn, ms, ...a) => setTimeout(fn, Math.min(ms, 50), ...a), clear: (h) => clearTimeout(h) }) });
+
+/**
  * The default levels of a CLI run are L1+L2+L6+L7 (the baseline); most tests are about caps, holds, ledgers and queues in units of the L1+L2 request cost, so their `main` calls pin `--levels 12`
  * (unless the test names `--levels`, `--candidates` or `--sample` itself). The tests of the new default say so and do not use this.
  */

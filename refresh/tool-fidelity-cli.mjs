@@ -196,6 +196,33 @@ function noRun(p) {
   return 0;
 }
 
+/**
+ * What the run would ask, model by model (`queueFor` plus the cli's own rules): the models whose KNOWN context is too small for the 157 KB fixture are not L3 candidates, but their small requests (L1, L2,
+ * spawn, the error result) fit any window, so they are queued for those only; the big step is not asked of a model whose KNOWN context is below BIG_MIN_CTX (never recorded as a failure).
+ * The verdict reads it too, so that "what is left to ask" means the same thing in the plan, in the report and in the loop's stop signal.
+ */
+function askedQueue({ set, cand, o, store }) {
+  const smallOnly = cand && !o.sample ? (cand.small ?? []) : [];
+  const base = cand ? { ...set, models: [...cand.entries, ...smallOnly] } : set;
+  let bigSkipped = 0;
+  const SMALL_LEVELS = new Set([1, 2, 6, 7]);
+  const asked = queueFor(base, store, o.levels, { force: o.force, retryFailed: o.retryFailed }).map((e) => (e.smallOnly ? { ...e, todo: e.todo.filter((l) => SMALL_LEVELS.has(l)) } : e)).filter((e) => e.todo.length).map((e) => {
+    if (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX)) return e;
+    bigSkipped += 1;
+    return { ...e, todo: e.todo.filter((l) => l !== 5) };
+  }).filter((e) => e.todo.length);
+  if (o.onlyGateway) { const keep = asked.filter((e) => e.prior?.xw === "gateway"); asked.length = 0; asked.push(...keep); }
+  return { asked, bigSkipped };
+}
+
+/** The tested models that still lack a level the run asks for (a record, no first strike, a level above L2 left in the queue): `[{key, held}]`; `held` is the state of a provider hold that keeps it from being asked. */
+function optionalOf({ set, cand, o, store, heldNow = {} }) {
+  if (o.force || o.retryFailed) return [];                              // a forced or retried pass is a manual re-ask, not the loop's baseline
+  return askedQueue({ set, cand, o, store }).asked
+    .filter((e) => e.prior && e.prior.lvr?.[0] !== "n" && e.prior.strikes !== 1 && e.todo.some((l) => l >= 3))
+    .map((e) => ({ key: e.key, held: heldNow[e.provider]?.r ?? null }));
+}
+
 /** The plan of one invocation, with every figure computed and nothing sent. Pure over its inputs. */
 export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers = null, presetKeys = null, presetNote = null, printed = false, tierMeta = null, nowMs = Date.now(), held = {} }) {
   const fullSet = probeSet(snap, bench);
@@ -231,18 +258,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
     const keep = new Set(sample.entries.map((e) => e.key));
     cand = { ...all, entries: sample.entries, excluded: [...all.excluded, ...all.entries.filter((e) => !keep.has(e.key)).map((e) => ({ key: e.key, reason: "not-in-sample" }))] };
   }
-  // the models whose KNOWN context is too small for the 157 KB fixture are not L3 candidates, but their small requests (L1, L2, spawn, the error result) fit any window: they are queued for those only
-  const smallOnly = cand && !o.sample ? (cand.small ?? []) : [];
-  const base = cand ? { ...set, models: [...cand.entries, ...smallOnly] } : set;
-  // the big step is not asked of a model whose KNOWN context is below BIG_MIN_CTX (never recorded as a failure)
-  let bigSkipped = 0;
-  const SMALL_LEVELS = new Set([1, 2, 6, 7]);
-  const asked = queueFor(base, store, o.levels, { force: o.force, retryFailed: o.retryFailed }).map((e) => (e.smallOnly ? { ...e, todo: e.todo.filter((l) => SMALL_LEVELS.has(l)) } : e)).filter((e) => e.todo.length).map((e) => {
-    if (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX)) return e;
-    bigSkipped += 1;
-    return { ...e, todo: e.todo.filter((l) => l !== 5) };
-  }).filter((e) => e.todo.length);
-  if (o.onlyGateway) { const keep = asked.filter((e) => e.prior?.xw === "gateway"); asked.length = 0; asked.push(...keep); }
+  const { asked, bigSkipped } = askedQueue({ set, cand, o, store });
   const tierOf = (e) => e.tier ?? tiers?.[e.provider] ?? null;
   const tiered = asked.map((e) => ({ ...e, tier: tierOf(e) }));
   const cl = clampDeep(tiered, { lift: liftCap });
@@ -315,7 +331,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const timeoutStats = smalls.length ? `${Math.round(smalls[0] / 1000)} s at the least, ${Math.round(smalls[Math.floor(smalls.length / 2)] / 1000)} s median, ${Math.round(smalls.at(-1) / 1000)} s at the most` : null;
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
   const untested = untestedTable(ledger.l12);
-  const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels });
+  const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels, optional: optionalOf({ set, cand, o, store, heldNow }) });
   return { untested, verdict, namedLifts, hardBlocked: { models: hardEntries.length, by: hardBy }, ownerBlocked: { models: ownerSticky.length + ownerCost.length, by: ownerBy }, ignoredHolds, heldInfo, capEff, queuedAllCount: selected.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
@@ -477,7 +493,7 @@ export function hardLines(p) {
 export const OWNER_ACTION = { "cap-too-big": "raise --tf-max-tokens-per-provider", "row-cost": "raise --max-row-cost", "priced-over-row-cap": "raise --max-row-cost to probe them", "route-shape": "fix the route: the provider wants another endpoint or message shape" };
 
 /** The sweep verdict block (dry run and report): what a re-run can still change. Every figure names its denominator: the models of the ledger that are not excluded. */
-export function verdictLines(v, { partial = false } = {}) {
+export function verdictLines(v, { partial = false, queued = 0 } = {}) {
   const fmt = (o) => Object.entries(o).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none";
   const of = `of ${num(v.total)}`;
   const stuck = v.stuck ? `; of which STUCK ${num(v.stuck)} (${fmt(v.byStuck)}; the same soft reason ${STUCK_RUNS} or more runs in a row, still recoverable)` : "";
@@ -489,6 +505,7 @@ export function verdictLines(v, { partial = false } = {}) {
   if (since) L.push(`  oldest since, per reason (the first time that reason was recorded, among the ${num(v.recoverable + v.hard + v.owner)} model(s) not tested): ${since}`);
   if (v.strikeOutOfLevels) L.push(`  note: ${num(v.strikeOutOfLevels)} first strike(s) failed at a level this run does not ask; they count as tested here and are asked again by a run that includes that level`);
   if (!v.recoverable && partial) L.push("  (the run was interrupted or stopped early: no DONE is claimed)");
+  else if (!v.recoverable && queued) L.push(`  (nothing is counted recoverable, but ${num(queued)} model(s) are queued: no DONE is claimed)`);
   else if (!v.recoverable) L.push(`DONE: nothing recoverable left (${num(v.tested)} of ${num(v.total)} model(s) tested, ${num(v.hard)} hard-blocked${v.owner ? `, ${num(v.owner)} need the owner` : ""})`);
   return L;
 }
@@ -648,7 +665,7 @@ export function printPlan(p, o) {
   if (p.run.perProvider.length > 12) L.push(`  ... and ${p.run.perProvider.length - 12} more provider(s)`);
   for (const line of coverageLines(p.ledger.l12, "L1+L2 (every listed model)")) L.push(show(line, 600));
   if (p.ledger.l3) for (const line of coverageLines(p.ledger.l3, "L3 (candidates and the rest of the probe set)")) L.push(show(line, 600));
-  if (!o.live) L.push(...verdictLines(p.verdict));
+  if (!o.live) L.push(...verdictLines(p.verdict, { queued: p.queued.length }));
   if (!p.queued.length) L.push(`  nothing to probe: ${o.retryFailed ? "no model has a confirmed failure" : "every model in the set already has a result for these levels (use --force to ask again)"}`);
   return L.join("\n");
 }
@@ -898,16 +915,16 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       const l12 = coverage(u.l12, store, { level: "l12", pending, plan: heldPlan, stuckRuns: o.pendingRuns, heldWhy, heldSince });
       const l3c = u.l3 ? coverage(u.l3, store, { level: "l3", pending, plan: heldPlan, stuckRuns: o.pendingRuns, heldWhy, heldSince }) : null;
       ledgerLines = [...coverageLines(l12, "L1+L2 (every listed model)"), ...untestedLines(untestedTable(l12)), ...(l3c ? coverageLines(l3c, "L3 (candidates and the rest of the probe set)") : [])];
-      verdict = sweepVerdict({ l12, l3: l3c, confirmed: conf, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels });
+      verdict = sweepVerdict({ l12, l3: l3c, confirmed: conf, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels, optional: optionalOf({ set: p.set, cand: p.cand, o, store, heldNow: nowHolds }) });
     } catch (e) { ledgerLines = [`coverage: the ledger could not be built (${e?.message ?? e}); this is a bug, not a result`]; verdict = null; }
   };
-  let capDropped = [];                                           // records the file's size cap pushed out in the last save
-  const writeOnce = () => { syncHeld(); const w = save(outFile, store, { live: true, now: now(), keep, preserve: stored.rejected ?? {}, pending, held, meta }); capDropped = Array.isArray(w?.dropped) ? w.dropped : []; };
+  let capDropped = [], whyStripped = 0;                          // records the file's size cap pushed out in the last save, and sentences it stripped
+  const writeOnce = () => { syncHeld(); const w = save(outFile, store, { live: true, now: now(), keep, preserve: stored.rejected ?? {}, pending, held, meta }); capDropped = Array.isArray(w?.dropped) ? w.dropped : []; whyStripped = w?.whyStripped ?? 0; };
   // A failed periodic save never stops the run: the records stay in memory and the next save (or the final one) carries them.
   const periodic = () => { try { writeOnce(); sinceSave = 0; } catch (e) { if (!saveWarned) { saveWarned = true; console.error(`tool-fidelity: warning: could not save (${e?.message ?? e}); the records are kept and the save is retried`); } } };
   const tally = { t: 0, v: 0, x: 0, u: 0, pending: 0 }, other = {}, why = new Map(), got = new Set(), escalated = new Set(), clampedKeys = new Set(), telemetry = makeTelemetry(), prov = {};
   let recorded = 0;
-  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {}, unavailBy = {}, whyBy = new Map(), doneBy = new Map(), deferredBy = { models: new Set(), levels: {} };
+  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {}, unavailBy = {}, whyBy = new Map(), doneBy = new Map(), flakyKeys = new Set(), deferredBy = { models: new Set(), levels: {} };
   let partials = 0;
   // What a model learned before a later level stopped it (a limit, a timeout, an error) is NOT thrown away: L1+L2 (and spawn / error result) that finished are recorded, the stopped level waits for a later run.
   // Only when L1 AND L2 both have a verdict (here or in the stored record): L1 alone would read as tested, and L2 would never be asked again.
@@ -933,9 +950,13 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     if (r.reason === "slow") { const pv = r.key.slice(0, r.key.indexOf("/")); slowBy[pv] = (slowBy[pv] ?? 0) + 1; slowList.push({ key: r.key, secs: r.secs }); }
     if (r.s !== "ok" || !r.tf) { other[r.s] = (other[r.s] ?? 0) + 1; why.set(r.key, pendingReasonOf(r, p.kept.find((k) => k.key === r.key))); const sent = sentenceOf(r); if (sent) whyBy.set(r.key, sent);
       const part = partialRecord(r.key);
-      if (part) { store[r.key] = part; if (part.strikes === 1) tally.pending += 1; else tally[part.t] += 1; recorded += 1; partials += 1; if (++sinceSave >= SAVE_EVERY) periodic(); }       // not in `got`: the stopped level stays pending with its reason
+      if (part) { store[r.key] = part; got.add(r.key); if (part.strikes === 1) tally.pending += 1; else tally[part.t] += 1; recorded += 1; partials += 1; if (++sinceSave >= SAVE_EVERY) periodic(); }       // in `got`: no pending reason is written beside a record that was saved (the stopped level is asked again because the queue still lacks it)
       return; }
-    for (const d of r.deferred ?? []) { deferredBy.models.add(r.key); deferredBy.levels[d.level] = (deferredBy.levels[d.level] ?? 0) + 1; }
+    for (const d of r.deferred ?? []) {
+      deferredBy.models.add(r.key); deferredBy.levels[d.level] = (deferredBy.levels[d.level] ?? 0) + 1;
+      flakyKeys.add(r.key);
+      const sent = sentenceOf({ p: d.why }); if (sent) whyBy.set(r.key, sent);
+    }
     const e = p.kept.find((k) => k.key === r.key);
     const rec = buildRecord(store[r.key] ?? null, r.tf.done, { now: now(), alias: !!e?.alias });
     if (!rec) { other.norecord = (other.norecord ?? 0) + 1; return; }       // no level actually ran: nothing is recorded
@@ -990,7 +1011,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     const before = JSON.stringify(pending), heldBefore = JSON.stringify(stored.held ?? {}), metaBefore = JSON.stringify(stored.meta ?? null);
     syncHeld();
     pending = updatePending(pending, { queue, recorded: got, store, now: now(), keepKeys: new Set([...p.set.models.map((m) => m.key), ...p.set.relay]),
-      reasonOf: (k) => capReasonOf(p, k) ?? why.get(k) ?? "not-run", whyOf: (k) => whyBy.get(k) ?? null });
+      reasonOf: (k) => capReasonOf(p, k) ?? why.get(k) ?? "not-run", whyOf: (k) => whyBy.get(k) ?? null, flaky: flakyKeys });
     // a provider that ANSWERED in this run (a manual recheck reached it): its stale auth and canary-* entries (models that were skipped, never asked) are not hard blocks any more
     for (const [pv, x] of Object.entries(prov)) if (x.answered && !x.blocked && !namedOnly.has(pv)) for (const k of Object.keys(pending)) if (k.startsWith(`${pv}/`) && /^(canary-|auth$)/.test(pending[k].r)) delete pending[k];
     buildLedger();
@@ -1006,6 +1027,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       }
     }
   }
+  if (whyStripped) console.log(`  NOTE: the file's size cap stripped the provider's sentence (why) from ${num(whyStripped)} pending entr${whyStripped === 1 ? "y" : "ies"} (oldest first, the sentences of stuck models last) before any record was dropped`);
   if (capDropped.length) {
     const gone = capDropped.filter((k) => !keep.has(k)).length;
     console.log(`  WARNING: the file's size cap pushed ${num(capDropped.length)} record(s) out of ${path.basename(outFile)}: ${num(gone)} of models that have left the catalogue, ${num(capDropped.length - gone)} the oldest ones (capacity, not expiry; they are asked again by a later run)`);

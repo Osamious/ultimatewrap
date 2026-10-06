@@ -7,7 +7,7 @@ import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { pinL12, freshDir, fakeFetch, goodModel, http, ok, ev, stream, streamWith, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, ok, ev, stream, streamWith, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { probeModel, runKind, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { main, plan, parseArgs, LIFT_PREVIEW, pendingReasonOf } from "../refresh/tool-fidelity-cli.mjs";
 import { resolveTierRows, loadTiers, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, loadFidelity, saveFidelity, capRecords, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
@@ -158,7 +158,7 @@ function env(rows, { policy, answer, tiers, now = NOW } = {}) {
   const pol = { schema: 1, models: [], ...(policy ?? {}), tiers: t };
   const deps = { snapshot: { ok: true, snap: { rows: [{ provider: "anthropic", keyId: RELAY_KEY_ID, models: [m("claude-x", { badge: "PLAN" })] }, ...rows] } }, bench: { get: (k) => (known.has(k) ? { s: "ok", t: 400, a: 1790699779 } : null) }, policy: pol, presetKeys: null,
     outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"), gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => now,
-    isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1 };
+    isAlive: () => false, findRunning: () => [], sweep: { ...SWEEP_FAST }, retryDelayMs: 1, rateBackoffMs: 1 };
   return { dir, deps, f, out: deps.outFile };
 }
 async function run(argv, deps) {

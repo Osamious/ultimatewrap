@@ -273,7 +273,9 @@ export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, pre
   let pend = pending, whyStripped = 0;
   if (pending && total > maxBytes) {
     pend = { ...pending };
-    const withWhy = Object.keys(pend).filter((k) => pend[k].why !== undefined).sort((a, b) => Date.parse(pend[a].at) - Date.parse(pend[b].at) || (a < b ? -1 : 1));
+    // the sentence of a STUCK model is the one the owner needs to judge it: it goes last
+    const stuck = (v) => (STUCK_REASONS.has(v.r) && (v.rn ?? v.n) >= STUCK_RUNS ? 1 : 0);
+    const withWhy = Object.keys(pend).filter((k) => pend[k].why !== undefined).sort((a, b) => stuck(pend[a]) - stuck(pend[b]) || Date.parse(pend[a].at) - Date.parse(pend[b].at) || (a < b ? -1 : 1));
     for (const k of withWhy) {
       if (total <= maxBytes) break;
       const { why, ...rest } = pend[k];
@@ -1065,14 +1067,16 @@ export function ledgerUniverses({ set, cand = null }) {
  * state), is dropped. Entries of models outside `keepKeys` are dropped. The ledger ignores an entry of a model that is tested. Pure.
  */
 /** Pending reasons that come from an ASK (the model was sent a request and got no verdict): such a model queues behind the ones never asked, and a later `cap` wait does not erase that history. */
-export const TRIED_REASONS = new Set(["rate", "quota", "pay", "auth", "gone", "error", "timeout", "empty", "slow", "reasoning-budget", "route-shape", "upstream-unavailable", "request-cap"]);
-export function updatePending(pending, { queue, recorded, store, reasonOf, whyOf = null, now = new Date(), keepKeys = null }) {
+export const TRIED_REASONS = new Set(["rate", "quota", "optional-flaky", "pay", "auth", "gone", "error", "timeout", "empty", "slow", "reasoning-budget", "route-shape", "upstream-unavailable", "request-cap"]);
+export function updatePending(pending, { queue, recorded, store, reasonOf, whyOf = null, flaky = null, now = new Date(), keepKeys = null }) {
   const out = { ...pending };
   if (keepKeys) for (const k of Object.keys(out)) if (!keepKeys.has(k)) delete out[k];             // a model that has left the probe set is not pending
   for (const e of queue) {
     const r = store[e.key];
-    if (recorded.has(e.key) || r?.strikes === 1) { delete out[e.key]; continue; }
-    const code = String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
+    // a model that got its record but had a small level (spawn, error result) set aside as flaky keeps a DEFERRAL MARKER: `optional-flaky`, with since and rn like any other reason (it counts toward stuck at rn >= 3)
+    const isFlaky = !!flaky?.has(e.key);
+    if (!isFlaky && (recorded.has(e.key) || r?.strikes === 1)) { delete out[e.key]; continue; }
+    const code = isFlaky ? "optional-flaky" : String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
     if ((code === "cap" || code === "quota-paused") && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;       // never asked this time (the cap, a provider paused on quota): what the last ask said stays           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
     const prev = out[e.key], same = !!prev && prev.r === code;
     const why = whyOf?.(e.key) ?? (same ? prev.why : undefined);
@@ -1173,7 +1177,7 @@ export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-
 export const OWNER_STICKY = new Set(["route-shape"]);
 export const OWNER_COST = new Set(["row-cost", "priced-over-row-cap"]);
 /** A soft reason that has been the answer this many runs in a row is STILL recoverable, but counted apart as stuck: only these reasons (a rate limit or a cap says nothing about the model). */
-export const STUCK_REASONS = new Set(["error", "timeout", "empty", "slow", "quota"]);
+export const STUCK_REASONS = new Set(["error", "timeout", "empty", "slow", "quota", "optional-flaky"]);
 export const STUCK_RUNS = 3;
 /** The optional levels of a tested model, by the short names the ledger uses, as the verdict names them. */
 const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
@@ -1189,7 +1193,7 @@ const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
  * recorded among the models that are not tested (the cool-down a re-run has had). Pure: `{total, tested, complete, incomplete, byMissing, recoverable, byRecoverable, stuck, byStuck, hard, byHard, owner, byOwner, excluded, oldestSince}`;
  * total = tested + recoverable + hard + owner.
  */
-export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS, levels = null }) {
+export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS, levels = null, optional = [] }) {
   const strikeOut = new Set();
   const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4 };
   const by = new Map(), missing = new Map();
@@ -1218,6 +1222,19 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
       else if (OWNER_REASONS.has(reason)) put(e.key, "owner", reason, since, runs);
       else put(e.key, "recoverable", reason === "queued" ? "not-run" : reason, since, runs);
     }
+  }
+  // A TESTED model that is still missing a level the run ASKS for (spawn and the error result by default; 3 to 5 only when they are asked and the model is eligible: `optional` is what the queue would
+  // send it) is not finished: it is recoverable (`optional-not-run`, or the reason of its pending entry, e.g. `optional-flaky` or `rate`), or hard when its provider is held.
+  for (const o of optional) {
+    const cur = by.get(o.key);
+    if (!cur || cur.s !== "tested") continue;
+    if (o.held) { put(o.key, "hard", HELD_STATES.includes(o.held) ? o.held : "gone", null); continue; }
+    const st = pending?.[o.key], reason = st ? st.r : "optional-not-run";
+    const since = st ? st.since ?? st.at : null, runs = st ? st.rn ?? st.n : 0;
+    const h = hardState(reason, prov(o.key), confirmed);
+    if (h) put(o.key, "hard", h, since, runs);
+    else if (OWNER_REASONS.has(reason)) put(o.key, "owner", reason, since, runs);
+    else put(o.key, "recoverable", reason, since, runs);
   }
   const tally = (s, f = () => true) => { const o = {}; for (const v of by.values()) if (v.s === s && f(v)) o[v.reason] = (o[v.reason] ?? 0) + 1; return o; };
   const count = (s, f = () => true) => [...by.values()].filter((v) => v.s === s && f(v)).length;

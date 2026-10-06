@@ -132,6 +132,9 @@ const ROUTE_WORDS = /must be called (via|through|at|using)|should be called (via
 // A bare QUOTA sentence ("daily limit reached", "quota exceeded", "no remaining quota", "per day", "allowance") is a free provider's allowance that resets by itself: the SOFT reason `quota` (recoverable, never
 // escalated to pay automatically: the owner decides). It stays `pay` when the same sentence has MONEY words: wallet, credit, balance, recharge, top-up, payment, funds, billing, plan (so "insufficient_quota, check your
 // plan and billing details" is pay) or when the status is 402.
+// A refusal whose OWN sentence says the credentials are wrong is the account's state, whatever the status (some providers answer a bad key with a 400): `auth`, never a schema verdict (a strike) and
+// never an answer. Only the key/token/credentials words count: "unknown key in properties" is a schema sentence and is not matched.
+const AUTH_SENTENCE = /(invalid|incorrect|wrong|missing|expired|revoked|bad)[ _-]+(api[ _-]*key|apikey|access[ _-]*token|auth(entication)?[ _-]*(token|key)|credentials?)|api[ _-]*key[ _-]+(is[ _-]+)?(invalid|incorrect|missing|not[ _-]+valid)|unauthori[sz]ed|authentication[ _-]+(failed|error|required)|not[ _-]+authenticated/i;
 const QUOTA_WORDS = /quota|daily limit|per[ -]day|limit reached|allowance/i;
 const MONEY_WORDS = /wallet|credit|balance|recharge|top[ -]?up|payment|funds|billing|\bplan\b/i;
 const RATE_SENTENCE = /rate[ -]?limit|too many requests|requests? per|tokens per|per[ -](minute|second|hour)|\b[rt]pm\b|try again in|retry (after|in)|resets? in/i;       // a rate limit, or a limit with a wait time, is its own (soft) reading, `rate`
@@ -147,6 +150,7 @@ export const namesRequest = (msg) => SCHEMA_WORDS.test(String(msg ?? "").replace
 function tightRead(text) {
   const t = classifyTight(text), msg = extractMessage(text);
   if (t && t !== "pay") return { s: t };
+  if (AUTH_SENTENCE.test(msg)) return { s: "auth" };
   if (isQuotaSentence(msg)) return { s: "quota" };            // before pay: a bare quota sentence is the provider's allowance, not an empty wallet
   if (t) return { s: t };
   if (WALLET_WORDS.test(msg)) return { s: "pay" };

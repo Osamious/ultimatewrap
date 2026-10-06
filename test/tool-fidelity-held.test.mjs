@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { pinL12, freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, plan } from "../refresh/tool-fidelity-cli.mjs";
 import { cleanHeld, activeHolds, HELD_MAX, MAX_FILE_BYTES, migrateCanary, coverage, saveFidelity, loadFidelity, FILE_NAME, REAL_FILE, HELD_PLAN, capRecords, renderFile } from "../refresh/tool-fidelity.mjs";
 
@@ -63,7 +63,7 @@ function cliEnv(rows, { answer, held, pending } = {}) {
   const f = fakeFetch(answer ?? goodModel);
   const deps = { snapshot: { ok: true, snap: { rows } }, bench: { get: (k) => (known.has(k) ? { s: "ok", t: 400, a: 1790699779 } : null) }, tiers: Object.fromEntries(rows.map((r) => [r.provider, "free"])),
     outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"), gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW,
-    isAlive: () => false, findRunning: () => [], rateBackoffMs: 1, sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1 };
+    isAlive: () => false, findRunning: () => [], rateBackoffMs: 1, sweep: { ...SWEEP_FAST }, retryDelayMs: 1 };
   if (held || pending) saveFidelity(deps.outFile, {}, { now: NOW, held: held ?? {}, pending: pending ?? {} });
   return { dir, deps, f, out: deps.outFile };
 }

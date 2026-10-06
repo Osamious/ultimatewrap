@@ -7,7 +7,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { pinL12, freshDir, cleanupDirs, madeDirs, fakeFetch, ev, stream, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, SWEEP_FAST, freshDir, cleanupDirs, madeDirs, fakeFetch, ev, stream, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main } from "../refresh/tool-fidelity-cli.mjs";
 import { probeSet, selectCandidates, drawSample, stratumOf, l3Rates, loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 import { STREAM_LIMITS } from "../refresh/tool-fidelity-probe.mjs";
@@ -81,7 +81,7 @@ function env(w, answer) {
   const dir = freshDir();
   const f = fakeFetch(answer ?? goodModel);
   const deps = { snapshot: { ok: true, snap: w.snap }, bench: w.bench, policy: { ...POLICY, tiers: w.tiers }, presetKeys: null, outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"),
-    gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW, isAlive: () => false, findRunning: () => [], sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1 };
+    gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW, isAlive: () => false, findRunning: () => [], sweep: { ...SWEEP_FAST }, retryDelayMs: 1, rateBackoffMs: 1 };
   return { dir, deps, f, out: deps.outFile };
 }
 async function run(argv, deps) {

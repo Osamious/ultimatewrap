@@ -7,9 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { pinL12, freshDir, fakeFetch, goodModel, http, record, kindOf, ev, stream, ok } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, record, kindOf, ev, stream, ok } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf } from "../refresh/tool-fidelity-cli.mjs";
 import { runKind, isQuotaSentence, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
+import { runSweep } from "../refresh/bench.mjs";
 import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, DEFAULT_LEVELS, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
@@ -28,7 +29,7 @@ function cliEnv(rows, { answer, store, held, pending } = {}) {
   const f = fakeFetch(answer ?? goodModel);
   const deps = { snapshot: { ok: true, snap: { rows } }, bench: { get: (k) => (known.has(k) ? { s: "ok", t: 400, a: 1790699779 } : null) }, tiers: Object.fromEntries(rows.map((r) => [r.provider, "free"])),
     outFile: path.join(dir, FILE_NAME), lockFile: path.join(dir, "bench.lock"), gateway: { base: "http://gw.test", key: "k" }, fetch: f, now: () => NOW,
-    isAlive: () => false, findRunning: () => [], rateBackoffMs: 1, sweep: { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1 }, retryDelayMs: 1 };
+    isAlive: () => false, findRunning: () => [], rateBackoffMs: 1, sweep: { ...SWEEP_FAST }, retryDelayMs: 1 };
   if (store || held || pending) saveFidelity(deps.outFile, store ?? {}, { now: NOW, held: held ?? {}, pending: pending ?? {} });
   return { dir, deps, f, out: deps.outFile, rows };
 }
@@ -641,7 +642,7 @@ test("finding 5 / C: a live run that sends nothing because nothing is queueable 
 
 test("finding 5: a run stopped early prints saturated=unknown, no DONE, and does not write the meta; exit codes are the sweep's", async () => {
   const e = cliEnv([many("pa", 6)]);
-  e.deps.sweep = { backoffBaseMs: 1, backoffMaxMs: 2, coolGapMs: 1, maxMs: 1 };
+  e.deps.sweep = { ...SWEEP_FAST, maxMs: 1 };
   const slow = e.deps.fetch;
   e.deps.fetch = async (url, init) => { await new Promise((r) => setTimeout(r, 15)); return slow(url, init); };
   const r = await run(["--live", "--per-provider", "1"], e.deps);
@@ -1105,7 +1106,7 @@ test("H: a stop at L3 (a rate limit) keeps what finished: L1, L2, spawn and the 
   const r1 = await run(argv, e.deps);
   const st = loadFidelity(e.out);
   assert.deepEqual([st.models["pa/m0"]?.lvr, st.models["pa/m0"]?.sp, st.models["pa/m0"]?.er], ["ppnn", "p", "p"], r1.out);
-  assert.equal(st.pending["pa/m0"].r, "rate", "the stopped level stays pending with its reason");
+  assert.equal(st.pending["pa/m0"], undefined, "no pending reason beside a record that was saved (the queue asks the stopped level again)");
   assert.match(r1.out, /1 of those 1 record\(s\) are partial/);
   e.f.calls.length = 0;
   e.deps.fetch = fakeFetch(goodModel);
@@ -1203,4 +1204,183 @@ test("H: a timeout on L6 (asked once more at double, then given up) is set aside
   const r = await probeModel({ levels: [1, 2, 3, 6, 7], done, ...FREE_TIER, ...probeConn(f, { timeouts: { small: 60, "157": 5000, big: 5000 } }) });
   assert.equal(r.inconclusive, undefined);
   assert.deepEqual([done[3].v, done[7].v, r.deferred.map((x) => [x.level, x.s])], ["p", "p", [[6, "timeout"]]]);
+});
+
+// ================================================================ round 3 (re-review of ccb681c)
+
+const kindRes = async (status, msg) => { const f = fakeFetch(() => http(status, msg)); return runKind("1", { fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "fa/m", timeoutMs: 5000 }); };
+
+// ---------------------------------------------------------------- 1: the default baseline shows in the verdict and the stop signal
+
+test("round 3 / 1: six models tested at L1+L2 only, default levels: recoverable 6 (optional-not-run), a non-empty queue, no DONE, saturated not yes", async () => {
+  const rows = [many("pa", 6)];
+  const store = Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`pa/m${i}`, record("ppnn")]));
+  const e = cliEnv(rows, { store });
+  const dry = await runRaw([], e.deps);
+  assert.match(dry.out, /sweep verdict: RECOVERABLE 6 of 6 \(optional-not-run 6\) \| HARD-BLOCKED 0 of 6 \(none;[^\n]*\) \| TESTED 0 of 6/);
+  assert.match(dry.out, /this run: 6 model\(s\) queued of 6/);
+  assert.doesNotMatch(dry.out, /DONE:/);
+  assert.match(dry.lines.at(-1), /^SATURATION saturated=unknown recoverable=6 hard=0 new_results=0 requests=0$/);
+  // --levels 12: the baseline is L1+L2, nothing is missing, the run says DONE as before
+  const l12 = await runRaw(["--levels", "12"], e.deps);
+  assert.match(l12.out, /RECOVERABLE 0 of 6 \(none\)[^\n]*TESTED 6 of 6/);
+  assert.match(l12.out, /DONE: nothing recoverable left/);
+  // the pure rule: a non-empty queue never prints DONE, whatever the counts say
+  const v = { recoverable: 0, hard: 0, tested: 2, total: 2, owner: 0, byRecoverable: {}, byHard: {}, byOwner: {}, excluded: 0, oldestSince: {} };
+  assert.ok(verdictLines(v).some((x) => x.startsWith("DONE")));
+  assert.ok(!verdictLines(v, { queued: 2 }).some((x) => x.startsWith("DONE")));
+  // a run that rate-limits L6 and L7 everywhere finds nothing new: still 6 recoverable, no DONE
+  const limited = cliEnv(rows, { store, answer: (c) => (["6", "2e"].includes(kindOf(c)) ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
+  const r1 = await runRaw(["--live", "--per-provider", "1"], limited.deps);
+  assert.match(r1.out, /RECOVERABLE 6 of 6 \(rate 6\)/);
+  assert.doesNotMatch(r1.out, /DONE:/);
+  assert.match(r1.lines.at(-1), /^SATURATION saturated=yes recoverable=6 hard=0 new_results=0 requests=\d+$/, "yes because the run recorded nothing new (everything rate-limited), not because nothing is recoverable");
+  assert.match(r1.out, /saturated: yes \(no new result in this run\)/);
+  // half of them answer: progress, three left
+  const mixed = cliEnv([many("pa", 3), many("pb", 3)], { store: Object.fromEntries(["pa", "pb"].flatMap((p) => [0, 1, 2].map((i) => [`${p}/m${i}`, record("ppnn")]))), answer: (c) => (c.body.model.startsWith("pb/") && ["6", "2e"].includes(kindOf(c)) ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
+  const r2 = await runRaw(["--live", "--per-provider", "1"], mixed.deps);
+  assert.match(r2.out, /RECOVERABLE 3 of 6 \(rate 3\)/);
+  assert.match(r2.lines.at(-1), /^SATURATION saturated=no recoverable=3 hard=0 new_results=3 requests=\d+$/, r2.out);
+  // and when they all answer: nothing left, DONE
+  const open = cliEnv(rows, { store });
+  const r3 = await runRaw(["--live", "--per-provider", "1"], open.deps);
+  assert.match(r3.out, /DONE: nothing recoverable left \(6 of 6 model\(s\) tested/);
+  assert.match(r3.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=0 new_results=6 requests=\d+$/);
+});
+
+test("round 3 / 1: a level above L2 counts as missing only when the run ASKS for it and the model is eligible: --levels 123 makes the L3 of an L1+L2 model recoverable, the default does not", async () => {
+  const e = cliEnv([many("pa", 2)], { store: { "pa/m0": record("ppnn", { sp: "p", er: "p" }), "pa/m1": record("ppnn", { sp: "p", er: "p" }) } });
+  const base = await runRaw([], e.deps);
+  assert.match(base.out, /RECOVERABLE 0 of 2 \(none\)/, "the baseline levels are all there");
+  assert.match(base.out, /DONE:/);
+  const deep = await runRaw(["--levels", "123"], e.deps);
+  assert.match(deep.out, /RECOVERABLE 2 of 2 \(optional-not-run 2\)/);
+  assert.doesNotMatch(deep.out, /DONE:/);
+  // a provider that is held cannot be asked: its missing levels are hard, not recoverable
+  const held = cliEnv([many("pa", 2)], { store: { "pa/m0": record("ppnn"), "pa/m1": record("ppnn") }, held: { pa: { r: "auth", at: hoursAgo(1) } } });       // (a pay or gone hold is ignored for a provider with confirmed results: holdIsWrong)
+  const h = await runRaw([], held.deps);
+  assert.match(h.out, /RECOVERABLE 0 of 2 \(none\) \| HARD-BLOCKED 2 of 2 \(auth 2;/);
+});
+
+// ---------------------------------------------------------------- 2: a 400 that says the credentials are wrong is auth
+
+test("round 3 / 2: a refusal whose own sentence says the key or token is wrong is `auth` at 400, 401, 403 and 422; a schema 400 that merely contains the word key is not", async () => {
+  for (const [status, msg] of [[400, "Invalid API key provided."], [400, "incorrect API key"], [400, "Incorrect api key provided: sk-..."], [400, "Unauthorized"], [400, "unauthorised request"], [400, "Authentication failed"], [400, "authentication error: invalid token"],
+    [400, "Missing API key"], [400, "Your API key is invalid"], [400, "invalid access token"], [400, "expired credentials"], [422, "invalid api key"], [401, "Invalid API key provided."], [403, "Invalid API key provided."], [401, "Unauthorized"]]) {
+    const r = await kindRes(status, msg);
+    assert.equal(r.s, "auth", `${status}: ${msg}`);
+    assert.equal(r.v, "i", "never a verdict: no strike");
+  }
+  for (const [status, msg] of [[400, "tools.0.input_schema: unknown key 'foo' in properties"], [400, "invalid key name in schema"], [400, "Unknown key in properties: additionalProperties"], [400, "property key must be a string"], [400, "Invalid parameter: tools.1.name"]]) {
+    const r = await kindRes(status, msg);
+    assert.notEqual(r.s, "auth", `${status}: ${msg}`);
+  }
+  assert.equal((await kindRes(400, "tools.0.input_schema: unknown key 'foo' in properties")).v, "f", "a schema refusal stays a verdict");
+});
+
+test("round 3 / 2: a provider that answers every request 400 'Invalid API key' is held as auth: no strikes, no records, nothing released", async () => {
+  const e = cliEnv([many("pa", 4)], { answer: () => http(400, "Invalid API key provided.") });
+  const r = await run(["--live", "--per-provider", "1"], e.deps);
+  const st = loadFidelity(e.out);
+  assert.deepEqual(Object.keys(st.models), [], "no schema strike, no record");
+  assert.equal(st.held.pa.r, "auth");
+  assert.match(r.out, /pa: auth \(the key was rejected\)/);
+  // a hold is not released by an answer that never came
+  e.deps.fetch = fakeFetch(() => http(400, "Invalid API key provided."));
+  await run(["--live", "--per-provider", "1", "--recheck-hard", "auth"], e.deps);
+  assert.equal(loadFidelity(e.out).held.pa.r, "auth");
+});
+
+// ---------------------------------------------------------------- 3: a saved partial record leaves no pending reason beside it
+
+test("round 3 / 3: a partial record is saved WITHOUT a pending reason (no newer pending entry beside a good L1+L2 record), and the queue still asks the missing level", async () => {
+  const e = cliEnv([many("pa", 1)], { answer: (c) => (kindOf(c) === "3a" ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
+  const argv = ["--live", "--levels", "123567", "--l3", "yes", "--only", "pa", "--per-provider", "1", "--tf-max-tokens-per-provider", "1000000"];
+  const r1 = await run(argv, e.deps);
+  const st = loadFidelity(e.out);
+  const rec = st.models["pa/m0"];
+  assert.deepEqual([rec.lvr, rec.sp, rec.er], ["ppnn", "p", "p"]);
+  assert.equal(st.pending["pa/m0"], undefined, "no pending entry beside the record that was saved");
+  assert.ok(!(st.pending["pa/m0"] && Date.parse(st.pending["pa/m0"].at) >= Date.parse(rec.at)), "the (record.at, pending) pair never shows a good L1+L2 record with a newer pending entry");
+  assert.match(r1.out, /RECOVERABLE 1 of 1 \(optional-not-run 1\)/, "the missing level is still counted: it is asked again");
+  const p = planOf(e, ["--levels", "123567", "--l3", "yes", "--only", "pa"], { store: st.models, pending: st.pending });
+  assert.deepEqual(p.queued.map((x) => [x.key, x.todo.join()]), [["pa/m0", "3,5"]], "queueFor still re-asks the stopped level");
+});
+
+// ---------------------------------------------------------------- 4: a flaky spawn / error-result level leaves a deferral marker
+
+test("round 3 / 4: a flaky L6 leaves the marker `optional-flaky` (since, rn, the provider's words), not a growing not-run; it counts toward stuck at rn >= 3 and is cleared when the level finally runs", async () => {
+  let open = false;
+  const e = cliEnv([many("pa", 1)], { answer: (c) => (!open && kindOf(c) === "6" ? http(500, "boom upstream") : goodModel(c)) });
+  const day = (d) => new Date(NOW.getTime() + d * DAY);
+  const states = [];
+  for (let d = 0; d < 3; d++) {
+    e.deps.now = () => day(d);
+    const r = await runRaw(["--live", "--per-provider", "1"], e.deps);
+    assert.equal(r.code, 0, r.err + r.out);
+    states.push(loadFidelity(e.out).pending["pa/m0"]);
+  }
+  assert.deepEqual(states.map((x) => [x.r, x.rn, x.n]), [["optional-flaky", 1, 1], ["optional-flaky", 2, 2], ["optional-flaky", 3, 3]], "the same reason in a row: rn counts, never a not-run");
+  assert.equal(states[2].since, day(0).toISOString());
+  assert.match(states[2].why, /boom upstream/);
+  e.deps.now = () => day(3);
+  const dry = await runRaw([], e.deps);
+  assert.match(dry.out, /RECOVERABLE 1 of 1 \(optional-flaky 1; of which STUCK 1 \(optional-flaky 1;/);
+  assert.match(dry.out, /stuck on pa: "boom upstream"/);
+  open = true;
+  e.deps.now = () => day(4);
+  await runRaw(["--live", "--per-provider", "1"], e.deps);
+  const st = loadFidelity(e.out);
+  assert.equal(st.pending["pa/m0"], undefined, "the level ran: the marker is gone");
+  assert.equal(st.models["pa/m0"].sp, "p");
+});
+
+// ---------------------------------------------------------------- 5: stuck sentences are the last to go; the report says what was stripped
+
+test("round 3 / 5: under the size cap the sentences of NON-stuck models go first, a stuck model's sentence last; the run summary says how many were stripped", async () => {
+  const at = (i) => new Date(NOW.getTime() + i * 1000).toISOString();
+  const words = "the provider says wait and try again later ".repeat(4).slice(0, 100);
+  const pending = {
+    "fa/s1": { r: "error", n: 5, rn: 5, at: at(0), why: words }, "fa/s2": { r: "timeout", n: 4, rn: 4, at: at(1), why: words },     // stuck, the OLDEST
+    "fa/n1": { r: "rate", n: 1, rn: 1, at: at(2), why: words }, "fa/n2": { r: "error", n: 1, rn: 1, at: at(3), why: words }, "fa/n3": { r: "quota", n: 2, rn: 2, at: at(4), why: words },
+  };
+  const models = { "fa/m": record("ppnn") };
+  const full = Buffer.byteLength(renderFile(Object.entries(models), NOW, pending, null));
+  const r = capRecords(models, { now: NOW, maxBytes: full - 250, pending });
+  assert.equal(r.whyStripped, 3, "three sentences of about 110 bytes");
+  assert.deepEqual(["fa/n1", "fa/n2", "fa/n3"].map((k) => r.pending[k].why), [undefined, undefined, undefined], "the non-stuck went first although they are newer");
+  assert.ok(r.pending["fa/s1"].why && r.pending["fa/s2"].why, "the stuck models keep theirs");
+  const more = capRecords(models, { now: NOW, maxBytes: full - 450, pending });
+  assert.equal(more.whyStripped, 5, "when the non-stuck are not enough, the stuck follow, oldest first");
+  // through a live run: the summary line
+  const e = cliEnv([many("pa", 1)]);
+  saveFidelity(e.out, {}, { now: NOW, pending: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`pz/p${i}`, { r: "rate", n: 1, at: at(i), why: words }])) });
+  e.deps.snapshot.snap.rows.push({ provider: "pz", keyId: "k.pz.free", models: Array.from({ length: 40 }, (_, i) => m(`p${i}`)) });
+  const keepKeys = Object.keys(loadFidelity(e.out).pending);
+  const stripped = Object.fromEntries(keepKeys.map((k) => [k, { r: "rate", n: 1, at: at(0) }]));
+  const cap = Buffer.byteLength(renderFile([], NOW, stripped, null)) + 1200;
+  e.deps.saveImpl = (file, mods, opts) => saveFidelity(file, mods, { ...opts, maxBytes: cap });
+  e.deps.bench = { get: (k) => (k.startsWith("pa/") || k.startsWith("pz/") ? { s: "ok", t: 400, a: 1790699779 } : null) };
+  e.deps.tiers.pz = "free";
+  const live = await run(["--live", "--only", "pa", "--per-provider", "1"], e.deps);
+  assert.equal(live.code, 0, live.err + live.out);
+  assert.match(live.out, /NOTE: the file's size cap stripped the provider's sentence \(why\) from \d+ pending entries \(oldest first, the sentences of stuck models last\) before any record was dropped/);
+});
+
+// ---------------------------------------------------------------- 6: the suite cannot hang
+
+test("round 3 / 6: the sweep seam bounds the wake timer: a wake the engine failed to arm (a pause that ends between its launch pass and its wake reading) costs at most 50 ms, never the 150-minute backstop", async () => {
+  const fired = await new Promise((resolve) => { const t0 = Date.now(); SWEEP_FAST.timers.set(() => resolve(Date.now() - t0), 9000000); });
+  assert.ok(fired < 1000, `${fired} ms`);
+  // an engine run with a controlled clock and the backstop armed, as the CLI arms it: it finishes
+  let c = 0, calls = 0;
+  const probe = async () => (++calls === 1 ? { s: "rate" } : { s: "ok" });
+  const groups = new Map([["pa", [{ key: "pa/m", provider: "pa", id: "m", free: true, cost: 0, worst: 0 }]]]);
+  let wd;
+  const done = await Promise.race([
+    runSweep({ groups, probe, now: () => ++c, backoffBaseMs: 3, backoffMaxMs: 3, coolGapMs: 1, maxMs: 150 * 60000, timers: SWEEP_FAST.timers, concurrency: 1, perProvider: 1 }),
+    new Promise((_, reject) => { wd = setTimeout(() => reject(new Error("the sweep engine hung")), 5000); }),
+  ]).finally(() => clearTimeout(wd));
+  assert.equal(calls, 2);
+  assert.equal(done.counts.ok, 1);
 });
