@@ -430,6 +430,57 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   eligible models are not tool-tested"). "Eligible" means allowed by the toggles; "usable" means it
   can stand in for a subagent (a known context of at least 128,000) and fits the request.
 
+### 5c. Classifier accuracy and the shadow tally (the evidence for the enforce decision)
+
+`node keysync/subagent-accuracy.mjs` answers two questions from the router's own logs, without a
+process start or a request: is the subagent classifier accurate enough to enforce on (plan 12.5), and
+what would each mode have done to the subagent requests already seen. It is read-only except for one
+optional file, `state/subagent/accuracy.json`, the file `set --enforce enforce` reads.
+
+```
+node keysync/subagent-accuracy.mjs                       # text report, writes nothing
+node keysync/subagent-accuracy.mjs --since 7d --json yes # the whole record as JSON
+node keysync/subagent-accuracy.mjs --write yes --live yes --cc-version 2.1.0 --ccr-version 3.0.22
+```
+
+Exit 0 means "computed": INSUFFICIENT is a normal result, not an error. Exit 1 is a read or write
+failure, exit 2 a usage error. `--since` is at most `30d`, because a PASS expires after 30 days.
+
+- **What is counted.** The classifier log generations (`classify.2.jsonl`, `classify.1.jsonl`,
+  `classify.jsonl`), the decision log and the agent log, in bounded 1 MiB chunks. Requests with no
+  session id (`hasSid` false, or the `nosession` spelling on an older line) are the UW tooling's own
+  probe traffic and are left out of EVERY denominator; the report says how many it left out.
+- **Ground truth.** The log has no labels. A request's true class is `rc` (the class Claude Code
+  sends when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`) when logged, otherwise the two independent
+  detectors, the agent id and the billing flag: both set is a built-in subagent, both clear is main.
+  A request where only the agent id fires (a teammate) has no second opinion and is reported on its
+  own line, never counted in T1. Agreement of the detectors tests consistency, not labelled truth;
+  the labelled sets of 12.5 stay the stronger evidence.
+- **Metrics.** T1 (at least 99% of corroborated tool-carrying subagent requests classified sub,
+  Wilson lower bound at least 97%), T2 (no helper call classified other than aux or returned on
+  another model, in at least 200), T3 (tool-less real subagents, reported), T4 (no main request
+  classified other than main, in at least 200), T5 (at most 1% of built-in requests without an agent
+  id, in at least 40), T6 (the Claude Code and CCR versions are recorded). Every line names its
+  population: `INSUFFICIENT: 12 of 40 requests`. Zero-tolerance metrics FAIL on the first violation.
+- **Minimum samples.** 5 subagent types with 40 requests each, 30 distinct subagents, 200 helper-shaped
+  requests, 200 main requests in 2 sessions with at least one `/model` switch, 3 sessions on 2 UTC
+  days. The agent type is logged only with the hint headers, so today the only types are the kinds
+  built-in, teammate and billing-only; the report states that and what traffic is missing.
+- **What the log cannot show.** A helper request is never in the decision log and carries no returned
+  model. T2 counts the helper-shaped requests the router did not classify aux and the helper-shaped
+  decision rows whose returned model differs; the router returns the asked model for aux and exempt
+  requests by construction.
+- **Shadow tally.** For every subagent request, what the compiled policy of each of `dynamic`,
+  `inherit` and `free` WOULD use: the share that moves off the asked model, the share that keeps it,
+  the share with no eligible substitute and the share with no learned main, by provider and model. It
+  is MODELLED from the inputs on disk (providers from the snapshot flag, not the live gateway), as an
+  expected value over the lead pool; it ignores cooling, payload caps and the tool tier rule. The
+  router's own shadow decisions are printed beside it (observed, exact for the policy then active).
+  These are G3 preconditions 1 and 7; the provider tally is the one to review with the owner.
+- **`--write yes --live yes`** needs both flags, replaces `accuracy.json` atomically with whatever
+  verdict was computed (a FAIL or INSUFFICIENT replaces a PASS and says so) and records the evidence
+  hash. The verdict is evidence for the owner's G3 decision, never the decision.
+
 ## 6. Phase B — catalogue refresh and health
 
 Refresh actions 6a to 6d are deliberate, manually-invoked commands by design; none
