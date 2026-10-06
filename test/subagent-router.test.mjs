@@ -227,7 +227,7 @@ test("helper-call accounting: auxOnRelay and aux volume by model and bytes, boun
   const all = [...e.files()].map((f) => fs.readFileSync(path.join(e.state, f), "utf8")).join("\n");
   assert.ok(!all.includes(secret), "no body text in any file written");
   const first = e.lines("classify.jsonl")[0];
-  assert.deepEqual(Object.keys(first).sort(), ["ag", "aid", "at", "bb", "bl", "cls", "ga", "m", "nt", "pid8", "rc", "sid", "sysb", "t", "tc"]);
+  assert.deepEqual(Object.keys(first).sort(), ["ag", "aid", "at", "bb", "bl", "cls", "ga", "hasSid", "m", "nt", "pid8", "rc", "sid", "sysb", "t", "tc", "ua"]);   // R-v3: hasSid and ua are the two added fields
   assert.equal(first.bb, "b0"); assert.equal(first.sysb, "s1");
 });
 
@@ -2007,10 +2007,14 @@ async function legacyDecide(pol, main, want, asked, X, config) {
   const pool = [];
   for (const i of S0) { const row = models[i]; if (!row || !ok(row.s) || !(row.c >= floor) || !fitsTok(row, true) || !fitsBy(row)) continue; pool.push(row); }
   let cand = null, fragile = false;
-  if (main && pool.some((r) => r.s === main)) cand = main;
-  else if (pool.length) {
-    const mp = main ? pool.filter((r) => legacyProviderOf(r.s) === legacyProviderOf(main)) : [];
-    const pool2 = mp.length ? mp : pool, lead = pool2[0], top = [];
+  // R-v3, the one intended difference (banding off too): above 200 KB a row with an unknown payload cap (pb 0) ranks LAST: known-cap rows are used when any exists; when none does, the
+  // unknown rows are the pool but main's own model is not taken first on its unknown cap. Up to 200 KB the oracle is the version 1 pool unchanged.
+  const big = X.bytes > 200 * 1024, known = pool.filter((r) => r.pb > 0), allUnknownBig = big && known.length === 0;
+  const pl = big && known.length ? known : pool;
+  if (main && !allUnknownBig && pl.some((r) => r.s === main)) cand = main;
+  else if (pl.length) {
+    const mp = main ? pl.filter((r) => legacyProviderOf(r.s) === legacyProviderOf(main)) : [];
+    const pool2 = mp.length ? mp : pl, lead = pool2[0], top = [];
     for (let i = 0; i < pool2.length && top.length < 3; i++) if (pool2[i].g === lead.g) top.push(pool2[i]);
     for (let i = 0; i < pool2.length && top.length < 3; i++) if (top.indexOf(pool2[i]) < 0) top.push(pool2[i]);
     fragile = top.length < 3;
@@ -3546,6 +3550,156 @@ test("D7: every NEW agent decision is written to agents.jsonl AND to decisions.j
   assert.equal(a.length, 1); assert.equal(d.length, 1, "the decision log still gets the new-agent line");
   assert.equal(a[0].ret, r); assert.equal(d[0].ret, r);
   assert.ok(SRC.includes('a: { name: "agents.jsonl", max: LOG_MAX, rate: 20, gens: 3 }') && /const LOG_MAX = 1024 \* 1024/.test(SRC), "1 MiB a file, three rotated generations kept");
+});
+
+// =====================================================================================================================
+// R-v3 (owner batch 2026-10-06): (1) the main-first shortcut only for main's row in the LEAD band, (2) an unknown payload cap ranks last above 200 KB, (3) classify.jsonl retention and the
+// hasSid / ua fields. Each has a positive and a negative case; the mutants that must fail them are listed in the commit message.
+// =====================================================================================================================
+const V3_ROWS = [row("groq/g1", { b: 0, g: 0 }), row("groq/g2", { b: 0, g: 1 }), row("groq/g3", { b: 1, g: 2 }), row("groq/g4", { b: 1, g: 3 })];
+const v3Policy = (owner = {}, rows = V3_ROWS) => mkPolicy({ owner: { mode: "dynamic", source: "same-provider", enforcement: "enforce", ...owner }, rows, withProv: true });
+async function v3Fan(e, n = 20, o = {}) {                         // n subagents of one session, each asking for a model that is not in the set: every one is a substitute pick
+  const got = [];
+  for (let i = 0; i < n; i++) { e.tick(100); got.push(await e.route(sub(HAIKU, { agent: `fan-${i}`, ...o }), CFG, {})); }
+  return got;
+}
+
+test("R-v3 (1): main's own model is taken first ONLY when its row is in the lead band (dynamic and free): main in band 0 -> every agent on main; main in band 1 -> a 20-agent fan-out spreads over band 0", async () => {
+  for (const mode of ["dynamic", "free"]) {
+    for (const [mainModel, want] of [["groq/g1", ["groq/g1"]], ["groq/g2", ["groq/g2"]]]) {
+      const e = env(v3Policy({ mode }), { slot: null });
+      await learn(e, mainModel);
+      assert.deepEqual([...new Set(await v3Fan(e))], want, `${mode}: main ${mainModel} is in the lead band: the shortcut holds`);
+    }
+    for (const mainModel of ["groq/g3", "groq/g4"]) {                                           // main is in the pool (same provider list) but in band 1
+      const e = env(v3Policy({ mode }), { slot: null });
+      await learn(e, mainModel);
+      const got = await v3Fan(e);
+      assert.deepEqual([...new Set(got)].sort(), ["groq/g1", "groq/g2"], `${mode}: main ${mainModel} is in band 1: the fan-out spreads over band 0, main is not used`);
+      assert.ok(got.filter((m) => m === "groq/g1").length >= 3 && got.filter((m) => m === "groq/g2").length >= 3, `${mode}: both band-0 rows carry real shares of 20 agents`);
+    }
+  }
+});
+
+test("R-v3 (1): the cases the restriction must not break: banding off, inherit mode, a one-band policy, a policy without band numbers and an unusable lead row keep their answers", async () => {
+  const e1 = env(v3Policy({ banded: false }), { slot: null });                                    // banding off: no bands, the old main-first shortcut
+  await learn(e1, "groq/g3");
+  assert.deepEqual([...new Set(await v3Fan(e1))], ["groq/g3"], "banded:false is the old behaviour");
+  const e2 = env(v3Policy({ mode: "inherit" }), { slot: null });                                  // inherit: main's model, whatever the bands say
+  await learn(e2, "groq/g3");
+  assert.deepEqual([...new Set(await v3Fan(e2))], ["groq/g3"], "inherit mode is unchanged");
+  const flat = [row("groq/g1", { b: 0 }), row("groq/g2", { b: 0 }), row("groq/g3", { b: 0 })];
+  const e3 = env(v3Policy({}, flat), { slot: null });                                             // one band: every row is in the lead band
+  await learn(e3, "groq/g3");
+  assert.deepEqual([...new Set(await v3Fan(e3))], ["groq/g3"], "a main in a one-band set keeps the shortcut");
+  const e4 = env(v3Policy({}, V3_ROWS.map((r) => ({ ...r, b: undefined }))), { slot: null });     // rows without a band number (an older compile): all equal, the shortcut holds
+  await learn(e4, "groq/g3");
+  assert.deepEqual([...new Set(await v3Fan(e4))], ["groq/g3"], "no band numbers: no restriction");
+  const CFG2 = cfg(["groq", ["g2", "g3", "g4"]]);                                                 // g1 is not resolvable: the lead band is {g2}: main g3 (band 1) spreads to g2 alone
+  const e5 = env(v3Policy(), { slot: null });
+  await e5.route(main("groq/g3", { sid: "s1" }), CFG2, {});
+  const got = []; for (let i = 0; i < 10; i++) { e5.tick(100); got.push(await e5.route(sub(HAIKU, { agent: `u-${i}` }), CFG2, {})); }
+  assert.deepEqual([...new Set(got)], ["groq/g2"], "the lead band is the first USABLE row's band");
+});
+
+test("R-v3 (1): the look-ahead that finds the lead band counts nothing: ctxSkip and payloadSkip of a shortcut decision equal those of the old shortcut (none for the rows it never reached)", async () => {
+  const rows = [row("groq/g1", { b: 0, g: 0, c: 64000 }), row("groq/g2", { b: 0, g: 1, c: 64000 }), row("groq/g3", { b: 0, g: 2 })];   // two rows below the 128k floor
+  const e = env(v3Policy({}, rows), { slot: null });
+  await learn(e, "groq/g3");
+  const before = { ...e.counters() };
+  await e.route(sub(HAIKU, { agent: "cnt-1" }), CFG, {});
+  assert.equal(e.counters().ctxSkip, before.ctxSkip, "the probe skipped g1 and g2 silently");
+  assert.equal(e.counters().payloadSkip, before.payloadSkip);
+});
+
+test("R-v3 (2): above 200 KB a row with an unknown payload cap ranks LAST, never excluded; up to 200 KB nothing is reordered", async () => {
+  const rows = [row("groq/g1", { b: 0, g: 0, pb: 0 }), row("groq/g2", { b: 0, g: 1, pb: 900000 }), row("groq/g3", { b: 0, g: 2, pb: 900000 })];
+  const pol = () => mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows });
+  const run = async (bytes) => { const e = env(pol(), { slot: null }); await learn(e, OPUS); return [...new Set(await v3Fan(e, 30, { bytes }))].sort(); };
+  assert.deepEqual(await run(300 * 1024), ["groq/g2", "groq/g3"], "300 KB: the unknown-cap g1 is never picked while known-cap rows fit");
+  assert.deepEqual(await run(100 * 1024), ["groq/g1", "groq/g2", "groq/g3"], "100 KB: the old pool, g1 included");
+  assert.deepEqual(await run(200 * 1024), ["groq/g1", "groq/g2", "groq/g3"], "exactly 200 KB is not over 200 KB");
+  assert.deepEqual(await run(undefined), ["groq/g1", "groq/g2", "groq/g3"], "no content-length: the old pool");
+  // a better band with an unknown cap still ranks below a known-cap row of a worse band
+  const two = () => mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows: [row("groq/g1", { b: 0, g: 0, pb: 0 }), row("groq/g2", { b: 1, g: 1, pb: 900000 })] });
+  const e = env(two(), { slot: null });
+  await learn(e, OPUS);
+  assert.deepEqual([...new Set(await v3Fan(e, 10, { bytes: 300 * 1024 }))], ["groq/g2"], "big: the known row of band 1 beats the unknown row of band 0");
+  const e2 = env(two(), { slot: null });
+  await learn(e2, OPUS);
+  assert.deepEqual([...new Set(await v3Fan(e2, 10, { bytes: 100 * 1024 }))], ["groq/g1"], "small: the rank decides, g1 leads");
+});
+
+test("R-v3 (2): an unknown-cap row is never EXCLUDED: when no known-cap row fits (or none exists) it still serves a big request; a known row whose cap is below the request is skipped as before", async () => {
+  const onlyUnknown = mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows: [row("groq/g1", { b: 0, g: 0 }), row("groq/g2", { b: 0, g: 1 })] });
+  const e = env(onlyUnknown, { slot: null });
+  await learn(e, OPUS);
+  assert.deepEqual([...new Set(await v3Fan(e, 20, { bytes: 900 * 1024 }))].sort(), ["groq/g1", "groq/g2"], "every row unknown: the same spread as before");
+  const mixed = mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows: [row("groq/g1", { b: 0, g: 0, pb: 100000 }), row("groq/g2", { b: 0, g: 1 })] });
+  const e2 = env(mixed, { slot: null });
+  await learn(e2, OPUS);
+  assert.deepEqual([...new Set(await v3Fan(e2, 10, { bytes: 300 * 1024 }))], ["groq/g2"], "g1's known cap (100 KB) is below the request: skipped; the unknown g2 is the last resort and serves");
+  assert.ok(e2.counters().payloadSkip >= 1);
+});
+
+test("R-v3 (2): main's own model with an unknown cap does not take a big request first when a known-cap row fits; a known-cap main still does", async () => {
+  const rows = [row("groq/g1", { b: 0, g: 0, pb: 0 }), row("groq/g2", { b: 0, g: 1, pb: 900000 })];
+  const mk = () => mkPolicy({ owner: { mode: "dynamic", source: "same-provider", enforcement: "enforce" }, rows, withProv: true });
+  const e = env(mk(), { slot: null });
+  await learn(e, "groq/g1");
+  assert.deepEqual([...new Set(await v3Fan(e, 10, { bytes: 300 * 1024 }))], ["groq/g2"], "big request: main g1 has an unknown cap and goes last");
+  const e2 = env(mk(), { slot: null });
+  await learn(e2, "groq/g1");
+  assert.deepEqual([...new Set(await v3Fan(e2, 10, { bytes: 100 * 1024 }))], ["groq/g1"], "small request: main g1 keeps the shortcut");
+  const e3 = env(mk(), { slot: null });
+  await learn(e3, "groq/g2");
+  assert.deepEqual([...new Set(await v3Fan(e3, 10, { bytes: 300 * 1024 }))], ["groq/g2"], "big request, known-cap main: the shortcut holds");
+});
+
+test("R-v3 (3): each classify line carries hasSid (a parseable session id was present) and ua (a closed class: claude-cli, sdk, other, none), never the raw user-agent", async () => {
+  const e = env(POL(), { slot: null });
+  const UAS = [["claude-cli/2.1.150 (external, cli)", "claude-cli"], ["claude-cli/2.1.150 (external, sdk-ts)", "sdk"], ["Anthropic/JS 0.60.0", "sdk"], ["anthropic/python 0.5", "sdk"], ["curl/8.4 TOPSECRET-UA-TOKEN", "other"], [undefined, "none"], ["", "none"], ["x".repeat(5000), "other"]];
+  for (const [ua, want] of UAS) {
+    await e.route(aux(HAIKU, { headers: ua === undefined ? {} : { "user-agent": ua } }), CFG, {});
+    const l = e.lines("classify.jsonl").at(-1);
+    assert.equal(l.ua, want, `user-agent ${JSON.stringify(String(ua).slice(0, 30))}`);
+    assert.ok(l.ua.length <= 16);
+    assert.equal(l.hasSid, true);
+  }
+  const noSid = { body: { model: HAIKU, tools: [] }, headers: { "x-claude-code-agent-id": "nosid-1" } };
+  await e.route(noSid, CFG, {});
+  assert.equal(e.lines("classify.jsonl").at(-1).hasSid, false, "no session id: false");
+  await e.route({ body: { model: HAIKU, tools: [] }, headers: { "x-claude-code-agent-id": "bad-1", "x-claude-code-session-id": "not a valid id!" }, sessionId: "not a valid id!" }, CFG, {});
+  assert.equal(e.lines("classify.jsonl").at(-1).hasSid, false, "an unparseable session id counts as none");
+  await e.route(main(SONNET, { sid: "s9", headers: { "user-agent": "claude-cli/2.1.150 (external, cli)" } }), CFG, {});
+  const m = e.lines("classify.jsonl").at(-1);
+  assert.deepEqual([m.cls, m.hasSid, m.ua], ["main", true, "claude-cli"], "a main request carries both too");
+  const all = [...e.files()].map((f) => fs.readFileSync(path.join(e.state, f), "utf8")).join("\n");
+  assert.ok(!all.includes("TOPSECRET-UA-TOKEN") && !all.includes("x".repeat(40)), "the raw user-agent reaches no file");
+  const off = env(POL({ classLog: "off" }), { slot: null });
+  await off.route(aux(HAIKU, { headers: { "user-agent": "curl/8" } }), CFG, {});
+  assert.equal(off.lines("classify.jsonl").length, 0, "classLog off still writes nothing");
+});
+
+test("R-v3 (3): classify.jsonl rotates at 8 MiB (not at the old 2 MiB) and keeps 2 generations: at most 3 files, 24 MiB (+ the size-check overshoot)", async () => {
+  const e = env(POL(), { slot: null });
+  const f = (n) => path.join(e.state, n), has = (n) => fs.existsSync(f(n)), size = (n) => (has(n) ? fs.statSync(f(n)).size : 0);
+  const line = JSON.stringify({ pad: "x".repeat(1000) }) + "\n";
+  const grow = (n) => fs.appendFileSync(f("classify.jsonl"), line.repeat(Math.ceil(n / line.length)));
+  const fire = async (tag) => { for (let i = 0; i < 50; i++) { e.tick(100); await e.route(aux(HAIKU, { agent: `${tag}${i}` }), CFG, {}); } };   // the size check runs on every 50th append
+  const MiB = 1024 * 1024;
+  grow(3 * MiB); await fire("a");
+  assert.ok(!has("classify.1.jsonl"), "3 MiB is above the OLD cap and below the new one: no rotation");
+  grow(5.5 * MiB); await fire("b");
+  assert.ok(has("classify.1.jsonl") && size("classify.1.jsonl") >= 8 * MiB, "past 8 MiB: the file became generation 1");
+  assert.ok(size("classify.jsonl") < 100 * 1024, "a fresh current file");
+  grow(8 * MiB); await fire("c");
+  assert.ok(has("classify.2.jsonl") && size("classify.2.jsonl") >= 8 * MiB, "the second rotation moved generation 1 to generation 2");
+  grow(8 * MiB); await fire("d");
+  assert.ok(!has("classify.3.jsonl"), "no third generation");
+  const total = ["classify.jsonl", "classify.1.jsonl", "classify.2.jsonl"].reduce((a, n) => a + size(n), 0);
+  assert.ok(total <= 3 * (8 * MiB + 50 * 4096), `the three files stay under 3 x (8 MiB + 200 KiB), now ${total}`);
+  assert.ok(/CLASS_MAX = 8 \* 1024 \* 1024/.test(SRC) && SRC.includes('name: "classify.jsonl", max: CLASS_MAX, rate: 50, gens: 2'), "the source pins 8 MiB and 2 generations");
 });
 
 // =====================================================================================================================
