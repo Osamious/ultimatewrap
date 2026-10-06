@@ -616,6 +616,16 @@ const sha = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 /** Free text that can carry a credential (an exception, an RPC error, a step tail, a refusal) is masked BEFORE it is cut to length and printed. */
 const safeMsg = (m, n = 300) => oneLine(redactSecrets(m), n);
 const intPid = (pid) => { if (!Number.isInteger(pid) || pid <= 0) throw new Error(`bad pid ${pid}`); return pid; };
+const intPort = (p) => { if (!Number.isInteger(p) || p <= 0 || p > 65535) throw new Error(`bad port ${p}`); return p; };
+/**
+ * The PowerShell texts of the process stop, exported so a test can PARSE them (never run them). LOCALE: the 'no listener' answer of the probe is read from the error id CmdletizationQuery_NotFound or, failing that, the English text
+ * 'No MSFT_NetTCPConnection objects found'; on another locale a port with no listener may therefore read as a FAILED probe, which REFUSES (fail closed, never a false 'free').
+ */
+export const PS_PROBE_LISTENER = (port) => `try { $c = @(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop); if ($c.Count -gt 0) { 'PID:' + $c[0].OwningProcess } else { 'NONE' } } catch { if ($_.FullyQualifiedErrorId -match 'CmdletizationQuery_NotFound' -or $_.Exception.Message -match 'No MSFT_NetTCPConnection objects found') { 'NONE' } else { 'FAIL' } }`;
+export const parseProbe = (text) => { const m = /^PID:(\d+)$/.exec(String(text).trim()); if (m) return { ok: true, pid: Number(m[1]) }; if (String(text).trim() === "NONE") return { ok: true, pid: null }; return { ok: false }; };
+export const PS_ANCESTORS = (pid) => `$ErrorActionPreference = 'Stop'; $all = @{}; Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { $all[[int]$_.ProcessId] = [int]$_.ParentProcessId }; $p = ${pid}; $out = @(); for ($i = 0; $i -lt 40; $i++) { if (-not $all.ContainsKey($p)) { break }; $p = $all[$p]; if ($p -eq 0) { break }; $out += $p }; ($out -join ',')`;
+export const parseAncestors = (text) => String(text).trim().split(",").filter(Boolean).map((x) => { const n = Number(x); if (!Number.isInteger(n) || n <= 0) throw new Error("unreadable ancestor list"); return n; });
+export const PS_STOP_VERIFIED = (pid) => `$ErrorActionPreference = 'Stop'; $id = ${pid}; $p = Get-Process -Id $id; $c = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $id); if (-not $c) { throw 'IDENTITY: no process row' }; if ($c.CreationDate.ToUniversalTime().ToString('o') -ne $env:UW_SNAP_CREATED) { throw 'IDENTITY: creation time differs' }; if ([string]$c.CommandLine -ne $env:UW_SNAP_CMD) { throw 'IDENTITY: command line differs' }; if ([math]::Abs(($p.StartTime.ToUniversalTime() - $c.CreationDate.ToUniversalTime()).TotalSeconds) -gt 2) { throw 'IDENTITY: the handle is another process' }; $p.Kill(); if (-not $p.WaitForExit(5000)) { throw 'NOT_GONE' }; 'KILLED'`;
 /** The lines of `cmdkey /list` that name an LLMKEY:* credential (the `Target:` line; matched on the LLMKEY: name so a localised label does not matter), trimmed and sorted: only these are hashed, so another application adding or removing a Windows credential is not a false RED. */
 export const llmkeyTargetLines = (text) => String(text ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => /LLMKEY:/i.test(l)).sort().join("\n");
 export function realSys() {
@@ -634,8 +644,18 @@ export function realSys() {
     listenerPid: (port) => listenerPid(port),
     listenPortsOf: (pid) => json(ps(`Get-NetTCPConnection -OwningProcess ${intPid(pid)} -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort | ConvertTo-Json -Compress`))
       .map((r) => ({ addr: String(r.LocalAddress), port: Number(r.LocalPort) })),
-    processes: () => json(ps("Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'node|ccr' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress"))
-      .map((r) => ({ pid: Number(r.ProcessId), ppid: Number(r.ParentProcessId), name: String(r.Name), cmd: String(r.CommandLine ?? "") })),
+    // created: the process's creation time as a UTC ISO string. Windows does NOT invalidate a stale ParentProcessId when a pid is reused, so a parent link is trusted only when the child is YOUNGER than its parent.
+    processes: () => json(ps("Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'node|ccr' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={ if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null } }} | ConvertTo-Json -Compress"))
+      .map((r) => ({ pid: Number(r.ProcessId), ppid: Number(r.ParentProcessId), name: String(r.Name), cmd: String(r.CommandLine ?? ""), created: r.Created ? String(r.Created) : null })),
+    // A STRICT probe: {ok:true, pid} or {ok:true, pid:null} (no listener) or {ok:false} when the probe itself failed. listenerPid above cannot tell a failed probe from no listener.
+    listenerProbe: (port) => { try { return parseProbe(ps(PS_PROBE_LISTENER(intPort(port)))); } catch { return { ok: false }; } },
+    // every ancestor pid of `pid` (parent first), from the UNFILTERED process table: the orchestrator's own chain (cmd.exe, a shell, claude) is not in the node|ccr table
+    ancestorsOf: (pid) => parseAncestors(ps(PS_ANCESTORS(intPid(pid)))),
+    // identify AND stop in ONE step (pid reuse): a handle is taken, the creation time and command line are compared with the verified snapshot, any difference refuses, then the handle is killed and the exit awaited
+    stopVerified: (snap) => {
+      const out = execFileSync(PS, ["-NoProfile", "-NonInteractive", "-Command", PS_STOP_VERIFIED(intPid(snap.pid))], { encoding: "utf8", timeout: 30000, windowsHide: true, env: { ...process.env, UW_SNAP_CREATED: String(snap.created ?? ""), UW_SNAP_CMD: String(snap.cmd ?? "") } }).trim();
+      if (out !== "KILLED") throw new Error(`stop of pid ${snap.pid} did not confirm: ${safeMsg(out, 80)}`);
+    },
     credSha: () => { try { return sha(llmkeyTargetLines(execFileSync(path.join(SYS32, "cmdkey.exe"), ["/list"], { encoding: "utf8", timeout: 15000, windowsHide: true }))); } catch (e) { return `(unreadable ${String(e.status ?? e.code ?? "")})`; } },
     proxySha: () => sha(regQuery("ProxyEnable") + regQuery("ProxyServer")),     // read-only reg query; only the hash is kept (the values are never printed)
     supervisorState: () => { try { return ps("(Get-ScheduledTask -TaskName 'UW Process Supervision' -ErrorAction SilentlyContinue).State") || "absent"; } catch { return "(unreadable)"; } },
@@ -1452,7 +1472,7 @@ export async function runE2e(argv, io = {}) {
     tripwire.assert("e2e:after-configure");
     if (k.error) { emit(L("FAIL", routers[0], "A0", `${k.error}: the enricher gate cannot be satisfied`)); throw new RefusalError(`REFUSED: ${k.error}`); }
     await prove(tripwire, "post-provider", "after-provider-save");
-    const ctx = { d, key: k.key, stub, out: say, emit, approved, tripwire, fallback: k.fallback, shared };
+    const ctx = { d, key: k.key, stub, out: say, emit, approved, tripwire, fallback: k.fallback, shared, baseline, daemonPid: () => daemonPid };      // baseline (the LIVE CCR pids) and the sandbox daemon pid: the scenario suite's identity-checked stop of the sandbox core worker needs both
     if (d.sessionPhases) {                                          // the scenario suite: its phases run on the SAME sandbox, after the same proofs, and end with the same isolation proof
       const res = await d.sessionPhases(ctx);
       emit(evalA11("next", baseline, baselineOf(d.sys)));

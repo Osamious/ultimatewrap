@@ -764,32 +764,92 @@ test("runSandbox and runSelftest pass the second token that matches the orchestr
 });
 
 // ====================================================================================== fix round 2 (the first replay run: no scenario was a router defect; the HARNESS read stale status, hid cooling state and fed the router wrong shapes)
-/** A virtual sandbox: a clock the sleeps advance, an in-memory scratch tree, a router that flushes status.json at most every 5 s (any request after the window flushes it), a core pid, and a gateway that answers 200. */
-async function virtualSandbox({ editBumpsPid = true, readyAfter = 2, dyingRewritesCooling = true } = {}) {
-  const { SCRATCH_STATE_DIR } = await import("../harness/subagent-sandbox-spec.mjs");
-  const mem = new Map(), r = (p) => path.resolve(p), V = { now: 1_800_000_000_000, statusAt: -1e15, reqs: [], corePid: 500, edits: 0, answered: 0 };
+/**
+ * A WINDOWS-SHAPED virtual sandbox: a clock the sleeps advance, an in-memory scratch tree, a router that flushes status.json at most every 5 s, and a process table with creation times. As in production the table the harness
+ * queries is FILTERED (names node|ccr), so a process behind cmd.exe or a shell is invisible to it, while ancestorsOf walks the UNFILTERED table. Processes: the sandbox daemon (100) holding the gateway and web ports, its core
+ * worker child (500) holding the core port, a LIVE CCR daemon (900) holding the live ports, the orchestrator (700, a node process under a hidden cmd.exe 710 under a hidden claude.exe 720).
+ * Stopping the core worker makes CCR respawn it (a new pid, created later) after `respawnMs`. Options break one rule each. Nothing here stops a real process: stopVerified only edits the table.
+ */
+const CLI = "C:\\npm\\node_modules\\@musistudio\\claude-code-router\\dist\\main\\cli.js", DIST = "C:\\npm\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
+const DAEMON_CMD = `"C:\\nvm4w\\nodejs\\node.exe" ${CLI} serve --daemon-child --no-open`;                     // the live and the sandbox daemon have the SAME command line
+const workerCmd = (dir) => `"C:\\nvm4w\\nodejs\\node.exe" --require ${dir}\\gateway-proxy-preload.cjs ${DIST}\\gateway-bootstrap.js`;
+async function virtualSandbox(o = {}) {
+  const { respawn = true, respawnMs = 1500, daemonReplaced = false, newParent = 100, readyAfter = 2, dyingRewritesCooling = true, coreRow = {}, extraRows = [], realOwners = {}, liveSvcText = null, baseline = { ccrPids: [900], liveServicePid: 900 },
+    daemonKnown = true, webHolder = 100, ccrFound = true, appdata = "C:\\Users\\osami\\AppData\\Roaming", listens = null, probeFail = [], coreHolderOverride, ancestorsOverride, onRead = null, beforeStop = null, staysAlive = false, daemonCmd = DAEMON_CMD, orchRow = {} } = o;
+  const { SCRATCH_STATE_DIR, LIVE_SERVICE_JSON, SANDBOX_PORTS, REAL_PORTS, CCR_CONFIG_DIR } = await import("../harness/subagent-sandbox-spec.mjs");
+  const mem = new Map(), r = (p) => path.resolve(p), T0 = 1_800_000_000_000, iso = (ms) => new Date(ms).toISOString();
+  const V = { now: T0, statusAt: -1e15, reqs: [], core: 500, daemon: 100, nextCore: 501, stopped: [], respawnAt: null, answered: 0, rpc: 0, log: [], reads: 0, T0, iso };
+  V.all = [
+    { pid: 720, ppid: 1, name: "claude.exe", cmd: "claude.exe", created: iso(T0 - 9e6) }, { pid: 710, ppid: 720, name: "cmd.exe", cmd: "cmd.exe /c node harness\\subagent-scenarios.mjs", created: iso(T0 - 8e6) },
+    { pid: 700, ppid: 710, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: iso(T0 - 7e6), ...orchRow },
+    { pid: 900, ppid: 1, name: "node.exe", cmd: DAEMON_CMD, created: iso(T0 - 6e6) },
+    { pid: 100, ppid: 1, name: "node.exe", cmd: daemonCmd, created: iso(T0 - 5e5) },
+    { pid: 500, ppid: 100, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR), created: iso(T0 - 4e5), ...coreRow }, ...extraRows,
+  ];
   const statusFile = r(path.join(SCRATCH_STATE_DIR, "status.json")), coolFile = r(path.join(SCRATCH_STATE_DIR, "cooling.json"));
-  const flush = () => { V.statusAt = V.now; mem.set(statusFile, JSON.stringify({ updatedAt: new Date(V.now).toISOString(), counters: { req: V.reqs.length }, cooling: [] })); };
+  if (liveSvcText != null) mem.set(r(LIVE_SERVICE_JSON), liveSvcText);
+  const flush = () => { V.statusAt = V.now; mem.set(statusFile, JSON.stringify({ updatedAt: iso(V.now), counters: { req: V.reqs.length }, cooling: [] })); };
   const d = {
     fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true },
-    sys: { readText: (p) => mem.get(r(p)) ?? null, listenerPid: () => V.corePid }, now: () => V.now, sleep: async (ms) => { V.now += ms; },
+    sys: {
+      selfPid: 700,
+      readText: (p) => mem.get(r(p)) ?? null,
+      processes: () => { V.log.push("processes"); V.reads += 1; const rows = V.all.filter((x) => /node|ccr/i.test(x.name)).map((x) => ({ ...x })); if (onRead) onRead(V.reads, V); return rows; },
+      listenerProbe: (port) => {
+        V.log.push(`probe:${port}`);
+        if (probeFail.includes(port)) return { ok: false };
+        if (port === SANDBOX_PORTS.core) { V.coreProbes = (V.coreProbes ?? 0) + 1; return { ok: true, pid: typeof coreHolderOverride === "function" ? coreHolderOverride(V.coreProbes, V) : coreHolderOverride !== undefined ? coreHolderOverride : V.core }; }
+        if (port === SANDBOX_PORTS.web) return { ok: true, pid: webHolder };
+        if (REAL_PORTS.includes(port)) return { ok: true, pid: realOwners[port] ?? 900 };
+        return { ok: true, pid: null };
+      },
+      listenPortsOf: (pid) => listens ?? (pid === 900 ? REAL_PORTS.map((p) => ({ addr: "127.0.0.1", port: p })) : [{ addr: "127.0.0.1", port: SANDBOX_PORTS.core }]),
+      ancestorsOf: (pid) => { if (ancestorsOverride) return ancestorsOverride; const out = []; for (let p = pid, i = 0; i < 40; i++) { const row = V.all.find((x) => x.pid === p); if (!row || !row.ppid || row.ppid === 1) break; out.push(row.ppid); p = row.ppid; } return out; },
+      stopVerified: (snap) => {                                                              // identify AND stop in one step: nothing real is touched
+        V.log.push(`stop:${snap.pid}`);
+        if (beforeStop) beforeStop(snap, V);
+        const row = V.all.find((x) => x.pid === snap.pid);
+        if (!row) throw new Error("IDENTITY: no process row");
+        if (row.created !== snap.created) throw new Error("IDENTITY: creation time differs");
+        if (row.cmd !== snap.cmd) throw new Error("IDENTITY: command line differs");
+        V.stopped.push(snap.pid);
+        if (staysAlive) return;
+        V.all = V.all.filter((x) => x.pid !== snap.pid);
+        if (snap.pid === V.core) { V.core = undefined; V.respawnAt = V.now + respawnMs; }
+      },
+    },
+    resolveWebPort: () => ({ port: SANDBOX_PORTS.web, pid: V.daemon }),
+    ccrInstall: () => (ccrFound ? { found: true, cli: CLI } : { found: false, reason: "test" }),
+    env: appdata === null ? {} : { APPDATA: appdata },
+    rpc: async () => { V.rpc += 1; throw new Error("the config RPC must not be used to replace a worker"); },
+    now: () => V.now,
+    sleep: async (ms) => {
+      V.now += ms;
+      if (V.core === undefined && respawn && V.respawnAt !== null && V.now >= V.respawnAt) {
+        V.core = V.nextCore++; V.respawnAt = null; V.answered = 0;
+        V.all.push({ pid: V.core, ppid: newParent, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR), created: iso(V.now) });
+        if (daemonReplaced) V.daemon = 101;
+      }
+    },
     fetch: async (url, init) => {
       const h = init.headers, aux = !JSON.parse(init.body).tools;
       V.reqs.push({ aux, agent: h["x-claude-code-agent-id"] ?? null });
       if (V.now - V.statusAt >= 5000) flush();                                          // the router flushes at most every 5 s
       V.answered += 1;
-      if (dyingRewritesCooling && V.answered === 1) mem.set(coolFile, "{\"v\":1,\"models\":{}}");      // the dying worker rewrites cooling.json on its way out
-      const status = V.answered > readyAfter || V.edits === 0 ? 200 : 503;
+      if (dyingRewritesCooling && V.answered === 1 && V.stopped.length) mem.set(coolFile, "{\"v\":1,\"models\":{}}");      // the dying worker rewrites cooling.json on its way out
+      const status = V.stopped.length && V.answered <= readyAfter ? 503 : 200;
       return { status, text: async () => "", headers: { forEach() {} } };
     },
   };
-  const editConfig = async () => { V.edits += 1; if (editBumpsPid && V.edits === 1) { V.corePid += 1; V.answered = 0; } };
-  return { V, d, mem, coolFile, editConfig, statusFile };
+  const notes = [];
+  const c = { d, key: "k", stub: { records: [] }, launchEnv: {}, baseline, daemonPid: () => (daemonKnown ? 100 : undefined), out: (l) => notes.push(l) };
+  return { V, d, c, mem, coolFile, statusFile, notes };
 }
+const prims = (v, extra = {}) => S.sandboxPrims(v.c, extra);
 
 test("H1 freshStatus: it waits until 5.1 s have passed since the last request, sends exactly ONE aux request, and returns the status THAT flush wrote; a plain read straight after a request is old", async () => {
   const v = await virtualSandbox();
-  const p = S.sandboxPrims({ d: v.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: v.editConfig });
+  const p = prims(v);
   await p.send("main", { model: ANCHOR, session: "s" });                                  // a request: flushes (the window had passed)
   const stale = await p.status();
   await v.d.sleep(1000);
@@ -810,7 +870,7 @@ test("H1 freshStatus: it waits until 5.1 s have passed since the last request, s
 
 test("H1 freshStatus: when updatedAt never moves the read says so (staleRead) instead of passing old numbers off as fresh", async () => {
   const v = await virtualSandbox();
-  const p = S.sandboxPrims({ d: { ...v.d, fetch: async () => ({ status: 200, text: async () => "", headers: { forEach() {} } }) }, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: v.editConfig });
+  const p = S.sandboxPrims({ ...v.c, d: { ...v.d, fetch: async () => ({ status: 200, text: async () => "", headers: { forEach() {} } }) } });
   v.d.fs.writeFileSync(v.statusFile, JSON.stringify({ updatedAt: "2026-01-01T00:00:00.000Z", counters: {} }));
   const s = await p.freshStatus();
   assert.equal(s.staleRead, true);
@@ -833,31 +893,189 @@ test("H1 scenario 3 reads no record COUNT (the status flush sends an aux request
   assert.ok(f.w.records.some((r) => /uwsc-s3n-1$/.test(r.headers["x-claude-code-agent-id"] ?? "")), "and so is the next agent's request");
 });
 
-test("H2 restart: the new worker must ANSWER before anything is measured, cooling.json is deleted AGAIN after the swap (the dying worker rewrote it), and the core pid must have changed", async () => {
+const REFUSAL = /^REFUSED to stop the sandbox core worker, nothing was stopped: /;
+test("process stop (round 4): the order is probes first, the process table LAST and read twice before the stop, then each target is identified AND stopped in ONE step (stopVerified), then the table is read to see it is gone; the config RPC is never used", async () => {
   const v = await virtualSandbox();
-  const p = S.sandboxPrims({ d: v.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: v.editConfig });
-  const r = await p.restartWorker();
+  const r = await prims(v).restartWorker();
   assert.deepEqual([r.pidBefore, r.pidAfter, r.changed, r.ready], [500, 501, true, true]);
-  assert.equal(v.mem.has(v.coolFile), false, "cooling.json (rewritten by the dying worker during the poll) is gone again");
-  assert.ok(v.V.reqs.length >= 3, "readiness was POLLED (503, 503, then 200)");
-  v.V.edits = 0;
-  const f = await p.freshWorker(); assert.equal(f.ready, true);
+  assert.deepEqual(v.V.stopped, [500], "exactly the core worker was stopped");
+  assert.equal(v.V.rpc, 0);
+  assert.equal(v.mem.has(v.coolFile), false, "cooling.json is gone again");
+  const log = v.V.log, firstRead = log.indexOf("processes"), lastProbeBeforeStop = Math.max(...log.slice(0, log.indexOf("stop:500")).map((x, i) => (x.startsWith("probe:") ? i : -1)));
+  assert.ok(log.slice(0, firstRead).every((x) => x.startsWith("probe:")) && log.slice(0, firstRead).length >= 6, "every port probe comes BEFORE the first table read (core, web and the four live ports)");
+  const beforeStop = log.slice(0, log.indexOf("stop:500"));
+  assert.equal(beforeStop.filter((x) => x === "processes").length, 2, "the table is read twice before the stop");
+  assert.equal(beforeStop.at(-1), "processes", "and the LAST thing before the stop is a table read");
+  assert.ok(lastProbeBeforeStop < beforeStop.lastIndexOf("processes"));
+  assert.equal(log[log.indexOf("stop:500") + 1], "processes", "after the stop the table is read to see the process is gone");
 });
 
-test("H2 freshWorker and reset REFUSE (an error of the run, not a router verdict) when the pid did not change or the worker never answers; reset restarts only when an earlier scenario left state", async () => {
-  const same = await virtualSandbox({ editBumpsPid: false });
-  const p = S.sandboxPrims({ d: same.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: same.editConfig });
-  assert.equal((await p.restartWorker()).changed, false);
-  await assert.rejects(() => p.freshWorker(), /was not replaced \(core pid 500 -> 500\).*nothing after this is a router verdict/);
-  await p.reset();                                                                         // not dirty: nothing to restart, nothing to refuse
-  p.markDirty();
-  await assert.rejects(() => p.reset(), /was not replaced/);
+test("process stop (round 4): the stale parent id of the ORCHESTRATOR (node harness\\subagent-scenarios.mjs) and of an unrelated `node some-mcp-server.js` is the reproduced defect: the old descendant rule returned [] for both; now stopRefusals refuses both, and restartWorker never stops them", async () => {
+  const stale = [{ pid: 700, ppid: 500, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: new Date(1_800_000_000_000 - 7e6).toISOString() },
+    { pid: 801, ppid: 500, name: "node.exe", cmd: "node some-mcp-server.js", created: new Date(1_800_000_000_000 - 3e6).toISOString() }];
+  const v = await virtualSandbox({ extraRows: [stale[1]], orchRow: { ppid: 500 }, ancestorsOverride: [710, 720] });      // the orchestrator's RECORDED parent is the worker's pid (stale after pid reuse); its real chain is 710, 720
+  const rows = v.V.all.filter((x) => /node/i.test(x.name));
+  const common = { rows, selfPid: 700, ancestors: [710, 720], underPid: 500, mode: "descendant" };
+  const orch = S.stopRefusals({ ...common, pid: 700 }), mcp = S.stopRefusals({ ...common, pid: 801 });
+  assert.ok(orch.includes("it is the orchestrator itself") && orch.some((x) => /not a CCR process/.test(x)) && orch.some((x) => /BEFORE its recorded parent 500/.test(x)), orch.join(" | "));
+  assert.ok(mcp.some((x) => /not a CCR process \(node some-mcp-server\.js\)/.test(x)) && mcp.some((x) => /BEFORE its recorded parent 500/.test(x)), mcp.join(" | "));
+  // the real flow: both look like descendants by their recorded parent, neither is PROVABLY one, so neither is stopped and the worker is
+  const r = await prims(v).restartWorker();
+  assert.equal(r.changed, true); assert.deepEqual(v.V.stopped, [500]);
+  assert.ok(v.notes.some((l) => /ignored 700, 801 .*stale parent id/.test(l)), v.notes.join("|"));
+  assert.ok(v.V.all.some((x) => x.pid === 700) && v.V.all.some((x) => x.pid === 801), "both are still there");
+  // a child that IS younger than the worker (a valid link) but is not a CCR process: fail closed
+  const mcp2 = await virtualSandbox({ extraRows: [{ pid: 802, ppid: 500, name: "node.exe", cmd: "node some-mcp-server.js", created: new Date(1_800_000_000_000 - 1e5).toISOString() }] });
+  await assert.rejects(() => prims(mcp2).restartWorker(), (e) => REFUSAL.test(e.message) && /its descendant 802: .*not a CCR process \(node some-mcp-server\.js\)/.test(e.message));
+  assert.deepEqual(mcp2.V.stopped, []);
+  // and a valid child that is the orchestrator itself
+  const me = await virtualSandbox({ extraRows: [{ pid: 803, ppid: 500, name: "node.exe", cmd: "node claude-code-router x", created: new Date(1_800_000_000_000 - 1e5).toISOString() }], ancestorsOverride: [710, 720] });
+  me.d.sys.selfPid = 803;
+  await assert.rejects(() => prims(me).restartWorker(), /its descendant 803: it is the orchestrator itself/);
+  assert.deepEqual(me.V.stopped, []);
+});
+
+test("descentProof: a link is trusted only when the child is YOUNGER than its parent, both times are known, and every parent is in the table (a process behind cmd.exe is not proved)", () => {
+  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
+  const rows = [{ pid: 1, ppid: 0, created: t(0) }, { pid: 2, ppid: 1, created: t(10) }, { pid: 3, ppid: 2, created: t(20) }];
+  assert.equal(S.descentProof(rows, 3, 1).ok, true);
+  assert.equal(S.descentProof([...rows.slice(0, 2), { pid: 3, ppid: 2, created: t(5) }], 3, 1).ok, false, "created before its parent");
+  assert.equal(S.descentProof([...rows.slice(0, 2), { pid: 3, ppid: 2, created: t(10) }], 3, 1).ok, false, "created at the SAME time is not later");
+  assert.match(S.descentProof([rows[0], { pid: 3, ppid: 2, created: t(20) }], 3, 1).why, /parent 2 is not in the process table .*cmd\.exe/);
+  assert.match(S.descentProof([rows[0], { pid: 2, ppid: 1 }], 2, 1).why, /creation time is missing/);
+  assert.equal(S.descentProof(rows, 1, 1).ok, false, "a pid does not descend from itself");
+});
+
+test("process stop (round 4): every refusal throws BEFORE anything is stopped and names the rule (live service.json pid, baseline, live port owner, a link that cannot be proved, a worker behind cmd.exe, a non-CCR command, an unknown daemon, a daemon that is not the daemon-child, a daemon off the web port, a foreign listener, a descendant that owns a live port or is the live pid, the orchestrator, an ancestor, the daemon itself, no holder)", async () => {
+  const young = new Date(1_800_000_000_000 - 1e5).toISOString(), kid = { pid: 600, ppid: 500, name: "node.exe", cmd: "node claude-code-router child", created: young };
+  const cases = [
+    ["the live service.json pid", { liveSvcText: JSON.stringify({ pid: 500 }) }, /it is the pid in the live service\.json/],
+    ["the baseline's live service.json pid", { baseline: { ccrPids: [900], liveServicePid: 500 } }, /it is the pid in the live service\.json/],
+    ["the baseline set of live CCR pids", { baseline: { ccrPids: [900, 500], liveServicePid: 900 } }, /it is in the baseline set of LIVE CCR pids/],
+    ["a LIVE port owner", { realOwners: { 3456: 500 } }, /it owns live port\(s\) 3456/],
+    ["a worker whose parent link cannot be proved (it sits behind cmd.exe)", { coreRow: { ppid: 710 } }, /its parent 710 is not in the process table \(a process behind cmd\.exe/],
+    ["a worker created BEFORE its recorded parent (pid reuse)", { coreRow: { created: new Date(1_800_000_000_000 - 9e5).toISOString() } }, /was created BEFORE its recorded parent 100/],
+    ["a command line that is not CCR", { coreRow: { cmd: "notepad.exe" } }, /its command line is not a CCR process \(notepad\.exe\)/],
+    ["an unknown daemon", { daemonKnown: false }, /the sandbox daemon pid is not known/],
+    ["a daemon whose command line is not the daemon-child (M3)", { daemonCmd: "node claude-code-router something-else" }, /the sandbox daemon's command line is not the CCR daemon-child/],
+    ["the daemon not holding the web port", { webHolder: 7 }, /does not hold the sandbox web port/],
+    ["a listener outside the sandbox", { listens: [{ addr: "0.0.0.0", port: 39457 }] }, /it listens outside the sandbox: .*not loopback/],
+    ["a descendant that owns a live port", { extraRows: [kid], realOwners: { 4517: 600 } }, /its descendant 600: it owns live port\(s\) 4517/],
+    ["a descendant that is the live service.json pid", { extraRows: [kid], liveSvcText: JSON.stringify({ pid: 600 }) }, /its descendant 600: it is the pid in the live service\.json/],
+    ["the core holder is the orchestrator itself", { coreHolderOverride: 700 }, /it is the orchestrator itself/],
+    ["the core holder is an ANCESTOR of the orchestrator", { ancestorsOverride: [500, 710] }, /it is an ancestor of the orchestrator/],
+    ["a torn live service.json", { liveSvcText: "{torn" }, /the live service\.json cannot be read \(\(unparseable\)\)/],
+    ["a failed probe of a live port", { probeFail: [3456] }, /the probe of live port 3456 failed, so who owns it is not known/],
+    ["a failed probe of the web port", { probeFail: [39458] }, /the probe of sandbox web port 39458 failed/],
+    ["a failed probe of the core port (no holder is known)", { probeFail: [39457] }, /the probe of sandbox core port 39457 failed|no process holds the sandbox core port/],
+    ["no baseline at all", { baseline: null }, /the baseline of live CCR pids was not handed over/],
+    ["a baseline without ccrPids", { baseline: { liveServicePid: null } }, /the baseline of live CCR pids was not handed over/],
+    ["an unreadable baseline service.json pid", { baseline: { ccrPids: [900], liveServicePid: "(unparseable)" } }, /the baseline's live service\.json pid is unreadable/],
+    ["a baseline pid that is missing altogether", { baseline: { ccrPids: [900] } }, /the baseline's live service\.json pid is unreadable \(\)/],
+    ["an EMPTY live set while a live service.json was recorded", { baseline: { ccrPids: [], liveServicePid: 900 } }, /lists no live CCR pid but recorded a live service\.json pid 900/],
+  ];
+  for (const [label, opts, re] of cases) {
+    const v = await virtualSandbox(opts);
+    await assert.rejects(() => prims(v).restartWorker(), (e) => /^REFUSED to stop the sandbox core worker, nothing was stopped: /.test(e.message) && re.test(e.message), label);
+    assert.deepEqual(v.V.stopped, [], `${label}: NOTHING was stopped`);
+  }
+  const daemon = await virtualSandbox({ coreHolderOverride: 100 });
+  await assert.rejects(() => prims(daemon).restartWorker(), /it is the sandbox daemon itself/);
+  assert.deepEqual(daemon.V.stopped, []);
+  const none = await virtualSandbox({ coreHolderOverride: null });
+  await assert.rejects(() => prims(none).restartWorker(), /no process holds the sandbox core port/);
+  const noSeam = await virtualSandbox(); delete noSeam.d.sys.stopVerified;
+  await assert.rejects(() => prims(noSeam).restartWorker(), /the system seam has no stopVerified/);
+});
+
+test("process stop (round 4): an EMPTY live set is accepted only when the baseline recorded no live service.json, and says so", async () => {
+  const v = await virtualSandbox({ baseline: { ccrPids: [], liveServicePid: null } });
+  const r = await prims(v).restartWorker();
+  assert.equal(r.changed, true);
+  assert.ok(v.notes.some((l) => /recorded NO live CCR process and no live service\.json/.test(l)), v.notes.join("|"));
+});
+
+test("process stop (round 4): pid reuse. A process table that changes between the two reads (same pid, other creation time or command line) refuses; a pid reused AFTER the second read is refused by the single-step identify-and-stop; a stop that leaves the process in the table throws; nothing else is ever stopped", async () => {
+  const swapped = await virtualSandbox({ onRead: (n, V) => { if (n === 1) { const row = V.all.find((x) => x.pid === 500); row.created = new Date(1_800_000_000_000 - 3e5).toISOString(); } } });
+  await assert.rejects(() => prims(swapped).restartWorker(), (e) => REFUSAL.test(e.message) && /changed between the two reads of the process table/.test(e.message));
+  assert.deepEqual(swapped.V.stopped, []);
+  const recmd = await virtualSandbox({ onRead: (n, V) => { if (n === 1) V.all.find((x) => x.pid === 500).cmd += " --other"; } });
+  await assert.rejects(() => prims(recmd).restartWorker(), /changed between the two reads/);
+  assert.deepEqual(recmd.V.stopped, []);
+  const moved = await virtualSandbox({ coreHolderOverride: (n, V) => (n === 1 ? V.core : 999) });                          // the port changed hands between the first probe and the re-probe before the stop
+  await assert.rejects(() => prims(moved).restartWorker(), (e) => REFUSAL.test(e.message) && /the holder of the sandbox core port changed from 500 before the stop/.test(e.message));
+  assert.deepEqual(moved.V.stopped, []);
+  const late = await virtualSandbox({ beforeStop: (snap, V) => { const row = V.all.find((x) => x.pid === snap.pid); row.created = new Date(1_800_000_000_000 - 1e5).toISOString(); row.cmd = "notepad.exe"; } });   // reused between the second read and the stop
+  await assert.rejects(() => prims(late).restartWorker(), /IDENTITY: creation time differs/);
+  assert.deepEqual(late.V.stopped, [], "the one-step stop refused: nothing was killed");
+  const alive = await virtualSandbox({ staysAlive: true });
+  await assert.rejects(() => prims(alive).restartWorker(), /the stop of pid 500 did not take effect: it is still in the process table/);
+  const gone = await virtualSandbox({ onRead: (n, V) => { if (n === 2) V.all = V.all.filter((x) => x.pid !== 500); } });                  // the worker vanished by itself between the reads
+  await assert.rejects(() => prims(gone).restartWorker(), /IDENTITY: no process row/);       // gone after the second read: the one-step stop finds no process to identify
+  assert.deepEqual(gone.V.stopped, []);
+});
+
+test("process stop (round 4): the cmd.exe case is documented fail-closed: a worker whose parent is a hidden cmd.exe is refused with that reason (the node/ccr table cannot prove the link)", async () => {
+  const v = await virtualSandbox({ coreRow: { ppid: 710 } });
+  await assert.rejects(() => prims(v).restartWorker(), /its parent 710 is not in the process table \(a process behind cmd\.exe or a shell is invisible to the node\/ccr table, so the link cannot be proved\)/);
+  assert.deepEqual(v.V.stopped, []);
+});
+
+test("stopRefusals is pure: the same rules over plain data (an empty list means the process may be stopped); the daemon is never a target", () => {
+  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
+  const scratch = "C:\\scratch\\appdata\\claude-code-router", real = "C:\\Users\\me\\AppData\\Roaming\\claude-code-router", dist = "C:\\ccr\\claude-code-router\\dist\\main";
+  const rows = [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${dist}\\gateway-bootstrap.js`, created: t(10) }];
+  const good = { rows, pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: real, distDir: dist }, selfPid: 7, ancestors: [8] };
+  assert.deepEqual(S.stopRefusals(good), []);
+  assert.ok(S.stopRefusals({ ...good, pid: 100, coreHolder: 100 }).some((x) => /daemon itself/.test(x)));
+  assert.deepEqual(S.stopRefusals({ ...good, coreHolder: 7 }), ["it does not hold the sandbox core port"]);
+  assert.deepEqual(S.stopRefusals({ ...good, expect: null }), ["no command-line expectation (scratch config path, real appdata path, installed CCR dist) was supplied"], "without an expectation a worker is never accepted");
+  assert.ok(S.stopRefusals({ ...good, expect: { ...good.expect, distDir: "" } }).some((x) => /no command-line expectation/.test(x)));
+  assert.deepEqual(S.stopRefusals({ rows, pid: 500, mode: "descendant", underPid: 100, selfPid: 7 }), []);
+  assert.deepEqual(S.stopRefusals({ pid: undefined }), ["no process holds the sandbox core port"]);
+  assert.ok(S.stopRefusals({ ...good, selfPid: 500 }).includes("it is the orchestrator itself"));
+  assert.ok(S.stopRefusals({ ...good, ancestors: [500] }).includes("it is an ancestor of the orchestrator"));
+  assert.ok(S.stopRefusals({ ...good, probeFailed: ["live port 3456"] }).some((x) => /probe of live port 3456 failed/.test(x)));
+});
+
+test("H2 after the stop: no respawn within 30 s, a REPLACED daemon, a new holder that cannot be proved under the daemon and a worker that never answers are each an ERROR of the run (an infrastructure fault, never a router verdict)", async () => {
+  const none = await virtualSandbox({ respawn: false });
+  await assert.rejects(() => prims(none).freshWorker(), /was stopped but no new process took the core port within 30 s: CCR did not respawn it/);
+  assert.deepEqual(none.V.stopped, [500]);
+  const rep = await virtualSandbox({ daemonReplaced: true });
+  await assert.rejects(() => prims(rep).freshWorker(), /the sandbox daemon itself was replaced \(pid 100 -> 101\)/);
+  const stray = await virtualSandbox({ newParent: 1 });
+  await assert.rejects(() => prims(stray).freshWorker(), /does not provably descend from the sandbox daemon 100: its parent 1 is not in the process table/);
   const dead = await virtualSandbox({ readyAfter: 1e9 });
-  const q = S.sandboxPrims({ d: dead.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: dead.editConfig });
-  await assert.rejects(() => q.freshWorker(), /did not answer a request within 20 s/);
-  const fine = await virtualSandbox();
-  const w = S.sandboxPrims({ d: fine.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: fine.editConfig });
-  w.markDirty(); await w.reset(); assert.equal(fine.V.corePid, 501, "a dirty reset replaced the worker");
+  await assert.rejects(() => prims(dead).freshWorker(), /did not answer a request within 20 s/);
+});
+
+test("H2 reset: a clean worker is NOT restarted, a dirty one is replaced, and a refusal reaches the caller", async () => {
+  const ok = await virtualSandbox(), w = prims(ok);
+  await w.reset(); assert.deepEqual(ok.V.stopped, [], "reset on a clean worker stops nothing");
+  w.markDirty(); await w.reset(); assert.deepEqual(ok.V.stopped, [500], "a dirty reset replaced the worker");
+  const live = await virtualSandbox({ liveSvcText: JSON.stringify({ pid: 500 }) }), q = prims(live);
+  q.markDirty(); await assert.rejects(() => q.reset(), /REFUSED/);
+  assert.deepEqual(live.V.stopped, []);
+});
+
+test("the PowerShell of the real stop and probe PARSES (never run here), identifies before it kills, and compares the creation time, the command line and the handle's start time; the pure parsers read their outputs", async () => {
+  const E = await import("../harness/subagent-e2e.mjs");
+  const stop = E.PS_STOP_VERIFIED(1234);
+  const at = (s) => stop.indexOf(s);
+  assert.ok(at("Get-Process -Id $id") >= 0 && at("IDENTITY: creation time differs") > at("Get-Process") && at("IDENTITY: command line differs") > 0 && at("IDENTITY: the handle is another process") > 0, "a handle is taken and the snapshot compared");
+  assert.ok(at("$p.Kill()") > at("IDENTITY: the handle is another process") && at("$p.Kill()") > at("IDENTITY: command line differs") && at("$p.Kill()") > at("IDENTITY: creation time differs"), "every identity check comes BEFORE the kill");
+  assert.ok(at("WaitForExit") > at("$p.Kill()") && at("NOT_GONE") > 0 && stop.endsWith("'KILLED'"), "the exit is awaited and confirmed, a failure throws; no SilentlyContinue");
+  assert.ok(!/SilentlyContinue/.test(stop) && /ErrorActionPreference = 'Stop'/.test(stop));
+  assert.deepEqual([E.parseProbe("PID:42"), E.parseProbe("NONE"), E.parseProbe("FAIL"), E.parseProbe("")], [{ ok: true, pid: 42 }, { ok: true, pid: null }, { ok: false }, { ok: false }], "a failed probe is not 'no listener'");
+  assert.deepEqual(E.parseAncestors("5,6,7"), [5, 6, 7]); assert.deepEqual(E.parseAncestors(""), []); assert.throws(() => E.parseAncestors("5,x"), /unreadable/);
+  const { execFileSync } = await import("node:child_process");
+  const PS = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  if (!fs.existsSync(PS)) return;                                                          // not Windows: the text checks above are all there is
+  for (const text of [stop, E.PS_PROBE_LISTENER(3456), E.PS_ANCESTORS(1234)]) {
+    const out = execFileSync(PS, ["-NoProfile", "-NonInteractive", "-Command", "$e = $null; $t = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($env:UW_TEXT, [ref]$t, [ref]$e); if ($e.Count) { 'ERR ' + $e[0].Message } else { 'PARSE_OK' }"], { encoding: "utf8", env: { ...process.env, UW_TEXT: text } }).trim();
+    assert.equal(out, "PARSE_OK", text.slice(0, 40));
+  }
 });
 
 test("H2 'cooling is empty' precondition: a scenario that needs a clean cooling list refuses to run on a leak, naming it as state of an earlier scenario, not a router verdict", async () => {
@@ -981,4 +1199,67 @@ test("H4 the sandbox has ONE provider: two DISTINCT failing models cool the prov
   const g = fakeWorld({});
   await S.runScenarios(g.prims, { only: ["3"] });
   assert.ok(g.w.cooling.has("uwstub/m-free") && g.w.cooling.has("uwstub/m-big"), "the shipped scenario ends with both cooled (step 2)");
+});
+
+// ====================================================================================== round 5 (sec-s5 re-verification: four small fixes)
+const young = (ms) => new Date(1_800_000_000_000 - ms).toISOString();
+test("F4 stop ORDER is pinned: every descendant (deepest first) is stopped BEFORE the worker, the worker is stopped LAST, and nothing it owned is left behind; reversing the order, or stopping only the worker, fails", async () => {
+  const kids = [{ pid: 600, ppid: 500, name: "node.exe", cmd: "node claude-code-router child", created: young(1e5) }, { pid: 601, ppid: 600, name: "node.exe", cmd: "node claude-code-router grandchild", created: young(5e4) }];
+  const v = await virtualSandbox({ extraRows: kids });
+  const r = await prims(v).restartWorker();
+  assert.deepEqual(v.V.stopped, [601, 600, 500], "the grandchild first, then the child, the worker LAST");
+  assert.deepEqual(v.V.log.filter((x) => x.startsWith("stop:")), ["stop:601", "stop:600", "stop:500"]);
+  assert.ok(!v.V.all.some((x) => x.pid === 600 || x.pid === 601), "no descendant of the old worker is left");
+  assert.equal(r.changed, true);
+});
+
+test("F2 the orchestrator's ancestors fail LOUD: an empty or unreadable list refuses (a node process always has a parent), and the query text stops on error", async () => {
+  for (const [label, anc] of [["empty", []], ["not a list", null], ["junk", ["x"]]]) {
+    const v = await virtualSandbox({ ancestorsOverride: anc });
+    v.d.sys.ancestorsOf = () => anc;
+    await assert.rejects(() => prims(v).restartWorker(), (e) => REFUSAL.test(e.message) && /the orchestrator's ancestors could not be read/.test(e.message), label);
+    assert.deepEqual(v.V.stopped, [], label);
+  }
+  const thrown = await virtualSandbox(); thrown.d.sys.ancestorsOf = () => { throw new Error("CIM query failed"); };
+  await assert.rejects(() => prims(thrown).restartWorker(), /CIM query failed/);
+  assert.deepEqual(thrown.V.stopped, []);
+  const E = await import("../harness/subagent-e2e.mjs"), text = E.PS_ANCESTORS(1234);
+  assert.ok(/ErrorActionPreference = 'Stop'/.test(text) && /Get-CimInstance Win32_Process -ErrorAction Stop/.test(text) && !/SilentlyContinue/.test(text), "a failed CIM query throws, it does not yield an empty table");
+});
+
+test("F3 the worker is told apart from the LIVE one by its command line: the daemons are identical, so the worker must name the SCRATCH config path, must not name the real Roaming claude-code-router path, and must run a script under the installed CCR dist; a refusal prints the first 120 characters and the missing expectation", async () => {
+  const REAL = "C:\\Users\\osami\\AppData\\Roaming\\claude-code-router";
+  const live = await virtualSandbox({ coreRow: { cmd: `"C:\\nvm4w\\nodejs\\node.exe" --require ${REAL}\\gateway-proxy-preload.cjs ${DIST}\\gateway-bootstrap.js` } });
+  await assert.rejects(() => prims(live).restartWorker(), (e) => REFUSAL.test(e.message) && /its command line names the REAL claude-code-router appdata path C:\\Users\\osami\\AppData\\Roaming\\claude-code-router/.test(e.message) && /does not contain the SANDBOX config path .*first 120 characters of its command line: "C:\\nvm4w\\nodejs\\node\.exe" --require C:\\Users\\osami/.test(e.message));
+  assert.deepEqual(live.V.stopped, []);
+  const elsewhere = await virtualSandbox({ coreRow: { cmd: `node C:\\evil\\x.js ${DIST}\\gateway-bootstrap.js --scratch C:\\x\\claude-code-router` } });          // the dist path is only a SUBSTRING of the command line
+  await assert.rejects(() => prims(elsewhere).restartWorker(), (e) => /its script c:\\evil\\x\.js is not under the installed CCR dist/.test(e.message) && /does not contain the SANDBOX config path/.test(e.message));
+  const sibling = await virtualSandbox({ coreRow: { cmd: `node --require %SCRATCH%\\gateway-proxy-preload.cjs ${DIST}-evil\\gateway-bootstrap.js` } });                      // a prefix of the dir NAME is not under the dir
+  await assert.rejects(() => prims(sibling).restartWorker(), /is not under the installed CCR dist/);
+  for (const [label, opts, re] of [["CCR install unknown", { ccrFound: false }, /the installed CCR \(its dist directory\) is not known/], ["real APPDATA unknown", { appdata: null }, /the real APPDATA is not known/]]) {
+    const v = await virtualSandbox(opts);
+    await assert.rejects(() => prims(v).restartWorker(), (e) => REFUSAL.test(e.message) && re.test(e.message), label);
+    assert.deepEqual(v.V.stopped, [], label);
+  }
+  const kid = await virtualSandbox({ extraRows: [{ pid: 600, ppid: 500, name: "node.exe", cmd: `node claude-code-router --require ${REAL}\\x.cjs`, created: young(1e5) }] });
+  await assert.rejects(() => prims(kid).restartWorker(), /its descendant 600: its command line names the REAL claude-code-router appdata path/);
+  assert.deepEqual(kid.V.stopped, []);
+  const ok = await virtualSandbox(); assert.equal((await prims(ok).restartWorker()).changed, true, "the faithful sandbox worker passes");
+});
+
+test("scriptOf reads the script a node command line runs, skipping flags and the value of --require", () => {
+  assert.equal(S.scriptOf('"C:\\nvm4w\\nodejs\\node.exe" --require C:\\a\\p.cjs C:\\ccr\\dist\\main\\gateway-bootstrap.js --x'), "c:\\ccr\\dist\\main\\gateway-bootstrap.js");
+  assert.equal(S.scriptOf("node -r pre.cjs --max-old-space-size=4096 C:/ccr/dist/main/cli.js serve"), "c:\\ccr\\dist\\main\\cli.js");
+  assert.equal(S.scriptOf("node"), ""); assert.equal(S.scriptOf(""), "");
+});
+
+test("F5 the worker's OWN listener list must contain the sandbox core port: an empty list (a failed query) or a list without it refuses", async () => {
+  for (const [label, listens] of [["empty", []], ["another sandbox port only", [{ addr: "127.0.0.1", port: 39456 }]], ["an ephemeral port only", [{ addr: "127.0.0.1", port: 50123 }]]]) {
+    const v = await virtualSandbox({ listens });
+    await assert.rejects(() => prims(v).restartWorker(), (e) => REFUSAL.test(e.message) && /its OWN listener list \(.*\) does not contain the sandbox core port 39457/.test(e.message), label);
+    assert.deepEqual(v.V.stopped, [], label);
+  }
+  const both = await virtualSandbox({ listens: [{ addr: "127.0.0.1", port: 39457 }, { addr: "127.0.0.1", port: 50123 }] });
+  assert.equal((await prims(both).restartWorker()).changed, true, "the core port plus an ephemeral one is the normal shape");
+  assert.ok(S.stopRefusals({ rows: [], pid: 5, listens: { bad: [], rec: [] }, corePort: 39457 }).some((x) => /OWN listener list \(empty\)/.test(x)));
 });
