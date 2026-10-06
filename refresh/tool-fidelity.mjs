@@ -176,9 +176,12 @@ export function loadFidelity(file = REAL_FILE) {
  * The PENDING map: for a model that was in a run's queue and ended it still untested, why, and in how many runs in a row. It is bookkeeping for the
  * coverage ledger (a model that waits for many runs is starving), not a result: it is dropped as soon as the model has one. `r` is a short reason code
  * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, route-shape, upstream-unavailable, cap, spend, row-cost, not-run), `n` the runs, `at` the last one,
- * `since` (additive, optional) the first time THIS reason was recorded in a row (an entry written before `since` existed reads as since its `at`).
+ * `since` (additive, optional) the first time THIS reason was recorded in a row (an entry written before `since` existed reads as since its `at`), `rn` (additive, optional) the runs in a row
+ * with THIS reason (it restarts at 1 when the reason changes; `n` is unchanged and counts every run; an entry without `rn` reads as rn = n) and `why` (additive, optional) the provider's own sentence,
+ * clipped and redacted, so every block can be audited.
  */
 export const PENDING_MAX = 5000;
+export const PENDING_WHY_CHARS = 120;
 export function cleanPending(raw) {
   const out = {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
@@ -186,7 +189,8 @@ export function cleanPending(raw) {
     if (!keyOk(k) || !v || typeof v !== "object") continue;
     if (typeof v.r !== "string" || !/^[a-z0-9-]{1,24}$/.test(v.r) || !Number.isInteger(v.n) || v.n < 1 || v.n > 9999) continue;
     if (typeof v.at !== "string" || !Number.isFinite(Date.parse(v.at))) continue;
-    out[k] = { r: v.r, n: v.n, at: v.at, ...(typeof v.since === "string" && Number.isFinite(Date.parse(v.since)) ? { since: v.since } : {}) };
+    out[k] = { r: v.r, n: v.n, at: v.at, ...(typeof v.since === "string" && Number.isFinite(Date.parse(v.since)) ? { since: v.since } : {}),
+      ...(Number.isInteger(v.rn) && v.rn >= 1 && v.rn <= 9999 ? { rn: v.rn } : {}), ...(typeof v.why === "string" && v.why.trim() ? { why: redactClip(v.why, PENDING_WHY_CHARS) } : {}) };
     if (Object.keys(out).length >= PENDING_MAX) break;
   }
   return out;
@@ -236,12 +240,14 @@ export function hardState(reason, provider, confirmed = {}) {
 export const recheckCovers = (recheck, state, provider) => !!recheck && recheck.reasons.includes(state) && (!recheck.providers.length || recheck.providers.includes(provider));
 /**
  * The META block (additive): what the last live run left behind for the next one. `recoverable` is the verdict's recoverable count at the END of that run, so the next run can tell whether the recoverable
- * set shrank (a loop must not spin forever on soft-but-stuck models); `at` is when.
+ * set shrank (a loop must not spin forever on soft-but-stuck models); `scope` is a stable hash of the flags that decide WHICH models the count is about (candidates, sample, --only, --include-tier, levels): only an
+ * equal scope is compared; `at` is when.
  */
 export function cleanMeta(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (!Number.isInteger(raw.recoverable) || raw.recoverable < 0 || raw.recoverable > 10000000 || typeof raw.at !== "string" || !Number.isFinite(Date.parse(raw.at))) return null;
-  return { recoverable: raw.recoverable, at: raw.at };
+  if (typeof raw.scope !== "string" || !/^[0-9a-f]{6,40}$/.test(raw.scope)) return null;                 // a count without its scope compares with nothing: it reads as no previous count
+  return { recoverable: raw.recoverable, scope: raw.scope, at: raw.at };
 }
 const metaText = (meta) => (meta ? `"meta":${JSON.stringify(meta)},` : "");
 const heldText = (held) => (held && Object.keys(held).length ? `"held":${JSON.stringify(held)},` : "");
@@ -1047,8 +1053,8 @@ export function ledgerUniverses({ set, cand = null }) {
  * state), is dropped. Entries of models outside `keepKeys` are dropped. The ledger ignores an entry of a model that is tested. Pure.
  */
 /** Pending reasons that come from an ASK (the model was sent a request and got no verdict): such a model queues behind the ones never asked, and a later `cap` wait does not erase that history. */
-export const TRIED_REASONS = new Set(["rate", "pay", "auth", "gone", "error", "timeout", "empty", "slow", "reasoning-budget", "route-shape", "upstream-unavailable", "request-cap"]);
-export function updatePending(pending, { queue, recorded, store, reasonOf, now = new Date(), keepKeys = null }) {
+export const TRIED_REASONS = new Set(["rate", "quota", "pay", "auth", "gone", "error", "timeout", "empty", "slow", "reasoning-budget", "route-shape", "upstream-unavailable", "request-cap"]);
+export function updatePending(pending, { queue, recorded, store, reasonOf, whyOf = null, now = new Date(), keepKeys = null }) {
   const out = { ...pending };
   if (keepKeys) for (const k of Object.keys(out)) if (!keepKeys.has(k)) delete out[k];             // a model that has left the probe set is not pending
   for (const e of queue) {
@@ -1056,8 +1062,11 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, now =
     if (recorded.has(e.key) || r?.strikes === 1) { delete out[e.key]; continue; }
     const code = String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
     if (code === "cap" && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
-    const prev = out[e.key];
-    out[e.key] = { r: code, n: Math.min(9999, (prev?.n ?? 0) + 1), at: now.toISOString(), since: prev && prev.r === code ? prev.since ?? prev.at : now.toISOString() };       // since: the first time THIS reason was recorded
+    const prev = out[e.key], same = !!prev && prev.r === code;
+    const why = whyOf?.(e.key) ?? (same ? prev.why : undefined);
+    out[e.key] = { r: code, n: Math.min(9999, (prev?.n ?? 0) + 1), at: now.toISOString(), since: same ? prev.since ?? prev.at : now.toISOString(),         // since: the first time THIS reason was recorded
+      rn: same ? Math.min(9999, (prev.rn ?? prev.n) + 1) : 1,                                                                                         // rn: runs in a row with THIS reason (a legacy entry reads as rn = n)
+      ...(why ? { why: redactClip(String(why), PENDING_WHY_CHARS) } : {}) };
   }
   return out;
 }
@@ -1110,7 +1119,7 @@ export function confirmedProviders(store) {
 export const holdIsWrong = (h, confirmed, provider) => !!h && (h.r === "gone" || h.r === "pay") && (confirmed?.[provider] ?? 0) > 0;
 /**
  * Releases holds: the named `providers` and, with `wrong`, every hold on gone or pay grounds whose provider has confirmed results. The `canary-*` pending entries of a released provider go too (they were
- * written by the pause and are judged again). Pure: `{held, pending, released: [{provider, r, confirmed, named}], missing: [provider]}`.
+ * written by the pause and are judged again). Pure: `{held, pending, released: [{provider, r, confirmed, named}], cleared: [pending key], missing: [provider]}` (`missing`: named providers with neither a hold nor a hard entry).
  */
 export function releaseHolds(store, pending, held, { providers = [], wrong = false } = {}) {
   const confirmed = confirmedProviders(store), hold = { ...(held ?? {}) }, pend = { ...(pending ?? {}) }, released = [];
@@ -1121,10 +1130,11 @@ export function releaseHolds(store, pending, held, { providers = [], wrong = fal
     delete hold[p];
     released.push({ provider: p, r: h.r, confirmed: confirmed[p] ?? 0, named: isNamed });
   }
-  const gone = new Set(released.map((x) => x.provider)), asked = new Set(released.filter((x) => x.named).map((x) => x.provider));
-  // the owner NAMED the provider: its models pending pay / auth / gone are lifted too (they are sticky otherwise); a hold released as wrong lifts only the canary entries its pause wrote
-  for (const k of Object.keys(pend)) { const pv = k.slice(0, k.indexOf("/")); if ((gone.has(pv) && /^canary-/.test(pend[k].r)) || (asked.has(pv) && /^(canary-)?(pay|auth|gone)$/.test(pend[k].r))) delete pend[k]; }
-  return { held: hold, pending: pend, released, missing: providers.filter((p) => !(held && Object.hasOwn(held, p))) };
+  const gone = new Set(released.map((x) => x.provider)), asked = new Set(providers), cleared = [];
+  // the owner NAMED the provider (held or not): its models pending pay / auth / gone are lifted too (they are sticky otherwise); a hold released as wrong lifts only the canary entries its pause wrote
+  for (const k of Object.keys(pend)) { const pv = k.slice(0, k.indexOf("/")); if ((gone.has(pv) && /^canary-/.test(pend[k].r)) || (asked.has(pv) && /^(canary-)?(pay|auth|gone)$/.test(pend[k].r))) { delete pend[k]; cleared.push(k); } }
+  const clearedOf = new Set(cleared.map((k) => k.slice(0, k.indexOf("/"))));
+  return { held: hold, pending: pend, released, cleared, missing: providers.filter((p) => !(held && Object.hasOwn(held, p)) && !clearedOf.has(p)) };
 }
 
 /**
@@ -1146,9 +1156,12 @@ export function untestedTable(cov) {
 // ------------------------------------------------------------------ the sweep verdict: what a re-run can still change
 
 /** Pending reasons that a re-run alone cannot change: the owner has to change a flag or the route (a row-cost ceiling, a route shape). Not recoverable, not an account state. */
-export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-shape"]);
+export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-shape", "cap-too-big"]);
+/** The owner reasons a normal run does not queue: `route-shape` is not queued while it is the stored reason; `row-cost` and `priced-over-row-cap` are not queued while the model is still over the row ceiling (raise --max-row-cost and they run). `cap-too-big` is worked out from the cap each run (raise --tf-max-tokens-per-provider). A named model or `--recheck-hard owner` asks them. */
+export const OWNER_STICKY = new Set(["route-shape"]);
+export const OWNER_COST = new Set(["row-cost", "priced-over-row-cap"]);
 /** A soft reason that has been the answer this many runs in a row is STILL recoverable, but counted apart as stuck: only these reasons (a rate limit or a cap says nothing about the model). */
-export const STUCK_REASONS = new Set(["error", "timeout", "empty", "slow"]);
+export const STUCK_REASONS = new Set(["error", "timeout", "empty", "slow", "quota"]);
 export const STUCK_RUNS = 3;
 /** The optional levels of a tested model, by the short names the ledger uses, as the verdict names them. */
 const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
@@ -1164,7 +1177,8 @@ const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
  * recorded among the models that are not tested (the cool-down a re-run has had). Pure: `{total, tested, complete, incomplete, byMissing, recoverable, byRecoverable, stuck, byStuck, hard, byHard, owner, byOwner, excluded, oldestSince}`;
  * total = tested + recoverable + hard + owner.
  */
-export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS }) {
+export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS, levels = null }) {
+  const strikeOut = new Set();
   const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4 };
   const by = new Map(), missing = new Map();
   const put = (key, s, reason, since = null, runs = 0) => { const cur = by.get(key); if (!cur || RANK[s] > RANK[cur.s]) by.set(key, { s, reason, since, runs }); };
@@ -1173,7 +1187,12 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
     if (!cov) continue;
     for (const e of cov.excluded) put(e.key, "excluded", e.reason);
     // a FIRST STRIKE has a stored result but is provisional: the next run asks it again, so it is recoverable, not tested
-    for (const e of cov.tested) { if (store?.[e.key]?.strikes === 1) put(e.key, "recoverable", "first-strike", store[e.key].at ?? null); else put(e.key, "tested", null); }
+    // (only when the level it failed at, `sl`, is one this run asks: otherwise nothing would ask it again here, so it counts as tested and is named in `strikeOutOfLevels`)
+    for (const e of cov.tested) {
+      const rec = store?.[e.key];
+      if (rec?.strikes === 1 && (!levels || levels.includes(rec.sl))) put(e.key, "recoverable", "first-strike", rec.at ?? null);
+      else { if (rec?.strikes === 1) strikeOut.add(e.key); put(e.key, "tested", null); }
+    }
     for (const e of cov.incomplete ?? []) missing.set(e.key, [...new Set([...(missing.get(e.key) ?? []), ...e.missing])]);
     for (const e of cov.held) put(e.key, "hard", HELD_STATES.includes(e.reason) ? e.reason : "gone", e.since ?? null);
     for (const e of cov.pending) {
@@ -1181,7 +1200,7 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
       const st = pending?.[e.key];
       const reason = (e.reason === "queued" || e.reason === "cap") && st ? st.r : e.reason;
       const same = st ? st.r === reason : true;
-      const since = same ? (st ? st.since ?? st.at : e.since ?? null) : null, runs = same ? (st ? st.n : e.runs ?? 0) : 0;
+      const since = same ? (st ? st.since ?? st.at : e.since ?? null) : null, runs = same ? (st ? st.rn ?? st.n : e.runs ?? 0) : 0;        // runs in a row with THIS reason (rn)
       const h = hardState(reason, prov(e.key), confirmed);
       if (h) put(e.key, "hard", h, since, runs);
       else if (OWNER_REASONS.has(reason)) put(e.key, "owner", reason, since, runs);
@@ -1198,7 +1217,7 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
   const byMissing = {};
   for (const k of incompleteKeys) for (const m of missing.get(k)) byMissing[OPTIONAL_NAME[m] ?? m] = (byMissing[OPTIONAL_NAME[m] ?? m] ?? 0) + 1;
   const v = { tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
-    stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
+    stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), strikeOutOfLevels: [...strikeOut].filter((k) => by.get(k)?.s === "tested").length, hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
   return { total: v.tested + v.recoverable + v.hard + v.owner, ...v };
 }
 

@@ -58,13 +58,16 @@ const T = { small: 50, "157": 50, big: 50 };
 
 test("a timeout is asked ONCE more at double the time inside the same run: the second attempt passes and the model gets a verdict; the doubled time stays for its later requests", async () => {
   let n = 0;
-  const f = slowFetch(() => (++n === 1 ? 500 : 80));                  // the first request is slower than 50 ms; every later one takes 80 ms: more than 50, less than the doubled 100
+  // wide margins (this file shares a busy machine with other test runs): the floor is 250 ms, the doubled time 500 ms; the first request takes 3 s (timed out at 250), every later one 400 ms:
+  // more than 250 (it would have timed out undoubled), less than 500 (it passes doubled), 150 ms and 100 ms of margin; the 2:1 ratio is the rule under test
+  const TW = { small: 250, "157": 250, big: 250 };
+  const f = slowFetch(() => (++n === 1 ? 3000 : 400));
   const done = {}, state = {};
-  const r = await probeModel({ levels: [1, 2], done, state, ...FREE, ...conn(f, T) });
+  const r = await probeModel({ levels: [1, 2], done, state, ...FREE, ...conn(f, TW) });
   assert.equal(r.inconclusive, undefined, "a verdict, not a timeout");
   assert.deepEqual([done[1].v, done[2].v], ["p", "p"]);
   assert.equal(state.tmult, 2);
-  assert.equal(f.calls.length, 4, "L1 twice (the first timed out), then 1a and L2 once each at the doubled time (80 ms would have timed out at 50)");
+  assert.equal(f.calls.length, 4, "L1 twice (the first timed out), then 1a and L2 once each at the doubled time (400 ms would have timed out at 250)");
   assert.equal(r.requests, 4, "the timed-out request counts toward the model's request ceiling");
   assert.equal(state.requests, 4);
 });

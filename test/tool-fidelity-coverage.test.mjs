@@ -260,7 +260,7 @@ test("updatePending: a model in the queue that ends the run untested gets one mo
   const out = updatePending(before, { queue: U("p/a", "p/b", "p/done", "p/strike", "p/c"), recorded: new Set(["p/done"]), store, now: NOW, keepKeys: new Set(["p/a", "p/b", "p/done", "p/strike", "p/c"]),
     reasonOf: (k) => ({ "p/a": "pay", "p/c": "Spend Cap!" })[k] });
   const T = NOW.toISOString();
-  assert.deepEqual(out, { "p/a": { r: "pay", n: 3, at: T, since: T }, "p/b": { r: "not-run", n: 1, at: T, since: T }, "p/c": { r: "spend-cap-", n: 1, at: T, since: T } }, "since: the first time THIS reason was recorded (p/a was rate before, so pay starts now)");
+  assert.deepEqual(out, { "p/a": { r: "pay", n: 3, at: T, since: T, rn: 1 }, "p/b": { r: "not-run", n: 1, at: T, since: T, rn: 1 }, "p/c": { r: "spend-cap-", n: 1, at: T, since: T, rn: 1 } }, "since: the first time THIS reason was recorded (p/a was rate before, so pay starts now)");
   const again = updatePending(out, { queue: U("p/a", "p/b"), recorded: new Set(), store, now: new Date(NOW.getTime() + 86400000), keepKeys: null, reasonOf: (k) => ({ "p/a": "pay" })[k] });
   assert.deepEqual([again["p/a"].n, again["p/a"].since, again["p/a"].at], [4, T, new Date(NOW.getTime() + 86400000).toISOString()], "the same reason again: since stays");
   const legacy = updatePending({ "p/a": { r: "error", n: 2, at: "2026-10-01T00:00:00.000Z" } }, { queue: U("p/a"), recorded: new Set(), store, now: NOW, keepKeys: null, reasonOf: () => "error" });

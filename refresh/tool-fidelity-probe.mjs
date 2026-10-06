@@ -129,6 +129,13 @@ const inconclusive = (s, why, extra = {}) => ({ v: "i", s, why: clip(why), ...ex
 // ("Your wallet balance is insufficient. Recharge at ..."), or the route says the model must be called another way. Neither says anything about the model.
 const WALLET_WORDS = /(wallet|account|credit|balance)[^.]{0,40}(insufficient|too low|empty|exhausted|depleted|not enough)|(insufficient|not enough|no remaining|out of) [^.]{0,20}(credits?|balance|funds|wallet|quota)|(please |kindly )?(recharge|top[ -]?up) (your|at|to|the)|credit limit (reached|exceeded|is)|payment required|add (funds|credits)/i;
 const ROUTE_WORDS = /must be called (via|through|at|using)|should be called (via|through|at)|wrong endpoint|use (the )?\/[\w./{}-]*v\d[\w./{}-]*|unsupported protocol|not supported (on|at) this (endpoint|route|api)|(only|exclusively) (available|supported) (via|on|at|through) [^.]{0,40}(\/v\d|messages|chat\/completions)/i;
+// A bare QUOTA sentence ("daily limit reached", "quota exceeded", "no remaining quota", "per day", "allowance") is a free provider's allowance that resets by itself: the SOFT reason `quota` (recoverable, never
+// escalated to pay automatically: the owner decides). It stays `pay` when the same sentence has MONEY words: wallet, credit, balance, recharge, top-up, payment, funds, billing, plan (so "insufficient_quota, check your
+// plan and billing details" is pay) or when the status is 402.
+const QUOTA_WORDS = /quota|daily limit|per[ -]day|limit reached|allowance/i;
+const MONEY_WORDS = /wallet|credit|balance|recharge|top[ -]?up|payment|funds|billing|\bplan\b/i;
+const RATE_SENTENCE = /rate[ -]?limit|too many requests|requests? per|tokens per|per[ -](minute|second|hour)|\b[rt]pm\b|try again in|retry (after|in)|resets? in/i;       // a rate limit, or a limit with a wait time, is its own (soft) reading, `rate`
+export const isQuotaSentence = (msg) => { const m = String(msg ?? ""); return QUOTA_WORDS.test(m) && !MONEY_WORDS.test(m) && !RATE_SENTENCE.test(m); };
 // A 400 whose sentence names none of these says nothing about the request's shape ("Upstream provider rejected the request"): an upstream hiccup until it repeats word for word.
 const SCHEMA_WORDS = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
 // The phrases a gateway or a provider puts in EVERY rejection, whatever it is about ("provider rejected the request", "invalid request error", "check the model, input, and parameters", a trace or request id):
@@ -138,9 +145,10 @@ const GENERIC_PHRASES = /(the )?(upstream )?provider rejected the request( as in
 export const namesRequest = (msg) => SCHEMA_WORDS.test(String(msg ?? "").replace(GENERIC_PHRASES, " "));
 /** The tight reading of a refusal text, plus the two shapes above: `{s, reason?, hint?}` or null. */
 function tightRead(text) {
-  const t = classifyTight(text);
+  const t = classifyTight(text), msg = extractMessage(text);
+  if (t && t !== "pay") return { s: t };
+  if (isQuotaSentence(msg)) return { s: "quota" };            // before pay: a bare quota sentence is the provider's allowance, not an empty wallet
   if (t) return { s: t };
-  const msg = extractMessage(text);
   if (WALLET_WORDS.test(msg)) return { s: "pay" };
   if (ROUTE_WORDS.test(msg)) return { s: "error", reason: "route-shape", hint: clip(msg).slice(0, 120) };
   return null;
@@ -454,7 +462,8 @@ function httpVerdict(kind, status, text, ra) {
     const size = status === 413 || SIZE_WORDS.test(text) || kind === "5";       // a refusal only at the big step, after the 157 KB step was accepted, is about size
     return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
   }
-  return inconclusive(classifyHttp(status, text), why, extra);
+  const cls = classifyHttp(status, text);
+  return inconclusive(cls === "pay" && status !== 402 && isQuotaSentence(extractMessage(text)) ? "quota" : cls, why, extra);
 }
 
 /**

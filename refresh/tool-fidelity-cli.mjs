@@ -44,11 +44,13 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { loadSnapshot } from "../menu/snapshot.mjs";
 import { loadBench } from "../menu/bench-data.mjs";
 import { gatewayConnection } from "../menu/ccr-client.mjs";
 import { sanitizeDisplay } from "../menu/sanitize.mjs";
+import { redactClip } from "../menu/redact.mjs";
 import { writeAtomic } from "../menu/atomic.mjs";
 import { runSweep } from "./bench.mjs";
 import { DEFAULTS, sweepOptions, sweepExit, gatewayUp, unprobedLines, EXIT_BUSY } from "./bench-cli.mjs";
@@ -56,7 +58,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -107,9 +109,10 @@ export function parseArgs(argv) {
     else if (a === "--reset-gone-holds") o.resetGoneHolds = true;
     else if (a === "--recheck-hard") {
       const items = (argv[++i] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-      if (!items.length || items.some((x) => !/^[A-Za-z0-9._@+-]{1,60}$/.test(x))) return { error: "--recheck-hard needs pay, auth and/or gone, optionally followed by provider names, comma separated (e.g. pay,openrouter; no reason named means all three)" };
-      const reasons = items.filter((x) => HELD_STATES.includes(x));
-      o.recheckHard = { reasons: reasons.length ? reasons : [...HELD_STATES], providers: items.filter((x) => !HELD_STATES.includes(x)) };
+      if (!items.length || items.some((x) => !/^[A-Za-z0-9._@+-]{1,60}$/.test(x))) return { error: "--recheck-hard needs pay, auth, gone and/or owner (the NEEDS-OWNER reasons: route-shape, row-cost, priced-over-row-cap), optionally followed by provider names, comma separated (e.g. pay,openrouter; no reason named means all four)" };
+      const isReason = (x) => HELD_STATES.includes(x) || x === "owner";
+      const reasons = items.filter(isReason);
+      o.recheckHard = { reasons: reasons.length ? reasons : [...HELD_STATES, "owner"], providers: items.filter((x) => !isReason(x)) };
     }
     else if (a === "--release-holds") {
       o.releaseHolds = (argv[++i] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
@@ -172,10 +175,23 @@ export function parseArgs(argv) {
   return o;
 }
 
+/** Why a queued model ended the run waiting for the cap: `cap` (it fits alone: a later run takes it) or `cap-too-big` (its own estimate is above the cap: the owner raises --tf-max-tokens-per-provider), else null. */
+export const capReasonOf = (p, key) => (p.waiting.some((e) => e.key === key) ? "cap" : p.tooBig.some((e) => e.key === key) ? "cap-too-big" : null);
+
+/**
+ * The SCOPE of a run: a stable hash of the flags that decide WHICH models the verdict's recoverable count is about (candidates, sample and seed, --only, --include-tier, --allow, levels, the policy and tiers files).
+ * The no-shrink saturation rule compares two runs only when their scope is equal.
+ */
+export function scopeOf(o) {
+  const sorted = (a) => [...(a ?? [])].map(String).sort();
+  const j = JSON.stringify({ c: !!o.candidates, s: o.sample || 0, seed: o.sample ? String(o.seed) : null, only: sorted(o.only), t: sorted(o.includeTiers), a: sorted(o.allow), l: sorted(o.levels), p: o.policyFile ?? null, f: o.tiersFile ?? null });
+  return createHash("sha1").update(j).digest("hex").slice(0, 16);
+}
+
 /** A live run that sent nothing: the verdict and the stop signal (zero new records: saturated). Returns the exit code. */
 function noRun(p) {
   for (const l of verdictLines(p.verdict)) console.log(l);
-  for (const l of saturationLines(p.verdict, saturation({ recoverable: p.verdict.recoverable }))) console.log(l);
+  for (const l of saturationLines(p.verdict, null, "none")) console.log(l);
   return 0;
 }
 
@@ -191,10 +207,26 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   // the owner's rule: only providers whose key tier is free are probed at all (a lifted tier too, once the five conditions hold): the rest are out of the probe set and counted
   const set = restrictToFree(fullSet, tiers, liftCap);
   const counts = fidelityCounts(set, store);
+  // What is BLOCKED is worked out before anything is chosen, so that a blocked model never takes a slot of --sample or --limit.
+  // HELD providers (an account state or two models gone): out of the queue BEFORE the per-provider cap, zero requests, not even a canary. --retry-accounts forces them back in.
+  // Hard reasons (pay, auth, gone) are STICKY: a hold has no expiry (unless --hold-hours asks for one) and a model pending one of them is not queued again by a normal run. Only a manual lift
+  // (--retry-accounts, --recheck-hard, and --release-holds in its own command) puts them back. NEEDS-OWNER reasons (route-shape, and row-cost / priced-over-row-cap while over the ceiling) are not queued either
+  // (--recheck-hard owner lifts them). Naming ONE model with --only provider/model (an exact id, never a provider name) is a manual act too: it lifts that model's own block and asks it.
+  const confirmed = confirmedProviders(store);
+  const named = namedKeys(o.only);
+  const lifted = (state, provider, key) => (!!o.retryAccounts && state !== "owner") || recheckCovers(o.recheckHard, state, provider) || (key !== undefined && named.has(key));
+  const holdsAll = Object.fromEntries(Object.entries(activeHolds(held, nowMs, o.holdHours)).filter(([pv, h]) => !lifted(h.r, pv)));
+  const ignoredHolds = Object.keys(holdsAll).filter((p) => holdIsWrong(holdsAll[p], confirmed, p));   // gone or pay is about MODELS where a provider has answered before: never a hold
+  const heldNow = Object.fromEntries(Object.entries(holdsAll).filter(([p]) => !ignoredHolds.includes(p)));
+  const hardOf = (e) => hardState(pending?.[e.key]?.r, e.provider, confirmed);
+  const isHeld = (e) => !!heldNow[e.provider] && !named.has(e.key);
+  const isHard = (e) => !heldNow[e.provider] && !!hardOf(e) && !lifted(hardOf(e), e.provider, e.key);
+  const isOwnerSticky = (e) => OWNER_STICKY.has(pending?.[e.key]?.r) && !lifted("owner", e.provider, e.key);
+  const isBlocked = (e) => isHeld(e) || isHard(e) || isOwnerSticky(e);
   const all = o.candidates ? selectCandidates({ set, policy, tiers: tiers ?? {}, includeTiers: lift.ok ? lift.lift.tiers : [], requestedTiers: o.includeTiers ?? [], pins: o.allow ?? [], presetKeys, maxTokens: o.maxTokens }) : null;
   let cand = all, sample = null;
   if (all && o.sample) {
-    sample = drawSample({ entries: all.entries, n: o.sample, seed: o.seed ?? "1" });
+    sample = drawSample({ entries: all.entries.filter((e) => !isBlocked(e)), n: o.sample, seed: o.seed ?? "1" });       // the blocked are not drawn: they would take places of the sample and send nothing
     const keep = new Set(sample.entries.map((e) => e.key));
     cand = { ...all, entries: sample.entries, excluded: [...all.excluded, ...all.entries.filter((e) => !keep.has(e.key)).map((e) => ({ key: e.key, reason: "not-in-sample" }))] };
   }
@@ -213,37 +245,39 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const tierOf = (e) => e.tier ?? tiers?.[e.provider] ?? null;
   const tiered = asked.map((e) => ({ ...e, tier: tierOf(e) }));
   const cl = clampDeep(tiered, { lift: liftCap });
-  const queuedAll = limitEntries(selectOnly(cl.entries, o.only), o.limit);
   const fallback = paidFallback(fullSet.models);                      // the whole set, so a narrowed run is charged like a full one
-  // HELD providers (an account state or two models gone, within the hold window): out of the queue BEFORE the per-provider cap, zero requests, not even a canary. --retry-accounts forces them back in.
-  const confirmed = confirmedProviders(store);
-  // Hard reasons (pay, auth, gone) are STICKY: a hold has no expiry (unless --hold-hours asks for one) and a model pending one of them is not queued again by a normal run. Only a manual lift
-  // (--retry-accounts, --recheck-hard, and --release-holds in its own command) puts them back.
-  // Naming ONE model with --only provider/model (an exact id, never a provider name) is a manual act too: it lifts that model's own block and asks it.
-  const named = namedKeys(o.only);
-  const lifted = (state, provider, key) => !!o.retryAccounts || recheckCovers(o.recheckHard, state, provider) || (key !== undefined && named.has(key));
-  const holdsAll = Object.fromEntries(Object.entries(activeHolds(held, nowMs, o.holdHours)).filter(([pv, h]) => !lifted(h.r, pv)));
-  const ignoredHolds = Object.keys(holdsAll).filter((p) => holdIsWrong(holdsAll[p], confirmed, p));   // gone or pay is about MODELS where a provider has answered before: never a hold
-  const heldNow = Object.fromEntries(Object.entries(holdsAll).filter(([p]) => !ignoredHolds.includes(p)));
-  const heldEntries = queuedAll.filter((e) => heldNow[e.provider] && !named.has(e.key));
+  // the scope (--only) first, THEN what is blocked, THEN --limit: a blocked model never takes a place of --limit
+  const selected = selectOnly(cl.entries, o.only);
+  const heldEntries = selected.filter(isHeld);
+  const hardEntries = selected.filter(isHard);
+  const ownerSticky = selected.filter(isOwnerSticky);
+  let runnable = selected.filter((e) => !isBlocked(e));
+  let ownerCost = [];
+  if (runnable.some((e) => OWNER_COST.has(pending?.[e.key]?.r))) {       // row-cost / priced-over-row-cap: not queued while the model is still over the row ceiling (raise --max-row-cost and it runs)
+    const cost = new Map(estimate(runnable, { maxTokens: o.maxTokens, fallback }).entries.map((x) => [x.key, x.cost]));
+    ownerCost = runnable.filter((e) => OWNER_COST.has(pending?.[e.key]?.r) && cost.get(e.key) > o.maxRowCost && !lifted("owner", e.provider, e.key));
+    const drop = new Set(ownerCost.map((e) => e.key));
+    runnable = runnable.filter((e) => !drop.has(e.key));
+  }
+  const queuedAll = limitEntries(runnable, o.limit);
   // A model that was already asked and ended without a verdict (rate, pay, gone, error, timeout, ...) goes BEHIND the models that were never asked: otherwise the same first few models of a big
   // provider take the cap every run, fail every run, and the ones behind them never run. A stable order: among equals the priority queue's own order stands.
   const triedBefore = (e) => { const x = pending?.[e.key]; return x && TRIED_REASONS.has(x.r) ? x.n : 0; };
-  const hardOf = (e) => hardState(pending?.[e.key]?.r, e.provider, confirmed);
-  const hardEntries = queuedAll.filter((e) => !heldNow[e.provider] && hardOf(e) && !lifted(hardOf(e), e.provider, e.key));
-  const namedLifts = queuedAll.filter((e) => named.has(e.key) && (hardOf(e) || heldNow[e.provider])).map((e) => {
+  const namedLifts = selected.filter((e) => named.has(e.key) && (hardOf(e) || heldNow[e.provider] || OWNER_STICKY.has(pending?.[e.key]?.r) || OWNER_COST.has(pending?.[e.key]?.r))).map((e) => {
     const st = hardOf(e), pe = pending?.[e.key];
-    return { key: e.key, state: st ?? heldNow[e.provider].r, since: st ? pe.since ?? pe.at : heldNow[e.provider].at, viaHold: !st };
+    if (st) return { key: e.key, kind: "hard", state: st, since: pe.since ?? pe.at, viaHold: false };
+    if (heldNow[e.provider]) return { key: e.key, kind: "hard", state: heldNow[e.provider].r, since: heldNow[e.provider].at, viaHold: true };
+    return { key: e.key, kind: "owner", state: pe.r, since: pe.since ?? pe.at, viaHold: false };
   });
-  const hardKeys = new Set(hardEntries.map((e) => e.key));
-  const hardBy = {};
-  for (const e of hardEntries) { const s = hardOf(e); hardBy[s] = (hardBy[s] ?? 0) + 1; }
-  const queued = queuedAll.filter((e) => (!heldNow[e.provider] || named.has(e.key)) && !hardKeys.has(e.key)).map((e, i) => ({ e, i, a: triedBefore(e) })).sort((x, y) => x.a - y.a || x.i - y.i).map((x) => x.e);
+  const hardBy = {}, ownerBy = {};
+  for (const e of hardEntries) { const st = hardOf(e); hardBy[st] = (hardBy[st] ?? 0) + 1; }
+  for (const e of [...ownerSticky, ...ownerCost]) { const r = pending[e.key].r; ownerBy[r] = (ownerBy[r] ?? 0) + 1; }
+  const queued = queuedAll.map((e, i) => ({ e, i, a: triedBefore(e) })).sort((x, y) => x.a - y.a || x.i - y.i).map((x) => x.e);
   const heldTok = {};
   for (const e of estimate(heldEntries, { maxTokens: o.maxTokens, fallback }).entries) { const x = (heldTok[e.provider] ??= { models: 0, tokens: 0 }); x.models += 1; x.tokens += e.tin; }
   const heldInfo = Object.entries(heldNow).map(([provider, h]) => ({ provider, r: h.r, at: h.at, until: h.until, models: heldTok[provider]?.models ?? 0, tokens: heldTok[provider]?.tokens ?? 0 })).sort((a, b) => b.models - a.models || (a.provider < b.provider ? -1 : 1));
   // the cap of the providers that are held is not spent on them: their share is split among the providers that can run (at most twice the cap)
-  const provsAll = new Set(queuedAll.map((e) => e.provider)).size, provsRun = new Set(queued.map((e) => e.provider)).size;
+  const provsAll = new Set(selected.map((e) => e.provider)).size, provsRun = new Set(queued.map((e) => e.provider)).size;
   const capEff = heldEntries.length && provsRun ? Math.min(o.tfMaxTokens * 2, Math.round(o.tfMaxTokens * provsAll / provsRun)) : o.tfMaxTokens;
   const est = estimate(queued, { maxTokens: o.maxTokens, fallback });
   const { kept, waiting, tooBig, needed } = applyProviderCap(est.entries, capEff);
@@ -262,7 +296,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
     const asked2 = queueFor({ ...wantSet, models: rows }, store, o.levels, { force: o.force, retryFailed: o.retryFailed }).map((e) => (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX) ? e : { ...e, todo: e.todo.filter((l) => l !== 5) })).filter((e) => e.todo.length);
     liftPreview = Object.fromEntries(want.map((t) => { const x = estimate(asked2.filter((e) => e.tier === t), { maxTokens: o.maxTokens, fallback }); return [t, { models: x.entries.length, requests: x.requests, inTokens: x.inTokens, usd: x.usd }]; }));
   }
-  const planned = (levels) => Object.fromEntries([...kept.map((e) => [e.key, overRow.has(e.key) ? PRICED_OVER_ROW : "queued"]), ...waiting.map((e) => [e.key, "cap"]), ...tooBig.map((e) => [e.key, "cap"])]
+  const planned = (levels) => Object.fromEntries([...kept.map((e) => [e.key, overRow.has(e.key) ? PRICED_OVER_ROW : "queued"]), ...waiting.map((e) => [e.key, "cap"]), ...tooBig.map((e) => [e.key, "cap-too-big"])]
     .filter(([k]) => [...kept, ...waiting, ...tooBig].find((e) => e.key === k).todo.some((l) => levels.includes(l))));
   const heldWhy = Object.fromEntries(Object.entries(heldNow).map(([p, h]) => [p, h.r]));
   const heldPlan = Object.fromEntries(set.models.filter((e) => heldNow[e.provider] && !named.has(e.key)).map((e) => [e.key, HELD_PLAN]));
@@ -280,8 +314,8 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const timeoutStats = smalls.length ? `${Math.round(smalls[0] / 1000)} s at the least, ${Math.round(smalls[Math.floor(smalls.length / 2)] / 1000)} s median, ${Math.round(smalls.at(-1) / 1000)} s at the most` : null;
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
   const untested = untestedTable(ledger.l12);
-  const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS });
-  return { untested, verdict, namedLifts, hardBlocked: { models: hardEntries.length, by: hardBy }, ignoredHolds, heldInfo, capEff, queuedAllCount: queuedAll.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
+  const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels });
+  return { untested, verdict, namedLifts, hardBlocked: { models: hardEntries.length, by: hardBy }, ownerBlocked: { models: ownerSticky.length + ownerCost.length, by: ownerBy }, ignoredHolds, heldInfo, capEff, queuedAllCount: selected.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
 /** Where the provider tiers came from, how old they are and which providers they do not cover (printed in the plan and in the report). */
@@ -311,9 +345,12 @@ async function mergeUnsaved(o, outFile, deps) {
   const cur = loadFidelity(outFile);
   if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was merged`); return 1; }
   const take = Object.keys(u.models).filter((k) => !cur.models[k] || Date.parse(u.models[k].at) > Date.parse(cur.models[k].at));
-  console.log(`tool-fidelity: ${path.basename(side)} holds ${num(Object.keys(u.models).length)} record(s): ${num(take.length)} would be taken (new, or newer than the state file's), ${num(Object.keys(u.models).length - take.length)} left alone`);
+  const newer = (a, b) => { const out = { ...a }; for (const [k, v] of Object.entries(b ?? {})) if (!out[k] || Date.parse(v.at) > Date.parse(out[k].at)) out[k] = v; return out; };
+  const takePend = Object.keys(newer(cur.pending, u.pending)).filter((k) => !cur.pending?.[k] || newer(cur.pending, u.pending)[k] !== cur.pending[k]);
+  const takeHeld = Object.keys(newer(cur.held, u.held)).filter((p) => !cur.held?.[p] || newer(cur.held, u.held)[p] !== cur.held[p]);
+  console.log(`tool-fidelity: ${path.basename(side)} holds ${num(Object.keys(u.models).length)} record(s): ${num(take.length)} would be taken (new, or newer than the state file's), ${num(Object.keys(u.models).length - take.length)} left alone; ${num(takePend.length)} pending entr${takePend.length === 1 ? "y" : "ies"} and ${num(takeHeld.length)} hold(s) would be folded in (the newer time wins)`);
   if (!o.live) { console.log("nothing was written. Re-run with --merge-unsaved --live to merge."); return 0; }
-  if (!take.length) { console.log("tool-fidelity: nothing newer to merge; the side file is left where it is"); return 0; }
+  if (!take.length && !takePend.length && !takeHeld.length) { console.log("tool-fidelity: nothing newer to merge; the side file is left where it is"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
   try {
@@ -321,9 +358,11 @@ async function mergeUnsaved(o, outFile, deps) {
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was merged`); return 1; }
     const merged = { ...fresh.models };
     for (const k of take) if (!merged[k] || Date.parse(u.models[k].at) > Date.parse(merged[k].at)) merged[k] = u.models[k];
-    (deps.saveImpl ?? saveFidelity)(outFile, merged, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending: fresh.pending ?? {} });
+    const pending = newer(fresh.pending, u.pending);
+    for (const k of take) delete pending[k];                       // a model that got its record here is not pending any more
+    (deps.saveImpl ?? saveFidelity)(outFile, merged, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending, held: newer(fresh.held, u.held) });
     try { fs.unlinkSync(side); } catch (e) { console.error(`tool-fidelity: merged, but could not delete ${path.basename(side)} (${e?.message ?? e})`); }
-    console.log(`tool-fidelity: ${num(take.length)} record(s) merged into ${path.basename(outFile)}; ${path.basename(side)} removed`);
+    console.log(`tool-fidelity: ${num(take.length)} record(s), ${num(takePend.length)} pending entr${takePend.length === 1 ? "y" : "ies"} and ${num(takeHeld.length)} hold(s) merged into ${path.basename(outFile)}; ${path.basename(side)} removed`);
     return 0;
   } catch (e) { console.error(`tool-fidelity: could not merge (${e?.message ?? e}); the side file is untouched`); return 1; }
   finally { got.release(); }
@@ -336,6 +375,7 @@ export function pendingReasonOf(r, entry) {
   if (r.w === "spend-cap") return "spend";
   if (r.w === "row-cost") return entry?.pricedOnFree ? PRICED_OVER_ROW : "row-cost";
   if (r.w === "rate-paused") return "rate";
+  if (r.w === "quota-paused") return "quota";
   return r.w ?? "skip";
 }
 
@@ -422,16 +462,18 @@ export function heldLines(p, o) {
 /** The hard-blocked models left out of the queue (stored reason pay, auth or gone, no hold needed): sticky until a manual lift. */
 export function hardLines(p) {
   const h = p.hardBlocked, L = [];
-  for (const x of p.namedLifts ?? []) L.push(show(`  ${x.key}: hard-blocked ${x.state}${x.viaHold ? " (its provider is held)" : ""} since ${x.since.slice(0, 16).replace("T", " ")}; asking it because you named it`, 240));
+  for (const x of p.namedLifts ?? []) L.push(show(`  ${x.key}: ${x.kind === "owner" ? "needs-owner" : "hard-blocked"} ${x.state}${x.viaHold ? " (its provider is held)" : ""} since ${x.since.slice(0, 16).replace("T", " ")}; asking it because you named it`, 240));
+  const ob = p.ownerBlocked;
+  if (ob?.models) L.push(`  needs-owner, not asked (route-shape is not queued while it is the stored reason; row-cost and priced-over-row-cap while over the row ceiling; --recheck-hard owner or naming the model lifts it): ${num(ob.models)} of ${num(p.queuedAllCount)} model(s) in the scope (${Object.entries(ob.by).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ")})`);
   if (!h?.models) return L;
-  return [...L,`  hard-blocked, not asked (a model pending pay, auth or gone is sticky: a normal run never asks it again; --recheck-hard pay,auth,gone[,provider] or --retry-accounts lifts it): ${num(h.models)} of ${num(p.queuedAllCount)} model(s) in the whole queue (${Object.entries(h.by).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ")})`];
+  return [...L,`  hard-blocked, not asked (a model pending pay, auth or gone is sticky: a normal run never asks it again; --recheck-hard pay,auth,gone[,provider] or --retry-accounts lifts it): ${num(h.models)} of ${num(p.queuedAllCount)} model(s) in the scope (${Object.entries(h.by).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ")})`];
 }
 
 /** What the owner must do about each NEEDS-OWNER reason: a re-run alone changes nothing. */
-export const OWNER_ACTION = { "row-cost": "raise --max-row-cost", "priced-over-row-cap": "raise --max-row-cost to probe them", "route-shape": "fix the route: the provider wants another endpoint or message shape" };
+export const OWNER_ACTION = { "cap-too-big": "raise --tf-max-tokens-per-provider", "row-cost": "raise --max-row-cost", "priced-over-row-cap": "raise --max-row-cost to probe them", "route-shape": "fix the route: the provider wants another endpoint or message shape" };
 
 /** The sweep verdict block (dry run and report): what a re-run can still change. Every figure names its denominator: the models of the ledger that are not excluded. */
-export function verdictLines(v) {
+export function verdictLines(v, { partial = false } = {}) {
   const fmt = (o) => Object.entries(o).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none";
   const of = `of ${num(v.total)}`;
   const stuck = v.stuck ? `; of which STUCK ${num(v.stuck)} (${fmt(v.byStuck)}; the same soft reason ${STUCK_RUNS} or more runs in a row, still recoverable)` : "";
@@ -440,16 +482,20 @@ export function verdictLines(v) {
     `  population: ${num(v.total)} model(s) of the ledger that are not excluded (${num(v.excluded)} more are excluded: not free, not probe-ok, relay, ...); recoverable + hard-blocked + tested${v.owner ? " + needs-owner" : ""} = ${num(v.total)}`];
   const since = Object.entries(v.oldestSince ?? {}).sort(([, a], [, b]) => Date.parse(a) - Date.parse(b)).map(([k, t]) => `${k} ${t.slice(0, 10)}`).join(", ");
   if (since) L.push(`  oldest since, per reason (the first time that reason was recorded, among the ${num(v.recoverable + v.hard + v.owner)} model(s) not tested): ${since}`);
-  if (!v.recoverable) L.push(`DONE: nothing recoverable left (${num(v.tested)} of ${num(v.total)} model(s) tested, ${num(v.hard)} hard-blocked${v.owner ? `, ${num(v.owner)} need the owner` : ""})`);
+  if (v.strikeOutOfLevels) L.push(`  note: ${num(v.strikeOutOfLevels)} first strike(s) failed at a level this run does not ask; they count as tested here and are asked again by a run that includes that level`);
+  if (!v.recoverable && partial) L.push("  (the run was interrupted or stopped early: no DONE is claimed)");
+  else if (!v.recoverable) L.push(`DONE: nothing recoverable left (${num(v.tested)} of ${num(v.total)} model(s) tested, ${num(v.hard)} hard-blocked${v.owner ? `, ${num(v.owner)} need the owner` : ""})`);
   return L;
 }
 
 /** The loop's last lines: a human line about THIS run and the machine-readable `SATURATION ...` line (always the final line). `sat` is `saturation(...)`, or null for a dry run (nothing was sent). */
-export function saturationLines(v, sat) {
+export function saturationLines(v, sat, mode = sat ? null : "dry") {
   const pc = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : "n/a");
-  const state = sat ? (sat.saturated ? "yes" : "no") : v.recoverable === 0 ? "yes" : "unknown";
+  const state = mode === "aborted" ? "unknown" : sat ? (sat.saturated ? "yes" : "no") : v.recoverable === 0 ? "yes" : "unknown";
   const L = [];
-  if (sat) L.push(`saturation of this run: ${num(sat.requests)} request(s) sent: ${num(sat.rate)} ended rate-limited (${pc(sat.rate, sat.requests)} of ${num(sat.requests)}), ${num(sat.failing)} ended rate, error or timeout (${pc(sat.failing, sat.requests)} of ${num(sat.requests)}); ${num(sat.newResults)} new record(s); saturated: ${sat.saturated ? `yes (${sat.why})` : "no"} (yes = no new record, or at least ${Math.round(SATURATION_FAIL_SHARE * 100)}% of the requests ended rate, error or timeout, or nothing recoverable is left)`);
+  if (mode === "aborted") L.push("saturation: not judged, the run was interrupted or stopped early (a partial run says nothing about the loop); run again");
+  else if (mode === "none") L.push(`saturation: this run sent nothing, so nothing was measured; ${v.recoverable === 0 ? "nothing is recoverable, so a loop should stop" : `${num(v.recoverable)} model(s) are recoverable but none could be queued now (see the lines above)`}`);
+  else if (sat) L.push(`saturation of this run: ${num(sat.requests)} request(s) sent: ${num(sat.rate)} ended rate-limited (${pc(sat.rate, sat.requests)} of ${num(sat.requests)}), ${num(sat.failing)} ended rate, error or timeout (${pc(sat.failing, sat.requests)} of ${num(sat.requests)}); ${num(sat.newResults)} new record(s); saturated: ${sat.saturated ? `yes (${sat.why})` : "no"} (yes = no new record, or at least ${Math.round(SATURATION_FAIL_SHARE * 100)}% of the requests ended rate, error or timeout, or nothing recoverable is left)`);
   else L.push(`saturation: not measured in a dry run (nothing was sent); ${v.recoverable === 0 ? "nothing is recoverable, so a loop should stop" : "run with --live to measure it"}`);
   L.push(`SATURATION saturated=${state} recoverable=${v.recoverable} hard=${v.hard} new_results=${sat ? sat.newResults : 0}`);
   return L;
@@ -491,18 +537,18 @@ async function releaseCommand(o, outFile, deps) {
   if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was changed`); return 1; }
   const opts = { providers: o.releaseHolds ?? [], wrong: !!o.resetGoneHolds };
   const r1 = releaseHolds(cur.models, cur.pending, cur.held, opts);
-  console.log(`tool-fidelity: ${num(r1.released.length)} of ${num(Object.keys(cur.held ?? {}).length)} hold(s) would be released${r1.released.length ? `: ${r1.released.slice(0, 15).map((x) => `${show(x.provider, 18)} (${x.r}${x.confirmed ? `, ${x.confirmed} confirmed` : ""})`).join(", ")}${r1.released.length > 15 ? ", ..." : ""}` : ""}`);
+  console.log(`tool-fidelity: ${num(r1.released.length)} of ${num(Object.keys(cur.held ?? {}).length)} hold(s) would be released${r1.released.length ? `: ${r1.released.slice(0, 15).map((x) => `${show(x.provider, 18)} (${x.r}${x.confirmed ? `, ${x.confirmed} confirmed` : ""})`).join(", ")}${r1.released.length > 15 ? ", ..." : ""}` : ""}${r1.cleared.length ? `; ${num(r1.cleared.length)} pay/auth/gone/canary pending entr${r1.cleared.length === 1 ? "y" : "ies"} would be cleared` : ""}`);
   if (r1.missing.length) console.log(show(`  not held: ${r1.missing.join(", ")}`, 300));
   if (!o.live) { console.log("nothing was written. Re-run with --live to apply it."); return 0; }
-  if (!r1.released.length) { console.log("tool-fidelity: nothing to release"); return 0; }
+  if (!r1.released.length && !r1.cleared.length) { console.log("tool-fidelity: nothing to release"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
     const m = releaseHolds(fresh.models, fresh.pending, fresh.held, opts);
-    (deps.saveImpl ?? saveFidelity)(outFile, fresh.models, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending: m.pending, held: m.held });
-    console.log(`tool-fidelity: ${num(m.released.length)} hold(s) released in ${path.basename(outFile)}`);
+    (deps.saveImpl ?? saveFidelity)(outFile, fresh.models, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending: m.pending, held: m.held, meta: null });       // a lift changes what is recoverable: the next run compares with nothing
+    console.log(`tool-fidelity: ${num(m.released.length)} hold(s) released and ${num(m.cleared.length)} pending entr${m.cleared.length === 1 ? "y" : "ies"} cleared in ${path.basename(outFile)}`);
     return 0;
   } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
   finally { got.release(); }
@@ -639,7 +685,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     // a provider whose first answer was a dead key, an empty balance or a missing model costs nothing more; one that keeps rate-limiting is left for the next run
     const ps = (prov[t.provider] ??= { rateStreak: 0, paused: false, blocked: null, answered: false, goneModels: new Set(), payModels: new Set(), episodes: 0 });
     if (ps.blocked) return { s: "skip", w: `canary-${ps.blocked}` };
-    if (ps.paused) return { s: "skip", w: "rate-paused" };
+    if (ps.paused) return { s: "skip", w: ps.paused === "quota" ? "quota-paused" : "rate-paused" };
     const tele = [];
     stats.started.add(t.key);
     stats.active.set(t.provider, (stats.active.get(t.provider) ?? 0) + 1);
@@ -665,6 +711,9 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
           await new Promise((res) => { const tm = setTimeout(res, ms); ac.signal.addEventListener("abort", () => { clearTimeout(tm); res(); }, { once: true }); });
         } else ps.paused = true;
       }
+    } else if (sx === "quota") {
+      // an exhausted allowance does not come back within the minute: after RATE_PAUSE_AFTER in a row the provider is left alone for the rest of the run (no wait), its models stay pending quota (soft)
+      if (++ps.rateStreak >= RATE_PAUSE_AFTER) { ps.rateStreak = 0; ps.paused = "quota"; }
     } else ps.rateStreak = 0;
     // The canary. AUTH is the key's state: the first answer decides for the provider. PAY and GONE are answers about MODELS (a free key meets models that need credit; a catalogue lists models that are
     // gone), so a provider that has answered before (a confirmed record from an earlier run) is never paused or held on those grounds: the model is pending pay / gone and the provider goes on. Without
@@ -818,13 +867,17 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const onSigint = () => { try { periodic(); } catch { /* the final save retries */ } if (++interrupts > 1) process.exit(130); console.error("\ntool-fidelity: stopping -- probes in flight are dropped (not recorded) and what finished is saved (Ctrl-C again to force)"); ac.abort(); };
   process.on("SIGINT", onSigint);
   let pending = { ...(stored.pending ?? {}) }, meta = stored.meta ?? null;
+  // the models this run asks only because the owner NAMED them: the provider they belong to is not released from its hold, and its other entries are not cleared, by their answer
+  const liftedKeys = new Set((p.namedLifts ?? []).map((x) => x.key));
+  const namedOnly = new Set([...new Set(p.kept.map((e) => e.provider))].filter((pv) => p.kept.filter((e) => e.provider === pv).every((e) => liftedKeys.has(e.key))));
   // the holds: a provider whose canary was an account state (pay, auth) or two models gone is written down with the time, so the next runs leave it alone for the hold window; a provider that answered is released
   const held = { ...(stored.held ?? {}) }, heldStamped = new Set();
   const syncHeld = () => {
-    const nowIso = now().toISOString();
+    const nowIso = now().toISOString(), conf = confirmedProviders(store);
     for (const [pv, x] of Object.entries(prov)) {
       if (x.blocked && HELD_STATES.includes(x.blocked) && !heldStamped.has(pv)) { held[pv] = { r: x.blocked, at: nowIso }; heldStamped.add(pv); }
-      else if (x.answered && held[pv] && !x.blocked) delete held[pv];
+      // a hold goes only when the provider ANSWERED and now has a confirmed (t or v) record; a named model's answer releases nothing but that model's own entry
+      else if (x.answered && held[pv] && !x.blocked && !namedOnly.has(pv) && (conf[pv] ?? 0) > 0) delete held[pv];
     }
   };
   let ledgerLines = [], verdict = null;
@@ -838,7 +891,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       const l12 = coverage(u.l12, store, { level: "l12", pending, plan: heldPlan, stuckRuns: o.pendingRuns, heldWhy, heldSince });
       const l3c = u.l3 ? coverage(u.l3, store, { level: "l3", pending, plan: heldPlan, stuckRuns: o.pendingRuns, heldWhy, heldSince }) : null;
       ledgerLines = [...coverageLines(l12, "L1+L2 (every listed model)"), ...untestedLines(untestedTable(l12)), ...(l3c ? coverageLines(l3c, "L3 (candidates and the rest of the probe set)") : [])];
-      verdict = sweepVerdict({ l12, l3: l3c, confirmed: conf, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS });
+      verdict = sweepVerdict({ l12, l3: l3c, confirmed: conf, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels });
     } catch (e) { ledgerLines = [`coverage: the ledger could not be built (${e?.message ?? e}); this is a bug, not a result`]; verdict = null; }
   };
   let capDropped = [];                                           // records the file's size cap pushed out in the last save
@@ -847,13 +900,21 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const periodic = () => { try { writeOnce(); sinceSave = 0; } catch (e) { if (!saveWarned) { saveWarned = true; console.error(`tool-fidelity: warning: could not save (${e?.message ?? e}); the records are kept and the save is retried`); } } };
   const tally = { t: 0, v: 0, x: 0, u: 0, pending: 0 }, other = {}, why = new Map(), got = new Set(), escalated = new Set(), clampedKeys = new Set(), telemetry = makeTelemetry(), prov = {};
   let recorded = 0;
-  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {}, unavailBy = {};
+  const stats = { started: new Set(), active: new Map() }, slowBy = {}, slowList = [], routeBy = {}, unavailBy = {}, whyBy = new Map();
+  // the provider's own sentence, clipped and redacted (the result carries it as `p`, usually inside the JSON body)
+  const sentenceOf = (r) => {
+    const raw = String(r.m ?? r.p ?? "");
+    if (!raw) return null;
+    const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(raw);
+    const t = (m ? m[1] : raw.replace(/^(stream error: )?(HTTP \d+: )?/, "")).replace(/\s+/g, " ").trim();
+    return t ? redactClip(t, 120) : null;
+  };
   const onResult = (r) => {
     if (r.escalated) escalated.add(r.key);
     if (r.w === "upstream-unavailable") { const pv = r.key.slice(0, r.key.indexOf("/")); const x = (unavailBy[pv] ??= { n: 0, hint: r.hint ?? "" }); x.n += 1; }
     if (r.w === "route-shape") { const pv = r.key.slice(0, r.key.indexOf("/")); const x = (routeBy[pv] ??= { n: 0, hint: r.hint ?? "" }); x.n += 1; }
     if (r.reason === "slow") { const pv = r.key.slice(0, r.key.indexOf("/")); slowBy[pv] = (slowBy[pv] ?? 0) + 1; slowList.push({ key: r.key, secs: r.secs }); }
-    if (r.s !== "ok" || !r.tf) { other[r.s] = (other[r.s] ?? 0) + 1; why.set(r.key, pendingReasonOf(r, p.kept.find((k) => k.key === r.key))); return; }
+    if (r.s !== "ok" || !r.tf) { other[r.s] = (other[r.s] ?? 0) + 1; why.set(r.key, pendingReasonOf(r, p.kept.find((k) => k.key === r.key))); const sent = sentenceOf(r); if (sent) whyBy.set(r.key, sent); return; }
     const e = p.kept.find((k) => k.key === r.key);
     const rec = buildRecord(store[r.key] ?? null, r.tf.done, { now: now(), alias: !!e?.alias });
     if (!rec) { other.norecord = (other.norecord ?? 0) + 1; return; }       // no level actually ran: nothing is recorded
@@ -876,7 +937,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     const tot = telemetry.total(), el = (Date.now() - started) / 1000;
     const act = [...stats.active].filter(([, n]) => n > 0).map(([k, n]) => `${show(k, 14)} ${n}`).join(", ") || "none";
     const sc = {};
-    for (const x of Object.values(prov)) if (x.paused || x.blocked) { const k = x.blocked ?? "rate"; sc[k] = (sc[k] ?? 0) + 1; }
+    for (const x of Object.values(prov)) if (x.paused || x.blocked) { const k = x.blocked ?? (x.paused === "quota" ? "quota" : "rate"); sc[k] = (sc[k] ?? 0) + 1; }
     const stopped = Object.entries(sc).map(([k, n]) => `${k} ${n}`).join(", ") || "none";          // counts only: the names are in the report and in the held block, not repeated every minute
     const toks = tot.usage ? `${tok(tot.inTok)} in / ${tok(tot.outTok)} out reported so far (estimate for the run ~${tok(p.run.inTokens)} in)` : `no usage reported yet (estimate for the run ~${tok(p.run.inTokens)} in)`;
     let remain = 0, known = tot.n > 0;
@@ -887,7 +948,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   };
   const hb = setInterval(heartbeat, deps.heartbeatMs ?? 60000);
   hb.unref?.();
-  let probes = 0, code = 0, saved = true;
+  let probes = 0, code = 0, saved = true, stoppedEarly = false;
   const skips = {};
   try {
     for (const [name, list] of phases) {
@@ -897,7 +958,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       probes += result.probes;
       for (const [w, n] of Object.entries(result.skips)) skips[w] = (skips[w] ?? 0) + n;
       code = Math.max(code, sweepExit(result));
-      if (result.aborted) { console.log(`  stopped (${result.stopped}); re-run to resume: models with a result are not asked again`); break; }
+      if (result.aborted) { stoppedEarly = true; console.log(`  stopped (${result.stopped}); re-run to resume: models with a result are not asked again`); break; }
     }
   } finally {
     clearInterval(hb);
@@ -908,11 +969,12 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     const before = JSON.stringify(pending), heldBefore = JSON.stringify(stored.held ?? {}), metaBefore = JSON.stringify(stored.meta ?? null);
     syncHeld();
     pending = updatePending(pending, { queue, recorded: got, store, now: now(), keepKeys: new Set([...p.set.models.map((m) => m.key), ...p.set.relay]),
-      reasonOf: (k) => (p.waiting.some((e) => e.key === k) || p.tooBig.some((e) => e.key === k) ? "cap" : why.get(k) ?? "not-run") });
+      reasonOf: (k) => capReasonOf(p, k) ?? why.get(k) ?? "not-run", whyOf: (k) => whyBy.get(k) ?? null });
     // a provider that ANSWERED in this run (a manual recheck reached it): its stale auth and canary-* entries (models that were skipped, never asked) are not hard blocks any more
-    for (const [pv, x] of Object.entries(prov)) if (x.answered && !x.blocked) for (const k of Object.keys(pending)) if (k.startsWith(`${pv}/`) && /^(canary-|auth$)/.test(pending[k].r)) delete pending[k];
+    const confNow = confirmedProviders(store);
+    for (const [pv, x] of Object.entries(prov)) if (x.answered && !x.blocked && !namedOnly.has(pv) && (confNow[pv] ?? 0) > 0) for (const k of Object.keys(pending)) if (k.startsWith(`${pv}/`) && /^(canary-|auth$)/.test(pending[k].r)) delete pending[k];
     buildLedger();
-    if (verdict && !ac.signal.aborted) meta = { recoverable: verdict.recoverable, at: now().toISOString() };
+    if (verdict && !ac.signal.aborted && !stoppedEarly) meta = { recoverable: verdict.recoverable, scope: scopeOf(o), at: now().toISOString() };
     if (recorded || JSON.stringify(pending) !== before || JSON.stringify(held) !== heldBefore || JSON.stringify(meta) !== metaBefore) {
       saved = false;
       for (let i = 0; i < 3 && !saved; i++) { try { writeOnce(); saved = true; } catch (e) { if (i < 2) await sleep(deps.retryDelayMs ?? 500); else saveWarned = e?.message ?? String(e); } }
@@ -934,14 +996,16 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   console.log(`  verified (v) ${tally.v}   tools at small size (t) ${tally.t}   failed (x) ${tally.x}   failed once, asked again next run ${tally.pending}`);
   const notRecorded = Object.entries(other).map(([s, n]) => `${s} ${n}`).join(", ");
   if (notRecorded) console.log(`  not recorded (they stay queued; a refusal about the account is not a verdict on the model): ${notRecorded}`);
-  if (p.waiting.length) console.log(`  ${num(p.waiting.length)} model(s) waited for the per-provider cap of ${num(o.tfMaxTokens)} input tokens: run again to continue`);
+  if (p.waiting.length) console.log(o.recheckHard || o.retryAccounts || p.namedLifts?.length
+    ? `  ${num(p.waiting.length)} model(s) waited for the per-provider cap of ${num(o.tfMaxTokens)} input tokens: repeat the same ${o.recheckHard ? "--recheck-hard" : o.retryAccounts ? "--retry-accounts" : "--only"} command to continue (a normal run would leave the lifted ones blocked)`
+    : `  ${num(p.waiting.length)} model(s) waited for the per-provider cap of ${num(o.tfMaxTokens)} input tokens: run again to continue`);
   const left = unprobedLines(skips, o);
   if (left) console.log(left);
   console.log(`  now: with a record ${num(after.withRecord)} of ${num(after.probeSet)} probe-ok (${num(after.probeOk)} incl. relay not probed); against the current fixture ${num(after.withRecordCurrent)} of ${num(after.probeSet)}; still queued ${num(after.queued)}; context length unknown ${num(after.ctxUnknown)} of ${num(after.probeSet)}`);
   for (const line of telemetry.lines((Date.now() - started) / 1000)) console.log(show(line, 900));
   for (const line of telemetry.timeoutLines(slowBy)) console.log(show(line, 300));
   if (slowList.length) console.log(show(`  pending: slow (the L1 request timed out twice, at the doubled time; never a verdict, a later run asks again): ${slowList.slice(0, 12).map((x) => `${x.key} (${x.secs} s)`).join(", ")}${slowList.length > 12 ? `, ... and ${slowList.length - 12} more` : ""}`, 900));
-  const paused = Object.entries(prov).filter(([, x]) => x.paused && !x.blocked).map(([k]) => `${show(k, 18)} (rate-limited)`);
+  const paused = Object.entries(prov).filter(([, x]) => x.paused && !x.blocked).map(([k, x]) => `${show(k, 18)} (${x.paused === "quota" ? "quota exhausted" : "rate-limited"})`);
   if (paused.length) console.log(`  left alone for the rest of this run, their models stay pending: ${paused.join(", ")}`);
   if (Object.keys(routeBy).length) {
     console.log("  providers needing a routing fix (the route says the model must be called another way: a different endpoint or message shape; not a model failure, never a strike; pending: route-shape):");
@@ -975,8 +1039,11 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   for (const line of ledgerLines) console.log(show(line, 600));
   if (verdict) {
     const tot = telemetry.total(), st = telemetry.statuses, rate = st.rate ?? 0;
-    for (const line of verdictLines(verdict)) console.log(line);
-    for (const line of saturationLines(verdict, saturation({ requests: tot.n, rate, failing: rate + (st.error ?? 0) + (st.timeout ?? 0), newResults: recorded, recoverable: verdict.recoverable, prevRecoverable: o.retryAccounts || o.recheckHard ? null : stored.meta?.recoverable ?? null }))) console.log(line);
+    const partial = stoppedEarly || ac.signal.aborted || interrupts > 0;
+    // the previous run's count is compared only for an equal scope, and never after a manual lift (a lift grows the set on purpose)
+    const prevRecoverable = o.retryAccounts || o.recheckHard || p.namedLifts?.length || stored.meta?.scope !== scopeOf(o) ? null : stored.meta.recoverable;
+    for (const line of verdictLines(verdict, { partial })) console.log(line);
+    for (const line of saturationLines(verdict, saturation({ requests: tot.n, rate, failing: rate + (st.error ?? 0) + (st.timeout ?? 0) + (st.quota ?? 0), newResults: recorded, recoverable: verdict.recoverable, prevRecoverable }), partial ? "aborted" : null)) console.log(line);
   } else console.log(`SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=${recorded}`);
   return code;
 }
