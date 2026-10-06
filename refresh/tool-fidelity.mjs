@@ -1248,9 +1248,9 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
     for (const e of cov.pending) {
       // this run's plan (`queued`, `cap`) hides why the model was pending before: the stored reason is the one that says what a re-run is up against
       const st = pending?.[e.key];
-      // this run's plan hides why the model was pending before: the stored reason says what a re-run is up against, EXCEPT a scheduling reason (cap, spend, not-run): a model this run QUEUES is not waiting for the
+      // this run's plan hides why the model was pending before: the stored reason says what a re-run is up against, EXCEPT a scheduling reason (cap, spend, not-run) or a NEEDS-OWNER one (row-cost, priced-over-row-cap, route-shape: the owner has since raised the ceiling or lifted it, so it is asked now): a model this run QUEUES is not waiting for the
       // cap any more, and one that waits for it now is `cap` whatever it was before
-      const reason = (e.reason === "queued" || e.reason === "cap") && st ? (e.reason === "queued" ? (SCHEDULING_REASONS.has(st.r) ? "not-run" : st.r) : (TRIED_REASONS.has(st.r) ? st.r : "cap")) : e.reason;
+      const reason = (e.reason === "queued" || e.reason === "cap") && st ? (e.reason === "queued" ? (SCHEDULING_REASONS.has(st.r) || OWNER_REASONS.has(st.r) ? "not-run" : st.r) : (TRIED_REASONS.has(st.r) ? st.r : "cap")) : e.reason;
       const same = st ? st.r === reason : true;
       const since = same ? (st ? st.since ?? st.at : e.since ?? null) : null, runs = same ? (st ? st.rn ?? st.n : e.runs ?? 0) : 0;        // runs in a row with THIS reason (rn)
       const h = hardState(reason, prov(e.key), confirmed);
@@ -1267,7 +1267,7 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
     if (o.held) { put(o.key, "hard", HELD_STATES.includes(o.held) ? o.held : "gone", null); continue; }
     const st = pending?.[o.key];
     let reason = st ? st.r : "optional-not-run";
-    if (o.plan === "queued" && st && SCHEDULING_REASONS.has(st.r)) reason = "optional-not-run";               // queued this run: not 'cap'
+    if (o.plan === "queued" && st && (SCHEDULING_REASONS.has(st.r) || OWNER_REASONS.has(st.r))) reason = "optional-not-run";               // queued this run: not 'cap'
     else if (o.plan === "cap" && !(st && TRIED_REASONS.has(st.r))) reason = "cap";
     const since = st ? st.since ?? st.at : null, runs = st ? st.rn ?? st.n : 0;
     const h = hardState(reason, prov(o.key), confirmed);
@@ -1436,12 +1436,23 @@ const extractMsg = (body) => { let t = String(body ?? ""); try { const j = JSON.
  * existed) has nothing to judge by and is left alone: `--release-holds <provider>` lifts those by hand. Pure: `{pending, cleared: [{key, why}]}`.
  */
 export function migrateAvailabilityPay(pending) {
-  const out = { ...(pending ?? {}) }, cleared = [];
+  const out = { ...(pending ?? {}) }, cleared = [], clipped = [];
   for (const [key, v] of Object.entries(pending ?? {})) {
     if (v?.r !== "pay" || typeof v.why !== "string" || !v.why.trim()) continue;
+    // a sentence at the clip length was cut: a money word after the cut is invisible, so it cannot be judged (like an entry with no sentence)
+    if (v.why.length >= PENDING_WHY_CHARS) { clipped.push(key); continue; }
     if (isAvailabilityText(v.why) && !hasMoneyWords(v.why)) { delete out[key]; cleared.push({ key, why: v.why }); }
   }
-  return { pending: out, cleared };
+  return { pending: out, cleared, clipped };
+}
+/**
+ * Providers HELD on `pay` whose pending pay entries carry no sentence with a money word (none stored, cut at the clip length, or availability-only): the hold may rest on an HTTP 402 alone. A hold keeps
+ * every model of the provider out of the queue, so dropping the model entries does not ask them again while it stands (`--release-holds <provider> --live` lifts it). Pure: sorted provider names.
+ */
+export function payHoldsOnBareEvidence(held, pending) {
+  const money = new Set();
+  for (const [key, v] of Object.entries(pending ?? {})) if (v?.r === "pay" && typeof v.why === "string" && hasMoneyWords(v.why)) money.add(key.slice(0, key.indexOf("/")));
+  return Object.entries(held ?? {}).filter(([p, h]) => h?.r === "pay" && !money.has(p)).map(([p]) => p).sort();
 }
 export const STALE_AFW = /^(file_path: (newline|backslash)|replace_all: missing|start_line: missing)/;
 export function migrateTransient(store) {

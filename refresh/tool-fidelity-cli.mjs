@@ -58,7 +58,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, migrateAvailabilityPay, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, migrateAvailabilityPay, payHoldsOnBareEvidence, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -398,6 +398,9 @@ async function mergeUnsaved(o, outFile, deps) {
   finally { got.release(); }
 }
 
+/** The spend tripwire in one phrase: a row priced at $0 (an unlisted price on a free-labelled key) whose response reported a cost. A tripwire, not a price. */
+const tripLine = (t) => `${num(t.models.size)} unlisted-free model(s) reported a cost: ${usd(t.usd)} (${show(Object.entries(t.by).map(([p, x]) => `${p} ${num(x.models.size)}`).join(", "), 160)})`;
+
 /** Why a model that did not get a result ends the run pending: the short code kept in the pending map (a reason is never an error, and never a verdict). */
 export function pendingReasonOf(r, entry) {
   if (r.reason === "reasoning-budget" || r.reason === "request-cap" || r.reason === "slow") return r.reason;
@@ -460,7 +463,9 @@ async function resetTransient(o, outFile, deps) {
   console.log(`  failures caused by the gateway's request translation: ${num(m1.tagged.length)} would be tagged xw gateway (they stay x)`);
   const pa1 = migrateAvailabilityPay(cur.pending);
   { const pp = {}; for (const c of pa1.cleared) { const p = c.key.slice(0, c.key.indexOf("/")); pp[p] = (pp[p] ?? 0) + 1; }
-    console.log(`  pending pay entries that rest on an availability sentence only (an HTTP 402 with "Upstream request failed."-style words and no money word: not evidence about the account): ${num(pa1.cleared.length)} of ${num(Object.values(cur.pending ?? {}).filter((x) => x.r === "pay").length)} would be dropped, the models asked again${pa1.cleared.length ? ` (${Object.entries(pp).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${show(k, 18)} ${num(n)}`).join(", ")})` : ""}; pay entries with no stored sentence stay: \`--release-holds <provider> --live\` lifts them by hand`); }
+    console.log(`  pending pay entries that rest on an availability sentence only (an HTTP 402 with "Upstream request failed."-style words and no money word: not evidence about the account): ${num(pa1.cleared.length)} of ${num(Object.values(cur.pending ?? {}).filter((x) => x.r === "pay").length)} would be dropped, the models asked again${pa1.cleared.length ? ` (${Object.entries(pp).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${show(k, 18)} ${num(n)}`).join(", ")})` : ""}; pay entries with no stored sentence, or one cut at the clip length (${num(pa1.clipped.length)}), cannot be judged and stay: \`--release-holds <provider> --live\` lifts them by hand`); }
+  const stillHeld = payHoldsOnBareEvidence(cur.held, pa1.pending);
+  if (stillHeld.length) console.log(`  STILL held on pay with no sentence of money words on record (the hold may rest on an HTTP 402 alone, and it keeps every model of the provider out of the queue even after its entries are dropped): ${show(stillHeld.join(", "), 200)}; \`--release-holds <provider> --live\` lifts it`);
   console.log(`  argument-fidelity failures that came from the old test content (a path with an escape look-alike, an optional parameter left out): ${num(m1.afReset.length)} would be cleared (ask again with --force --levels 1 --only provider/model)`);
   if (!o.live) { console.log("nothing was written. Re-run with --reset-transient --live to apply it."); return 0; }
   if (!m1.cleared.length && !m1.tagged.length && !m1.afReset.length && !pa1.cleared.length) { console.log("tool-fidelity: nothing to change"); return 0; }
@@ -476,6 +481,8 @@ async function resetTransient(o, outFile, deps) {
     pending = pa.pending;
     (deps.saveImpl ?? saveFidelity)(outFile, m.store, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending });
     if (pa.cleared.length) console.log(`tool-fidelity: ${num(pa.cleared.length)} pending pay entr${pa.cleared.length === 1 ? "y" : "ies"} on an availability sentence dropped`);
+    const held2 = payHoldsOnBareEvidence(fresh.held, pending);
+    if (held2.length) console.log(`tool-fidelity: STILL held on pay with no sentence of money words on record: ${show(held2.join(", "), 200)} (their models stay out of the queue until the hold is lifted: --release-holds <provider> --live)`);
     console.log(`tool-fidelity: ${num(m.cleared.length)} record(s) cleared, ${num(m.tagged.length)} tagged xw gateway and ${num(m.afReset.length)} argument-fidelity result(s) cleared in ${path.basename(outFile)}; the next run asks the cleared ones again`);
     return 0;
   } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
@@ -509,7 +516,7 @@ export function hardLines(p) {
 export const OWNER_ACTION = { "cap-too-big": "raise --tf-max-tokens-per-provider", "row-cost": "raise --max-row-cost", "priced-over-row-cap": "raise --max-row-cost to probe them", "route-shape": "fix the route: the provider wants another endpoint or message shape" };
 
 /** The sweep verdict block (dry run and report): what a re-run can still change. Every figure names its denominator: the models of the ledger that are not excluded. */
-export function verdictLines(v, { partial = false, queued = 0 } = {}) {
+export function verdictLines(v, { partial = false, queued = 0, tripwire = null } = {}) {
   const fmt = (o) => Object.entries(o).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "none";
   const of = `of ${num(v.total)}`;
   const stuck = v.stuck ? `; of which STUCK ${num(v.stuck)} (${fmt(v.byStuck)}; the same soft reason ${STUCK_RUNS} or more runs in a row, still recoverable)` : "";
@@ -518,6 +525,7 @@ export function verdictLines(v, { partial = false, queued = 0 } = {}) {
     `  population: ${num(v.total)} model(s) of the ledger that are not excluded (${num(v.excluded)} more are excluded: not free, not probe-ok, relay, ...); recoverable + hard-blocked + tested${v.owner ? " + needs-owner" : ""} = ${num(v.total)}`];
   for (const [pv, x] of Object.entries(v.stuckWhy ?? {}).slice(0, 6)) if (x.why) L.push(show(`  stuck on ${pv}: "${x.why}" (${x.n} of its ${x.total} stuck model(s) say so; the provider's own words)`, 260));
   if ((v.recoverable || v.hard) && v.recoverableTested !== undefined) L.push(`  of which tested at L1+L2 (a record with both verdicts): RECOVERABLE ${num(v.recoverableTested)} of ${num(v.recoverable)}, HARD-BLOCKED ${num(v.hardTested)} of ${num(v.hard)}`);
+  if (tripwire?.models.size) L.push(show(`  NOTE: spend tripwire: ${tripLine(tripwire)}; the rest of those providers' models are pending spend (recoverable only when the owner accepts the cost or raises --max-spend)`, 400));
   const since = Object.entries(v.oldestSince ?? {}).sort(([, a], [, b]) => Date.parse(a) - Date.parse(b)).map(([k, t]) => `${k} ${t.slice(0, 10)}`).join(", ");
   if (since) L.push(`  oldest since, per reason (the first time that reason was recorded, among the ${num(v.recoverable + v.hard + v.owner)} model(s) not tested): ${since}`);
   if (v.strikeOutOfLevels) L.push(`  note: ${num(v.strikeOutOfLevels)} first strike(s) failed at a level this run does not ask; they count as tested here and are asked again by a run that includes that level`);
@@ -732,7 +740,7 @@ export function liveRefusal(o, p) {
  * well as in the engine: every level a probe COMPLETED is charged, also when a later level errors (the engine charges only what a finished result
  * reports), so the report and the budget of the next phase count it.
  */
-function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench = null, stats = { started: new Set(), active: new Map() }, rateBackoffMs = null, confirmed = {}, doneBy = null }) {
+function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench = null, stats = { started: new Set(), active: new Map() }, rateBackoffMs = null, confirmed = {}, doneBy = null, tripwire = { models: new Set(), usd: 0, by: {} } }) {
   // Spend is charged per REQUEST that was sent and billed, from what the answer reported (or the estimate when it did not): a level that was only part way, an answer that was all thinking
   // (and the larger-budget request asked again after it) count; a rate limit, a dead key, a server error and a TIME-OUT (no complete answer: nothing was delivered) cost nothing.
   const BILLED = new Set(["empty"]);
@@ -743,6 +751,13 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
       const inT = x.inTok ?? kindSize(x.kind).inTokens, outT = x.outTok ?? (x.s === "timeout" ? 0 : x.max ?? BUDGETS[x.kind]);
       spend.total += (inT * price.in + outT * price.out) / 1e6;
     }
+    // TRIPWIRE: a row priced at $0 because the key is free-labelled and the listing has no price (`unlistedOnFree`) whose response REPORTS a cost is not free after all. The cost is charged to the spend, counted in the
+    // run summary, and the PROVIDER is left alone for the rest of the run (its other models are pending `spend`). It is a tripwire, not a price: nothing is estimated from it.
+    if (t.entry.unlistedOnFree) for (const x of tele) if (x.cost > 0) {
+      spend.total += x.cost; tripwire.usd += x.cost; tripwire.models.add(t.key);
+      const b = (tripwire.by[t.provider] ??= { models: new Set(), usd: 0 }); b.models.add(t.key); b.usd += x.cost;
+      if (prov[t.provider]) prov[t.provider].spendStop = true;
+    }
   };
   const floors = { small: o.timeoutSmall * 1000, "157": o.timeout157 * 1000, big: o.timeoutBig * 1000 };
   const caps = { small: o.timeoutMaxSmall * 1000, "157": o.timeoutMax157 * 1000, big: o.timeoutMaxBig * 1000 };
@@ -752,6 +767,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     // a provider whose first answer was a dead key, an empty balance or a missing model costs nothing more; one that keeps rate-limiting is left for the next run
     const ps = (prov[t.provider] ??= { rateStreak: 0, paused: false, blocked: null, answered: false, goneModels: new Set(), payModels: new Set(), authModels: new Set(), episodes: 0 });
     if (ps.blocked) return { s: "skip", w: `canary-${ps.blocked}` };
+    if (ps.spendStop) return { s: "skip", w: "spend-cap" };           // the tripwire fired on this provider: no more of its models in this run
     if (ps.paused) return { s: "skip", w: ps.paused === "quota" ? "quota-paused" : "rate-paused" };
     const tele = [];
     stats.started.add(t.key);
@@ -1017,7 +1033,8 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     if (++sinceSave >= SAVE_EVERY) periodic();
   };
   const lift = p.lift.ok ? p.lift.lift : null;
-  const probe = makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench, stats, rateBackoffMs: deps.rateBackoffMs ?? null, confirmed: confirmedProviders(store), doneBy });
+  const tripwire = { models: new Set(), usd: 0, by: {} };
+  const probe = makeProbe({ o, gw, tripwire, fetchImpl, ac, spend, lift, telemetry, prov, clampedKeys, bench, stats, rateBackoffMs: deps.rateBackoffMs ?? null, confirmed: confirmedProviders(store), doneBy });
   const opts = { ...sweepOptions(o), perProvider: p.perProvider, ...(deps.sweep ?? {}) };
   const phases = [["free tier", p.kept.filter((e) => e.free)], ["paid tier", p.kept.filter((e) => !e.free)]].filter(([, l]) => l.length);
   const started = Date.now();
@@ -1095,6 +1112,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   const after = fidelityCounts(p.set, store);
   console.log(`\ntool-fidelity: ${recorded} record(s) ${saved ? "written" : "NOT saved"} in ${Math.round((Date.now() - started) / 1000)}s; est. spend ${usd(spend.total)} of the ${usd(o.maxSpend)} cap; ${probes} model(s) attempted`);
   for (const line of tierLines(p)) console.log(show(line, 600));
+  if (tripwire.models.size) console.log(show(`  ${tripLine(tripwire)}: charged to the spend above and the provider(s) left alone for the rest of this run (their other models pending: spend); a row with no listed price on a free-labelled key was costed at $0, so this is a surprise for the owner to accept or to cap (a tripwire, not a price)`, 500));
   console.log(`  verified (v) ${tally.v}   tools at small size (t) ${tally.t}   failed (x) ${tally.x}   failed once, asked again next run ${tally.pending}`);
   if (partials) console.log(`  ${num(partials)} of those ${num(recorded)} record(s) are partial: a later level (a limit, a timeout, an error) stopped the model after L1+L2 and any small levels had finished; what finished is kept, the stopped level waits for a later run`);
   if (deferredBy.models.size) console.log(`  ${num(deferredBy.models.size)} model(s) kept their other levels while a small level was set aside (${Object.entries(deferredBy.levels).map(([l, n]) => `${l === "6" ? "spawn" : l === "7" ? "error-result" : `L${l}`} ${n}`).join(", ")}; an error, a timeout or an empty answer on that request alone): a later run asks them again`);
@@ -1146,7 +1164,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     const partial = stoppedEarly || ac.signal.aborted || interrupts > 0;
     // the previous run's count is compared only for an equal scope, and never after a manual lift (a lift grows the set on purpose)
     const prevRecoverable = o.retryAccounts || o.recheckHard || p.namedLifts?.length || stored.meta?.scope !== scopeOf(o) ? null : stored.meta.recoverable;
-    for (const line of verdictLines(verdict, { partial })) console.log(line);
+    for (const line of verdictLines(verdict, { partial, tripwire })) console.log(line);
     const rec = recordable && !partial;
     const sat = saturation({ requests: tot.n, rate: rate + (st.quota ?? 0), failing: rate + (st.error ?? 0) + (st.timeout ?? 0) + (st.quota ?? 0) + (st.empty ?? 0), newResults: recorded, recoverable: verdict.recoverable, prevRecoverable,
       history: rec ? scopedHistory : null, thisRun: rec ? runEntry : null, runs: o.saturateRuns, gain: o.saturateGain, yieldPct: o.saturateYield });

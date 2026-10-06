@@ -141,8 +141,12 @@ const AUTH_SENTENCE = new RegExp(`^\\W*(?:(?:error|authentication_error|invalid_
 const QUOTA_WORDS = /quota|daily limit|per[ -]day|limit reached|allowance/i;
 const MONEY_WORDS = /wallet|credit|balance|recharge|top[ -]?up|payment|funds|billing|\bplan\b/i;
 const RATE_SENTENCE = /rate[ -]?limit|too many requests|requests? per|tokens per|per[ -](minute|second|hour)|\b[rt]pm\b|try again in|retry (after|in)|resets? in/i;       // a rate limit, or a limit with a wait time, is its own (soft) reading, `rate`
-/** Does the sentence say anything about money (wallet, credit, balance, recharge, top-up, payment, funds, billing, plan)? */
-export const hasMoneyWords = (msg) => MONEY_WORDS.test(String(msg ?? "")) || WALLET_WORDS.test(String(msg ?? ""));
+// The wider list the HTTP 402 gate uses: a 402 is a pay unless its sentence says ONLY that the upstream failed. It adds what a provider says about an account that has to pay or upgrade (subscription, upgrade, spend,
+// limit reached, paid, purchase, deposit, invoice, usage limit, monthly) and the response sweep's own pay phrases (requires a paid/lite/premium plan, tier required). It is NOT used for the soft `quota` reading, where
+// "daily limit reached" must stay a quota: that reading keeps the narrow MONEY_WORDS.
+const PAY_402_WORDS = /subscri(?:be|ption)|upgrade|\bspend(?:ing)?\b|limit reached|\bpaid\b|purchase|deposit|invoice|usage limit|monthly|requires? (?:an? )?(?:active )?(?:paid|lite|premium)|tier[_ ]required/i;
+/** Does the sentence say anything about money or an account that has to pay (wallet, credit, balance, recharge, top-up, payment, funds, billing, plan, subscription, upgrade, spend, limit reached, paid, purchase, deposit, invoice, usage limit, monthly)? */
+export const hasMoneyWords = (msg) => { const m = String(msg ?? ""); return MONEY_WORDS.test(m) || WALLET_WORDS.test(m) || PAY_402_WORDS.test(m); };
 export const isQuotaSentence = (msg) => { const m = String(msg ?? ""); return QUOTA_WORDS.test(m) && !MONEY_WORDS.test(m) && !RATE_SENTENCE.test(m); };
 // A 400 whose sentence names none of these says nothing about the request's shape ("Upstream provider rejected the request"): an upstream hiccup until it repeats word for word.
 const SCHEMA_WORDS = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
@@ -205,7 +209,7 @@ async function readStream(res, { signal, expect = 0 } = {}) {
   if (!reader) return { noBody: true, blocks: [], streamError: null, stopped: false };
   const dec = new TextDecoder(), parser = createSseParser();
   const blocks = new Map(), closed = new Set();
-  let streamError = null, stopped = false, chars = 0, events = 0, stopReason = null, bytes = 0, overflow = false, inTok = null, outTok = null, sawUsage = false, after = 0, early = false;
+  let streamError = null, stopped = false, chars = 0, events = 0, stopReason = null, bytes = 0, overflow = false, inTok = null, outTok = null, cost = null, sawUsage = false, after = 0, early = false;
   const block = (index) => {
     let b = blocks.get(index);
     if (!b && blocks.size < STREAM_LIMITS.blocks) { b = { type: null, name: null, id: null, start: null, json: "", text: "" }; blocks.set(index, b); }
@@ -222,7 +226,7 @@ async function readStream(res, { signal, expect = 0 } = {}) {
         events += 1;
         if (events > STREAM_LIMITS.events) { overflow = true; break scan; }
         const d = ev.data;
-        if (ev.type === "message_start") { const n = d?.message?.usage?.input_tokens; if (Number.isFinite(n)) inTok = n; }
+        if (ev.type === "message_start") { const n = d?.message?.usage?.input_tokens; if (Number.isFinite(n)) inTok = n; const c = d?.message?.usage?.cost; if (Number.isFinite(c) && c >= 0) cost = c; }
         else if (ev.type === "content_block_start" && Number.isInteger(d?.index)) {
           const b = block(d.index);
           if (!b) { overflow = true; break scan; }
@@ -239,6 +243,7 @@ async function readStream(res, { signal, expect = 0 } = {}) {
         else if (ev.type === "message_delta") {
           if (typeof d?.delta?.stop_reason === "string") stopReason = d.delta.stop_reason;
           const n = d?.usage?.output_tokens; if (Number.isFinite(n)) outTok = n;
+          const c = d?.usage?.cost; if (Number.isFinite(c) && c >= 0) cost = c;                  // a provider that reports what the request COST (the usage's own `cost`, in dollars): the tripwire for a row priced at $0
           sawUsage = true;
         } else if (ev.type === "error") streamError = d?.error?.message ?? "stream error";
         else if (ev.type === "message_stop") { stopped = true; break scan; }
@@ -254,7 +259,7 @@ async function readStream(res, { signal, expect = 0 } = {}) {
     try { await Promise.race([Promise.resolve(reader.cancel()), new Promise((r) => { t = setTimeout(r, 500); })]); } catch { /* closed */ }
     clearTimeout(t);
   }
-  return { blocks: [...blocks.values()], streamError, stopped, events, stopReason, overflow, inTok, outTok, early };
+  return { blocks: [...blocks.values()], streamError, stopped, events, stopReason, overflow, inTok, outTok, cost, early };
 }
 
 const toolBlocks = (r) => r.blocks.filter((b) => b.type === "tool_use");
@@ -438,7 +443,7 @@ async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, maxTok
       return { ...httpVerdict(kind, res.status, text, ra), http: res.status, body: text, ...tele() };
     }
     const rs = await readStream(res, { signal: ac.signal, expect: EXPECT_TOOLS[kind] });
-    return { ...judge(kind, { ...rs, max: maxTokens }), ...tele({ inTok: rs.inTok, outTok: rs.outTok, early: rs.early }) };
+    return { ...judge(kind, { ...rs, max: maxTokens }), ...tele({ inTok: rs.inTok, outTok: rs.outTok, cost: rs.cost, early: rs.early }) };
   } catch (e) {
     if (timedOut) return { ...inconclusive("timeout", `no complete answer within ${timeoutMs} ms`), ...tele() };
     if (signal?.aborted) return { aborted: true };
@@ -554,7 +559,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     let r = await runKind(kind, opts);
     if (r.aborted) return r;
     spent(r);
-    const teleOf = (x, max) => ({ kind, level: LEVEL_OF[kind], bytes: x.bytes ?? 0, ms: x.ms ?? 0, inTok: x.inTok ?? null, outTok: x.outTok ?? null, v: x.v, s: x.s, early: !!x.early, reqs: x.reqs ?? 1, max });
+    const teleOf = (x, max) => ({ kind, level: LEVEL_OF[kind], bytes: x.bytes ?? 0, ms: x.ms ?? 0, inTok: x.inTok ?? null, outTok: x.outTok ?? null, cost: x.cost ?? null, v: x.v, s: x.s, early: !!x.early, reqs: x.reqs ?? 1, max });
     if (r.v === "i" && r.s === "empty" && !state.escalated && kindBudget(kind) < ESCALATED_MAX_TOKENS) {
       if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
       state.escalated = true; state.maxTokens = ESCALATED_MAX_TOKENS;

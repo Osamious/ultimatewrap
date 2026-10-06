@@ -12,7 +12,7 @@ import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeO
 import { runKind, isQuotaSentence, hasMoneyWords, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { runSweep } from "../refresh/bench.mjs";
 import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
-import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, migrateAvailabilityPay, appendHistory, historyOf, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, migrateAvailabilityPay, payHoldsOnBareEvidence, PENDING_WHY_CHARS, appendHistory, historyOf, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
@@ -133,7 +133,7 @@ test("a model with a result is never queued again by a normal run; a recoverable
 // ---------------------------------------------------------------- the verdict is the ledger's partition
 
 test("the verdict counts match the ledger partition (tested + pending + held + excluded) and name their denominator", () => {
-  const rows = [many("pa", 6), many("pb", 3), many("pc", 3), many("pd", 2)];
+  const rows = [many("pa", 6), many("pb", 3), many("pc", 3), { provider: "pd", keyId: "k.pd.free", models: [m("m0"), m("m1", { badge: "PAID", pin: 500, pout: 500 })] }];       // pd/m1 is priced over the row ceiling: its stored row-cost is NEEDS-OWNER
   const e = cliEnv(rows);
   const store = { "pa/m0": record("ppnn"), "pa/m1": record("ppnn"), "pd/m0": record("ppnn") };
   const pending = { "pa/m2": pend("rate"), "pa/m3": pend("error"), "pa/m4": pend("pay"), "pc/m0": pend("gone"), "pc/m1": pend("auth"), "pd/m1": pend("row-cost") };
@@ -2005,7 +2005,7 @@ test("--reset-transient also drops the pay entries that rest on an availability 
   const before = fs.readFileSync(e.out, "utf8");
   const dry = await run(["--reset-transient"], e.deps);
   assert.equal(dry.code, 0, dry.err);
-  assert.match(dry.out, /pending pay entries that rest on an availability sentence only .*: 3 of 5 would be dropped, the models asked again \(anymodel 3\); pay entries with no stored sentence stay/);
+  assert.match(dry.out, /pending pay entries that rest on an availability sentence only .*: 3 of 5 would be dropped, the models asked again \(anymodel 3\); pay entries with no stored sentence, or one cut at the clip length \(0\), cannot be judged and stay/);
   assert.match(dry.out, /nothing was written/);
   assert.equal(fs.readFileSync(e.out, "utf8"), before, "dry: not a byte changed");
   const live = await run(["--reset-transient", "--live"], e.deps);
@@ -2063,4 +2063,119 @@ test("row ceiling: the refusal estimate counts only the models that will be aske
   assert.match(dryNarrow.out, /over the \$[\d.]+ row ceiling, NOT asked and not in the estimate: 1 priced model\(s\)/);
   assert.match(dryNarrow.out, /costliest models asked \(3 of 5 cost money\): pb\/p2 \$/);
   assert.match(dryNarrow.out, /per tier this run: free 5 model\(s\)/);
+});
+
+// ================================================================ round 5
+
+// ---------------------------------------------------------------- 1: the spend tripwire for a row priced at $0 that reports a cost
+
+const withCost = (c) => (call) => { const a = goodModel(call); return typeof a.body === "string" ? { ...a, body: a.body.replace('"output_tokens":5', '"output_tokens":5,"cost":' + c) } : a; };
+
+test("tripwire: an unlisted-price row on a free-labelled key whose response REPORTS a cost is charged to the spend, counted in the summary, and its PROVIDER is left alone for the rest of the run (pending spend); a provider that reports nothing is unaffected", async () => {
+  const rows = [{ provider: "pa", keyId: "k.pa.free", models: Array.from({ length: 4 }, (_, i) => m("u" + i, { badge: null, pin: null, pout: null })) }, { provider: "pb", keyId: "k.pb.free", models: Array.from({ length: 2 }, (_, i) => m("v" + i, { badge: null, pin: null, pout: null })) }];
+  const e = cliEnv(rows, { answer: (call) => (call.body.model.startsWith("pa/") ? withCost(0.002)(call) : goodModel(call)) });
+  const r = await run(["--live", "--concurrency", "1", "--per-provider", "1", "--max-spend", "5"], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  const asked = (pv) => calls(e.f).filter((c) => c.body.model.startsWith(pv + "/")).map((c) => c.body.model);
+  assert.deepEqual([...new Set(asked("pa"))], ["pa/u0"], "the first model of pa reported a cost: no other model of pa is asked");
+  assert.equal(new Set(asked("pb")).size, 2, "pb reported nothing: both models asked");
+  const want = asked("pa").length * 0.002;
+  const spent = Number(/est\. spend \$([\d.]+) of the/.exec(r.out)[1]);
+  assert.ok(Math.abs(spent - want) < 1e-3, "the reported cost is in the spend: " + spent + " against " + want);
+  assert.match(r.out, /1 unlisted-free model\(s\) reported a cost: \$[\d.]+ \(pa 1\)/);
+  assert.match(r.out, /NOTE: spend tripwire: 1 unlisted-free model\(s\) reported a cost/, "and the verdict says so");
+  const st = loadFidelity(e.out);
+  assert.deepEqual(["pa/u1", "pa/u2", "pa/u3"].map((k) => st.pending[k]?.r), ["spend", "spend", "spend"]);
+  assert.ok(st.models["pa/u0"] && st.models["pb/v0"] && st.models["pb/v1"], "the model that reported the cost keeps its result");
+  assert.equal(r.out.includes("DONE: nothing recoverable left"), false, "the spend-pending models are recoverable: no DONE");
+});
+
+test("tripwire: a row tagged free that reports a cost is NOT an unlisted-free row: no tripwire, the provider goes on", async () => {
+  const rows = [{ provider: "pa", keyId: "k.pa.free", models: Array.from({ length: 3 }, (_, i) => m("t" + i)) }];       // tagged free (pin 0, pout 0)
+  const e = cliEnv(rows, { answer: withCost(0.5) });
+  const r = await run(["--live", "--concurrency", "1", "--per-provider", "1", "--max-spend", "5"], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.equal(new Set(calls(e.f).map((c) => c.body.model)).size, 3);
+  assert.equal(/reported a cost/.test(r.out), false);
+  assert.match(r.out, /est\. spend \$0\.0+ of/);
+});
+
+// ---------------------------------------------------------------- 2: the 402 money-word gate
+
+test("402: subscription, upgrade, spend, limit reached, paid, purchase, deposit, billing, invoice, usage limit, monthly, plan keep a 402 a PAY (also in the migration); a bare availability sentence stays upstream-unavailable", async () => {
+  const pay = ["Upstream request failed: subscription required", "Upstream request failed: monthly spend limit reached for your organization", "anymodel: Upstream request failed. Please upgrade your account",
+    "Upstream request failed: paid models only", "Upstream request failed. Purchase credits to continue", "Upstream error: deposit required", "Upstream request failed: unpaid invoice", "Upstream request failed: usage limit exceeded",
+    "Upstream request failed (billing)", "Upstream request failed: your plan does not include this model", "Upstream request failed: this model requires a paid plan", "Service unavailable: monthly cap hit", "Upstream request failed: spending limit"];
+  for (const msg of pay) {
+    const r = await kindRes(402, msg);
+    assert.equal(r.s, "pay", "402: " + msg);
+    assert.equal(hasMoneyWords(msg), true, msg);
+  }
+  for (const msg of ["Upstream request failed.", "anymodel: Upstream request failed.", "The selected model is temporarily unavailable. Try another model.", "Upstream error", "Service unavailable, please retry"]) {
+    const r = await kindRes(402, msg);
+    assert.deepEqual([r.s, r.reason], ["error", "upstream-unavailable"], "402: " + msg);
+    assert.equal(hasMoneyWords(msg), false, msg);
+  }
+  assert.equal(hasMoneyWords("Upstream request failed: rapid retry advised"), false, "whole words: rapid is not paid");
+  // the quota reading is NOT widened: a bare "daily limit reached" stays quota on a 403
+  const q = await kindRes(403, "Daily limit reached for free tier");
+  assert.equal(q.reason ?? q.s, "quota");
+  // the migration keeps every one of those entries pending pay
+  const pending = Object.fromEntries(pay.map((w, i) => ["anymodel/m" + i, { r: "pay", n: 12, at: hoursAgo(3), why: w }]));
+  const mig = migrateAvailabilityPay(pending);
+  assert.deepEqual(mig.cleared, [], "no money-worded entry is dropped");
+  assert.equal(Object.keys(mig.pending).length, pay.length);
+  assert.equal(migrateAvailabilityPay({ "anymodel/x": { r: "pay", n: 1, at: hoursAgo(1), why: "Upstream request failed." } }).cleared.length, 1);
+});
+
+// ---------------------------------------------------------------- 3: an entry cut at the clip length is unjudgeable; holds that rest on a bare 402 are named
+
+test("migrateAvailabilityPay: a sentence at the clip length (a money word after the cut is invisible) is left alone like one with no sentence; a shorter identical sentence is dropped", () => {
+  const head = "anymodel: Upstream request failed. ";
+  const cut = head + "x".repeat(PENDING_WHY_CHARS - head.length);
+  assert.equal(cut.length, PENDING_WHY_CHARS);
+  const e = (why) => ({ r: "pay", n: 12, at: hoursAgo(3), why });
+  const r = migrateAvailabilityPay({ "anymodel/cut": e(cut), "anymodel/short": e(head.trim()), "anymodel/near": e(cut.slice(0, -1)) });
+  assert.deepEqual(r.cleared.map((x) => x.key).sort(), ["anymodel/near", "anymodel/short"]);
+  assert.deepEqual(r.clipped, ["anymodel/cut"]);
+  assert.ok("anymodel/cut" in r.pending, "kept: pay");
+});
+
+test("payHoldsOnBareEvidence: a pay hold with no money-word sentence among its pay entries is named; one with a money sentence, or an auth hold, is not", () => {
+  const held = { anymodel: { r: "pay", at: hoursAgo(2) }, other: { r: "pay", at: hoursAgo(2) }, authp: { r: "auth", at: hoursAgo(2) } };
+  const pending = { "anymodel/a": { r: "pay", n: 2, at: hoursAgo(1) }, "other/a": { r: "pay", n: 2, at: hoursAgo(1), why: "Your wallet balance is insufficient" }, "anymodel/b": { r: "pay", n: 2, at: hoursAgo(1), why: "Upstream request failed." } };
+  assert.deepEqual(payHoldsOnBareEvidence(held, pending), ["anymodel"]);
+  assert.deepEqual(payHoldsOnBareEvidence({}, pending), []);
+  assert.deepEqual(payHoldsOnBareEvidence(null, null), []);
+});
+
+test("--reset-transient names the providers STILL held on pay with no money sentence, in the dry run and after applying", async () => {
+  const pending = { "anymodel/m0": { r: "pay", n: 12, at: hoursAgo(3), why: "anymodel: Upstream request failed." }, "anymodel/m1": { r: "pay", n: 7, at: hoursAgo(30) }, "good/m0": { r: "pay", n: 3, at: hoursAgo(3), why: "Payment required" } };
+  const e = cliEnv([many("anymodel", 3), many("good", 2)], { pending, held: { anymodel: { r: "pay", at: hoursAgo(3) }, good: { r: "pay", at: hoursAgo(3) } } });
+  const dry = await run(["--reset-transient"], e.deps);
+  const line = dry.out.split("\n").find((l) => l.includes("STILL held")) ?? "";
+  assert.match(line, /STILL held on pay with no sentence of money words on record .*: anymodel; /);
+  assert.equal(/\bgood\b/.test(line), false, "a hold with a money sentence is not named");
+  const live = await run(["--reset-transient", "--live"], e.deps);
+  assert.equal(live.code, 0, live.err);
+  assert.match(live.out, /STILL held on pay with no sentence of money words on record: anymodel /);
+});
+
+// ---------------------------------------------------------------- 4: a NEEDS-OWNER reason of a model this run QUEUES reads not-run
+
+test("verdict: a model queued THIS run whose stored reason is priced-over-row-cap (the ceiling was raised), row-cost or route-shape (named, lifted) reads not-run, not NEEDS-OWNER; still over the ceiling it stays NEEDS-OWNER", () => {
+  const rows = [{ provider: "pb", keyId: "k.pb.free", models: [m("big", { badge: "PAID", pin: 500, pout: 500 }), m("rs"), m("rc", { badge: "PAID", pin: 400, pout: 400 }), m("fine")] }];
+  const e = cliEnv(rows);
+  const pending = { "pb/big": pend("priced-over-row-cap", 3), "pb/rc": pend("row-cost", 3), "pb/rs": pend("route-shape", 3) };
+  const low = planOf(e, [], { pending });
+  assert.equal(low.verdict.owner, 3, "default ceiling: the two cost reasons and route-shape are NEEDS-OWNER");
+  assert.deepEqual(keys(low), ["pb/fine"]);
+  const raised = planOf(e, ["--max-row-cost", "100"], { pending });
+  assert.deepEqual(keys(raised), ["pb/big", "pb/fine", "pb/rc"], "the ceiling is raised: they are queued (route-shape stays out unless lifted)");
+  assert.equal(raised.verdict.byRecoverable["not-run"], 3, JSON.stringify(raised.verdict.byRecoverable));
+  assert.equal(raised.verdict.owner, 1, "only route-shape is left for the owner");
+  const lifted = planOf(e, ["--max-row-cost", "100", "--only", "pb/rs"], { pending });
+  assert.deepEqual(keys(lifted), ["pb/rs"], "named: route-shape is lifted");
+  assert.equal(lifted.verdict.owner, 2, "the two cost models are not in this --only scope: they keep their stored reason");
+  assert.equal(lifted.verdict.byRecoverable["not-run"], 2, "route-shape lifted and queued, plus the untested model that this --only scope does not ask: not-run");
 });
