@@ -194,23 +194,26 @@ const SIZE_WORDS = /too (large|big|long)|entity too large|payload|request size|c
  * The record keeps it as `ctxStated` (tokens) and lowers `capBelow` to the byte figure `STATED_BYTES_PER_TOKEN` converts it to.
  */
 export const STATED_BYTES_PER_TOKEN = 3;       // a conservative bound: ordinary English and code run 3.5 to 4.5 bytes per token, JSON schemas fewer; 3 never lets a request through that the stated limit would refuse
+// Each pattern names the LIMIT by its own wording (limit / maximum / max / at most / allowed / must be <= / > maximum / exceeds the context window of): a sentence that carries TWO token figures (the
+// request size and the limit) takes the one next to the limit word, never the request size; a figure with no limit word beside it ("context length of 47046 tokens exceeded") is ambiguous and gives null.
 const STATED_RES = [
   /maximum context (?:length|window|size)\s*(?:of|is|:|=)\s*(\d[\d,_]*)/i,
-  /context (?:length|window|size|limit)\s*(?:of|is|:|=)\s*(\d[\d,_]*)\s*(?:tokens?)?/i,
-  /exceeds? (?:the )?(?:model's )?(?:maximum|max|limit)[^.\d(]{0,50}\(?\s*(\d[\d,_]*)/i,
+  /exceeds? (?:the |this |your )?(?:model's )?context (?:length|window|size|limit)\s*(?:of|is|:|=)\s*(\d[\d,_]*)/i,
   /\d[\d,_]*\s*tokens?\s*>\s*(\d[\d,_]*)\s*(?:maximum|max)/i,
-  /(?:supports?|allows?|accepts?) (?:a |an )?(?:maximum|max|at most|up to)(?: context| input)?(?: length| window)? of (\d[\d,_]*)\s*tokens/i,
   /tokens?[^.\d]{0,60}must be\s*(?:<=|\u2264|at most|no more than|less than or equal to)\s*(\d[\d,_]*)/i,
+  /(?:supports?|allows?|accepts?) (?:a |an )?(?:maximum|max|at most|up to)(?: context| input)?(?: length| window)? of (\d[\d,_]*)\s*tokens/i,
+  /allowed\s*\(\s*(\d[\d,_]*)/i,
+  /(?:limit|maximum|max(?:imum)?|at most)(?:\s+(?:allowed|permitted|context|input|prompt|token|tokens|length|size|window|number of tokens))*\s*(?:of|is|:|=|\()?\s*(\d[\d,_]*)/gi,
 ];
 export function statedLimit(text) {
   const t = String(text ?? "");
   if (!t || LIMIT_WORDS.test(t)) return null;                                            // a rate limit or an allowance is not a context limit
   if (/completion tokens|max_tokens|output tokens/i.test(t) && !/context|input|prompt/i.test(t)) return null;
-  for (const re of STATED_RES) {
-    const m = re.exec(t);
-    if (!m) continue;
-    const n = Number(m[1].replace(/[,_]/g, ""));
-    if (Number.isInteger(n) && n >= 1000 && n <= 20_000_000) return n;
+  for (const r of STATED_RES) {
+    for (const m of t.matchAll(new RegExp(r.source, r.flags.includes("g") ? r.flags : r.flags + "g"))) {
+      const n = Number(m[1].replace(/[,_]/g, ""));
+      if (Number.isInteger(n) && n >= 1000 && n <= 20_000_000) return n;
+    }
   }
   return null;
 }

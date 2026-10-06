@@ -14,7 +14,7 @@
 //   node refresh/tool-fidelity-cli.mjs --live --recheck-hard pay,openrouter   the MANUAL lift of hard blockers (pay, auth, gone: sticky, never re-asked by a normal run)
 //
 // THE LOOP. Run passes, stop at saturation, resume for what is recoverable. Every run ends with `sweep verdict: RECOVERABLE ... | HARD-BLOCKED ... | TESTED ...` and a final
-// machine-readable `SATURATION saturated=<yes|no|unknown> recoverable=<n> hard=<m> new_results=<k>` line (docs/runbook.md 6g).
+// machine-readable `SATURATION saturated=<yes|no|unknown> recoverable=<n> hard=<m> new_results=<k> requests=<n> reason=<...> deepen_blocked=<n> account_state=<m>` line (split it on spaces, read the fields by name: docs/runbook.md 6g).
 //
 // WHAT RUNS. The set is every model the bench found answering (probe-ok), the `tools: false` ones included (the catalogue claim is what
 // is being tested) and the Anthropic relay's excluded (known good by provenance; reported as "not probed"). A model with a record is not
@@ -565,11 +565,17 @@ export function strikeCommand(v) {
   const list = v.strikeOutList ?? [];
   if (!list.length) return [];
   const sls = [...new Set(list.map((x) => x.sl).filter((l) => Number.isInteger(l)))].sort((a, b) => a - b);
-  const provs = [...new Set(list.map((x) => x.key.slice(0, x.key.indexOf("/"))))].sort();
   const levels = [...new Set([1, 2, ...sls])].sort((a, b) => a - b).join("");
-  const cmd = `node refresh/tool-fidelity-cli.mjs --live --levels ${levels}${sls.some((l) => l >= 3 && l <= 5) ? " --l3 yes" : ""} --only ${provs.join(",")} --max-spend 5 --tf-max-tokens-per-provider 5000000`;
+  const ids = list.map((x) => x.key).sort();
+  // the EXACT ids, not the provider names: `--only <provider>` would also queue L3 for every tested model of that provider (about 40,000 tokens each). At most 10 ids per command, so none comes near an OS command-line
+  // limit (cmd.exe 8,191 characters); there is no --only-file, so a longer list is several commands, the first 3 printed and the rest counted.
+  const batches = []; for (let k = 0; k < ids.length; k += 10) batches.push(ids.slice(k, k + 10));
+  const cmd = (b) => `node refresh/tool-fidelity-cli.mjs --live --levels ${levels}${sls.some((l) => l >= 3 && l <= 5) ? " --l3 yes" : ""} --only ${b.join(",")} --max-spend 5 --tf-max-tokens-per-provider 5000000`;
+  const shown = batches.slice(0, 3), left = ids.length - shown.reduce((a, b) => a + b.length, 0);
   return [`  first strikes the default levels never retry: ${num(list.length)} model(s), failed at ${sls.map((l) => "L" + l).join(", ")}: ${show(list.slice(0, 10).map((x) => x.key + " (L" + x.sl + ")").join(", "), 500)}${list.length > 10 ? `, ... and ${list.length - 10} more` : ""}`,
-    `  ask them with: ${show(cmd, 600)}`];
+    `  ask them with (the exact ids: --only <provider> would also queue L3 for every tested model of that provider)${batches.length > 1 ? `, ${batches.length} commands of at most 10 ids (no --only-file exists)` : ""}: ${show(cmd(shown[0]), 900)}`,
+    ...shown.slice(1).map((b) => `  ask them with (next ${b.length}): ${show(cmd(b), 900)}`),
+    ...(left > 0 ? [`  ... and ${num(left)} more model(s): repeat with the next 10 ids (sorted by id) after these`] : [])];
 }
 
 /** The held-providers block (dry run and report): who is held, why, since when, until when, and what that frees. */
@@ -630,7 +636,7 @@ export function trendLine(entries) {
 
 /**
  * The loop's last lines: a human line about THIS run, the next action when the run is saturated by diminishing returns or failing, the trend of the last runs, and the machine-readable
- * `SATURATION saturated=<yes|no|unknown> recoverable=<n> hard=<m> new_results=<k> requests=<n> reason=<...>` line (always the final line, the fields always in this order). `sat` is `saturation(...)`, or null for a
+ * `SATURATION saturated=<yes|no|unknown> recoverable=<n> hard=<m> new_results=<k> requests=<n> reason=<...> deepen_blocked=<n> account_state=<m>` line (always the final line, the fields always in this order; `reason` is NOT the last field any more: a loop script splits the line on spaces and reads the fields by name). `sat` is `saturation(...)`, or null for a
  * dry run (nothing was sent); `extra.history` the runs to show in the trend. The reason is done, zero-new, failing, diminishing, no-shrink (a fallback), scope-exhausted, none (not saturated) or unknown.
  */
 export function saturationLines(v, sat, mode = sat ? null : "dry", extra = {}) {

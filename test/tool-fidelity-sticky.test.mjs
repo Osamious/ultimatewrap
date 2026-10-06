@@ -2475,13 +2475,65 @@ test("first strikes the default levels never retry: the verdict prints their cou
   assert.match(text, /note: 12 first strike\(s\) failed at a level this run does not ask/);
   assert.match(text, /first strikes the default levels never retry: 12 model\(s\), failed at L3: .*\(L3\), \.\.\. and 2 more/);
   assert.equal((/never retry: [^\n]*/.exec(text)[0].match(/pa\/m\d+ \(L3\)/g) ?? []).length, 10, "ten named");
-  assert.match(text, /ask them with: node refresh\/tool-fidelity-cli\.mjs --live --levels 123 --l3 yes --only pa --max-spend 5 --tf-max-tokens-per-provider 5000000/);
-  assert.equal(strikeCommand({ strikeOutList: [{ key: "pa/x", sl: 3 }, { key: "pb/y", sl: 3 }] }).at(-1), "  ask them with: node refresh/tool-fidelity-cli.mjs --live --levels 123 --l3 yes --only pa,pb --max-spend 5 --tf-max-tokens-per-provider 5000000");
+  assert.match(text, /ask them with \(the exact ids: --only <provider> would also queue L3 for every tested model of that provider\), 2 commands of at most 10 ids \(no --only-file exists\): node refresh\/tool-fidelity-cli\.mjs --live --levels 123 --l3 yes --only pa\/m0,pa\/m1,pa\/m10,pa\/m11,pa\/m2,pa\/m3,pa\/m4,pa\/m5,pa\/m6,pa\/m7 --max-spend 5 --tf-max-tokens-per-provider 5000000/);
+  assert.match(text, /ask them with \(next 2\): node refresh\/tool-fidelity-cli\.mjs --live --levels 123 --l3 yes --only pa\/m8,pa\/m9 --max-spend 5/);
+  assert.equal(/--only pa --/.test(text), false, "never the bare provider name");
+  assert.equal(strikeCommand({ strikeOutList: [{ key: "pb/y", sl: 3 }, { key: "pa/x", sl: 3 }] }).at(-1), "  ask them with (the exact ids: --only <provider> would also queue L3 for every tested model of that provider): node refresh/tool-fidelity-cli.mjs --live --levels 123 --l3 yes --only pa/x,pb/y --max-spend 5 --tf-max-tokens-per-provider 5000000");
   assert.equal(/--l3 yes/.test(strikeCommand({ strikeOutList: [{ key: "pa/x", sl: 6 }] }).at(-1)), false, "a spawn strike needs no --l3");
   assert.deepEqual(strikeCommand({ strikeOutList: [] }), []);
   const asked = planDef(e, ["--levels", "123"], { store }).verdict;
   assert.deepEqual(asked.strikeOutList, [{ key: "pb/m0", sl: 6 }], "with --levels 123 the L3 strikes are asked; the L6 strike is now the one out of levels");
   const t2 = verdictLines(asked).join("\n");
   assert.match(t2, /never retry: 1 model\(s\), failed at L6: pb\/m0 \(L6\)/);
-  assert.match(t2, /--levels 126 --only pb /);
+  assert.match(t2, /--levels 126 --only pb\/m0 /);
+});
+
+// ================================================================ round 11: review findings
+
+test("statedLimit with TWO token figures takes the LIMIT (the figure next to limit / maximum / max / allowed / must be <= / exceeds the context window of), never the request size; a figure with no limit word beside it is ambiguous and gives null", () => {
+  const limit = [
+    ["context length of 47046 tokens exceeds the limit of 32768", 32768],
+    ["Your context length of 47046 tokens exceeds the limit of 32,768 tokens", 32768],
+    ["requested 47046 tokens, maximum 32768", 32768],
+    ["you requested 47046 tokens but the limit is 32768 tokens", 32768],
+    ["47046 tokens exceeds the maximum context length of 32768 tokens", 32768],
+    ["the prompt has 47046 tokens; max allowed: 32768", 32768],
+    ["input token count (47046) exceeds the maximum number of tokens allowed (32768)", 32768],
+    ["This model's maximum context length is 32768 tokens. However, you requested 47046 tokens (46790 in the messages, 256 in the completion)", 32768],
+    ["prompt is too long: 47046 tokens > 32768 maximum", 32768],
+    ["Input validation error: inputs tokens + max_new_tokens must be <= 32768. Given: 47046 inputs tokens and 256 max_new_tokens", 32768],
+    ['nvidia: This model\'s maximum context length is 32768 tokens. However, you requested 47046 tokens (46790 in the messages,', 32768],
+  ];
+  for (const [text, want] of limit) assert.equal(statedLimit(text), want, text);
+  const ambiguous = [
+    "context length of 47046 tokens exceeded",
+    "requested 47046 tokens and 32768 tokens are available",
+    "prompt has 47046 tokens, the model supports a context length of 32768",
+    "47046 tokens in the messages and 32768 tokens in the tools",
+    "context length of 47046 tokens",
+  ];
+  for (const text of ambiguous) assert.equal(statedLimit(text), null, text);
+});
+
+test("the printed first-strike command names the EXACT provider/model ids: its plan queues only the struck models, never the tested non-struck models of the same provider (which `--only <provider>` would also send L3)", () => {
+  const rows = [{ provider: "pa", keyId: "k.pa.free", models: Array.from({ length: 8 }, (_, i) => m("m" + i)) }];
+  const store = {};
+  for (let i = 0; i < 3; i++) store[`pa/m${i}`] = record("ppnn", { strikes: 1, sl: 3 });          // struck at L3: the default levels never retry them
+  for (let i = 3; i < 8; i++) store[`pa/m${i}`] = record("ppnn", { sp: "p", er: "p" });             // tested, no L3 yet, nothing struck
+  const e = cliEnv(rows);
+  const v = planDef(e, [], { store }).verdict;
+  assert.deepEqual(v.strikeOutList.map((x) => x.key).sort(), ["pa/m0", "pa/m1", "pa/m2"]);
+  const line = strikeCommand(v).find((l) => l.includes("ask them with"));
+  const argv = line.slice(line.indexOf("tool-fidelity-cli.mjs") + "tool-fidelity-cli.mjs".length).trim().split(" ");
+  assert.equal(argv[argv.indexOf("--only") + 1], "pa/m0,pa/m1,pa/m2", line);
+  assert.deepEqual(keys(planDef(e, argv, { store })), ["pa/m0", "pa/m1", "pa/m2"], "the printed command asks the three struck models and nothing else");
+  assert.deepEqual(keys(planDef(e, ["--levels", "123", "--l3", "yes", "--only", "pa", "--max-spend", "5", "--tf-max-tokens-per-provider", "5000000"], { store })), ["pa/m0", "pa/m1", "pa/m2", "pa/m3", "pa/m4", "pa/m5", "pa/m6", "pa/m7"], "the old form (the provider name) queued the five tested models too");
+  // more than ten: several commands of at most ten ids, the rest counted
+  const many35 = { strikeOutList: Array.from({ length: 35 }, (_, i) => ({ key: `pa/x${String(i).padStart(2, "0")}`, sl: 3 })) };
+  const out = strikeCommand(many35);
+  const cmds = out.filter((l) => l.includes("--only "));
+  assert.equal(cmds.length, 3, "three commands shown");
+  for (const c of cmds) assert.ok(c.split("--only ")[1].split(" ")[0].split(",").length <= 10 && c.length < 1200, c.length);
+  assert.match(out.at(-1), /\.\.\. and 5 more model\(s\): repeat with the next 10 ids/);
+  assert.match(out.find((l) => l.includes("ask them with")), /4 commands of at most 10 ids \(no --only-file exists\)/);
 });
