@@ -53,7 +53,7 @@ import { sanitizeDisplay } from "../menu/sanitize.mjs";
 import { redactClip } from "../menu/redact.mjs";
 import { writeAtomic } from "../menu/atomic.mjs";
 import { runSweep } from "./bench.mjs";
-import { DEFAULTS, sweepOptions, sweepExit, gatewayUp, unprobedLines, EXIT_BUSY } from "./bench-cli.mjs";
+import { DEFAULTS, sweepOptions, gatewayUp, unprobedLines, EXIT_BUSY } from "./bench-cli.mjs";
 import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
@@ -400,6 +400,18 @@ async function mergeUnsaved(o, outFile, deps) {
 
 /** The spend tripwire in one phrase: a row priced at $0 (an unlisted price on a free-labelled key) whose response reported a cost. A tripwire, not a price. */
 const tripLine = (t) => `${num(t.models.size)} unlisted-free model(s) reported a cost: ${usd(t.usd)} (${show(Object.entries(t.by).map(([p, x]) => `${p} ${num(x.models.size)}`).join(", "), 160)})`;
+
+/**
+ * The exit code of a TOOL sweep run, from its own outcome (the response sweep's `sweepExit` asks whether a probe came back `ok`, which says nothing about a tool sweep: a run that wrote 42 records has no
+ * `ok` count). 0 when the run completed (records or partial records written, or nothing to ask) and for a Ctrl-C; 4 for the engine's give-up on a dead gateway (decided by the caller); 3 ONLY when requests were
+ * sent, NO record and NO partial record was written, and at least one MODEL ended the run on an unexplained failure (`outcomes`: the models that got no result, by how they ended; `error` or `timeout`; a level set aside inside a model that finished does not count): a real 'nothing worked'. Rate limits and exhausted quotas are saturation (0, the
+ * SATURATION line says so), and so are the account states (pay, auth, gone), which are reported as providers needing attention. Pure.
+ */
+export function toolSweepExit({ gaveUp = false, signal = false, requests = 0, records = 0, outcomes = {} } = {}) {
+  if (gaveUp) return 4;
+  if (signal) return 0;
+  return requests > 0 && records === 0 && ((outcomes.error ?? 0) + (outcomes.timeout ?? 0)) > 0 ? 3 : 0;
+}
 
 /** Why a model that did not get a result ends the run pending: the short code kept in the pending map (a reason is never an error, and never a verdict). */
 export function pendingReasonOf(r, entry) {
@@ -1057,7 +1069,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   };
   const hb = setInterval(heartbeat, deps.heartbeatMs ?? 60000);
   hb.unref?.();
-  let probes = 0, code = 0, saved = true, stoppedEarly = false;
+  let probes = 0, code = 0, saved = true, stoppedEarly = false, signalStop = false;
   const skips = {};
   try {
     for (const [name, list] of phases) {
@@ -1066,7 +1078,8 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
         gatewayCheck: () => gatewayUp(gw.base, { fetchImpl }), probe, onResult });
       probes += result.probes;
       for (const [w, n] of Object.entries(result.skips)) skips[w] = (skips[w] ?? 0) + n;
-      code = Math.max(code, sweepExit(result));
+      if (result.outage?.gaveUp) code = Math.max(code, 4);                  // the engine's own give-up on a dead gateway; the 3 is the tool sweep's, decided once at the end (toolSweepExit)
+      if (result.stopped === "signal") signalStop = true;
       if (result.aborted) { stoppedEarly = true; console.log(`  stopped (${result.stopped}); re-run to resume: models with a result are not asked again`); break; }
     }
   } finally {
@@ -1170,7 +1183,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       history: rec ? scopedHistory : null, thisRun: rec ? runEntry : null, runs: o.saturateRuns, gain: o.saturateGain, yieldPct: o.saturateYield });
     for (const line of saturationLines(verdict, sat, partial ? "aborted" : null, { history: rec ? [...scopedHistory, runEntry].slice(-HISTORY_PER_SCOPE) : scopedHistory, starved })) console.log(line);
   } else console.log(`SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=${recorded} requests=${telemetry.total().n} reason=unknown`);
-  return code;
+  return Math.max(code, toolSweepExit({ gaveUp: false, signal: signalStop || ac.signal.aborted || interrupts > 0, requests: telemetry.total().n, records: recorded, outcomes: other }));
 }
 
 /**

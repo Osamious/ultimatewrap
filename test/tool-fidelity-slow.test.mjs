@@ -247,7 +247,7 @@ test("the CLI applies the ADAPTIVE timeout per model from the bench: a model who
   const f = slowFetch((b) => (b.model === "fa/pricey" ? 1000 : 150));        // known: 3 x 100 ms = 300 ms, capped at 200 ms: enough for 150 ms. unknown: the 50 ms floor, doubled to 100 ms: not enough
   const e = env(rows, { fetch: f, bench });
   const r = await run(["--live", "--per-provider", "1", "--max-spend", "5", "--max-row-cost", "5", ...SMALL], e.deps);
-  assert.equal(r.code, 3, "partial: two models stayed pending (the bench exit code for that)");
+  assert.equal(r.code, 0, "records were written; two models stayed pending (timeouts): the run completed, exit 0");
   const st = loadFidelity(e.out);
   assert.ok(st.models["fa/known"], "its own bench time gave it room");
   assert.equal(calls(f).filter((c) => c.body.model === "fa/known").length, 3, "L1, argument fidelity and L2, no timeout at all");

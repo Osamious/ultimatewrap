@@ -122,7 +122,7 @@ test("SPEND counts the levels a probe COMPLETED even when a later level errors: 
   const e = env([["pb", "b1", { pin: 100, pout: 100 }], ["pb", "b2", { pin: 100, pout: 100 }], ["pb", "b3", { pin: 100, pout: 100 }]],
     { answer: (c) => (c.body.messages.length === 3 ? http(429, "slow down") : goodModel(c)) });
   const r = await run(["--live", "--max-spend", "5", "--max-row-cost", "5"], e.deps);
-  assert.equal(r.code, 3, "no model answered ok in this run (every L2 was rate limited): the bench's own exit code for that");
+  assert.equal(r.code, 0, "every L2 was rate limited and nothing was recorded: rate limiting is saturation, not a failure of the sweep (exit 0; the response sweep's 3 does not apply)");
   const m = r.out.match(/est\. spend \$([\d.]+) of the \$5\.00 cap/);
   assert.ok(m, r.out);
   // each model completed L1 and then hit the rate limit at L2, on every attempt; with pb's first answers rate limited the provider is paused after three

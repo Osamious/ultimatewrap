@@ -8,7 +8,7 @@ import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
 import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, record, kindOf, ev, stream, ok } from "./fixtures/tool-fidelity-helpers.mjs";
-import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf, trendLine, liveRefusal } from "../refresh/tool-fidelity-cli.mjs";
+import { main, parseArgs, plan, toolSweepExit, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf, trendLine, liveRefusal } from "../refresh/tool-fidelity-cli.mjs";
 import { runKind, isQuotaSentence, hasMoneyWords, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { runSweep } from "../refresh/bench.mjs";
 import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
@@ -2178,4 +2178,32 @@ test("verdict: a model queued THIS run whose stored reason is priced-over-row-ca
   assert.deepEqual(keys(lifted), ["pb/rs"], "named: route-shape is lifted");
   assert.equal(lifted.verdict.owner, 2, "the two cost models are not in this --only scope: they keep their stored reason");
   assert.equal(lifted.verdict.byRecoverable["not-run"], 2, "route-shape lifted and queued, plus the untested model that this --only scope does not ask: not-run");
+});
+
+// ---------------------------------------------------------------- exit code of the tool sweep
+
+test("exit code: toolSweepExit is 0 for records written or nothing sent, 0 for Ctrl-C and for rate limits, 4 for the gateway give-up, and 3 only for 'requests sent, no record, an unexplained failure'", () => {
+  assert.equal(toolSweepExit({ requests: 12, records: 42, outcomes: { error: 3, timeout: 2 } }), 0, "42 records: the run worked, whatever else failed");
+  assert.equal(toolSweepExit({ requests: 0, records: 0 }), 0, "nothing queueable");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 9 } }), 0, "all rate limited: saturation");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { quota: 4, pay: 3, auth: 2 } }), 0, "quota and account states are reported, not an outage");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { rate: 8, error: 1 } }), 3, "zero records and one unexplained failure");
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { timeout: 1 } }), 3);
+  assert.equal(toolSweepExit({ requests: 9, records: 0, outcomes: { error: 9 }, signal: true }), 0, "Ctrl-C is the user's decision");
+  assert.equal(toolSweepExit({ gaveUp: true, requests: 9, records: 5 }), 4);
+  assert.equal(toolSweepExit(), 0);
+});
+
+test("exit code, live: a run that wrote records exits 0 though no probe counts as ok; all requests rate limited with no record exits 0 with a SATURATION line; every request failing exits 3", async () => {
+  const good = cliEnv([many("pa", 3)]);
+  assert.equal((await run(["--live"], good.deps)).code, 0);
+  const rate = cliEnv([many("pa", 3)], { answer: () => http(429, "slow down", { "retry-after": "1" }) });
+  const r = await run(["--live"], rate.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.match(r.out, /SATURATION saturated=/);
+  assert.deepEqual(Object.keys(loadFidelity(rate.out).models), []);
+  const bad = cliEnv([many("pa", 3)], { answer: () => http(500, "internal boom") });
+  const b = await run(["--live"], bad.deps);
+  assert.equal(b.code, 3, b.err + b.out);
+  assert.deepEqual(Object.keys(loadFidelity(bad.out).models), [], "nothing worked: no record");
 });
