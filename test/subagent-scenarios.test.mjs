@@ -248,11 +248,12 @@ test("judge 6 (bad policy): each variant serves the asked model with 200 and the
   assert.equal(ok("6", { variants: [ev.variants[0]] }).verdict, "FAIL", "variants not run");
 });
 
-test("judge 7 (worker restart): the handed-off model must survive a REAL restart (pid changed); the same pid is a FINDING; a different model after the restart FAILS", () => {
-  const ev = { handoffSeen: true, handedTo: "uwstub/m-big", afterModel: "m-big", pidBefore: 100, pidAfter: 101 };
-  assert.equal(ok("7", ev).verdict, "PASS");
-  assert.equal(ok("7", { ...ev, pidAfter: 100 }).verdict, "FINDING");
-  assert.equal(ok("7", { ...ev, afterModel: "m-free" }).verdict, "FAIL");
+test("judge 7: the handed-off model must be KEPT on the agent's next request; without a router restart (the router runs in the sandbox daemon) the verdict is a FINDING, never a PASS; a different model FAILS; a missing setup handoff FAILS; the PASS needs a real restart", () => {
+  const ev = { handoffSeen: true, handedTo: "uwstub/m-big", afterModel: "m-big" };
+  assert.equal(ok("7", ev).verdict, "FINDING"); assert.match(ok("7", ev).text, /the router runs inside the sandbox daemon.*journal replay after a restart is NOT shown here/);
+  assert.equal(ok("7", { ...ev, pidBefore: 100, pidAfter: 100 }).verdict, "FINDING");
+  assert.equal(ok("7", { ...ev, pidBefore: 100, pidAfter: 101 }).verdict, "PASS", "kept for a judge that is handed a real restart");
+  assert.equal(ok("7", { ...ev, afterModel: "m-free" }).verdict, "FAIL"); assert.match(ok("7", { ...ev, afterModel: "m-free" }).text, /the handoff was not kept/);
   assert.equal(ok("7", { ...ev, handoffSeen: false }).verdict, "FAIL");
 });
 
@@ -440,7 +441,7 @@ function fakeWorld(bug = {}) {
     if (pol.exempt.includes(model)) return plain();                                      // never reached by a correct world: exempt is read under inherit only (here: a dynamic policy with an exempt list is served like any other)
     const key = `${session}:${aid}`;
     let e = w.sticky.get(key), chosen, retry = false;
-    if (w.blocked.size && !w.logFd) { count("logDropped"); count("journalFail"); if (bug.failOnBlocked) return { status: 500, ms: 5, headers: {} }; }      // a worker that already holds its log descriptor open does not notice the swap
+    if (w.blocked.size && !bug.silentLogs) { count("journalFail"); if (!w.logFd) count("logDropped"); if (bug.failOnBlocked) return { status: 500, ms: 5, headers: {} }; }      // a worker that already holds its log descriptor open does not notice the swap
     if (!w.blocked.size) w.logFd = true;
     if (e && o.messages === e.len && !bug.noRetrySignal) retry = true;
     if (retry) {
@@ -465,7 +466,7 @@ function fakeWorld(bug = {}) {
     return { status: st.status, ms, headers: st.retryAfter !== null ? { "retry-after": String(st.retryAfter) } : {} };
   }
   const prims = {
-    send, stub, now: () => 1_800_000_000_000, sleep: async (ms) => { if (ms >= 1000 && !bug.overlayIgnored) for (const m of w.overlayPending) w.overlay.add(m); if (ms >= 1000) w.overlayPending.clear(); }, settle: async () => {}, markDirty: () => {},
+    send, stub, now: () => 1_800_000_000_000, sleep: async (ms) => { if (ms >= 1000 && !bug.overlayIgnored) for (const m of w.overlayPending) w.overlay.add(m); if (ms >= 1000) w.overlayPending.clear(); }, settle: async () => {},
     policy: async (p) => { w.policy = p; w.flag = false; },
     writeState: async (f, text) => { w.files.set(f, text); if (f === "policy.json") { try { w.policy = JSON.parse(text); } catch { w.policy = "corrupt"; } } },
     appendState: async (f, text) => { w.files.set(f, (w.files.get(f) ?? "") + text); w.torn = !bug.tornIgnored; },
@@ -479,8 +480,6 @@ function fakeWorld(bug = {}) {
     rollback: async () => { w.flag = true; if (bug.gwRestart) w.gw = { pid: 101, serviceSha: "s" }; return true; }, resume: async () => { w.flag = false; },
     feedOverlay: async (m) => { w.overlayPending.add(m); return true; },                // the router re-reads observed.json at most once a second: effective after a wait of one second or more
     lastOut: async () => [...w.agents.filter((a) => a.act === "handoff").map((a) => `HANDOFF ${a.from} -> ${a.to} (retry 1, hop 1)`), ...w.agents.filter((a) => a.act !== "handoff").map((a) => `asked ${a.asked} ran ${a.ret}`)],
-    restartWorker: async () => { const pidBefore = w.corePid; if (!bug.noRestart) { w.corePid += 1; w.logFd = false; w.cooling.clear(); w.files.delete("cooling.json"); } if (bug.noReplay) w.sticky.clear(); return { pidBefore, pidAfter: w.corePid, changed: w.corePid !== pidBefore, ready: true }; },
-    freshWorker: async () => { const r = await prims.restartWorker(); if (!r.changed) throw new Error("the router worker was not replaced"); return r; },
     claude: null, realCheck: null,
     reset: async () => { w.files.delete("cooling.json"); if (!bug.resetIneffective) w.cooling.clear(); w.overlay.clear(); w.overlayPending.clear(); w.sticky.clear(); w.flag = false; w.torn = false; w.tornCounted = false; w.warnings.length = 0; w.published = { counters: w.published.counters, warnings: [], cooling: bug.resetIneffective ? w.published.cooling : [] }; },
   };
@@ -491,19 +490,19 @@ const runAll = async (bug, extra = {}) => { const { prims } = fakeWorld(bug); co
 test("the whole suite against a CORRECT fake sandbox: every scenario passes (11 DEGRADED by design, C4 a FINDING for one worker), one result line each naming the client, and the suite verdict is OK with the non-PASS ids listed as not G3 evidence", async () => {
   const { by, lines } = await runAll({});
   const verdicts = Object.fromEntries(Object.entries(by).map(([k, v]) => [k, v.verdict]));
-  assert.deepEqual(verdicts, { 1: "PASS", 2: "PASS", 3: "PASS", 4: "PASS", 5: "PASS", 6: "PASS", 7: "PASS", 8: "PASS", 9: "PASS", 10: "PASS", 11: "DEGRADED", C1: "PASS", C2: "PASS", C3: "PASS", C4: "FINDING" });
+  assert.deepEqual(verdicts, { 1: "PASS", 2: "PASS", 3: "PASS", 4: "PASS", 5: "PASS", 6: "PASS", 7: "FINDING", 8: "PASS", 9: "PASS", 10: "PASS", 11: "DEGRADED", C1: "PASS", C2: "PASS", C3: "PASS", C4: "FINDING" });
   assert.equal(lines.length, 15); assert.ok(lines.every((l) => S.parseScenarioLine(l)));
   assert.ok(lines.every((l) => /\[replay\]/.test(l)), "every line says replay (scenarios 4-10 and C1-C4 and the DEGRADED line of 11 included)");
   assert.ok(lines.filter((l) => !/^SCENARIO PASS/.test(l)).every((l) => /\[not G3 evidence\]$/.test(l)));
   const v = S.suiteVerdict(lines, S.ALL.map((s) => s.id));
-  assert.equal(v.ok, true); assert.deepEqual(v.notG3, ["11", "C4"]);
+  assert.equal(v.ok, true); assert.deepEqual(v.notG3, ["7", "11", "C4"]);
   assert.deepEqual((await runAll({ workers: 2 })).by.C4.verdict, "PASS");
 });
 
 test("MUTATION (the fake router gets one defect each): every defect turns EXACTLY the matching scenarios to FAIL or FINDING and leaves every other scenario as it was", async () => {
   const cases = [
     [{ rewriteAux: true }, { 8: "FAIL" }], [{ noHandoff: true }, { 2: "FAIL", 3: "FAIL", 7: "FAIL", 10: "FAIL" }], [{ noRetrySignal: true }, { 2: "FINDING", 3: "FAIL", 7: "FAIL", 10: "FAIL" }],
-    [{ mainClass: true }, { 4: "FAIL" }], [{ stickyBroken: true }, { 5: "FAIL", 7: "FAIL" }], [{ noNewerWarn: true }, { 6: "FAIL" }], [{ noRestart: true }, { 7: "FINDING", C1: "FAIL", C3: "FAIL" }], [{ noReplay: true }, { 7: "FAIL" }],
+    [{ mainClass: true }, { 4: "FAIL" }], [{ stickyBroken: true }, { 5: "FAIL", 7: "FAIL" }], [{ noNewerWarn: true }, { 6: "FAIL" }], [{ silentLogs: true }, { C3: "FAIL" }],
     [{ rollbackIgnored: true }, { 9: "FAIL" }], [{ gwRestart: true }, { 9: "FAIL" }], [{ noSpread: true }, { 10: "FAIL" }], [{ overlayIgnored: true }, { 11: "FINDING" }],
     [{ tornIgnored: true }, { C2: "FAIL" }], [{ failOnBlocked: true }, { C3: "FAIL" }], [{ errorOnState: true }, { C1: "FAIL" }], [{ slow: true }, { 3: "FAIL" }],
     // F4: the broken variants a vacuous judge would have passed
@@ -765,77 +764,61 @@ test("runSandbox and runSelftest pass the second token that matches the orchestr
 
 // ====================================================================================== fix round 2 (the first replay run: no scenario was a router defect; the HARNESS read stale status, hid cooling state and fed the router wrong shapes)
 /**
- * A WINDOWS-SHAPED virtual sandbox: a clock the sleeps advance, an in-memory scratch tree, a router that flushes status.json at most every 5 s, a process table with creation times, and a FAKE sandbox web RPC.
- * The RPC knows ONLY getConfig and saveConfig (any other method, restartGateway and startGateway included, is recorded in V.badRpc and throws), and a saveConfig that changes `Providers` makes CCR replace its core worker
- * (a new pid, created later, after `respawnMs`): as in CCR 3.0.22, whose `_E(old, new)` test starts a new worker when Providers differ and which never respawns a worker that was merely killed. The REAL guard
- * functions (assertPayloadIsolated, assertIsolatedConfig) check every payload and result. There is no seam that can stop a process: d.sys has no stop function at all. Options break one rule each.
+ * A WINDOWS-SHAPED virtual sandbox for the REAL sandboxPrims: a clock the sleeps advance, an in-memory scratch tree, and a ROUTER MODEL that behaves as the real one does where it matters here: status.json is flushed at most
+ * every 5 s, and the cooling state lives in the router's MEMORY (V.cool) and is merged from cooling.json only when the file's stat changed (at most once a second) and only for a record whose `t` is NEWER than the one held
+ * (router coolView), so deleting the file clears nothing. The seam has NO rpc, NO guard and NO process function at all: a harness that calls one throws. V.coolFail is the router's coolFail (rung ladder 2 min / 10 min / 60 min / 6 h).
  */
-const DAEMON_CMD = `"C:\\nvm4w\\nodejs\\node.exe" C:\\ccr\\dist\\main\\cli.js serve --daemon-child --no-open`;                     // the live and the sandbox daemon have the SAME command line
-const workerCmd = (dir) => `"C:\\nvm4w\\nodejs\\node.exe" --require ${dir}\\gateway-proxy-preload.cjs C:\\ccr\\dist\\main\\gateway-bootstrap.js`;
-const sandboxConfig = async () => {
-  const { GATEWAY_PORT, GATEWAY_CORE_PORT, SCRATCH_SETTINGS } = await import("../harness/config.mjs");
-  const { SCRATCH_ROUTER, SANDBOX_PORTS } = await import("../harness/subagent-sandbox-spec.mjs");
-  const { STUB_MODELS } = await import("../harness/stub-upstream.mjs");
-  return { gateway: { host: "127.0.0.1", port: GATEWAY_PORT, corePort: GATEWAY_CORE_PORT }, HOST: "127.0.0.1", PORT: GATEWAY_PORT, CUSTOM_ROUTER_PATH: SCRATCH_ROUTER,
-    Router: { fallback: { mode: "off", models: [] }, rules: [] }, Providers: [{ name: "uwstub", api_base_url: `http://127.0.0.1:${SANDBOX_PORTS.stub}`, models: [...STUB_MODELS] }],
-    profile: { enabled: true, claudeCode: { settingsFile: SCRATCH_SETTINGS }, profiles: [{ id: "p", agent: "claude-code", enabled: true, scope: "global", settingsFile: SCRATCH_SETTINGS }] } };
-};
+const LADDER = [2 * 60000, 10 * 60000, 60 * 60000, 6 * 3600000];
 async function virtualSandbox(o = {}) {
-  const { respawn = true, respawnMs = 0, daemonReplaced = false, newParent = 100, readyAfter = 2, dyingRewritesCooling = true, daemonKnown = true, listenFail = false,
-    failSave = null, cfgTweak = null, guardHook = null, tripwireHook = null } = o;
-  const { SCRATCH_STATE_DIR, SANDBOX_PORTS } = await import("../harness/subagent-sandbox-spec.mjs");
-  const guard = await import("../harness/guard.mjs");
+  const { readyAfter = 0 } = o;
+  const { SCRATCH_STATE_DIR } = await import("../harness/subagent-sandbox-spec.mjs");
   const mem = new Map(), r = (p) => path.resolve(p), T0 = 1_800_000_000_000, iso = (ms) => new Date(ms).toISOString();
-  const V = { now: T0, statusAt: -1e15, reqs: [], core: 500, daemon: 100, nextCore: 501, respawnAt: null, answered: 0, rpc: [], badRpc: [], saves: [], log: [], progress: [], T0, iso, cfg: await sandboxConfig(), respawns: 0, guardCalls: [], tripwire: 0 };
-  V.all = [
-    { pid: 700, ppid: 710, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: iso(T0 - 7e6) },
-    { pid: 100, ppid: 1, name: "node.exe", cmd: DAEMON_CMD, created: iso(T0 - 5e5) },
-    { pid: 500, ppid: 100, name: "node.exe", cmd: workerCmd(path.join(SCRATCH_STATE_DIR, "..")), created: iso(T0 - 4e5) },
-  ];
+  const V = { now: T0, statusAt: -1e15, reqs: [], cool: new Map(), coolChk: -1e15, coolText: null, T0, iso, answered: 0 };
   const statusFile = r(path.join(SCRATCH_STATE_DIR, "status.json")), coolFile = r(path.join(SCRATCH_STATE_DIR, "cooling.json"));
-  const flush = () => { V.statusAt = V.now; mem.set(statusFile, JSON.stringify({ updatedAt: iso(V.now), counters: { req: V.reqs.length }, cooling: [] })); };
-  const replaceWorker = () => { V.all = V.all.filter((x) => x.pid !== V.core); V.core = V.nextCore++; V.respawns += 1; V.answered = 0; V.all.push({ pid: V.core, ppid: newParent, name: "node.exe", cmd: workerCmd("C:\\x"), created: iso(V.now + 1) }); if (daemonReplaced) V.daemon = 101; };
-  const realGuard = { assertPayloadIsolated: (...a) => { V.guardCalls.push(a[1]); guardHook?.(V.guardCalls.length); return guard.assertPayloadIsolated(...a); }, assertIsolatedConfig: (c) => guard.assertIsolatedConfig(c) };
+  const coolSync = () => {                                                                // router coolView: stat changed, at most once a second, a NEWER record replaces the one in memory
+    if (V.now - V.coolChk < 1000) return;
+    V.coolChk = V.now;
+    const text = mem.get(coolFile) ?? null;
+    if (text === V.coolText) return;
+    V.coolText = text;
+    let m = null; try { m = JSON.parse(text)?.models ?? null; } catch { /* torn */ }
+    for (const k of Object.keys(m ?? {})) {
+      const x = m[k], cur = V.cool.get(k);
+      if (!x || !Number.isFinite(x.u) || !Number.isFinite(x.t)) continue;
+      if (!cur || x.t > cur.t) V.cool.set(k, { u: Math.min(x.u, V.now + LADDER[3]), l: x.l | 0, t: Math.min(x.t, V.now), n: x.n > 0 ? x.n : 1, t0: Math.min(x.t0, Math.min(x.t, V.now)) });
+    }
+  };
+  V.coolFail = (sel) => {                                                                // router coolFail: already cooling = no change; a streak escalates; the file is rewritten
+    coolSync();
+    const cur = V.cool.get(sel);
+    if (cur && V.now < cur.u) return;
+    let n = 1, t0 = V.now;
+    if (cur && V.now <= cur.u + 3600000 && V.now - cur.t0 <= 24 * 3600000) { n = cur.n + 1; t0 = cur.t0; }
+    const lvl = n >= 4 ? 3 : n - 1;
+    V.cool.set(sel, { u: V.now + LADDER[lvl], l: lvl, t: V.now, n, t0 });
+    const models = {}; for (const [k, v] of V.cool) models[k] = v;
+    V.coolText = JSON.stringify({ v: 1, models }); mem.set(coolFile, V.coolText);
+  };
+  const flush = () => {
+    V.statusAt = V.now; coolSync();
+    const cooling = [...V.cool].filter(([, v]) => v.u > V.now).map(([k, v]) => ({ key: k, rung: v.l, leftSec: Math.round((v.u - V.now) / 1000), fails: v.n }));
+    mem.set(statusFile, JSON.stringify({ updatedAt: iso(V.now), counters: { req: V.reqs.length }, cooling }));
+  };
   const d = {
     fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true },
-    guard: realGuard,
-    sys: {
-      selfPid: 700,
-      readText: (p) => mem.get(r(p)) ?? null,
-      processes: () => V.all.map((x) => ({ ...x })),
-      listenerProbe: (port) => { V.log.push(`probe:${port}`); if (listenFail) return { ok: false }; return port === SANDBOX_PORTS.core ? { ok: true, pid: V.core ?? null } : { ok: true, pid: null }; },
-    },
-    resolveWebPort: () => ({ port: SANDBOX_PORTS.web, pid: V.daemon }),
-    rpc: async (method, args = []) => {
-      V.rpc.push(method);
-      if (method === "getConfig") { const cfg = structuredClone(V.cfg); cfgTweak?.(cfg, V); return cfg; }
-      if (method === "saveConfig") {
-        const [cfg, opts] = args; V.saves.push({ cfg: structuredClone(cfg), opts });
-        if (failSave === V.saves.length) throw new Error("saveConfig failed: scripted");
-        const providersChanged = JSON.stringify(cfg.Providers) !== JSON.stringify(V.cfg.Providers);
-        V.cfg = structuredClone(cfg);
-        if (providersChanged && respawn) { V.all = V.all.filter((x) => x.pid !== V.core); V.core = undefined; V.respawnAt = V.now + respawnMs; if (respawnMs === 0) replaceWorker(); }
-        return structuredClone(cfg);
-      }
-      V.badRpc.push(method); throw new Error(`the fake sandbox RPC does not know ${method}`);
-    },
+    sys: { selfPid: 700, readText: (p) => mem.get(r(p)) ?? null },
     now: () => V.now,
-    sleep: async (ms) => {
-      V.now += ms;
-      if (V.core === undefined && respawn && V.respawnAt !== null && V.now >= V.respawnAt) { V.respawnAt = null; replaceWorker(); }
-    },
+    sleep: async (ms) => { V.now += ms; },
     fetch: async (url, init) => {
       const h = init.headers, aux = !JSON.parse(init.body).tools;
       V.reqs.push({ aux, agent: h["x-claude-code-agent-id"] ?? null });
       if (V.now - V.statusAt >= 5000) flush();                                          // the router flushes at most every 5 s
       V.answered += 1;
-      if (dyingRewritesCooling && V.answered === 1 && V.respawns) mem.set(coolFile, "{\"v\":1,\"models\":{}}");      // the dying worker rewrites cooling.json on its way out
-      const status = V.respawns && V.answered <= readyAfter ? 503 : 200;
-      return { status, text: async () => "", headers: { forEach() {} } };
+      return { status: V.answered <= readyAfter ? 503 : 200, text: async () => "", headers: { forEach() {} } };
     },
   };
   const notes = [];
-  const c = { d, key: "k", stub: { records: [] }, launchEnv: {}, daemonPid: () => (daemonKnown ? 100 : undefined), out: (l) => { notes.push(l); V.progress.push(l); }, tripwire: { assert: (l) => { V.tripwire += 1; tripwireHook?.(l, V); } }, fallback: { mode: "off", models: [] } };
+  const c = { d, key: "k", stub: { records: [] }, launchEnv: {}, out: (l) => notes.push(l) };
   return { V, d, c, mem, coolFile, statusFile, notes };
 }
 const prims = (v, extra = {}) => S.sandboxPrims(v.c, extra);
@@ -974,13 +957,14 @@ test("H5 scenario 11: after the overlay record is fed the suite waits more than 
   assert.ok(waits.some((ms) => ms >= 1100), `the runner asked for a wait of at least 1.1 s (${waits})`);
 });
 
-test("H7 C3 runs on a FRESH worker: a worker that already holds its log descriptor open does not notice the swap, so a harness that skips the replacement sees nothing and FAILs; the judge accepts journalFail OR logDropped", async () => {
+test("H7 C3 reports through the JOURNAL path whatever the router's log descriptor does (a router held open since an earlier scenario hides logDropped, but a new session's journal is always opened afresh, so journalFail counts); a router that counts nothing FAILs; the judge accepts journalFail OR logDropped", async () => {
   const good = await S.runScenarios(fakeWorld({}).prims, { only: ["C3"] });
-  assert.equal(good[0].result.verdict, "PASS", good[0].result.text);
-  const g = fakeWorld({});
-  const fdOpen = { ...g.prims, freshWorker: async () => { g.w.logFd = true; } };                                  // no replacement: the worker keeps its open descriptor
-  const lazy = await S.runScenarios(fdOpen, { only: ["C3"] });
-  assert.equal(lazy[0].result.verdict, "FAIL", lazy[0].result.text); assert.match(lazy[0].result.text, /logDropped 0 -> 0, journalFail 0 -> 0/);
+  assert.equal(good[0].result.verdict, "PASS", good[0].result.text); assert.match(good[0].result.text, /journalFail \+3/);
+  const g = fakeWorld({}); g.w.logFd = true;                                                         // the descriptor of an earlier scenario is still open
+  const held = await S.runScenarios(g.prims, { only: ["C3"] });
+  assert.equal(held[0].result.verdict, "PASS", held[0].result.text); assert.equal(g.w.counters.logDropped ?? 0, 0);
+  const silent = await S.runScenarios(fakeWorld({ silentLogs: true }).prims, { only: ["C3"] });
+  assert.equal(silent[0].result.verdict, "FAIL", silent[0].result.text); assert.match(silent[0].result.text, /logDropped 0 -> 0, journalFail 0 -> 0/);
   const base = { requests: [{ status: 200 }], status0: { counters: {}, warnings: [] } };
   assert.equal(ok("C3", { ...base, status1: { counters: { journalFail: 2 }, warnings: [] } }).verdict, "PASS", "journalFail alone is a report");
   assert.equal(ok("C3", { ...base, status1: { counters: { logDropped: 1 }, warnings: [] } }).verdict, "PASS");
@@ -988,15 +972,15 @@ test("H7 C3 runs on a FRESH worker: a worker that already holds its log descript
   assert.equal(ok("C3", { ...base, status1: { counters: {}, warnings: [] } }).verdict, "FAIL");
 });
 
-test("H6 C1 stamps the shapes the router writes, BEFORE the first request of each session, on a fresh worker; the judge names the request that failed with its status and error", async () => {
+test("H6 C1 stamps the shapes the router writes, BEFORE the first request of each session (session ids no process has seen, so the router reads the main files on its memory miss); the judge names the request that failed with its status and error", async () => {
   const f = fakeWorld({});
   const writes = [], order = [];
-  const prims = { ...f.prims, freshWorker: async () => { order.push("fresh"); return f.prims.freshWorker(); }, writeState: async (n, text) => { order.push(`write ${n}`); writes.push([n, text]); return f.prims.writeState(n, text); },
+  const prims = { ...f.prims, writeState: async (n, text) => { order.push(`write ${n}`); writes.push([n, text]); return f.prims.writeState(n, text); },
     send: async (shape, o) => { order.push(`send ${shape}`); return f.prims.send(shape, o); } };
   const r = await S.runScenarios(prims, { only: ["C1"] });
   assert.equal(r[0].result.verdict, "PASS", r[0].result.text);
   const firstSend = order.findIndex((x) => x.startsWith("send")), lastWrite = Math.max(...order.map((x, i) => (x.startsWith("write") ? i : -1)));
-  assert.ok(order.indexOf("fresh") >= 0 && order.indexOf("fresh") < firstSend, "a fresh worker comes first");
+  assert.ok(firstSend >= 0, "requests were sent");
   assert.ok(lastWrite < order.indexOf("send sub"), "every stamp is written before the first subagent request");
   const main = writes.filter(([n]) => /^main-/.test(n)).map(([, t]) => JSON.parse(t)), cool = JSON.parse(writes.find(([n]) => n === "cooling.json")[1]);
   assert.ok(main.length === 2 && main.every((m) => typeof m.t === "string" && !Number.isNaN(Date.parse(m.t)) && m.model && m.beta1m === false), "main files: {model, beta1m, t: ISO string}");
@@ -1012,7 +996,7 @@ test("scenario 7: the judge prints handoffNone, retry, the cooling list, the age
   const r = ok("7", ev);
   assert.equal(r.verdict, "FAIL");
   for (const piece of ["handoffNone 2", "retry 1", "cooling [uwstub/m-free, prov:uwstub]", "m-free:429, m-free:429", "core pid 5 -> 6"]) assert.ok(r.text.includes(piece), `${piece} in: ${r.text}`);
-  assert.match(ok("7", { handoffSeen: true, handedTo: "uwstub/m-main", afterModel: "uwstub/m-big", pidBefore: 5, pidAfter: 6, setup: ev.setup }).text, /served uwstub\/m-big, not the handed-off uwstub\/m-main \(setup: handoffNone 2/);
+  assert.match(ok("7", { handoffSeen: true, handedTo: "uwstub/m-main", afterModel: "uwstub/m-big", pidBefore: 5, pidAfter: 6, setup: ev.setup }).text, /served uwstub\/m-big, not the handed-off uwstub\/m-main: the handoff was not kept \(setup: handoffNone 2/);
   assert.equal(ok("7", { handoffSeen: true, handedTo: "uwstub/m-main", afterModel: "uwstub/m-main", pidBefore: 5, pidAfter: 6 }).verdict, "PASS");
 });
 
@@ -1039,150 +1023,74 @@ test("H4 the sandbox has ONE provider: two DISTINCT failing models cool the prov
   assert.ok(g.w.cooling.has("uwstub/m-free") && g.w.cooling.has("uwstub/m-big"), "the shipped scenario ends with both cooled (step 2)");
 });
 
-// ====================================================================================== fix round 4 (the fourth replay run: CCR 3.0.22 never respawns a killed core worker; the worker is replaced by CCR itself through a sandbox config save)
-const stubModels = (cfg) => cfg.Providers.find((p) => p.name === "uwstub").models;
+// ====================================================================================== fix round 5 (the fifth replay run: the router lives in the sandbox DAEMON, so replacing the core worker never cleared its cooling; the reset writes newer, expired cooling records instead)
+const state = async (name) => path.join((await import("../harness/subagent-sandbox-spec.mjs")).SCRATCH_STATE_DIR, name);
 
-test("R4-1 the worker is replaced by TWO sandbox config saves (add m-x1 to uwstub, then remove it), each with applyProfile false, through getConfig/saveConfig only; the core pid changes twice; no process is stopped (the seam has no stop function)", async () => {
+test("R5-1 reset clears the router's cooling: deleting cooling.json clears NOTHING (the defect of run 5), the reset's newer-and-expired records do; the next failure starts at rung 0 again (the streak is ended)", async () => {
   const v = await virtualSandbox(), w = prims(v);
-  assert.equal(v.d.sys.stopVerified, undefined); assert.equal(v.d.sys.listenPortsOf, undefined);
-  const r = await w.restartWorker();
-  assert.deepEqual(r, { pidBefore: 500, pidMid: 501, pidAfter: 502, changed: true, ready: true, saves: 2 });
-  assert.equal(v.V.saves.length, 2);
-  assert.deepEqual(v.V.saves.map((s) => s.opts), [{ applyProfile: false }, { applyProfile: false }], "applyProfile false on both: no global profile apply");
-  assert.ok(stubModels(v.V.saves[0].cfg).includes("m-x1") && stubModels(v.V.saves[0].cfg).length === 4, "the first save ADDS m-x1");
-  assert.ok(!stubModels(v.V.saves[1].cfg).includes("m-x1") && stubModels(v.V.saves[1].cfg).length === 3, "the second REMOVES it: three stub models as before");
-  assert.deepEqual(v.V.rpc, ["getConfig", "saveConfig", "getConfig", "saveConfig"], "no other RPC method");
-  assert.deepEqual(v.V.badRpc, [], "restartGateway and startGateway are never called");
-  assert.equal(v.V.respawns, 2); assert.equal(v.V.core, 502);
-  assert.equal(v.V.tripwire, 2, "the tripwire ran after each save");
-  assert.equal(v.mem.has(v.coolFile), false, "cooling.json (rewritten by the dying worker) is deleted again once the new worker answers");
-  assert.ok(!/Router\.fallback/.test(JSON.stringify(v.V.saves.map((s) => s.cfg.Router))) || v.V.saves.every((s) => s.cfg.Router.fallback.mode === "off"), "the fallback is untouched");
+  v.V.coolFail("uwstub/m-free"); v.V.coolFail("uwstub/m-big"); v.V.coolFail("prov:uwstub");
+  let s = await w.freshStatus();
+  assert.deepEqual(s.cooling.map((x) => x.key).sort(), ["prov:uwstub", "uwstub/m-big", "uwstub/m-free"], "the scenario left three cooling entries in the router");
+  v.mem.delete(v.coolFile);                                                              // what the old reset did
+  v.V.now += 6000; s = await w.freshStatus();
+  assert.equal(s.cooling.length, 3, "deleting the file cleared nothing: the router holds cooling in memory");
+  await w.reset();
+  s = await w.freshStatus();
+  assert.deepEqual(s.cooling, [], "after the reset the fresh status lists no cooling");
+  v.V.coolFail("uwstub/m-free");
+  const e = v.V.cool.get("uwstub/m-free");
+  assert.equal(e.l, 0, "rung 0 again"); assert.equal(e.n, 1, "no streak carried over"); assert.equal(e.u - v.V.now, 2 * 60000, "a 2-minute cooldown, not the 10 minutes an escalated rung would give");
 });
 
-test("R4-2 holder-change polling: a slow respawn is waited for (a progress line every 5 s), up to 60 s per save; the wait is 60 s, not 30", async () => {
-  assert.equal(S.WORKER_POLL_MS * S.WORKER_WAIT_POLLS, 60000);
-  const slow = await virtualSandbox({ respawnMs: 23000 });
-  const t0 = slow.V.now, r = await prims(slow).restartWorker();
-  assert.equal(r.changed, true); assert.ok(slow.V.now - t0 >= 46000, `two waits of about 23 s (${slow.V.now - t0} ms virtual)`);
-  assert.ok(slow.V.progress.filter((l) => /^worker restart: after the add save: the core port 39457 is held by nobody, waiting for a process other than 500 \(\d+ s of 60 s\)/.test(l)).length >= 4, "progress lines while waiting");
-  const edge = await virtualSandbox({ respawnMs: 59000 });
-  assert.equal((await prims(edge).restartWorker()).changed, true, "59 s is still inside the window (it would have timed out at 30 s)");
-});
-
-test("R4-3 no new holder within 60 s: the call throws naming the wait, the RESTORE save is still sent (the config is never left edited), and the worker stays dirty so the next reset tries again", async () => {
-  const v = await virtualSandbox({ respawn: false }), w = prims(v);
+test("R5-2 what reset writes: v:1 records for every sandbox model and the provider key, each NEWER than now and EXPIRED more than an hour ago with n 1; shadow.flag and observed.json are removed; it waits 1.2 s for the router's one-second re-read; the seam has no RPC, guard or process function, so nothing is restarted or stopped", async () => {
+  const v = await virtualSandbox(), w = prims(v);
+  assert.deepEqual(Object.keys(v.d.sys).sort(), ["readText", "selfPid"]); assert.equal(v.d.rpc, undefined); assert.equal(v.d.guard, undefined);
+  const flag = await state("shadow.flag"), obs = path.join(path.dirname(path.dirname(await state("x"))), "observed.json");
+  v.mem.set(path.resolve(flag), "auto:X\n"); v.mem.set(path.resolve(obs), "{}");
   const t0 = v.V.now;
-  await assert.rejects(() => w.restartWorker(), /the sandbox core worker was not replaced: no process other than 500 held the core port within 60 s of the add save/);
-  assert.ok(v.V.now - t0 >= 60000, "it waited the whole 60 s");
-  assert.equal(v.V.saves.length, 2, "add AND restore were sent"); assert.ok(!stubModels(v.V.cfg).includes("m-x1"), "and the sandbox config is back to three stub models");
-  const d2 = await virtualSandbox({ respawn: false }), q = prims(d2);
-  q.markDirty();
-  await assert.rejects(() => q.reset(), /was not replaced/); const first = d2.V.saves.length;
-  await assert.rejects(() => q.reset(), /was not replaced/); assert.ok(d2.V.saves.length > first, "the second reset tried again: the flag was not cleared by the failure");
-  const none = await virtualSandbox({ listenFail: true });
-  await assert.rejects(() => prims(none).restartWorker(), /no process holds the sandbox core port 39457/);
-  assert.deepEqual(none.V.saves, [], "nothing was saved when the holder is not known");
+  await w.reset();
+  assert.equal(v.V.now - t0, 1200, "exactly the 1.2 s wait");
+  assert.equal(v.mem.has(path.resolve(flag)), false); assert.equal(v.mem.has(path.resolve(obs)), false);
+  const f = JSON.parse(v.mem.get(v.coolFile));
+  assert.equal(f.v, 1); assert.deepEqual(Object.keys(f.models).sort(), ["prov:uwstub", "uwstub/m-big", "uwstub/m-free", "uwstub/m-main"]);
+  for (const x of Object.values(f.models)) { assert.ok(x.t > t0, "newer than now"); assert.ok(t0 - x.u > 3600000, "expired by more than the one-hour streak window"); assert.equal(x.n, 1); assert.equal(x.l, 0); assert.ok(["u", "l", "t", "n", "t0"].every((k) => Number.isFinite(x[k]))); }
+  await w.reset(); assert.equal(v.V.now - t0, 2400, "a reset costs 1.2 s whether or not the last scenario cooled anything; no process is ever restarted");
 });
 
-test("R4-4 the RESTORE save fails: the call throws saying the config still lists the extra stub model, and the worker stays dirty", async () => {
-  const v = await virtualSandbox({ failSave: 2 }), w = prims(v);
-  await assert.rejects(() => w.restartWorker(), /the RESTORE save failed \(saveConfig failed: scripted\), so the sandbox config still lists the extra stub model/);
-  assert.equal(v.V.saves.length, 2);
-  const d2 = await virtualSandbox({ failSave: 2 }), q = prims(d2);
-  q.markDirty();
-  await assert.rejects(() => q.reset(), /RESTORE save failed/);
-  await assert.rejects(() => q.reset(), /RESTORE save failed|was not replaced/, "still dirty: reset tries again");
-  const add = await virtualSandbox({ failSave: 1 });
-  await assert.rejects(() => prims(add).restartWorker(), /the sandbox core worker was not replaced: the add save failed/);
-  assert.equal(add.V.saves.length, 2, "the restore is still attempted after a failed add");
+test("R5-3 a full suite run does 16 resets (15 scenarios plus the one between the two variants of scenario 2): about 20 s of waiting and NO core restart; a scenario that throws leaves nothing the next reset does not clear", async () => {
+  const f = fakeWorld({}); let resets = 0;
+  const prims2 = { ...f.prims, reset: async () => { resets += 1; return f.prims.reset(); } };
+  const res = await S.runScenarios(prims2, {});
+  assert.equal(res.length, 15); assert.equal(resets, 16);
+  const g = fakeWorld({}); let n = 0;
+  const throwing = { ...g.prims, send: async (shape, o) => { if (o.agentId === "uwsc-s2-1" && n++ === 0) throw new Error("boom"); return g.prims.send(shape, o); } };
+  const out = await S.runScenarios(throwing, { only: ["2", "3"] });
+  assert.equal(out[0].result.verdict, "FAIL"); assert.equal(out[1].result.verdict, "PASS", out[1].result.text);
 });
 
-test("R4-5 every save goes through assertPayloadIsolated (allowProviders) BEFORE it is sent and assertIsolatedConfig after; an isolation violation sends nothing more and stops the whole RUN (runScenarios rethrows it)", async () => {
-  const v = await virtualSandbox(); await prims(v).restartWorker();
-  assert.deepEqual(v.V.guardCalls, [{ allowProviders: true }, { allowProviders: true }], "both payloads were checked, Providers allowed only for the stub provider");
-  const hook = await virtualSandbox({ guardHook: (n) => { if (n === 1) throw new Error("ISOLATION VIOLATION: scripted"); } });
-  await assert.rejects(() => prims(hook).restartWorker(), /ISOLATION VIOLATION: scripted/);
-  assert.equal(hook.V.saves.length, 0, "the refused payload was never sent, and the restore is not tried after a violation");
-  const g2 = await virtualSandbox({ guardHook: (n) => { if (n === 2) throw new Error("ISOLATION VIOLATION: restore payload"); } });
-  await assert.rejects(() => prims(g2).restartWorker(), /ISOLATION VIOLATION: restore payload/); assert.equal(g2.V.saves.length, 1);
-  const trip = await virtualSandbox({ tripwireHook: () => { throw new Error("ISOLATION VIOLATION: tripwire"); } });
-  await assert.rejects(() => prims(trip).restartWorker(), /ISOLATION VIOLATION: tripwire/);
-  const tw = await virtualSandbox({ guardHook: (n) => { if (n === 1) throw new Error("ISOLATION VIOLATION: through the suite"); } });
-  const w = prims(tw); w.markDirty();
-  await assert.rejects(() => S.runScenarios({ ...w, reset: () => w.reset() }, { only: ["4"] }), /ISOLATION VIOLATION: through the suite/, "not one scenario's FAIL: the run stops");
-  assert.equal(S.isFatalRun(Object.assign(new Error("x"), { name: "RpcTimeoutError" })), true); assert.equal(S.isFatalRun(Object.assign(new Error("x"), { name: "RefusalError" })), true);
-  assert.equal(S.isFatalRun(new Error("the sandbox core worker was not replaced: x")), false, "an ordinary failure of the replacement is one scenario's FAIL");
+test("R5-4 the scenario harness makes no RPC call, restarts nothing and stops no process: no editSandboxConfig, saveConfig, restartGateway, startGateway, restartWorker, freshWorker, markDirty or stop seam; killTree (the `claude -p` child it spawned itself) is the one allowed kill", async () => {
+  const file = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-scenarios.mjs");
+  const raw = fs.readFileSync(file, "utf8");
+  assert.ok(/export function killTree/.test(raw), "the exception exists");
+  const code = raw.split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n").replace(/\n\s*"how the scenarios read the router[^\n]*/, "")
+    .replace(/export function killTree\([^\n]*\n[\s\S]*?\n\}\n/, "");     // killTree is cut out before the scan, so a second kill anywhere else is still caught
+  assert.ok(!/process\.kill|Stop-Process|stopProcess|stopVerified|stopRefusals|descendantsLeafFirst|listenPortsOf|editSandboxConfig|saveConfig|restartWorker|freshWorker|markDirty|["'`]restartGateway["'`]|["'`]startGateway["'`]|\.rpc\(/.test(code));
+  assert.match(S.planLines().join("\n"), /The suite restarts NOTHING and stops NO process\. The router runs inside the sandbox DAEMON/);
+  assert.doesNotMatch(S.planLines().join("\n"), /STOP of the sandbox's core worker|two saves and two core respawns/);
 });
 
-test("R4-6 a payload that names a non-sandbox path or port refuses before anything is sent: a live port, the live settings file, another router path, a provider that is not the stub", async () => {
-  const { LIVE_SETTINGS } = await import("../harness/config.mjs");
-  const cases = [
-    ["live gateway port", (cfg) => { cfg.gateway.port = 3456; cfg.PORT = 3456; }, /ISOLATION VIOLATION/],
-    ["live core port", (cfg) => { cfg.gateway.corePort = 3457; }, /ISOLATION VIOLATION/],
-    ["live settings file", (cfg) => { cfg.profile.profiles[0].settingsFile = LIVE_SETTINGS; }, /ISOLATION VIOLATION/],
-    ["blank settings file", (cfg) => { cfg.profile.profiles[0].settingsFile = ""; }, /ISOLATION VIOLATION/],
-    ["another router path", (cfg) => { cfg.CUSTOM_ROUTER_PATH = "C:\\Users\\me\\.uw\\spike\\uw-router.cjs"; }, /CUSTOM_ROUTER_PATH is not the scratch copy/],
-    ["a provider that is not the stub", (cfg) => { cfg.Providers.push({ name: "other", api_base_url: "https://example.invalid", models: ["x"] }); }, /a provider other than the sandbox stub/],
-    ["the stub provider pointing at a live port", (cfg) => { cfg.Providers[0].api_base_url = "http://127.0.0.1:3456"; }, /a provider other than the sandbox stub/],
-    ["an enabled Router rule", (cfg) => { cfg.Router.rules = [{ id: "r", enabled: true }]; }, /an enabled Router\.rules entry exists/],
-    ["a fallback chain naming a live model", (cfg) => { cfg.Router.fallback = { mode: "model-chain", models: ["anthropic/claude-sonnet-5-5"] }; }, /a fallback model is not a uwstub\/\* selector/],
-  ];
-  for (const [label, tweak, re] of cases) {
-    const v = await virtualSandbox({ cfgTweak: tweak });
-    await assert.rejects(() => prims(v).restartWorker(), re, label);
-    assert.equal(v.V.saves.length, 0, `${label}: nothing was sent`);
-    assert.deepEqual(v.V.badRpc, [], label);
-  }
-});
-
-test("R4-7 after the replacement: the sandbox daemon must be the same one, the new holder must provably descend from it, and the worker must ANSWER; a replaced daemon, an unprovable holder and a worker that never answers all throw", async () => {
-  const daemon = await virtualSandbox({ daemonReplaced: true });
-  await assert.rejects(() => prims(daemon).restartWorker(), /the sandbox daemon itself was replaced \(pid 100 -> 101\)/);
-  const orphan = await virtualSandbox({ newParent: 999 });
-  await assert.rejects(() => prims(orphan).restartWorker(), /does not provably descend from the sandbox daemon 100: its parent 999 is not in the process table/);
-  const stranger = await virtualSandbox({ newParent: 700 });
-  await assert.rejects(() => prims(stranger).restartWorker(), /does not provably descend from the sandbox daemon 100/, "a holder under another process (the orchestrator) is not the daemon's child");
-  const dumb = await virtualSandbox({ readyAfter: 1e9 }), w = prims(dumb);
-  const r = await w.restartWorker();
-  assert.equal(r.ready, false, "40 polls of 500 ms: the call reports it, freshWorker turns it into an error");
-  await assert.rejects(() => w.freshWorker(), /did not answer a request within 20 s after its replacement/);
-  const unknown = await virtualSandbox({ daemonKnown: false });
-  await assert.rejects(() => prims(unknown).restartWorker(), /the sandbox daemon pid is not known/);
-  assert.equal(unknown.V.saves.length, 0);
-});
-
-test("R4-8 reset and the runners use this path: a dirty reset performs the two saves and clears the flag only after they succeeded; a clean reset saves nothing; a throwing run marks the worker dirty; the harness has no process-stopping code and calls no restartGateway/startGateway", async () => {
-  const v = await virtualSandbox(), w = prims(v);
-  await w.reset(); assert.equal(v.V.saves.length, 0, "a clean worker is not replaced");
-  w.markDirty(); await w.reset(); assert.equal(v.V.saves.length, 2, "a dirty one is: two saves"); await w.reset(); assert.equal(v.V.saves.length, 2, "and the flag was cleared after the success");
-  assert.equal(v.V.respawns, 2);
-  let dirty = 0;
-  const res = await S.runScenarios({ reset: async () => { throw new Error("the sandbox core worker was not replaced: x"); }, markDirty: () => { dirty += 1; } }, { only: ["4", "5"] });
-  assert.deepEqual(res.map((r) => r.result.verdict), ["FAIL", "FAIL"]); assert.equal(dirty, 2, "each throwing run marked the worker dirty");
-  const code = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-scenarios.mjs"), "utf8")
-    .split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n").replace(/\n\s*"how the scenarios read the router[^\n]*/, "")
-    .replace(/export function killTree\([^\n]*\n[\s\S]*?\n\}\n/, "");     // killTree (the `claude -p` child this harness spawned itself, killed on a timeout) is the ONE allowed exception: the whole function is cut out before the scan, so a second kill anywhere else is still caught
-  assert.ok(/export function killTree/.test(fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-scenarios.mjs"), "utf8")), "the exception exists: killTree is still there");
-  assert.ok(!/process\.kill|Stop-Process|stopProcess|stopVerified|stopRefusals|descendantsLeafFirst|listenPortsOf|["'`]restartGateway["'`]|["'`]startGateway["'`]|\.rpc\(/.test(code), "no stop seam, no gateway-restart RPC and no direct RPC call in the scenario harness");
-});
-
-test("R4-9 a provider with autoFetchModels refuses before ANY save (CCR would arm a model auto-refresh whose config-change hook runs the global profile apply); the stub provider as the harness creates it (autoFetchModels false, or absent) still passes", async () => {
+test("R5-5 a provider with autoFetchModels refuses in the isolation guard (CCR would arm a model auto-refresh whose config-change hook runs the global profile apply); the stub provider as the harness creates it (autoFetchModels false, or absent) still passes", async () => {
   const guard = await import("../harness/guard.mjs");
-  const cfg = await sandboxConfig();
+  const { GATEWAY_PORT, GATEWAY_CORE_PORT, SCRATCH_SETTINGS } = await import("../harness/config.mjs");
+  const { SCRATCH_ROUTER, SANDBOX_PORTS } = await import("../harness/subagent-sandbox-spec.mjs");
+  const cfg = { gateway: { host: "127.0.0.1", port: GATEWAY_PORT, corePort: GATEWAY_CORE_PORT }, HOST: "127.0.0.1", PORT: GATEWAY_PORT, CUSTOM_ROUTER_PATH: SCRATCH_ROUTER,
+    Providers: [{ name: "uwstub", api_base_url: `http://127.0.0.1:${SANDBOX_PORTS.stub}`, models: ["m-main"] }],
+    profile: { enabled: true, claudeCode: { settingsFile: SCRATCH_SETTINGS }, profiles: [{ id: "p", agent: "claude-code", enabled: true, scope: "global", settingsFile: SCRATCH_SETTINGS }] } };
   assert.doesNotThrow(() => guard.assertPayloadIsolated(cfg, { allowProviders: true }), "no flag: passes");
   cfg.Providers[0].autoFetchModels = false;
-  assert.doesNotThrow(() => guard.assertPayloadIsolated(cfg, { allowProviders: true }), "false (as buildSandboxConfig writes it): passes");
-  for (const flag of [true, 1, "yes"]) {
-    const bad = structuredClone(cfg); bad.Providers[0].autoFetchModels = flag;
-    assert.throws(() => guard.assertPayloadIsolated(bad, { allowProviders: true }), /autoFetchModels set/, String(flag));
-  }
+  assert.doesNotThrow(() => guard.assertPayloadIsolated(cfg, { allowProviders: true }), "false (as the e2e stub provider is written): passes");
+  for (const flag of [true, 1, "yes"]) { const bad = structuredClone(cfg); bad.Providers[0].autoFetchModels = flag; assert.throws(() => guard.assertPayloadIsolated(bad, { allowProviders: true }), /autoFetchModels set/, String(flag)); }
   const second = structuredClone(cfg); second.Providers.push({ name: "uwstub2", autoFetchModels: true });
   assert.throws(() => guard.assertPayloadIsolated(second, { allowProviders: true }), /provider "uwstub2" has autoFetchModels set/, "any provider, not only the first");
-  const v = await virtualSandbox({ cfgTweak: (c2) => { c2.Providers[0].autoFetchModels = true; } });
-  await assert.rejects(() => prims(v).restartWorker(), /ISOLATION VIOLATION.*autoFetchModels set/);
-  assert.equal(v.V.saves.length, 0, "nothing was sent");
-  const ok = await virtualSandbox({ cfgTweak: (c2) => { c2.Providers[0].autoFetchModels = false; } });
-  assert.equal((await prims(ok).restartWorker()).changed, true, "the case it must not break: the stub provider created with the flag false");
   assert.ok(/autoFetchModels: false/.test(fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-e2e.mjs"), "utf8")), "the e2e stub provider is written with autoFetchModels false");
 });
-

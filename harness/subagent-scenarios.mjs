@@ -22,10 +22,10 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  runE2e, defaults as e2eDefaults, send as e2eSend, waitFor, writeSafe, rmSafe, installRouter, editSandboxConfig, X1_MODEL, logObj, buildShadowPolicy, policyContentHash, bareOf, modelIs,
+  runE2e, defaults as e2eDefaults, send as e2eSend, waitFor, writeSafe, rmSafe, installRouter, logObj, buildShadowPolicy, policyContentHash, bareOf, modelIs,
   ANCHOR, TAG_MODEL, ASKED_MODEL, NOTICE_MARK, X4_AGENT, X4_PARENT,
 } from "./subagent-e2e.mjs";
-import { SANDBOX_PORTS, SCRATCH_ROOT, SCRATCH_STATE_DIR, REPO_ROOT, EXECUTED_FILES as G1_FILES, hashExecutedFiles, CCR_CONFIG_DIR, buildLaunchEnv, resolveCcrInstall, ccrInstallLines, RefusalError } from "./subagent-sandbox-spec.mjs";
+import { SANDBOX_PORTS, SCRATCH_ROOT, SCRATCH_STATE_DIR, REPO_ROOT, EXECUTED_FILES as G1_FILES, hashExecutedFiles, CCR_CONFIG_DIR, buildLaunchEnv, resolveCcrInstall, ccrInstallLines } from "./subagent-sandbox-spec.mjs";
 import { STUB_MODELS } from "./stub-upstream.mjs";
 
 export const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -39,14 +39,6 @@ const rel = (f) => path.relative(REPO_ROOT, f).replace(/\\/g, "/");
 /** the orchestrator set, this file, and keysync/subagent-policy.mjs (the orchestrator runs it for `last`, see defaultLastText) */
 export const EXECUTED_FILES = Object.freeze([...G1_FILES.map(rel), SCENARIOS_FILE, "keysync/subagent-policy.mjs"]);
 const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
-/** The worker replacement waits for the new core holder up to WORKER_WAIT_POLLS x WORKER_POLL_MS = 60 s (was 30 s) after each of its two saves. */
-export const WORKER_POLL_MS = 500, WORKER_WAIT_POLLS = 120;
-/** The G1 X1 edit: the sandbox stub provider (and only it) gains the model X1_MODEL, or loses it again. `Providers` is part of CCR's own restart test, so a save of either makes CCR stop and respawn its core worker. */
-export function setX1Model(cfg, add) {
-  const p = (cfg.Providers ?? []).find((x) => x && x.name === "uwstub");
-  if (!p) throw new RefusalError("REFUSED: provider uwstub is missing from the sandbox config");
-  p.models = add ? [...STUB_MODELS, X1_MODEL] : [...STUB_MODELS];
-}
 /** An error that must stop the whole run (teardown, evidence), never become one scenario's FAIL: a refusal, a timed-out RPC (it may or may not have been applied), an isolation violation. */
 export const isFatalRun = (e) => !!e && (e.name === "RefusalError" || e.name === "RpcTimeoutError" || /ISOLATION VIOLATION/.test(String(e.message)));
 const clip = (v, n = 80) => String(v ?? "").replace(/[^\x20-\x7e]/g, "?").slice(0, n);
@@ -95,7 +87,7 @@ export const SCENARIOS = Object.freeze([
   { id: "6", key: "bad-policy", client: "replay", runs: 1, title: "CORRUPT, MISSING AND NEWER POLICY",
     proves: "a corrupt policy file (POLICY_CORRUPT), a newer one (POLICY_NEWER) and a missing one (silent) each serve the model ASKED for, with the matching warning, and no request fails" },
   { id: "7", key: "worker-restart", client: "replay", runs: 1, title: "WORKER RESTART",
-    proves: "after the router worker is replaced (a verified stop of its core worker child: the core pid changes) and the cooling file is cleared, an agent that had been HANDED OFF (to main's model, which comes first when it is in the set) is still served the handed-off model: the sticky journal replays it; FINDING when no restart could be made" },
+    proves: "an agent that had been HANDED OFF (to main's model, which comes first when it is in the set) is still served the handed-off model on its next request; the journal REPLAY after a router restart is not exercised here (the router runs inside the sandbox daemon, which cannot be restarted), so the verdict is a FINDING; FAIL when the handoff is not kept or never happened" },
   { id: "8", key: "helper-calls", client: "replay", runs: 1, title: "HELPER CALLS",
     proves: "title, summary and background calls (an agent id and no tools; no agent id and no tools; an exempt alias) are NEVER rewritten: the stub's model equals the asked model on every one" },
   { id: "9", key: "rollback", client: "replay", runs: 1, title: "ROLLBACK MID-RUN",
@@ -106,9 +98,9 @@ export const SCENARIOS = Object.freeze([
     proves: "ONE failure, then AVOIDANCE: the agent fails at once with no further request, and the next agent (a new agent id) is steered to a different eligible model; reported as DEGRADED (as designed), never as a seamless handoff" },
 ]);
 export const CHAOS = Object.freeze([
-  { id: "C1", key: "clock-jump", client: "replay", runs: 1, title: "WALL-CLOCK JUMP (state left by a jump)", proves: "state stamped a day in the future and a day in the past, in the shapes the router writes (cooling.json {v,models:{sel:{u,l,t,n,t0}}}, main-<sid>.json with an ISO time), is tolerated by a FRESH worker: requests are served, no router error is counted (the host clock itself is NOT changed)" },
+  { id: "C1", key: "clock-jump", client: "replay", runs: 1, title: "WALL-CLOCK JUMP (state left by a jump)", proves: "state stamped a day in the future and a day in the past, in the shapes the router writes (cooling.json {v,models:{sel:{u,l,t,n,t0}}}, main-<sid>.json with an ISO time), is tolerated: requests are served, no router error is counted (the host clock itself is NOT changed)" },
   { id: "C2", key: "torn-journal", client: "replay", runs: 1, title: "TORN JOURNAL", proves: "a journal with garbage and a partial last line is ignored: the request is served, no error is counted, the torn lines are counted" },
-  { id: "C3", key: "log-write-failure", client: "replay", runs: 1, title: "LOG AND JOURNAL WRITE FAILURE (ENOSPC emulated)", proves: "on a FRESH worker (its log file descriptors are cached, so a worker that had written the log would not notice), when the agent log and the session journal cannot be written the request is still served and `logDropped` (the log), `journalFail` (the journal) or LOG_DROPPED reports it (the disk is NOT filled: the targets are made unwritable)" },
+  { id: "C3", key: "log-write-failure", client: "replay", runs: 1, title: "LOG AND JOURNAL WRITE FAILURE (ENOSPC emulated)", proves: "when the agent log and the session journal cannot be written the request is still served and `logDropped` (the log), `journalFail` (the journal) or LOG_DROPPED reports it (the disk is NOT filled: the targets are made unwritable)" },
   { id: "C4", key: "two-workers", client: "replay", runs: 1, title: "TWO WORKERS, ONE STATE DIRECTORY", proves: "with two worker status files both agree on the same sticky model; FINDING when only one worker exists (G1 X2 measured one)" },
 ]);
 export const ALL = Object.freeze([...SCENARIOS, ...CHAOS]);
@@ -242,8 +234,8 @@ J["7"] = (ev) => {
   const su = ev.setup ?? {};
   const detail = `setup: handoffNone ${clip(su.handoffNone ?? "?", 6)}, retry ${clip(su.retry ?? "?", 6)}, cooling [${asArr(su.cooling).map((x) => clip(x, 40)).join(", ") || "empty"}], the agent's answers [${asArr(su.answers).map((x) => clip(x, 30)).join(", ") || "none"}]; core pid ${clip(ev.pidBefore ?? "?", 12)} -> ${clip(ev.pidAfter ?? "?", 12)}`;
   if (!ev.handoffSeen) return R("FAIL", `the setup handoff did not happen, so there is no handed-off model to replay (${detail})`);
-  if (!(ev.pidBefore && ev.pidAfter) || ev.pidBefore === ev.pidAfter) return R("FINDING", `no worker restart could be made (core pid ${clip(ev.pidBefore ?? "?", 12)} -> ${clip(ev.pidAfter ?? "?", 12)}): the journal replay is not shown here (router unit tests cover it)`);
-  if (!ev.afterModel || !modelIs(ev.afterModel, ev.handedTo)) return R("FAIL", `after the restart (core pid ${ev.pidBefore} -> ${ev.pidAfter}) the agent was served ${clip(ev.afterModel)}, not the handed-off ${clip(ev.handedTo)} (${detail})`);
+  if (!ev.afterModel || !modelIs(ev.afterModel, ev.handedTo)) return R("FAIL", `the agent's next request was served ${clip(ev.afterModel)}, not the handed-off ${clip(ev.handedTo)}: the handoff was not kept (${detail})`);
+  if (!(ev.pidBefore && ev.pidAfter) || ev.pidBefore === ev.pidAfter) return R("FINDING", `the handed-off model ${clip(ev.handedTo)} is kept on the agent's next request, but no router restart could be made: the router runs inside the sandbox daemon, which the isolation proof pins, so the journal replay after a restart is NOT shown here (the router journal tests cover it)`);
   return R("PASS", `core pid ${ev.pidBefore} -> ${ev.pidAfter}; the agent was still served the handed-off model ${clip(ev.handedTo)}`);
 };
 /**
@@ -401,7 +393,6 @@ const OVERLAY_WAIT_MS = 1200;                            // above the router's o
 const MAIN_OUTSIDE = "uwstub/m-lead";                    // a main model that is not a row of the scenario's policy
 const NOT_IN_SET = "uwstub/m-gone";                       // a TAG naming a model the policy does not hold: the router substitutes (the asked model stays a real stub model, so CCR resolves the request)
 RUN["2"] = async (p, o) => {
-  p.markDirty?.();
   const aid = aidFor(o.run, "s2"), sess = `uwsc-s2-${o.run}`, real = !!(o.real && p.claude);
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big", "m-main"] }));
   p.stub.setScript({ decide: limitFree, ...(real ? { onMain: spawnOnce("s2") } : {}) }); p.stub.clear();
@@ -415,8 +406,8 @@ RUN["2"] = async (p, o) => {
   }
   await p.settle();
   const base = await evidenceBase(p), records = [...p.stub.records], lastOut = await rollupLast(p);
-  // the FREE-MODE variant, always replayed: a fresh worker, a free policy of two free rows (the paid m-big is not in it), the same 429 on m-free
-  await p.reset?.(); p.markDirty?.();
+  // the FREE-MODE variant, always replayed: after a reset (cooling cleared), a free policy of two free rows (the paid m-big is not in it), the same 429 on m-free
+  await p.reset?.();
   const faid = aidFor(o.run, "s2f"), fsess = `uwsc-s2f-${o.run}`;
   await p.policy(scenarioPolicy({ mode: "free", rows: [{ name: "m-free", fp: 1 }, { name: "m-main", fp: 1 }] }));
   p.stub.setScript({ decide: limitFree }); p.stub.clear();
@@ -430,7 +421,6 @@ RUN["2"] = async (p, o) => {
     free: { aid: faid, chosen: "uwstub/m-free", rows: ["uwstub/m-free", "uwstub/m-main"], paid: ["uwstub/m-big"], records: [...p.stub.records], agents: fbase.agents, status0: fstatus0, status1: fbase.status } };
 };
 RUN["3"] = async (p, o) => {
-  p.markDirty?.();
   const sess = `uwsc-s3-${o.run}`, real = !!(o.real && p.claude);
   // main (ANCHOR, m-main) is NOT a row: main's own model comes first when it is in the set (plan 6.2, router decide), which would hide both the steering and the failure. Two rows only, and ONE model cools in step 1:
   // two DISTINCT failing models of the sandbox's single provider within 5 minutes would also cool the provider key (router coolFail) and demote every row, so step 1 must cool exactly one.
@@ -505,7 +495,6 @@ RUN["6"] = async (p, o) => {
   return { variants };
 };
 RUN["7"] = async (p, o) => {
-  p.markDirty?.();
   const aid = aidFor(o.run, "s7"), sess = `uwsc-s7-${o.run}`;
   // main (ANCHOR, m-main) IS a row here on purpose: a handoff goes to main's own model first (plan 6.2, router decide), so the handed-off model is m-main and the journal must replay exactly that
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big", "m-main"] }));
@@ -519,12 +508,12 @@ RUN["7"] = async (p, o) => {
   const handedTo = hs[0]?.to;
   const st = await p.freshStatus();                                                      // what the judge prints if the setup handoff is missing: handoffNone, retry, the cooling list, the agent's answers
   const setup = { handoffNone: counter(st, "handoffNone"), retry: counter(st, "retry"), cooling: asArr(st?.cooling).map((x) => x?.key), answers: stubSub(p, aid).map((r) => `${bareOf(r.model)}:${r.sent?.status}`) };
-  const restart = await p.restartWorker();                                               // a fresh worker; the dying one may rewrite cooling.json, so it is deleted again once the new one answers
-  await p.send("main", { model: ANCHOR, session: sess });                                // the new worker learns main again
+  // The router CANNOT be restarted here: it runs inside the sandbox daemon (the gateway process), which the isolation proof pins, not in the core worker CCR can replace. So the next request of the agent is served from the router's
+  // MEMORY, not replayed from the journal: it shows the handed-off model is kept, nothing about a restart (the verdict is a FINDING, which the plan allows for scenario 7).
   p.stub.clear();
   await SUB(p, { session: sess, agentId: aid, messages: 5 });
   await p.settle();
-  return { handoffSeen: hs.length > 0, handedTo, afterModel: stubSub(p, aid)[0]?.model, pidBefore: restart?.pidBefore, pidAfter: restart?.pidAfter, setup };
+  return { handoffSeen: hs.length > 0, handedTo, afterModel: stubSub(p, aid)[0]?.model, setup };
 };
 RUN["8"] = async (p, o) => {
   const sess = `uwsc-s8-${o.run}`, calls = [];
@@ -550,7 +539,6 @@ RUN["8"] = async (p, o) => {
   return { calls, control };
 };
 RUN["9"] = async (p, o) => {
-  p.markDirty?.();
   const sess = `uwsc-s9-${o.run}`;
   await p.policy(scenarioPolicy({ rows: ["m-free"] }));
   p.stub.setScript({}); p.stub.clear();
@@ -567,7 +555,6 @@ RUN["9"] = async (p, o) => {
   return { beforeModel, policy: "uwstub/m-free", afterModel: stubSub(p, aidFor(o.run, "s9b"))[0]?.model, asked: ASKED_MODEL, gw0, gw1, flag };
 };
 RUN["10"] = async (p, o) => {
-  p.markDirty?.();
   const sess = `uwsc-s10-${o.run}`;
   // TWO bands: m-free and m-big are the lead band (0), m-main is a worse band (1). Every agent asks a real stub model but names a tag the policy does not hold, so each is substituted
   await p.policy(scenarioPolicy({ rows: [{ name: "m-free", b: 0 }, { name: "m-big", b: 0 }, { name: "m-main", b: 1 }] }));
@@ -593,7 +580,6 @@ RUN["10"] = async (p, o) => {
   return { a, b, band: ["uwstub/m-free", "uwstub/m-big"], otherBand: ["uwstub/m-main"], cooled: ["uwstub/m-free"] };
 };
 RUN["11"] = async (p, o) => {
-  p.markDirty?.();
   const a = aidFor(o.run, "s11a"), b = aidFor(o.run, "s11b"), sess = `uwsc-s11-${o.run}`, real = !!(o.real && p.claude);
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big"] }));
   p.stub.setScript({ decide: (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? { status: 429, retryAfter: 3600 } : undefined), ...(real ? { onMain: spawnOnce("s11") } : {}) }); p.stub.clear();
@@ -613,11 +599,9 @@ RUN["11"] = async (p, o) => {
 };
 const DAY_MS = 86400000;
 RUN.C1 = async (p, o) => {
-  p.markDirty?.();
   const sess = `uwsc-c1-${o.run}`, past = `${sess}p`, now = p.now(), requests = [];
   const iso = (ms) => new Date(ms).toISOString();
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big"] }));
-  await p.freshWorker();                                                                 // the router reads a session's main file only on a MEMORY MISS: a worker that already knows the session would never see the stamp
   p.stub.setScript({}); p.stub.clear();
   const status0 = await p.freshStatus();
   // the shapes the router itself writes, stamped BEFORE the first request of each session: main-<sid>.json is {model, beta1m, t: ISO string}; cooling.json is {v:1, models:{sel:{u, l, t, n, t0}}} (u: ms until, t: ms of the failure)
@@ -645,7 +629,6 @@ RUN.C2 = async (p, o) => {
 RUN.C3 = async (p, o) => {
   const sess = `uwsc-c3-${o.run}`, requests = [];
   await p.policy(scenarioPolicy({ rows: ["m-free"] }));
-  await p.freshWorker();                                                                 // appendLog caches its file descriptor: a worker that had already written agents.jsonl would not notice the file being replaced by a directory
   p.stub.setScript({}); p.stub.clear();
   await p.send("main", { model: ANCHOR, session: sess });
   const status0 = await p.freshStatus();
@@ -653,7 +636,7 @@ RUN.C3 = async (p, o) => {
   try {
     for (let i = 0; i < 3; i++) requests.push(await SUB(p, { session: sess, agentId: aidFor(o.run, `c3${i}`), messages: 3 }));
     await p.settle();
-  } finally { await p.unblockState("agents.jsonl"); await p.unblockState(`agents-${sess}.jsonl`); p.markDirty?.(); }      // this worker's log stays down for 30 s after a failure: the next scenario gets a fresh one
+  } finally { await p.unblockState("agents.jsonl"); await p.unblockState(`agents-${sess}.jsonl`); }      // the router keeps its logs down for 30 s after a failed append (it runs in the daemon and is not restarted): scenarios after C3 do not read the logs
   return { requests: requests.map((r) => ({ status: r.status })), status0, status1: await p.freshStatus() };
 };
 RUN.C4 = async (p, o) => {
@@ -674,7 +657,7 @@ export async function runScenarios(p, { only = null, runs = null, real = false }
     const n = runs ?? scn.runs, evs = [];
     for (let i = 1; i <= n; i++) {
       try { await p.reset?.(); evs.push(await RUN[scn.id](p, { run: i, real: real && scn.client === "real" })); }     // cooling, an overlay record and a rollback flag of an earlier scenario must not leak into this one
-      catch (e) { if (isFatalRun(e)) throw e; evs.push({ __error: clip(e?.message, 160) }); p.markDirty?.(); }     // a run that threw (or a reset that could not replace the worker) may have left cooling in the worker's memory: the NEXT reset must replace it
+      catch (e) { if (isFatalRun(e)) throw e; evs.push({ __error: clip(e?.message, 160) }); }     // a run that threw is that scenario's FAIL (an isolation violation or a refusal stops the whole run); the next reset clears whatever it left
     }
     const errs = evs.filter((e) => e && e.__error);
     const res = errs.length ? { id: scn.id, verdict: "FAIL", runs: evs.length, passed: evs.length - errs.length, text: `a run threw: ${errs[0].__error}`, rows: [] } : judgeRuns(scn, evs);
@@ -799,18 +782,17 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
   const { d, key, stub } = c;
   const state = (f) => path.join(SCRATCH_STATE_DIR, f);
   const readJson = (f) => { try { return JSON.parse(d.sys.readText(state(f)) ?? "null"); } catch { return null; } };
-  let dirty = false, startedAt = d.now(), lastSendEnd = d.now();        // lastSendEnd: when the last request (ours or the client's) ended: the router flushes status.json at most 5 s after its previous flush, which is no later than that
+  let startedAt = d.now(), lastSendEnd = d.now();        // lastSendEnd: when the last request (ours or the client's) ended: the router flushes status.json at most 5 s after its previous flush, which is no later than that
   const gw = () => ({ pid: d.sys.listenerPid(SANDBOX_PORTS.gateway), serviceSha: sha256(String(d.sys.readText(path.join(CCR_CONFIG_DIR, "service.json")) ?? "(absent)")) });
   const launchEnv = c.launchEnv ?? buildLaunchEnv(process.env, { preloadGuard: false });
   const prims = {
     send: async (shape, over) => { try { return await e2eSend(d, key, shape, over); } finally { lastSendEnd = d.now(); } }, stub, now: () => d.now(), sleep: (ms) => d.sleep(ms),
     settle: async () => { await d.sleep(400); },
-    markDirty: () => { dirty = true; },
-    // cooling lives in the router worker's memory (and cooling.json, which the worker re-reads only when the file changes), so after a scenario that cooled a model the only reliable reset is a fresh worker
+    // every scenario starts from a clean slate: no shadow flag, no overlay record, no cooling (see clearCooling: deleting cooling.json would not clear what the router holds in memory)
     reset: async () => {
-      for (const f of ["cooling.json", "shadow.flag"]) rmSafe(d, state(f));
+      rmSafe(d, state("shadow.flag"));
       rmSafe(d, path.join(SCRATCH_STATE_DIR, "..", "observed.json"));
-      if (dirty) { await prims.freshWorker(); dirty = false; }                             // a restart that did not change the pid would leave the cooling of the last scenario in memory: that is an error, not a result
+      await prims.clearCooling();
     },
     policy: async (p) => writeSafe(d, state("policy.json"), JSON.stringify(p)),
     writeState: async (f, text) => writeSafe(d, state(f), text),
@@ -837,55 +819,15 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
     resume: async () => { rmSafe(d, state("shadow.flag")); },
     feedOverlay: async (model, st) => { writeSafe(d, path.join(SCRATCH_STATE_DIR, "..", "observed.json"), JSON.stringify({ schema: 1, writtenAt: new Date(d.now()).toISOString(), feed: "ok", models: { [model]: { s: st, t: 0, a: Math.floor(d.now() / 1000), l: 1 } } })); return true; },
     lastOut: lastText,
-    // WHY NOT A KILL. CCR 3.0.22 never respawns a dead core worker: its exit handler only sets the gateway state to "error" (dist cli.js handleCoreGatewayTermination), and nothing starts it again until `start(config)` runs.
-    // `start()` runs when a saved config differs in something `_E(old, new)` compares (ports, observability, proxy, agent, Providers, plugins, ...) and it begins with `stop()`, which ends the old worker itself, then spawns a
-    // new one. A Router.fallback swap is outside `_E` (a hot update, no respawn), but a Providers edit is inside it: so the worker is replaced the way G1 X1 does it, by adding a model to the sandbox stub provider and removing
-    // it again, each save through the SANDBOX web RPC with applyProfile false (editSandboxConfig: payload checked before it is sent, the persisted result after, only the stub provider allowed, tripwire after).
-    // restartGateway and startGateway are NEVER called (they apply the global profile with no opt-out) and no process is stopped by this harness: CCR replaces its own worker. Two saves, so two respawns.
-    restartWorker: async () => {
-      const sys = d.sys, core = SANDBOX_PORTS.core, fail = (m) => { throw new Error(`the sandbox core worker was not replaced: ${m}`); };
-      for (const fn of ["processes", "listenerProbe"]) if (typeof sys[fn] !== "function") fail(`the system seam has no ${fn}`);
-      const daemonPid = typeof c.daemonPid === "function" ? c.daemonPid() : c.daemonPid;
-      if (!Number.isInteger(daemonPid)) fail("the sandbox daemon pid is not known, so the new worker cannot be tied to it");
-      const holder = () => { const h = sys.listenerProbe(core); return h?.ok && Number.isInteger(h.pid) ? h.pid : null; };
-      const pidBefore = holder();
-      if (pidBefore === null) fail(`no process holds the sandbox core port ${core}`);
-      const awaitNew = async (from, what) => {                                              // up to 60 s, a progress line every 5 s
-        for (let i = 1; i <= WORKER_WAIT_POLLS; i++) {
-          await d.sleep(WORKER_POLL_MS);
-          const h = holder();
-          if (h !== null && h !== from) return h;
-          if (i % 10 === 0) c.out?.(`worker restart: ${what}: the core port ${core} is held by ${h ?? "nobody"}, waiting for a process other than ${from} (${i * WORKER_POLL_MS / 1000} s of ${WORKER_WAIT_POLLS * WORKER_POLL_MS / 1000} s)`);
-        }
-        return null;
-      };
-      let pidMid = null, problem = null;
-      try { await editSandboxConfig(c, "scn-restart-add", (cfg) => setX1Model(cfg, true)); }
-      // A fatal error in the add edit (isolation violation, refusal, timed-out RPC) is rethrown WITHOUT a restore, on purpose: nothing more is sent to a daemon whose isolation is in doubt. The sandbox config may keep m-x1;
-      // that is harmless (teardown scrubs Providers[]) and R4-5 pins it.
-      catch (e) { if (isFatalRun(e)) throw e; problem = `the add save failed: ${clip(e?.message, 120)}`; }
-      if (!problem) { pidMid = await awaitNew(pidBefore, "after the add save"); if (pidMid === null) problem = `no process other than ${pidBefore} held the core port within ${WORKER_WAIT_POLLS * WORKER_POLL_MS / 1000} s of the add save`; }
-      try { await editSandboxConfig(c, "scn-restart-restore", (cfg) => setX1Model(cfg, false)); }       // always tried: the sandbox config is never left edited
-      catch (e) { if (isFatalRun(e)) throw e; throw new Error(`the sandbox core worker was not replaced cleanly: ${problem ? `${problem}; ` : ""}the RESTORE save failed (${clip(e?.message, 120)}), so the sandbox config still lists the extra stub model`); }
-      if (problem) fail(problem);
-      const pidAfter = await awaitNew(pidMid, "after the restore save");
-      if (pidAfter === null) fail(`no process other than ${pidMid} held the core port within ${WORKER_WAIT_POLLS * WORKER_POLL_MS / 1000} s of the restore save`);
-      // the daemon must be the SAME one (the isolation proof pins its pid) and the new holder must provably descend from it
-      const web = d.resolveWebPort();
-      if (web.pid !== daemonPid) throw new Error(`the sandbox daemon itself was replaced (pid ${daemonPid} -> ${web.pid}) while its core worker was: the isolation proof pins the daemon pid, so the run cannot go on`);
-      const proof = descentProof(sys.processes(), pidAfter, daemonPid);
-      if (!proof.ok) throw new Error(`the process that took the core port (pid ${pidAfter}) does not provably descend from the sandbox daemon ${daemonPid}: ${proof.why}`);
-      // the new worker must ANSWER before anything is measured (the first request after a respawn can fail), and the dying one may have rewritten cooling.json on its way out: delete it again once the new one is up
-      let ready = false;
-      for (let i = 0; i < 40 && !ready; i++) { const r = await prims.send("aux", { model: ASKED_MODEL, agentId: "uwsc-ready", session: "uwsc-ready", messages: 1 }); ready = r.status === 200; if (!ready) await d.sleep(500); }
-      rmSafe(d, state("cooling.json"));
-      return { pidBefore, pidMid, pidAfter, changed: pidAfter !== pidBefore, ready, saves: 2 };
-    },
-    freshWorker: async () => {
-      const r = await prims.restartWorker();
-      if (!r.changed) throw new Error(`the router worker was not replaced (core pid ${r.pidBefore ?? "?"} -> ${r.pidAfter ?? "?"}): state of the last scenario (cooling, open files) is still in it, so nothing after this is a router verdict`);
-      if (!r.ready) throw new Error("the router worker did not answer a request within 20 s after its replacement");
-      return r;
+    // CLEAR THE ROUTER'S COOLING. The router (CUSTOM_ROUTER_PATH) is evaluated by the sandbox DAEMON's gateway, not by the core worker CCR can replace (live proof: its status file is status-<pid36>.json and the pid is the daemon's;
+    // run 5 replaced the core worker and the cooling stayed). Its state is globalThis of that process, so nothing short of replacing the daemon (which the isolation proof pins) clears it. What CAN be done through the router's own
+    // documented channel: coolView re-reads cooling.json when its stat changes (at most once a second) and a record REPLACES the one in memory when its `t` is newer. Deleting the file clears nothing; writing records that are NEWER
+    // and already EXPIRED (u two hours back, which also ends the streak: a failure later than an hour after `u` starts at rung 0) for every model of the sandbox provider and for the provider key does. Nothing is restarted or stopped.
+    clearCooling: async () => {
+      const t = d.now(), gone = t - 2 * 3600000, models = {};
+      for (const k of [...STUB_MODELS.map((m) => `uwstub/${m}`), "prov:uwstub"]) models[k] = { u: gone, l: 0, t: t + 1000, n: 1, t0: gone };
+      writeSafe(d, state("cooling.json"), JSON.stringify({ v: 1, models }));
+      await d.sleep(1200);                                                               // the router looks at the file at most once a second
     },
     claude: real && spawnClaude && identity ? async ({ prompt, maxTurns }) => {
       writeSafe(d, path.join(SCRATCH_CLAUDE_CONFIG, "settings.json"), canarySettings(key));          // canary: the sandbox claude-config's own settings point at the sandbox gateway with the sandbox-only key
@@ -931,7 +873,7 @@ export function planLines() {
     "`--real yes` is a SEPARATE, RISKIER mode with its own consent (--approve-plan --real yes): a real headless Claude Code (`claude -p`) is started for scenarios 1, 2, 3 and 11 only (the others, and the free-mode variant of 2 and the cooldown steering of 3, stay replays). It is pointed at the sandbox by environment only (the sandbox's whitelist launch environment with HOME, USERPROFILE, APPDATA, LOCALAPPDATA, TEMP and CLAUDE_CONFIG_DIR under the scratch root, ANTHROPIC_BASE_URL and a sandbox-only key, a scratch working directory, a canary settings.json in the sandbox claude-config, --setting-sources user and --strict-mcp-config when the launcher has them). The approval pins the launcher's path, sha256 and --version. After the run the suite checks that the real ~/.claude.json and ~/.claude/projects hold nothing for the scratch directory, that the child wrote under the sandbox claude-config, and that no request carrying its session id reached the live gateway (result RC). That the real ~/.claude is never touched cannot be verified offline.",
     "scenarios (what each must prove; client: REAL = the client's own behaviour is measured with --real yes, REPLAY = the shapes are enough):",
     ...SCENARIOS.map((s) => `  ${s.id.padStart(2)} ${s.title} [${s.client === "real" ? "REAL with --real yes, else replay" : "REPLAY"}, ${s.runs} run${s.runs === 1 ? "" : "s"}]: ${s.proves}`),
-    "how the scenarios read the router (stated so a result can be trusted): (a) every counter and the cooling list come from a FRESH status: the router flushes status.json at most every 5 s, so the suite waits 5.1 s after its last request, sends one helper-shaped (aux) request, waits for the write and then reads; the router's own agent and decision logs are read as a second witness where one exists (a handoff line with its rsrc and reason, the first sticky-hit line). (b) MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes (and hands off to) main's model before it spreads (plan 6.2, router decide). Scenarios 3 and 10 therefore keep main OUTSIDE the set (10 names a main model no row has, so its main request may be refused by the gateway: only the router's lesson from it counts), while scenarios 2 and 7 keep it in the set on purpose (their handoff target is main's model). Whether that shortcut is wanted is an owner decision still open; the suite documents it, it does not judge it. (c) A router worker that served earlier scenarios is REPLACED before the next one when an earlier scenario left state in it (cooling in memory and, for a provider key, for two minutes; open log files). The suite STOPS NO PROCESS to do it: CCR 3.0.22 never respawns a dead core worker (its exit handler only sets the gateway to the error state), and a Router.fallback swap is a hot update that does not respawn it either, so the worker is replaced by CCR itself the way G1 X1 does it: the sandbox stub provider uwstub gains one model (m-x1) and loses it again, two saves through the SANDBOX web RPC with applyProfile false; a saved Providers change makes CCR stop its core worker and start a new one. Each save goes through the same checks as every G1 config edit (the payload is checked for isolation BEFORE it is sent, the persisted result AFTER, only the uwstub provider at the sandbox stub address may exist, the tripwire runs after it), restartGateway and startGateway are never called (they apply the global profile with no opt-out), and an isolation violation, a refusal or a timed-out RPC stops the whole run. After each save the suite waits (60 s at most, a progress line every 5 s) for a process other than the previous one to hold the sandbox core port, then checks that the sandbox daemon is the same one and that the new holder provably descends from it (every parent link is trusted only when the child was created later than its parent, and every parent is in the node/ccr process table), polls a request until it answers 200, and deletes cooling.json again (the dying worker can rewrite it). If the restore save fails, or the holder does not change, the call throws and the worker stays marked for replacement; the restore is attempted even after a failed wait, so the sandbox config is not left edited. Every replacement is two saves and two core respawns. The isolation proof reports a changed core pid as a RECORD, never a failure. A scenario that needs a clean cooling list checks that it is empty first; a worker that cannot be replaced is an error of the run, not a router verdict. (d) The sandbox has ONE provider: two distinct failing models within five minutes also cool the provider key and demote every row, so scenario 3 cools exactly one model before the all-limited step.",
+    "how the scenarios read the router (stated so a result can be trusted): (a) every counter and the cooling list come from a FRESH status: the router flushes status.json at most every 5 s, so the suite waits 5.1 s after its last request, sends one helper-shaped (aux) request, waits for the write and then reads; the router's own agent and decision logs are read as a second witness where one exists (a handoff line with its rsrc and reason, the first sticky-hit line). (b) MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes (and hands off to) main's model before it spreads (plan 6.2, router decide). Scenarios 3 and 10 therefore keep main OUTSIDE the set (10 names a main model no row has, so its main request may be refused by the gateway: only the router's lesson from it counts), while scenarios 2 and 7 keep it in the set on purpose (their handoff target is main's model). Whether that shortcut is wanted is an owner decision still open; the suite documents it, it does not judge it. (c) The suite restarts NOTHING and stops NO process. The router runs inside the sandbox DAEMON (the gateway process, whose pid is the one in the router's status-<pid36>.json), not in the core worker CCR can replace: replacing the core worker was tried (run 5) and the router kept its cooling, so nothing short of replacing the daemon, which the isolation proof pins, resets the router's memory. Every scenario instead starts from a clean slate by the router's own documented channel: shadow.flag and observed.json are deleted, and cooling.json is overwritten with records for every sandbox model and the provider key that are NEWER than any the router holds and already EXPIRED (u two hours back, which also ends a failure streak), because the router merges cooling.json when its stat changes (at most once a second) and a newer record replaces the one in memory, while deleting the file would clear nothing; the suite then waits 1.2 s, and a scenario that needs a clean cooling list checks FRESH status that it is empty and throws (not a router verdict) when it is not. Session ids and agent ids are unique per scenario, so sticky entries and per-session files cannot leak. Consequences, stated: scenario 7 cannot show the journal replay after a restart (it shows the handed-off model is kept on the next request and is a FINDING, which the plan allows); scenario C3 cannot fail the router's cached log descriptor from outside, so it reports the journal path (journalFail), and the router keeps its logs down for 30 s after such a failure. A scenario that cannot start from a clean slate is an error of the run, not a router verdict. The isolation proof still records a core pid; the suite makes no RPC call at all. (d) The sandbox has ONE provider: two distinct failing models within five minutes also cool the provider key and demote every row, so scenario 3 cools exactly one model before the all-limited step.",
     "chaos checks (same sandbox):",
     ...CHAOS.map((s) => `  ${s.id} ${s.title} [REPLAY, ${s.runs} run]: ${s.proves}`),
     "verdicts: PASS; FAIL (anything wrong: the suite is NOT OK); FINDING (allowed ONLY for scenarios 2, 7 and C4: a named thing could not be shown here: no retry signal reached the router, no worker restart could be made, one worker); DEGRADED (scenario 11 ONLY: one failure then avoidance, the behaviour the quality bar promises, never a seamless handoff). Every line that is not a PASS says it is not G3 evidence, and the exit code is non-zero for a FINDING anywhere else.",
