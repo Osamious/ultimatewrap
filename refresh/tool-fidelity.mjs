@@ -49,7 +49,7 @@ import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { RELAY_KEY_ID, isTier } from "../menu/tiers.mjs";
 import { SUBSTITUTE_FLOOR, funnel } from "../menu/subagent-funnel.mjs";
 import { isFree, UNPRICED_PER_M } from "./bench.mjs";
-import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText, namesRequest } from "./tool-fidelity-probe.mjs";
+import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText, namesRequest, hasMoneyWords } from "./tool-fidelity-probe.mjs";
 export { NOT_FREE_REASON };
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 
@@ -1430,6 +1430,19 @@ const extractMsg = (body) => { let t = String(body ?? ""); try { const j = JSON.
  * Clears the records whose reason is an availability or unnamed 400 (never a verdict; an `x` or a strike that those texts produced) and tags the gateway-translation failures with `xw: gateway`.
  * The failed level is reset to untested; a record with nothing else known is removed (asked again from scratch). Also clears `af`/`afw` whose reason came from the old content design (`afReset`). Pure: `{store, cleared: [{key, kind, shape, level, removed}], tagged: [key], afReset: [key]}`.
  */
+/**
+ * Pending `pay` entries that rest on an AVAILABILITY sentence only ("anymodel: Upstream request failed.") with no money word: written when an HTTP 402 alone made it `pay`. Such an entry is not evidence about the
+ * account and, being hard, would never be asked again: the migration drops it so the model is queued again (like `--reset-transient` does for records). An entry with no stored sentence (written before `why`
+ * existed) has nothing to judge by and is left alone: `--release-holds <provider>` lifts those by hand. Pure: `{pending, cleared: [{key, why}]}`.
+ */
+export function migrateAvailabilityPay(pending) {
+  const out = { ...(pending ?? {}) }, cleared = [];
+  for (const [key, v] of Object.entries(pending ?? {})) {
+    if (v?.r !== "pay" || typeof v.why !== "string" || !v.why.trim()) continue;
+    if (isAvailabilityText(v.why) && !hasMoneyWords(v.why)) { delete out[key]; cleared.push({ key, why: v.why }); }
+  }
+  return { pending: out, cleared };
+}
 export const STALE_AFW = /^(file_path: (newline|backslash)|replace_all: missing|start_line: missing)/;
 export function migrateTransient(store) {
   const out = {}, cleared = [], tagged = [], afReset = [];

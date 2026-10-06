@@ -58,7 +58,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, migrateAvailabilityPay, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -452,18 +452,24 @@ async function resetTransient(o, outFile, deps) {
   const reopened = m1.cleared.filter((c) => c.reopen);
   if (reopened.length) console.log(`  of those, ${num(reopened.length)} are L3 failures that rest on an empty answer or unfinished call arguments, written before the stop reason and the budget were looked at (${tally(reopened, (c) => c.shape)}); L3 is asked again and the stop reason is kept (l3w)`);
   console.log(`  failures caused by the gateway's request translation: ${num(m1.tagged.length)} would be tagged xw gateway (they stay x)`);
+  const pa1 = migrateAvailabilityPay(cur.pending);
+  { const pp = {}; for (const c of pa1.cleared) { const p = c.key.slice(0, c.key.indexOf("/")); pp[p] = (pp[p] ?? 0) + 1; }
+    console.log(`  pending pay entries that rest on an availability sentence only (an HTTP 402 with "Upstream request failed."-style words and no money word: not evidence about the account): ${num(pa1.cleared.length)} of ${num(Object.values(cur.pending ?? {}).filter((x) => x.r === "pay").length)} would be dropped, the models asked again${pa1.cleared.length ? ` (${Object.entries(pp).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${show(k, 18)} ${num(n)}`).join(", ")})` : ""}; pay entries with no stored sentence stay: \`--release-holds <provider> --live\` lifts them by hand`); }
   console.log(`  argument-fidelity failures that came from the old test content (a path with an escape look-alike, an optional parameter left out): ${num(m1.afReset.length)} would be cleared (ask again with --force --levels 1 --only provider/model)`);
   if (!o.live) { console.log("nothing was written. Re-run with --reset-transient --live to apply it."); return 0; }
-  if (!m1.cleared.length && !m1.tagged.length && !m1.afReset.length) { console.log("tool-fidelity: nothing to change"); return 0; }
+  if (!m1.cleared.length && !m1.tagged.length && !m1.afReset.length && !pa1.cleared.length) { console.log("tool-fidelity: nothing to change"); return 0; }
   const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
   if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
   try {
     const fresh = loadFidelity(outFile);
     if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
     const m = migrateTransient(fresh.models);
-    const pending = { ...(fresh.pending ?? {}) };
+    let pending = { ...(fresh.pending ?? {}) };
     for (const c of m.cleared) delete pending[c.key];
+    const pa = migrateAvailabilityPay(pending);
+    pending = pa.pending;
     (deps.saveImpl ?? saveFidelity)(outFile, m.store, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending });
+    if (pa.cleared.length) console.log(`tool-fidelity: ${num(pa.cleared.length)} pending pay entr${pa.cleared.length === 1 ? "y" : "ies"} on an availability sentence dropped`);
     console.log(`tool-fidelity: ${num(m.cleared.length)} record(s) cleared, ${num(m.tagged.length)} tagged xw gateway and ${num(m.afReset.length)} argument-fidelity result(s) cleared in ${path.basename(outFile)}; the next run asks the cleared ones again`);
     return 0;
   } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
@@ -972,7 +978,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
   };
   // the provider's own sentence, clipped and redacted (the result carries it as `p`, usually inside the JSON body)
   const sentenceOf = (r) => {
-    const raw = String(r.m ?? r.p ?? "");
+    const raw = String(r.m ?? r.p ?? r.hint ?? "");                 // (a skipped model of the route-shape / upstream-unavailable kind carries the provider's sentence as `hint`)
     if (!raw) return null;
     const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(raw);
     const t = (m ? m[1] : raw.replace(/^(stream error: )?(HTTP \d+: )?/, "")).replace(/\s+/g, " ").trim();

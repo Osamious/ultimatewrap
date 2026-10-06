@@ -9,10 +9,10 @@ import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
 import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, record, kindOf, ev, stream, ok } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf, trendLine, liveRefusal } from "../refresh/tool-fidelity-cli.mjs";
-import { runKind, isQuotaSentence, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
+import { runKind, isQuotaSentence, hasMoneyWords, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { runSweep } from "../refresh/bench.mjs";
 import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
-import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, appendHistory, historyOf, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, migrateAvailabilityPay, appendHistory, historyOf, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
@@ -1939,4 +1939,89 @@ test("verdict labels: a model this run QUEUES is not projected as `cap`, a model
   assert.match(t.out, /TESTED 4 of 4 \(complete for every level it is eligible for 1 of 4; tested but optional levels not run: 3 of 4 model\(s\), 4 level gap\(s\) \(a model can have more than one\): /);
   const sums = /level gap\(s\) \(a model can have more than one\): ([^)]*)\)/.exec(t.out)[1].split(", ").map((x) => Number(x.split(" ").at(-1)));
   assert.equal(sums.reduce((a, b) => a + b, 0), 4, "the breakdown adds up to the gaps it names");
+});
+
+// ================================================================ an HTTP 402 with an availability-only sentence is not a sticky pay
+
+test("402 + an availability-only sentence ('anymodel: Upstream request failed.') is `upstream-unavailable` (soft); a money word, or any sentence that is not availability, keeps pay; other statuses are unchanged", async () => {
+  const soft = async (status, msg) => { const r = await kindRes(status, msg); return [r.s, r.reason ?? null]; };
+  for (const msg of ["anymodel: Upstream request failed.", "Upstream request failed.", "The selected model is temporarily unavailable. Try another model.", "Service unavailable, please retry", "upstream error"]) {
+    assert.deepEqual(await soft(402, msg), ["error", "upstream-unavailable"], `402: ${msg}`);
+  }
+  for (const msg of ["Payment required", "Insufficient balance", "no credits", "Your wallet balance is insufficient. Recharge at [url]", "Upstream request failed. Please top up your account", "Upstream error: billing problem", "Your plan does not include this model", "Forbidden", "This model requires a subscription"]) {
+    assert.deepEqual((await soft(402, msg))[0], "pay", `402: ${msg}`);
+  }
+  // the status is only softened at 402: the others read as before (the table the owner asked about)
+  assert.deepEqual([await soft(401, "anymodel: Upstream request failed."), await soft(403, "anymodel: Upstream request failed."), await soft(404, "anymodel: Upstream request failed.")].map((x) => x[0]), ["auth", "auth", "gone"]);
+  assert.deepEqual([await soft(400, "anymodel: Upstream request failed."), await soft(500, "anymodel: Upstream request failed."), await soft(429, "anymodel: Upstream request failed.")].map((x) => x[0]), ["error", "error", "rate"]);
+  assert.equal(hasMoneyWords("Upstream request failed."), false);
+  assert.equal(hasMoneyWords("Please top up"), true);
+});
+
+test("402 availability sentences in a live run: the models are pending upstream-unavailable (soft, asked again), no pay entry, no canary-pay and no hold, even when every model of the provider answers that way", async () => {
+  const bad = () => http(402, "anymodel: Upstream request failed.");
+  const all = cliEnv([many("anymodel", 5)], { answer: bad });
+  const r = await run(["--live", "--per-provider", "1"], all.deps);
+  const st = loadFidelity(all.out);
+  assert.deepEqual(st.held, {}, "two models out of credit would hold a provider; an availability sentence is not that");
+  assert.ok(Object.values(st.pending).length === 5 && Object.values(st.pending).every((x) => x.r === "upstream-unavailable"), JSON.stringify(Object.values(st.pending).map((x) => x.r)));
+  assert.equal(calls(all.f).length, 5, "every model was asked: no pay pause");
+  assert.match(r.out, /RECOVERABLE 5 of 5 \(upstream-unavailable 5\)/);
+  assert.match(Object.values(st.pending)[0].why, /Upstream request failed/);
+  // a real pay sentence still holds the provider on two models
+  const pay = cliEnv([many("pb", 5)], { answer: () => http(402, "Payment required") });
+  await run(["--live", "--per-provider", "1"], pay.deps);
+  assert.equal(loadFidelity(pay.out).held.pb.r, "pay");
+  // a normal run asks the unavailable ones again (soft); a pay one is not asked
+  assert.equal(planOf(all, [], { store: {}, pending: st.pending }).queued.length, 5);
+});
+
+// ---------------------------------------------------------------- the migration
+
+test("migrateAvailabilityPay (pure): pay entries whose stored sentence is availability-only and has no money word are dropped; no sentence, a money word, another reason, another kind of hard reason: untouched", () => {
+  const e = (r, why, extra = {}) => ({ r, n: 12, at: hoursAgo(3), since: hoursAgo(3), rn: 1, ...(why ? { why } : {}), ...extra });
+  const pending = {
+    "anymodel/a": e("pay", "anymodel: Upstream request failed."), "anymodel/b": e("pay", "Upstream request failed."), "anymodel/c": e("pay", "The selected model is temporarily unavailable. Try another model."),
+    "anymodel/d": e("pay"), "anymodel/d2": { r: "pay", n: 7, at: hoursAgo(30) },
+    "anymodel/f": e("pay", "Your wallet balance is insufficient. Recharge at [url]"), "anymodel/g": e("pay", "Upstream request failed. Please top up your account"), "anymodel/h": e("pay", "Payment required"),
+    "anymodel/i": e("rate", "Upstream request failed."), "anymodel/j": e("gone", "Upstream request failed."), "anymodel/k": e("canary-pay", "Upstream request failed."), "anymodel/l": e("auth", "Upstream request failed."),
+  };
+  const before = JSON.stringify(pending);
+  const r = migrateAvailabilityPay(pending);
+  assert.equal(JSON.stringify(pending), before, "pure");
+  assert.deepEqual(r.cleared.map((x) => x.key).sort(), ["anymodel/a", "anymodel/b", "anymodel/c"]);
+  assert.deepEqual(Object.keys(r.pending).sort(), ["anymodel/d", "anymodel/d2", "anymodel/f", "anymodel/g", "anymodel/h", "anymodel/i", "anymodel/j", "anymodel/k", "anymodel/l"]);
+  assert.deepEqual(migrateAvailabilityPay(r.pending).cleared, [], "idempotent");
+  assert.deepEqual(migrateAvailabilityPay(null).cleared, []);
+});
+
+test("--reset-transient also drops the pay entries that rest on an availability sentence (dry by default, --live under the lock); --release-holds <provider> --live lifts the ones with no sentence; then the models are queued again", async () => {
+  const pend2 = (r, why, n = 12) => ({ r, n, at: hoursAgo(3), since: hoursAgo(3), rn: 1, ...(why ? { why } : {}) });
+  const pending = {
+    "anymodel/m0": pend2("pay", "anymodel: Upstream request failed."), "anymodel/m1": pend2("pay", "anymodel: Upstream request failed.", 14), "anymodel/m2": pend2("pay", "Upstream request failed."),
+    "anymodel/m3": { r: "pay", n: 7, at: hoursAgo(30) }, "anymodel/m4": pend2("pay", "Your wallet balance is insufficient"), "anymodel/m5": pend2("rate", "slow down", 2),
+  };
+  const e = cliEnv([many("anymodel", 8)], { store: { "anymodel/m7": record("ppnn", { sp: "p", er: "p" }) }, pending });
+  const before = fs.readFileSync(e.out, "utf8");
+  const dry = await run(["--reset-transient"], e.deps);
+  assert.equal(dry.code, 0, dry.err);
+  assert.match(dry.out, /pending pay entries that rest on an availability sentence only .*: 3 of 5 would be dropped, the models asked again \(anymodel 3\); pay entries with no stored sentence stay/);
+  assert.match(dry.out, /nothing was written/);
+  assert.equal(fs.readFileSync(e.out, "utf8"), before, "dry: not a byte changed");
+  const live = await run(["--reset-transient", "--live"], e.deps);
+  assert.equal(live.code, 0, live.err + live.out);
+  assert.match(live.out, /3 pending pay entries on an availability sentence dropped/);
+  let st = loadFidelity(e.out);
+  assert.deepEqual(Object.keys(st.pending).sort(), ["anymodel/m3", "anymodel/m4", "anymodel/m5"], "no sentence, a money sentence and a rate entry stay");
+  assert.ok(st.models["anymodel/m7"], "records untouched");
+  assert.match((await run(["--reset-transient", "--live"], e.deps)).out, /nothing to change/);
+  // the three are asked again by a normal run; the pay ones with no usable sentence are still blocked
+  const p = planOf(e, [], { store: st.models, pending: st.pending });
+  assert.deepEqual(keys(p), ["anymodel/m0", "anymodel/m1", "anymodel/m2", "anymodel/m5", "anymodel/m6"], "m3 and m4 (pay) stay hard-blocked");
+  // the ones with no sentence are lifted by hand, with the existing command
+  const rel = await run(["--release-holds", "anymodel", "--live"], e.deps);
+  assert.equal(rel.code, 0, rel.err);
+  st = loadFidelity(e.out);
+  assert.deepEqual(Object.keys(st.pending), ["anymodel/m5"], "every pay entry of the provider is gone (and the soft rate entry stays)");
+  assert.equal(planOf(e, [], { store: st.models, pending: st.pending }).queued.length, 7);
 });

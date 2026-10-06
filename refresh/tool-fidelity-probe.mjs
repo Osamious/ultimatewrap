@@ -141,6 +141,8 @@ const AUTH_SENTENCE = new RegExp(`^\\W*(?:(?:error|authentication_error|invalid_
 const QUOTA_WORDS = /quota|daily limit|per[ -]day|limit reached|allowance/i;
 const MONEY_WORDS = /wallet|credit|balance|recharge|top[ -]?up|payment|funds|billing|\bplan\b/i;
 const RATE_SENTENCE = /rate[ -]?limit|too many requests|requests? per|tokens per|per[ -](minute|second|hour)|\b[rt]pm\b|try again in|retry (after|in)|resets? in/i;       // a rate limit, or a limit with a wait time, is its own (soft) reading, `rate`
+/** Does the sentence say anything about money (wallet, credit, balance, recharge, top-up, payment, funds, billing, plan)? */
+export const hasMoneyWords = (msg) => MONEY_WORDS.test(String(msg ?? "")) || WALLET_WORDS.test(String(msg ?? ""));
 export const isQuotaSentence = (msg) => { const m = String(msg ?? ""); return QUOTA_WORDS.test(m) && !MONEY_WORDS.test(m) && !RATE_SENTENCE.test(m); };
 // A 400 whose sentence names none of these says nothing about the request's shape ("Upstream provider rejected the request"): an upstream hiccup until it repeats word for word.
 const SCHEMA_WORDS = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
@@ -470,6 +472,9 @@ function httpVerdict(kind, status, text, ra) {
     return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
   }
   const cls = classifyHttp(status, text);
+  // HTTP 402 is `pay` by its status alone (a gateway's opaque sentence is kept), but a 402 whose OWN sentence is only about availability ("Upstream request failed.") and has no money word is not evidence about
+  // the account: it is `upstream-unavailable` (soft, asked again), never a sticky pay. A money word in the sentence keeps it pay.
+  if (cls === "pay" && status === 402 && isAvailabilityText(text) && !hasMoneyWords(extractMessage(text))) return inconclusive("error", why, { ...extra, reason: "upstream-unavailable", hint: clip(extractMessage(text)).slice(0, 120) });
   // a bare quota sentence is the provider's allowance, whatever status carries it: read as pay (a loose payment word) or, on a 403, as auth ("forbidden"), it is `quota` instead. Real auth words stay auth.
   const quotaLike = (cls === "pay" || (cls === "auth" && status === 403)) && status !== 402 && isQuotaSentence(extractMessage(text));
   return inconclusive(quotaLike ? "quota" : cls, why, extra);
