@@ -4,7 +4,7 @@
 // prices and, with `--outcomes yes`, CCR's `request_logs` through an injectable read-only seam (a fixture database in every test, never the real one). The `--json` form
 // has a FROZEN shape: `REPORT_SCHEMA` and the key order built below are pinned by a test. `last --json` keeps its own S1d shape.
 import fs from "node:fs";
-import { readAgentLog, classTraffic, trafficLines, isProbeSid, readStatus, readCompiled, printable, formatHandoff, localWhen, sinceMs, tally, provOf, CLASS_FILES, payloadGateLine } from "./subagent-policy.mjs";
+import { readAgentLog, readClassLog, classTraffic, trafficLines, isProbeSid, isProbeRow, readStatus, readCompiled, printable, formatHandoff, localWhen, sinceMs, tally, provOf, payloadGateLine } from "./subagent-policy.mjs";
 import { loadSnapshot } from "../menu/snapshot.mjs";
 import { stripOneM } from "../menu/subagent-funnel.mjs";
 import { loadSqlite } from "../refresh/observe.mjs";
@@ -170,7 +170,7 @@ export function contextGrowth(classLines, { sinceT = null, session = null } = {}
   const by = new Map();
   let requests = 0, bytesN = 0, over200k = 0, over1m = 0;
   for (const o of classLines ?? []) {
-    if (!isObject(o) || o.cls !== "sub" || isProbeSid(o.sid)) continue;          // probe traffic carries no session id: it is not a client subagent
+    if (!isObject(o) || o.cls !== "sub" || isProbeRow(o)) continue;          // probe traffic carries no session id: it is not a client subagent
     const t = Date.parse(o.t);
     if (!Number.isFinite(t) || (sinceT !== null && t < sinceT)) continue;
     if (session !== null && session !== undefined && !sessionMatches(session, String(o.sid ?? ""))) continue;
@@ -194,13 +194,13 @@ export function contextGrowth(classLines, { sinceT = null, session = null } = {}
 }
 
 /** The traffic shares of the report window, from the classifier log: probe traffic (no session id) is its own number and out of every share (see classTraffic in the policy library). Pure. */
-export function trafficOf(classLines, { sinceT = null, session = null } = {}) {
+export function trafficOf(classLines, { sinceT = null, session = null } = {}, log = null) {
   const keep = (o) => { const t = Date.parse(o.t); return Number.isFinite(t) && (sinceT === null || t >= sinceT) && (session === null || session === undefined || sessionMatches(session, String(o.sid ?? ""))); };
-  return { label: "classifier log", denominator: "client requests with a session id", ...classTraffic(classLines, keep) };
+  return { label: "classifier log", denominator: "client requests with a session id", ...classTraffic(classLines, keep), log };
 }
 
 /** The whole report as one plain object (the `--json` shape, in its frozen key order). Pure given its inputs. */
-export function buildReport({ lines, unreadable, files, status, snap, nowMs, since, session, outcomes, limit = JSON_ROWS, classLines = [], compiled = null }) {
+export function buildReport({ lines, unreadable, files, status, snap, nowMs, since, session, outcomes, limit = JSON_ROWS, classLines = [], classLog = null, compiled = null }) {
   const sinceT = since ? nowMs - sinceMs(since) : null;
   const inWin = lines.map(reportRecord).filter((r) => (sinceT === null || Date.parse(r.t) >= sinceT) && (session === undefined || session === null || sessionMatches(session, r.sid)));
   const decisions = inWin.filter((r) => r.kind === "decision"), handoffs = inWin.filter((r) => r.kind === "handoff");
@@ -226,7 +226,7 @@ export function buildReport({ lines, unreadable, files, status, snap, nowMs, sin
     handoffs: handListed.map((r) => ({ t: r.t, sid: r.sid, aid: r.aid, text: r.handoff })),
     contextGrowth: contextGrowth(classLines, { sinceT, session }),
     payload: { compiledAvailable: !!compiled, allowed: compiled ? num(compiled.counts?.allowed) : null, unknownLimit: compiled ? num(compiled.counts?.payloadUnknown) : null, gateLine: compiled ? payloadGateLine(compiled.counts ?? {}) : null },
-    traffic: trafficOf(classLines, { sinceT, session }),
+    traffic: trafficOf(classLines, { sinceT, session }, classLog),
   };
 }
 
@@ -290,8 +290,9 @@ export async function cmdReport(p, flags, io, opts = {}) {
   const status = readStatus(p.statusFile);
   const snap = loadSnapshot(p.snapshotFile);
   const cr = readCompiled(p.compiledFile);
+  const cl = readClassLog(p.stateDir);
   const report = buildReport({ lines, unreadable, files, status, snap, nowMs, since: flags.since, session: flags.session, outcomes: flags.outcomes ? { p, opts } : null,
-    classLines: readAgentLog(p.stateDir, CLASS_FILES).lines, compiled: cr.ok ? cr.value : null });
+    classLines: cl.lines, classLog: cl.log, compiled: cr.ok ? cr.value : null });
   if (flags.json) { io.out(JSON.stringify(report)); return 0; }
   for (const l of renderReport(report, nowMs)) io.out(l);
   return 0;

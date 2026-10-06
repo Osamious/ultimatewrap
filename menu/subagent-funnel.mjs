@@ -19,6 +19,9 @@ export const SELECTOR_RE = new RegExp(`^[A-Za-z0-9_./:@+~-]{1,${SELECTOR_MAX}}$`
 export const SUBSTITUTE_FLOOR = 128000;
 export const ONE_M = 1000000;
 export const PAYLOAD_RISK_BYTES = 1000000;
+// The request size the tool sweep's big step sends (about 400 KB): a record with `big: "p"` proves the model ACCEPTED a body of this size. It is emitted on the compiled row as `bk` (routing data: it is in the content hash
+// through `models`; it changes no eligibility, rank, tier or count, and a router that does not know the field ignores it). A `big: "f"`, a missing or a garbled `big` never emits it.
+export const BIG_PROVEN_BYTES = 400000;
 /** Measured in the live shadow (state/subagent/classify.jsonl, 2026-10-05; never read by a test): 337 classified subagent requests, 317 over 200 KB, 71 over 1 MB (sa-A1). */
 export const PAYLOAD_SAMPLE = Object.freeze({ n: 337, over200k: 317, over1m: 71 });
 const pct = (a, b) => Math.round((100 * a) / b);
@@ -341,6 +344,7 @@ export function funnel(inputs, toggles) {
     else if (g.toolsAny) { tier = "u"; basis = "unprobed"; }
     else { g.stage = "tools-false-claim"; continue; }
     g.toolTier = tier; g.toolBasis = basis;
+    g.bigProven = tf?.big === "p";
     // Measured tool fidelity beyond the class (state/tool-fidelity.json): the big step and L4 are rank keys inside class v, and a REFUSAL about size
     // (capBelow, an observed upper bound) lowers the payload cap. maxBytes is only a lower bound and never sets a cap.
     if (basis === "tool-fidelity") {
@@ -487,6 +491,7 @@ export function funnel(inputs, toggles) {
     fp: fx && freeTier(tierOf(g)) ? 1 : 0, ft: fx && strictTier(tierOf(g)) && g.tag ? 1 : 0, g: g.g, b: g.b,
     ...(g.ci ? { ci: 1 } : {}),                                  // c? : the context is INFERRED from a sibling, a floor-only 128k prior, never measured
     ...(g.limit > 0 && g.limitSource ? { pbSource: g.limitSource } : {}),   // where pb came from: catalogue | capBelow (a tool-fidelity size refusal) | known-issue
+    ...(g.bigProven ? { bk: BIG_PROVEN_BYTES } : {}),            // the sweep proved the model accepts a body this size (record big: "p"); additive, read by no rank key
   }));
   const inherit = T.mode === "inherit";
   const lists = { all: [], byProvider: Object.create(null), prov: Object.create(null) };

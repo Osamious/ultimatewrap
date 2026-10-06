@@ -1319,5 +1319,27 @@ test("status and show: the router's lifetime counters stay as they are, and the 
     assert.match(r.out, /^ {0,2}non-client probe traffic \(7 of 11 classified requests\), excluded: they carry no session id$/m);
     assert.match(r.out, /^ {0,2}client requests \(with a session id; every share below is of these 4\): main 1 \(25%\), sub 2 \(50%\), aux 1 \(25%\)$/m);
     assert.match(r.out, /^ {0,2}agent-shaped client requests \(3 of 4\): teammates 1 \(an agent id without the billing flag\), built-in 2 \(the billing flag\); the two detectors disagree on 1 of 3$/m);
+    assert.match(r.out, /^ {0,2}classifier log: read 0\.0 MiB of 0\.0 MiB kept \(1 of 3 files\); absent: classify\.2\.jsonl, classify\.1\.jsonl$/m);
+    assert.ok(!/user agent of client/.test(r.out), "lines of an older router carry no ua: no ua line");
   }
+});
+
+test("status and show: the classifier log is read across its three files (classify.2.jsonl included), said with both sizes, and a truncated file is called TRUNCATED; hasSid and ua lines are used", async () => {
+  const s = setup();
+  await SET(s, ...FREE);
+  status(s, {});
+  const row = (t, sid, o = {}) => JSON.stringify({ t, sid, aid: null, pid8: null, cls: "main", ag: 0, bl: 0, nt: 3, ga: 0, sysb: "s2", m: "x/y", rc: null, at: null, bb: "b1", tc: 1, hasSid: sid !== "nosessio", ua: "claude-cli", ...o });
+  fs.writeFileSync(path.join(s.state, "classify.2.jsonl"), [row("2026-10-05T08:00:00.000Z", "d2e51e39"), row("2026-10-05T08:01:00.000Z", "nosessio")].join("\n") + "\n");
+  fs.writeFileSync(path.join(s.state, "classify.1.jsonl"), row("2026-10-05T09:00:00.000Z", "d2e51e39", { ua: "sdk" }) + "\n");
+  fs.writeFileSync(path.join(s.state, "classify.jsonl"), row("2026-10-05T10:00:00.000Z", "d2e51e39", { cls: "sub", ag: 1, aid: "a" }) + "\n");
+  for (const cmd of [STATUS, (x) => run(["show", ...x.F])]) {
+    const r = await cmd(s);
+    assert.equal(r.status, 0, r.err);
+    assert.match(r.out, /^ {0,2}classifier log: read 0\.0 MiB of 0\.0 MiB kept \(3 of 3 files\)$/m);
+    assert.match(r.out, /^ {0,2}non-client probe traffic \(1 of 4 classified requests\), excluded/m, "the generation-2 probe line is counted");
+    assert.match(r.out, /^ {0,2}user agent of client requests \(3 of 3 carry it; lines of an older router do not\): claude-cli 2, sdk 1, other 0, none 0$/m);
+  }
+  const big = row("2026-10-05T10:00:00.000Z", "d2e51e39") + "\n";
+  fs.writeFileSync(path.join(s.state, "classify.jsonl"), big.repeat(Math.ceil((9 * 1024 * 1024) / big.length)));
+  for (const cmd of [STATUS, (x) => run(["show", ...x.F])]) assert.match((await cmd(s)).out, /^ {0,2}classifier log: read 8\.5 MiB of 9\.\d MiB kept \(3 of 3 files\); TRUNCATED: only the newest 8\.5 MiB of 9\.\d MiB of classify\.jsonl was read, so older lines are not counted$/m);
 });

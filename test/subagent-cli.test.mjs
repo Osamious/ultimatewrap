@@ -358,6 +358,10 @@ test("explain: exit 3 E_UNKNOWN_MODEL for an unknown id; a full answer for a kno
   assert.match(alias.out, /ALIAS: yes \(pool rule/);
   wr(path.join(s.dir, "tool-fidelity.json"), { schema: 1, models: { "fx-free-a/fxa-alpha": { t: "t" } } });
   assert.match(cli(["explain", "fx-free-a/fxa-alpha", ...s.F]).out, /tool tier: t \(tool-fidelity\), tool-fidelity record present/);
+  assert.ok(!/proven to accept/.test(cli(["explain", "fx-free-a/fxa-alpha", ...s.F]).out), "no big step result: nothing is claimed");
+  wr(path.join(s.dir, "tool-fidelity.json"), { schema: 1, models: { "fx-free-a/fxa-alpha": { t: "t", lvr: "ppnn", big: "p" }, "fx-free-a/fxa-beta": { t: "t", lvr: "ppnn", big: "f" } } });
+  assert.match(cli(["explain", "fx-free-a/fxa-alpha", ...s.F]).out, /^proven to accept 400 KB \(400,000 bytes\): the tool sweep's big step passed \(compiled as bk 400000; .*it changes no tier, rank or count here\)$/m);
+  assert.ok(!/proven to accept/.test(cli(["explain", "fx-free-a/fxa-beta", ...s.F]).out), "a failed big step is never reported as proof");
   const gone = cli(["explain", "fx-free-a/fxa-dead", ...s.F]);
   assert.equal(gone.status, 0); assert.match(gone.out, /stage: bench-gone/);
 });

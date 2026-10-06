@@ -183,11 +183,12 @@ test("report --json yes: the schema is FROZEN (schema 3, a fixed key order at ev
     handoffs: [{ t: "2026-10-05T11:40:00.000Z", sid: "s1aaaaaa", aid: "agent-2", text: `HANDOFF ${ALPHA} -> ${BETA} (retry 2, hop 1)` }],
     contextGrowth: { label: "estimate", agents: 0, measurable: 0, singleRequest: 0, requests: 0, ratio: null, sizeSample: { requests: 0, over200k: 0, over1m: 0 } },
     payload: { compiledAvailable: false, allowed: null, unknownLimit: null, gateLine: null },
-    traffic: { label: "classifier log", denominator: "client requests with a session id", requests: 0, probe: 0, probeAgentShaped: 0, client: 0, main: 0, sub: 0, aux: 0, exempt: 0, other: 0, agentShaped: 0, teammates: 0, builtIn: 0, detectorDisagree: 0 } };
+    traffic: { label: "classifier log", denominator: "client requests with a session id", requests: 0, probe: 0, probeAgentShaped: 0, client: 0, main: 0, sub: 0, aux: 0, exempt: 0, other: 0, agentShaped: 0, teammates: 0, builtIn: 0, detectorDisagree: 0, uaLogged: 0, ua: { "claude-cli": 0, sdk: 0, other: 0, none: 0 },
+      log: { files: [{ name: "classify.2.jsonl", state: "absent" }, { name: "classify.1.jsonl", state: "absent" }, { name: "classify.jsonl", state: "absent" }], keptBytes: 0, readBytes: 0, unreadableLines: 0 } } };
   assert.equal(r.out, JSON.stringify(golden), "byte-for-byte golden");
   assert.equal(JSON.parse(r.out).estimateLabel, rep.ESTIMATE_LABEL);
   assert.equal(rep.REPORT_SCHEMA, 3);
-  assert.deepEqual(Object.keys(j.traffic), ["label", "denominator", "requests", "probe", "probeAgentShaped", "client", "main", "sub", "aux", "exempt", "other", "agentShaped", "teammates", "builtIn", "detectorDisagree"]);
+  assert.deepEqual(Object.keys(j.traffic), ["label", "denominator", "requests", "probe", "probeAgentShaped", "client", "main", "sub", "aux", "exempt", "other", "agentShaped", "teammates", "builtIn", "detectorDisagree", "uaLogged", "ua", "log"]);
   assert.deepEqual(Object.keys(j.contextGrowth), ["label", "agents", "measurable", "singleRequest", "requests", "ratio", "sizeSample"]);
   assert.deepEqual(Object.keys(j.payload), ["compiledAvailable", "allowed", "unknownLimit", "gateLine"]);
 });
@@ -521,7 +522,9 @@ test("traffic: rows with no session id (nosessio, nosession, none) are PROBE tra
   rows.push(trow("2026-10-05T11:06:00.000Z", "s1aaaaaa", { cls: "aux", ag: 1, bl: 1, aid: "bi1" }), trow("2026-10-05T11:07:00.000Z", "s1aaaaaa", { cls: "aux" }));                          // 2 aux
   wr(path.join(s.state, "classify.jsonl"), rows.join("\n"));
   const j = JSON.parse((await REPORT(s, "--json", "yes")).out);
-  assert.deepEqual(j.traffic, { label: "classifier log", denominator: "client requests with a session id", requests: 19, probe: 10, probeAgentShaped: 2, client: 9, main: 3, sub: 4, aux: 2, exempt: 0, other: 0, agentShaped: 5, teammates: 2, builtIn: 3, detectorDisagree: 3 });
+  const { log: lg, ...tr } = j.traffic;
+  assert.deepEqual(tr, { label: "classifier log", denominator: "client requests with a session id", requests: 19, probe: 10, probeAgentShaped: 2, client: 9, main: 3, sub: 4, aux: 2, exempt: 0, other: 0, agentShaped: 5, teammates: 2, builtIn: 3, detectorDisagree: 3, uaLogged: 0, ua: { "claude-cli": 0, sdk: 0, other: 0, none: 0 } });
+  assert.deepEqual([lg.files.map((f) => f.state), lg.readBytes === lg.keptBytes, lg.keptBytes > 0], [["absent", "absent", "read"], true, true], "only the current classify.jsonl exists: read whole");
   const t = (await REPORT(s)).out;
   assert.match(t, /^non-client probe traffic \(10 of 19 classified requests, 2 of them agent-shaped\), excluded: they carry no session id$/m);
   assert.match(t, /^client requests \(with a session id; every share below is of these 9\): main 3 \(33%\), sub 4 \(44%\), aux 2 \(22%\)$/m);
@@ -553,4 +556,108 @@ test("traffic: only probe rows -> no client shares, said plainly; no classifier 
   const lib = await import("../keysync/subagent-policy.mjs");
   assert.deepEqual([lib.isProbeSid("nosessio"), lib.isProbeSid("NOSESSION"), lib.isProbeSid(""), lib.isProbeSid(undefined), lib.isProbeSid("d2e51e39")], [true, true, true, true, false]);
   assert.deepEqual(lib.trafficLines(lib.classTraffic([])), []);
+});
+
+// ---- router v3 classifier log: 3 files (classify.2.jsonl oldest), 8 MiB each, a bounded read that says what it read; hasSid and ua are new fields that older lines lack
+const vrow = (t, sid, over = {}) => JSON.stringify({ t, sid, aid: null, pid8: null, cls: "main", ag: 0, bl: 0, nt: 3, ga: 0, sysb: "s2", m: "x/y", rc: null, at: null, bb: "b1", tc: 100, hasSid: sid !== "nosessio", ua: "claude-cli", ...over });
+const oldrow = (t, sid, over = {}) => { const o = JSON.parse(vrow(t, sid, over)); delete o.hasSid; delete o.ua; return JSON.stringify(o); };
+const MiB = 1024 * 1024;
+
+test("classify log: classify.2.jsonl is read with the other two (oldest first), and the line says 'read X of X kept (3 of 3 files)'; an absent generation is NAMED, never silent", async () => {
+  const s = setup(); writeLog(s);
+  wr(path.join(s.state, "classify.2.jsonl"), [vrow("2026-10-05T08:00:00.000Z", "s0aaaaaa"), vrow("2026-10-05T08:01:00.000Z", "s0aaaaaa", { cls: "sub", ag: 1, aid: "g2" })].join("\n") + "\n");
+  wr(path.join(s.state, "classify.1.jsonl"), vrow("2026-10-05T09:00:00.000Z", "s1aaaaaa") + "\n");
+  wr(path.join(s.state, "classify.jsonl"), [vrow("2026-10-05T10:00:00.000Z", "s2aaaaaa"), vrow("2026-10-05T10:01:00.000Z", "nosessio")].join("\n") + "\n");
+  const j = JSON.parse((await REPORT(s, "--json", "yes")).out).traffic;
+  assert.deepEqual([j.requests, j.client, j.probe, j.sub], [5, 4, 1, 1], "all three files are counted");
+  assert.deepEqual(j.log.files.map((f) => [f.name, f.state, f.truncated]), [["classify.2.jsonl", "read", false], ["classify.1.jsonl", "read", false], ["classify.jsonl", "read", false]]);
+  assert.equal(j.log.readBytes, j.log.keptBytes);
+  assert.match((await REPORT(s)).out, /^classifier log: read 0\.0 MiB of 0\.0 MiB kept \(3 of 3 files\)$/m);
+  fs.rmSync(path.join(s.state, "classify.1.jsonl"));
+  assert.match((await REPORT(s)).out, /^classifier log: read 0\.0 MiB of 0\.0 MiB kept \(2 of 3 files\); absent: classify\.1\.jsonl$/m);
+  const cg = JSON.parse((await REPORT(s, "--json", "yes")).out).contextGrowth;
+  assert.equal(cg.agents, 1, "the generation-2 subagent line reaches the context growth too");
+});
+
+test("classify log: lines of an older router (no hasSid, no ua) are tolerated: probe by the sid spelling, no ua line; new lines use hasSid and count ua over their own denominator; an unknown ua value is other", async () => {
+  const s = setup(); writeLog(s);
+  wr(path.join(s.state, "classify.jsonl"), [
+    oldrow("2026-10-05T10:00:00.000Z", "nosessio", { cls: "sub", ag: 1, aid: "p" }), oldrow("2026-10-05T10:01:00.000Z", "s1aaaaaa"),                    // old: 1 probe (agent-shaped), 1 client
+    vrow("2026-10-05T10:02:00.000Z", "s1aaaaaa"), vrow("2026-10-05T10:03:00.000Z", "s1aaaaaa", { ua: "sdk", cls: "sub", ag: 1, aid: "a" }),
+    vrow("2026-10-05T10:04:00.000Z", "s1aaaaaa", { ua: "none" }), vrow("2026-10-05T10:05:00.000Z", "s1aaaaaa", { ua: "Mozilla/5.0" }),                  // an unknown spelling counts as other
+    vrow("2026-10-05T10:06:00.000Z", "s9zzzzzz", { hasSid: false, cls: "sub", ag: 1, bl: 0, aid: "q" }),                                              // the router says no session id: probe, even with a real-looking sid
+    vrow("2026-10-05T10:07:00.000Z", "nosessio", { ua: "other" }),
+  ].join("\n") + "\n");
+  const t = JSON.parse((await REPORT(s, "--json", "yes")).out).traffic;
+  assert.deepEqual([t.requests, t.probe, t.probeAgentShaped, t.client], [8, 3, 2, 5], "an old probe row, a hasSid:false row and a nosessio row are probe traffic; the 2 agent-shaped ones are counted apart");
+  assert.deepEqual([t.uaLogged, t.ua], [4, { "claude-cli": 1, sdk: 1, other: 1, none: 1 }], "4 of the 5 client rows carry ua (the old one does not and is not counted as none)");
+  const out = (await REPORT(s)).out;
+  assert.match(out, /^user agent of client requests \(4 of 5 carry it; lines of an older router do not\): claude-cli 1, sdk 1, other 1, none 1$/m);
+  // only old lines: no ua line at all
+  wr(path.join(s.state, "classify.jsonl"), [oldrow("2026-10-05T10:00:00.000Z", "s1aaaaaa"), oldrow("2026-10-05T10:01:00.000Z", "nosessio")].join("\n") + "\n");
+  assert.ok(!/user agent/.test((await REPORT(s)).out));
+  // context growth: a hasSid:false subagent line is not a client subagent
+  wr(path.join(s.state, "classify.jsonl"), [vrow("2026-10-05T10:00:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, aid: "z", hasSid: false, tc: 10 }), vrow("2026-10-05T10:01:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, aid: "z", hasSid: false, tc: 90 })].join("\n") + "\n");
+  assert.equal(JSON.parse((await REPORT(s, "--json", "yes")).out).contextGrowth.agents, 0);
+  wr(path.join(s.state, "classify.jsonl"), [vrow("2026-10-05T10:00:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, aid: "z", tc: 10 }), vrow("2026-10-05T10:01:00.000Z", "s1aaaaaa", { cls: "sub", ag: 1, aid: "z", tc: 90 })].join("\n") + "\n");
+  assert.equal(JSON.parse((await REPORT(s, "--json", "yes")).out).contextGrowth.agents, 1, "the same lines with hasSid true count");
+});
+
+test("classify log: a file over the read cap is read from its NEWEST end only, the cut line is dropped, and the line says TRUNCATED with both sizes; a file of the cap or less is read whole", async () => {
+  const s = setup(); writeLog(s);
+  const f = path.join(s.state, "classify.jsonl");
+  const line = (i) => vrow(`2026-10-05T10:${pad2(Math.floor(i / 60) % 60)}:${pad2(i % 60)}.000Z`, "s1aaaaaa", { aid: `a${i}` }) + "\n";
+  wr(f, Array.from({ length: 100 }, (_, i) => line(i)).join(""));
+  const size = fs.statSync(f).size;
+  const whole = lib.readClassLog(s.state, { maxBytes: size });
+  assert.deepEqual([whole.lines.length, whole.log.files.find((x) => x.name === "classify.jsonl").truncated], [100, false], "exactly the cap: whole");
+  const cut = lib.readClassLog(s.state, { maxBytes: size - 10 });
+  const cf = cut.log.files.find((x) => x.name === "classify.jsonl");
+  assert.deepEqual([cf.truncated, cf.read, cf.size, cut.lines.length, cut.lines[0].aid], [true, size - 10, size, 99, "a1"], "10 bytes cut into line 0: that partial line is dropped, not counted as unreadable");
+  assert.equal(cut.log.unreadableLines, 0);
+  const txt = lib.trafficLines({ ...lib.classTraffic(cut.lines), log: cut.log }).join("\n");
+  assert.match(txt, /^classifier log: read 0\.0 MiB of 0\.0 MiB kept \(1 of 3 files\); TRUNCATED: only the newest 0\.0 MiB of 0\.0 MiB of classify\.jsonl was read, so older lines are not counted; absent: classify\.2\.jsonl, classify\.1\.jsonl$/m);
+  // a real file over the default cap (8.5 MiB): 9 MiB on disk
+  const big = vrow("2026-10-05T10:00:00.000Z", "s1aaaaaa") + "\n";
+  fs.writeFileSync(f, big.repeat(Math.ceil((9 * MiB) / big.length)));
+  const kept = fs.statSync(f).size / MiB;
+  const out = (await REPORT(s)).out;
+  assert.match(out, new RegExp(`^classifier log: read 8\\.5 MiB of ${kept.toFixed(1).replace(".", "\\.")} MiB kept \\(1 of 3 files\\); TRUNCATED: only the newest 8\\.5 MiB of ${kept.toFixed(1).replace(".", "\\.")} MiB of classify\\.jsonl was read, so older lines are not counted; absent: classify\\.2\\.jsonl, classify\\.1\\.jsonl$`, "m"));
+  const tj = JSON.parse((await REPORT(s, "--json", "yes")).out).traffic;
+  assert.ok(tj.log.files[2].truncated && tj.log.readBytes === Math.round(8.5 * MiB) && tj.requests > 40000, "about 8.5 MiB of 207-byte rows");
+  // three files: each is bounded by itself, and every one is named in the totals
+  for (const n of ["classify.2.jsonl", "classify.1.jsonl"]) fs.writeFileSync(path.join(s.state, n), big.repeat(Math.ceil((8 * MiB) / big.length)));
+  const t3 = JSON.parse((await REPORT(s, "--json", "yes")).out).traffic.log;
+  assert.deepEqual([t3.files.map((x) => x.state), t3.files.map((x) => x.truncated)], [["read", "read", "read"], [false, false, true]]);
+  assert.match((await REPORT(s)).out, /^classifier log: read 24\.\d MiB of 25\.\d MiB kept \(3 of 3 files\); TRUNCATED: only the newest 8\.5 MiB of 9\.0 MiB of classify\.jsonl was read/m);
+});
+
+test("classify log: the chunked reader gives the same rows for any chunk size (multi-byte text, a missing final newline, a torn line), and drops a line longer than the chunk with a count", () => {
+  const s = setup();
+  fs.mkdirSync(s.state, { recursive: true });
+  const f = path.join(s.state, "classify.jsonl");
+  const rows = [vrow("2026-10-05T10:00:00.000Z", "s1aaaaaa", { m: "x/ünïcode-é" }), "{torn", vrow("2026-10-05T10:01:00.000Z", "s1aaaaaa", { aid: "二" }), "", vrow("2026-10-05T10:02:00.000Z", "s1aaaaaa")];
+  fs.writeFileSync(f, rows.join("\n"));                                                         // no final newline
+  const ref = lib.readClassLog(s.state);
+  assert.deepEqual([ref.lines.length, ref.unreadable], [3, 1]);
+  assert.equal(ref.lines[1].aid, "二");
+  for (const chunk of [1, 7, 64, 200, 4096]) {
+    const r = lib.readClassLog(s.state, { chunk });
+    assert.deepEqual(r.lines, ref.lines, `chunk ${chunk}: the same rows`);
+    assert.equal(r.unreadable, ref.unreadable, `chunk ${chunk}: the same unreadable count`);
+  }
+  fs.writeFileSync(f, [vrow("2026-10-05T10:00:00.000Z", "s1aaaaaa"), "x".repeat(5000), vrow("2026-10-05T10:01:00.000Z", "s1aaaaaa")].join("\n") + "\n");
+  const r = lib.readClassLog(s.state, { chunk: 1024, maxLine: 1024 });
+  assert.deepEqual([r.lines.length, r.unreadable], [2, 1], "the 5000-byte line is dropped and counted; the lines around it are kept");
+});
+
+test("classify log: only the report fields are kept per row; a directory under a log name is UNREADABLE (said, not fatal)", async () => {
+  const s = setup(); writeLog(s);
+  wr(path.join(s.state, "classify.jsonl"), vrow("2026-10-05T10:00:00.000Z", "s1aaaaaa", { extra: "x".repeat(100), m: "y" }) + "\n");
+  const r = lib.readClassLog(s.state);
+  assert.deepEqual(Object.keys(r.lines[0]).sort(), ["ag", "bb", "bl", "cls", "hasSid", "sid", "t", "tc", "ua"].sort().concat(["aid"]).sort(), "t cls sid aid ag bl bb tc hasSid ua, nothing else");
+  assert.ok(!("extra" in r.lines[0]) && !("m" in r.lines[0]));
+  fs.mkdirSync(path.join(s.state, "classify.1.jsonl"));
+  const out = (await REPORT(s)).out;
+  assert.match(out, /^classifier log: read 0\.0 MiB of 0\.0 MiB kept \(1 of 3 files\); absent: classify\.2\.jsonl; UNREADABLE: classify\.1\.jsonl \(not a file\)$/m);
 });

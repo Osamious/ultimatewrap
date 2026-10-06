@@ -21,7 +21,7 @@ import { filterRegistry, chooseKeys } from "./keysync.mjs";
 import { CONTRACT as CC } from "../menu/cc-contract.mjs";
 import { CONTRACT as CCR, rpc, requestLogsDb, dataDir } from "../menu/ccr-client.mjs";
 import { funnel, emptyStage, FREE_TAG, SCOPE_NAMES, FREE_SCOPES, DEFAULT_MIN_SET, SUBSTITUTE_FLOOR, SUBSTITUTE_K, PREMIUM_RULE,
-  providerOf, stripOneM, CTX_VALUES, CTX_FLOORS, ctxSpec, ctxLabel, ctxClassOf, TTFT_BUCKETS, knownIssueText, payloadSampleText, RANK_LABELS, SWEEP_MIN_N } from "../menu/subagent-funnel.mjs";
+  providerOf, stripOneM, CTX_VALUES, CTX_FLOORS, ctxSpec, ctxLabel, ctxClassOf, TTFT_BUCKETS, knownIssueText, payloadSampleText, RANK_LABELS, SWEEP_MIN_N, BIG_PROVEN_BYTES } from "../menu/subagent-funnel.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { isExcludedTier, freeScopeOf, RELAY_TIER } from "../menu/tiers.mjs";
 import { CLI, CODES, codeRow, KINDS } from "../menu/subagent-codes.mjs";
@@ -1085,7 +1085,7 @@ async function cmdShow(p, flags, io, opts = {}) {
     if (isObject(s.policy) && typeof s.policy.headline === "string" && (!compiled || s.policy.enforcement === compiled.owner.enforcement) && printable(s.policy.headline, 200) !== v.sentence) L.push(`  ${printable(s.policy.headline, 200)}`);
     if (Number.isInteger(s.workers) && s.workers > 1) L.push(`  (merged over ${s.workers} router worker status files)`);
     if (flags.detail && isObject(s.policy)) L.push(`  router effective mode: enforcement ${printable(s.policy.enforcement ?? "?", 20)}, inject ${printable(s.policy.inject ?? "?", 20)}${s.policy.rollbackFlag ? ", rollback flag set (acts as shadow)" : ""}; policy ${printable(s.policy.state ?? "?", 20)}`);
-    L.push(...trafficLines(classTraffic(readAgentLog(p.stateDir, CLASS_FILES).lines)).map((x) => `  ${x}`));
+    L.push(...trafficLines(classTrafficOfLog(p.stateDir)).map((x) => `  ${x}`));
     for (const w of Array.isArray(s.warnings) ? s.warnings : []) if (isObject(w)) L.push(`  router warning ${printable(w.code, 40)}${w.detail ? `: ${printable(w.detail)}` : ""}`);
     for (const [sid, m] of Object.entries(isObject(s.mainBySession) ? s.mainBySession : {})) if (isObject(m)) L.push(`  main of session ${printable(sid, 16)}: ${printable(m.model)}`);
   }
@@ -1124,7 +1124,7 @@ async function cmdStatus(p, flags, io, opts = {}) {
     const cn = isObject(status.counters) ? status.counters : {};
     const upd = Date.parse(status.updatedAt ?? "");
     L.push(`router: last seen ${Number.isFinite(upd) ? `${ago(nowMs - upd)} ago` : "at an unknown time"}; ${cn.sub ?? 0} subagent requests of ${cn.req ?? 0} requests since ${printable(status.since ?? "?", 40)}`);
-    L.push(...trafficLines(classTraffic(readAgentLog(p.stateDir, CLASS_FILES).lines)).map((x) => `  ${x}`));
+    L.push(...trafficLines(classTrafficOfLog(p.stateDir)).map((x) => `  ${x}`));
     if (v.state === "WAITING") L.push("  (this report predates your latest save, or comes from a router still on the older copy: the router uses the new one from its next request)");
     L.push(...warningLines(status.warnings, "warning "));
   } else L.push(sr.reason === "missing" ? "router: no status file yet (it has not run with a policy)" : `router: status unreadable right now (${sr.reason})`);
@@ -1136,7 +1136,7 @@ async function cmdStatus(p, flags, io, opts = {}) {
 const LOG_FILES = ["agents.3.jsonl", "agents.2.jsonl", "agents.1.jsonl", "agents.jsonl"];       // oldest first: the current file plus three rotated generations
 const LOG_READ_MAX = 4 * 1024 * 1024;
 /** Reads the agent decision log and its rotated files; a torn or non-object line is skipped and counted, never fatal. */
-export const CLASS_FILES = ["classify.1.jsonl", "classify.jsonl"];                                // the classifier log (one line per classified request) and its one rotated generation
+export const CLASS_FILES = ["classify.2.jsonl", "classify.1.jsonl", "classify.jsonl"];            // the classifier log (one line per classified request), OLDEST FIRST: router v3 keeps the current file and two rotated generations (8 MiB each, up to 8.2 MiB with the append-check overshoot)
 /**
  * TRAFFIC SHARES from the classifier log (one line per classified request: cls main|sub|aux|exempt, ag agent id present, bl billing flag, sid the first 8 characters of the session id). Requests WITHOUT a session id
  * (the router's fallback spelling "nosession", cut to "nosessio" in this log) are the UW tooling's own probe traffic (keysync and refresh probe profiles), not client sessions and not a subagent bypass: they are
@@ -1144,13 +1144,17 @@ export const CLASS_FILES = ["classify.1.jsonl", "classify.jsonl"];              
  * teammates = an agent id without the billing flag, builtIn = the billing flag (the built-in subagent shape); the two detectors disagree exactly when ag differs from bl.
  */
 export const isProbeSid = (sid) => { const s = String(sid ?? "").toLowerCase(); return s === "" || s === "nosession" || s === "nosessio"; };
+/** A classifier line is probe traffic when the router said so (router v3 `hasSid: false`) or, on an older line without that field, when its session spelling says so. A line with no session id is the same set under both rules. */
+export const isProbeRow = (x) => x?.hasSid === false || isProbeSid(x?.sid);
+const UA_CLASSES = ["claude-cli", "sdk", "other", "none"];                                       // the router's closed user-agent classes (never the raw header); any other spelling counts as "other"
 export function classTraffic(classLines, keep = () => true) {
-  const o = { requests: 0, probe: 0, probeAgentShaped: 0, client: 0, main: 0, sub: 0, aux: 0, exempt: 0, other: 0, agentShaped: 0, teammates: 0, builtIn: 0, detectorDisagree: 0 };
+  const o = { requests: 0, probe: 0, probeAgentShaped: 0, client: 0, main: 0, sub: 0, aux: 0, exempt: 0, other: 0, agentShaped: 0, teammates: 0, builtIn: 0, detectorDisagree: 0, uaLogged: 0, ua: { "claude-cli": 0, sdk: 0, other: 0, none: 0 } };
   for (const x of classLines ?? []) {
     if (!isObject(x) || typeof x.cls !== "string" || !keep(x)) continue;
     o.requests += 1;
-    if (isProbeSid(x.sid)) { o.probe += 1; if (x.ag === 1 || x.bl === 1) o.probeAgentShaped += 1; continue; }      // an agent-shaped probe row is excluded too, but counted (never silently lost)
+    if (isProbeRow(x)) { o.probe += 1; if (x.ag === 1 || x.bl === 1) o.probeAgentShaped += 1; continue; }      // an agent-shaped probe row is excluded too, but counted (never silently lost); this IS the "no session id and agent-shaped" count
     o.client += 1;
+    if (typeof x.ua === "string") { o.uaLogged += 1; o.ua[UA_CLASSES.includes(x.ua) ? x.ua : "other"] += 1; }       // lines of a router before v3 carry no ua: counted out of uaLogged, not as "none"
     if (x.cls === "main" || x.cls === "sub" || x.cls === "aux" || x.cls === "exempt") o[x.cls] += 1; else o.other += 1;
     const ag = x.ag === 1, bl = x.bl === 1;
     if (ag || bl) { o.agentShaped += 1; if (ag && !bl) o.teammates += 1; if (bl) o.builtIn += 1; }
@@ -1161,12 +1165,80 @@ export function classTraffic(classLines, keep = () => true) {
 const sharePct = (a, b) => (b > 0 ? ` (${Math.round((100 * a) / b)}%)` : "");
 /** The plain lines of the traffic shares: the probe traffic as its own line, then every share over the client requests that carry a session id. */
 export function trafficLines(tr) {
-  if (!tr || !tr.requests) return [];
-  const L = [`non-client probe traffic (${tr.probe} of ${tr.requests} classified requests${tr.probeAgentShaped ? `, ${tr.probeAgentShaped} of them agent-shaped` : ""}), excluded: they carry no session id`];
+  const logLine = classLogLine(tr?.log);
+  if (!tr || !tr.requests) return logLine ? [logLine] : [];
+  const L = logLine ? [logLine] : [];
+  L.push(`non-client probe traffic (${tr.probe} of ${tr.requests} classified requests${tr.probeAgentShaped ? `, ${tr.probeAgentShaped} of them agent-shaped` : ""}), excluded: they carry no session id`);
   if (!tr.client) { L.push("client requests (with a session id): none in the classifier log"); return L; }
   L.push(`client requests (with a session id; every share below is of these ${tr.client}): main ${tr.main}${sharePct(tr.main, tr.client)}, sub ${tr.sub}${sharePct(tr.sub, tr.client)}, aux ${tr.aux}${sharePct(tr.aux, tr.client)}${tr.exempt ? `, exempt ${tr.exempt}${sharePct(tr.exempt, tr.client)}` : ""}${tr.other ? `, other ${tr.other}` : ""}`);
   if (tr.agentShaped) L.push(`agent-shaped client requests (${tr.agentShaped} of ${tr.client}): teammates ${tr.teammates} (an agent id without the billing flag), built-in ${tr.builtIn} (the billing flag); the two detectors disagree on ${tr.detectorDisagree} of ${tr.agentShaped}`);
+  if (tr.uaLogged) L.push(`user agent of client requests (${tr.uaLogged} of ${tr.client} carry it; lines of an older router do not): ${UA_CLASSES.map((k) => `${k} ${tr.ua[k]}`).join(", ")}`);
   return L;
+}
+/** The traffic shares of the whole classifier log on disk, with what was read of it (the `log` field is what trafficLines prints). */
+export function classTrafficOfLog(stateDir) { const c = readClassLog(stateDir); return { ...classTraffic(c.lines), log: c.log }; }
+const mib = (n) => `${(n / 1048576).toFixed(1)} MiB`;
+/** The one line that says how much of the classifier log was read, with both sizes: nothing is silently cut. Null when no classifier file exists at all (nothing to qualify). */
+export function classLogLine(log) {
+  if (!log || !Array.isArray(log.files) || log.files.every((f) => f.state === "absent")) return null;
+  const by = (st) => log.files.filter((f) => f.state === st);
+  const trunc = log.files.filter((f) => f.truncated), absent = by("absent"), bad = by("unreadable");
+  let s = `classifier log: read ${mib(log.readBytes)} of ${mib(log.keptBytes)} kept (${by("read").length} of ${log.files.length} files)`;
+  if (trunc.length) s += `; TRUNCATED: only the newest ${trunc.map((f) => `${mib(f.read)} of ${mib(f.size)} of ${f.name}`).join(", ")} ${trunc.length === 1 ? "was" : "were"} read, so older lines are not counted`;
+  if (absent.length) s += `; absent: ${absent.map((f) => f.name).join(", ")}`;
+  if (bad.length) s += `; UNREADABLE: ${bad.map((f) => `${f.name} (${printable(f.why ?? "?", 40)})`).join(", ")}`;
+  if (log.unreadableLines) s += `; ${log.unreadableLines} unreadable lines skipped`;
+  return s;
+}
+/**
+ * Reads the classifier log (CLASS_FILES, oldest first) in bounded 1 MiB chunks: a file larger than `maxBytes` (default 8.5 MiB, above the 8.2 MiB a router-v3 file can reach, so a normal file is read whole) gives only its newest
+ * `maxBytes`, its first partial line dropped. Memory, worst case: one 1 MiB chunk plus a carried partial line of at most 1 MiB (`maxLine`: a longer line is dropped and counted), and the kept rows (only the ten fields the report uses).
+ * Measured on three 8.2 MiB files of 207-byte rows (about 120,000 rows): about 27 MiB of rows kept after a collection and a process growth of about 68 MiB at the peak; no file is ever held whole. A torn or non-object line is counted,
+ * never fatal. Returns the rows plus `log` (what was read of what was kept).
+ */
+export const CLASS_READ_MAX = Math.round(8.5 * 1024 * 1024);
+const CLASS_KEEP = ["t", "cls", "sid", "aid", "ag", "bl", "bb", "tc", "hasSid", "ua"];
+export function readClassLog(stateDir, { maxBytes = CLASS_READ_MAX, chunk = 1024 * 1024, maxLine = 1024 * 1024 } = {}) {
+  const rows = [];
+  const log = { files: [], keptBytes: 0, readBytes: 0, unreadableLines: 0 };
+  const take = (raw) => {
+    if (!raw.trim()) return;
+    let o;
+    try { o = JSON.parse(raw); } catch { log.unreadableLines += 1; return; }
+    if (!isObject(o) || typeof o.t !== "string" || !Number.isFinite(Date.parse(o.t))) { log.unreadableLines += 1; return; }
+    const r = {};
+    for (const k of CLASS_KEEP) if (o[k] !== undefined) r[k] = o[k];
+    rows.push(r);
+  };
+  for (const name of CLASS_FILES) {
+    const f = path.join(stateDir, name);
+    let st;
+    try { st = fs.statSync(f); } catch (e) { log.files.push({ name, state: e?.code === "ENOENT" ? "absent" : "unreadable", why: e?.code === "ENOENT" ? undefined : (e?.code ?? "error") }); continue; }
+    if (!st.isFile()) { log.files.push({ name, state: "unreadable", why: "not a file" }); continue; }
+    const start = Math.max(0, st.size - maxBytes);
+    let fd = null;
+    try {
+      fd = fs.openSync(f, "r");
+      const buf = Buffer.allocUnsafe(chunk);
+      let pos = start, carry = Buffer.alloc(0), skip = start > 0;      // skip: the rest of a line whose beginning is not read (the cut start, or a dropped overlong line)
+      while (pos < st.size) {
+        const n = fs.readSync(fd, buf, 0, Math.min(chunk, st.size - pos), pos);
+        if (n <= 0) break;
+        pos += n;
+        const data = carry.length ? Buffer.concat([carry, buf.subarray(0, n)]) : buf.subarray(0, n);
+        let from = 0, nl;
+        while ((nl = data.indexOf(10, from)) !== -1) { if (skip) skip = false; else take(data.toString("utf8", from, nl)); from = nl + 1; }
+        carry = Buffer.from(data.subarray(from));                 // a copy: the chunk buffer is reused
+        if (carry.length > maxLine) { if (!skip) log.unreadableLines += 1; carry = Buffer.alloc(0); skip = true; }
+      }
+      if (carry.length && !skip) take(carry.toString("utf8"));    // the last line of a file that does not end in a newline (a torn write is counted by take)
+    } catch (e) { log.files.push({ name, state: "unreadable", why: e?.code ?? "error" }); continue; }
+    finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* the file was read; a failed close changes nothing */ } } }
+    log.files.push({ name, state: "read", size: st.size, read: st.size - start, truncated: start > 0 });
+    log.keptBytes += st.size; log.readBytes += st.size - start;
+  }
+  rows.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+  return { lines: rows, unreadable: log.unreadableLines, files: log.files.filter((f) => f.state === "read").length, log };
 }
 export function readAgentLog(stateDir, names = LOG_FILES) {
   const lines = [];
@@ -1598,6 +1670,7 @@ async function cmdExplain(p, flags, io, target) {
   if (grp.reprobe) L.push(`re-probe: its bench status is ${grp.status} on a sample older than 2 days; a transient status is not proof it cannot work, so it waits for a re-probe`);
   L.push(`ctx: ${grp.c > 0 ? n(grp.c) : "unknown"} (${grp.ci ? "INFERRED (c?) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k; ctx UNPROVEN: the only proof is the 400 KB big step (about 100k tokens), the router's per-request fit check decides" : grp.tag1m ? "[1m] sibling" : grp.c > 0 ? "catalogue" : "unknown"}${grp.n ? "; n:1 listing-only, needs the context-1m beta header" : ""}); substitutable: ${grp.c >= SUBSTITUTE_FLOOR ? "yes" : "no (needs a known context of at least 128,000)"}`);
   L.push(`payload cap: ${grp.limit > 0 ? `${sizeCell(grp.limit)} (band ${capBand(grp.limit)}; source ${grp.limitSource ?? "?"})` : "unknown (the size check does nothing for it until a limit is measured)"}`);
+  if (grp.bigProven) L.push(`proven to accept 400 KB (${BIG_PROVEN_BYTES.toLocaleString("en-US")} bytes): the tool sweep's big step passed (compiled as bk ${BIG_PROVEN_BYTES}; a router that reads it can rank this row above rows with no measured limit; it changes no tier, rank or count here)`);
   if (grp.in) {
     for (const s of FREE_SCOPES) {
       const why = grp.in[s] ? "PASS" : freeScopeOf(grp.tier) === null ? `FAIL (tier ${grp.tier} is in no free scope)`

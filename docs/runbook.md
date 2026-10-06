@@ -371,6 +371,21 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   disagreement is made of teammates. The router's own lifetime counters (`req`, `main`, `sub`) are
   per router, not per session, so they still include the probe traffic; the lines above are the
   client view. Any classifier-accuracy matrix must use these client-only denominators.
+  The classifier log is read from all of its files, oldest first (`classify.2.jsonl`,
+  `classify.1.jsonl`, `classify.jsonl`: router v3 keeps 8 MiB in each), each read in bounded chunks
+  up to 8.5 MiB (a normal file is read whole). One line says how much was read ("classifier log: read
+  24.0 MiB of 24.0 MiB kept (3 of 3 files)"); a file over the cap is read from its newest end and the
+  line says TRUNCATED with both sizes, an absent generation is named, and an unreadable file says
+  UNREADABLE. The read keeps only ten fields per row, about 27 MiB in memory for the full 24 MiB of
+  rows (measured). A router v3 line also carries `hasSid` (the router's own word that the request had
+  no session id; an older line is judged by its session spelling, the same set) and `ua` (the user
+  agent as claude-cli, sdk, other or none): `status`, `show` and `report` add one line, "user agent
+  of client requests (N of M carry it)", counting only the lines that have it. The "agent-shaped probe
+  rows" figure is the no-session-id and agent-shaped count; there is no separate one.
+  `bk` on a compiled row (400,000: the tool sweep's big step passed for that model) is routing data
+  and so part of the content hash: a rebuild that gains `bk` rows changes the hash, and so the
+  injected marker once; it changes no tier, rank, band or count, and `explain` says "proven to accept
+  400 KB" for such a row.
   `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
   `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves

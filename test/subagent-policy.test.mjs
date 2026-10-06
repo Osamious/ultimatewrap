@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { fixtureFlagMap } from "./fixtures/subagent-flags.mjs";
 import * as lib from "../keysync/subagent-policy.mjs";
-import { funnel, FREE_TAG, fnv1a32, priceText, priceSum, isPremium, emptyStage, SELECTOR_RE, toolEligible, nonAgentReason, knownIssueOf, knownIssueText, RANK_LABELS, SUBSTITUTE_FLOOR, CTX_VALUES, hintCapOf, ctxSpec } from "../menu/subagent-funnel.mjs";
+import { funnel, BIG_PROVEN_BYTES, FREE_TAG, fnv1a32, priceText, priceSum, isPremium, emptyStage, SELECTOR_RE, toolEligible, nonAgentReason, knownIssueOf, knownIssueText, RANK_LABELS, SUBSTITUTE_FLOOR, CTX_VALUES, hintCapOf, ctxSpec } from "../menu/subagent-funnel.mjs";
 import { sweepLines, ctxUnprovenLines } from "../keysync/subagent-policy.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { TIERS, isTier, tierList, RELAY_KEY_ID, RELAY_TIER, freeScopeOf, isExcludedTier, isProvenanceVerified } from "../menu/tiers.mjs";
@@ -1671,4 +1671,35 @@ test("D-bk hint == floor: the compiled ctxHints equal the toggle's own floor (a 
     if (floor > 0) assert.ok(r.models.filter((m) => m.c >= floor).every((m) => r.ctxHints[m.s] === floor), `${ctx}: a row at or above the hard floor is hinted exactly the floor`);
     else assert.ok(r.models.filter((m) => m.c >= 128000).every((m) => r.ctxHints[m.s] === 128000), `${ctx}: any and every soft preference hint 128000`);
   }
+});
+
+// ---- `bk`: the size the sweep proved the model accepts (record big: "p"), an additive optional routing field of a compiled row (a router follow-up reads it)
+test("bk: a compiled row carries bk = BIG_PROVEN_BYTES (400000) only when its tool-fidelity record has big p; big f, absent, garbled or n never emit it, whatever the row's own cap", () => {
+  const spec = { pa: [{ id: "p1", ctx: 200000 }, { id: "f1", ctx: 200000 }, { id: "none", ctx: 200000 }, { id: "gar1", ctx: 200000 }, { id: "gar2", ctx: 200000 }, { id: "gar3", ctx: 200000 }, { id: "cap", ctx: 200000, limit: { bytes: 300000 } }, { id: "norec", ctx: 200000 }] };
+  const rec = (big) => ({ t: "v", lvr: "pppn", ...(big === undefined ? {} : { big }) });
+  const tf = { models: { "pa/p1": rec("p"), "pa/f1": rec("f"), "pa/none": rec(undefined), "pa/gar1": rec("P"), "pa/gar2": rec(true), "pa/gar3": rec("n"), "pa/cap": rec("p") } };
+  const r = funnel(syn(spec, { tf }), T({ unverified: "allow-warn" }));
+  assert.equal(BIG_PROVEN_BYTES, 400000);
+  const m = (id) => r.models.find((x) => x.s === `pa/${id}`);
+  assert.deepEqual(["p1", "f1", "none", "gar1", "gar2", "gar3", "cap", "norec"].map((id) => [id, m(id)?.bk]), [["p1", 400000], ["f1", undefined], ["none", undefined], ["gar1", undefined], ["gar2", undefined], ["gar3", undefined], ["cap", 400000], ["norec", undefined]]);
+  for (const id of ["f1", "none", "gar1", "gar2", "gar3", "norec"]) assert.ok(!Object.hasOwn(m(id), "bk"), `${id}: the key is absent, not undefined or 0`);
+  assert.deepEqual([m("p1").pb, m("cap").pb, m("cap").pbSource], [0, 300000, "catalogue"], "bk is evidence of acceptance: it does not set or change pb (a catalogue limit stays)");
+});
+
+test("bk changes no eligibility, rank, tier, band or count: the same inputs with every big p replaced by n give the same rows apart from bk, the same order, lists and counts; only the hash of the models differs", () => {
+  const spec = { pa: ["a", "b", "c", "d", "e"].map((id) => ({ id, ctx: 200000 })) };
+  const mk = (big) => ({ models: Object.fromEntries(["a", "b", "c", "d", "e"].map((id, i) => [`pa/${id}`, { t: "v", lvr: "pppn", big: i % 2 === 0 ? big : "f" }])) });
+  const withP = funnel(syn(spec, { tf: mk("p") }), T());
+  const withN = funnel(syn(spec, { tf: mk("n") }), T());
+  const strip = (rows) => rows.map(({ bk, ...x }) => x);
+  assert.equal(withP.models.filter((x) => x.bk === 400000).length, 3, "a, c, e");
+  assert.equal(withN.models.filter((x) => "bk" in x).length, 0);
+  assert.deepEqual(strip(withP.models), strip(withN.models), "rows, order, tiers, bands, caps: identical apart from bk");
+  assert.deepEqual([withP.lists, withP.counts, withP.warnings.map((w) => w.code)], [withN.lists, withN.counts, withN.warnings.map((w) => w.code)]);
+  const h = (r) => lib.hashOf({ schema: 1, owner: {}, models: r.models, lists: r.lists });
+  assert.notEqual(h(withP), h(withN), "bk is routing data: it is in the content hash through the rows");
+  assert.equal(h(withN), h(funnel(syn(spec, { tf: mk("n") }), T())), "and the same inputs hash the same");
+  // a record change on a row that gains no bk leaves the hash alone
+  const tf2 = mk("p"); tf2.models["pa/b"] = { t: "v", lvr: "pppn", big: "f", note: "x" };
+  assert.equal(h(funnel(syn(spec, { tf: tf2 }), T())), h(withP));
 });
