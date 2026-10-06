@@ -241,17 +241,25 @@ export const recheckCovers = (recheck, state, provider) => !!recheck && recheck.
 /**
  * The META block (additive): what the last live run left behind for the next one. `recoverable` is the verdict's recoverable count at the END of that run, so the next run can tell whether the recoverable
  * set shrank (a loop must not spin forever on soft-but-stuck models); `scope` is a stable hash of the flags that decide WHICH models the count is about (candidates, sample, --only, --include-tier, levels): only an
- * equal scope is compared; `at` is when. `history` (additive, optional, at most 5) is one small record per recorded run of ONE scope: `{at, scope, asked, newTested, deepened, rateShare, testedTotal, recoverable}`.
+ * equal scope is compared; `at` is when. `history` (additive, optional, at most 5 per scope and 12 in all) is one small record per recorded run: `{at, scope, asked, newTested, deepened, rateShare, testedTotal, recoverable}`.
  */
 export function cleanMeta(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (!Number.isInteger(raw.recoverable) || raw.recoverable < 0 || raw.recoverable > 10000000 || typeof raw.at !== "string" || !Number.isFinite(Date.parse(raw.at))) return null;
   if (typeof raw.scope !== "string" || !/^[0-9a-f]{6,40}$/.test(raw.scope)) return null;                 // a count without its scope compares with nothing: it reads as no previous count
-  const history = Array.isArray(raw.history) ? raw.history.map(cleanRun).filter(Boolean).slice(-HISTORY_MAX) : [];
+  const history = Array.isArray(raw.history) ? raw.history.map(cleanRun).filter(Boolean).slice(-HISTORY_TOTAL) : [];
   return { recoverable: raw.recoverable, scope: raw.scope, at: raw.at, ...(history.length ? { history } : {}) };
 }
 /** The last runs of one scope, for the diminishing-returns rule: one small record per run (see `saturation`). Anything malformed is dropped, not repaired. */
-export const HISTORY_MAX = 5;
+export const HISTORY_PER_SCOPE = 5, HISTORY_TOTAL = 12;
+/** The history after a recorded run: written unfiltered, so that runs of different scopes (a plain loop and a --candidates loop, say) each build their own series; at most 5 entries per scope and 12 in all. */
+export function appendHistory(history, entry) {
+  const all = [...(history ?? []), entry], seen = {}, keep = [];
+  for (let i = all.length - 1; i >= 0; i -= 1) { const sc = all[i].scope; seen[sc] = (seen[sc] ?? 0) + 1; if (seen[sc] <= HISTORY_PER_SCOPE) keep.unshift(all[i]); }
+  return keep.slice(-HISTORY_TOTAL);
+}
+/** The entries of ONE scope: the only ones the rule compares. */
+export const historyOf = (history, scope) => (history ?? []).filter((h) => h.scope === scope);
 function cleanRun(h) {
   if (!h || typeof h !== "object" || Array.isArray(h)) return null;
   if (typeof h.at !== "string" || !Number.isFinite(Date.parse(h.at)) || typeof h.scope !== "string" || !/^[0-9a-f]{6,40}$/.test(h.scope)) return null;
@@ -1273,24 +1281,25 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
   }
   const stuckWhy = {};
   for (const [pv, e] of Object.entries(stuckBy)) { const top = [...e.sentences].sort((a, b) => b[1] - a[1])[0]; stuckWhy[pv] = { total: e.total, ...(top ? { why: top[0], n: top[1] } : {}) }; }
-  const v = { stuckWhy, tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
+  const testedOf = (s) => [...by].filter(([k, x]) => x.s === s && testedState(store?.[k])).length;
+  const v = { recoverableTested: testedOf("recoverable"), hardTested: testedOf("hard"), stuckWhy, tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
     stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), strikeOutOfLevels: [...strikeOut].filter((k) => by.get(k)?.s === "tested").length, hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
   return { total: v.tested + v.recoverable + v.hard + v.owner, ...v };
 }
 
 /**
  * What one run ADDED, from the records before and after it: `newTested` models that went from not tested to tested (any class, x included; a provisional first strike is not tested, resolving one is; a
- * model saved only as a PARTIAL record, `partial`, is not counted) and `deepened` tested models that gained a level the run asked for (`levels`: 3 to 7). Pure over the two stores.
+ * model saved as a PARTIAL record, stopped at a later level, IS: its L1+L2 verdicts are what makes it tested) and `deepened` tested models that gained a level the run asked for (`levels`: 3 to 7). Pure over the two stores.
  */
 export const testedState = (r) => !!r && r.lvr?.[0] !== "n" && r.strikes !== 1;
 const gained = (b, a, l) => (l === 3 ? b.lvr?.[2] === "n" && a.lvr?.[2] !== "n" : l === 4 ? b.lvr?.[3] === "n" && a.lvr?.[3] !== "n" : l === 5 ? b.big === undefined && a.big !== undefined
   : l === 6 ? b.sp === undefined && a.sp !== undefined : l === 7 ? b.er === undefined && a.er !== undefined : false);
-export function runGain(before, after, { levels = [], partial = null } = {}) {
+export function runGain(before, after, { levels = [] } = {}) {
   let newTested = 0, deepened = 0;
   for (const [k, r] of Object.entries(after ?? {})) {
     const was = before?.[k];
     if (r === was) continue;
-    if (!testedState(was)) { if (testedState(r) && !partial?.has(k)) newTested += 1; continue; }
+    if (!testedState(was)) { if (testedState(r)) newTested += 1; continue; }
     if (levels.some((l) => gained(was, r, l))) deepened += 1;
   }
   return { newTested, deepened };
@@ -1308,7 +1317,7 @@ export const SATURATION_FAIL_SHARE = 0.8;
 export const SATURATE_GAIN = 1, SATURATE_YIELD = 5, SATURATE_RUNS = 2;
 const pct1 = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : null);
 export function diminishingReturns({ history = null, thisRun = null, runs = SATURATE_RUNS, gain = SATURATE_GAIN, yieldPct = SATURATE_YIELD } = {}) {
-  const n = Math.max(1, Math.min(HISTORY_MAX, runs));
+  const n = Math.max(1, Math.min(HISTORY_PER_SCOPE, runs));
   if (!thisRun || !Array.isArray(history) || history.length < n - 1) return null;
   const set = [...(n > 1 ? history.slice(-(n - 1)) : []), thisRun];
   const low = (e) => e.testedTotal > 0 && (e.newTested * 100) / e.testedTotal < gain && (e.asked > 0 ? ((e.newTested + e.deepened) * 100) / e.asked < yieldPct : true);

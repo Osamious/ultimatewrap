@@ -12,7 +12,7 @@ import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeO
 import { runKind, isQuotaSentence, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { runSweep } from "../refresh/bench.mjs";
 import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
-import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, appendHistory, historyOf, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
@@ -213,7 +213,7 @@ test("a live run ends with the verdict, its saturation line and, last, the machi
   const r1 = await run(["--live", "--per-provider", "1", ...CAP], e.deps);
   assert.equal(r1.code, 0, r1.err + r1.out);
   assert.match(r1.out, /sweep verdict: RECOVERABLE 3 of 6 \(cap 3\) \| HARD-BLOCKED 0 of 6 \(none; lift only with --recheck-hard\/--release-holds\) \| TESTED 3 of 6/);
-  assert.match(r1.out, /saturation of this run: \d+ request\(s\) sent: 0 ended rate-limited or over quota \(0% of \d+\), 0 ended rate, error, timeout or quota \(0% of \d+\); 3 new record\(s\); saturated: no/);
+  assert.match(r1.out, /saturation of this run: \d+ request\(s\) sent: 0 ended rate-limited or over quota \(0% of \d+\), 0 ended rate, error, timeout, quota or empty \(a thinking-only answer\) \(0% of \d+\); 3 new record\(s\); saturated: no/);
   assert.match(r1.lines.at(-1), /^SATURATION saturated=no recoverable=3 hard=0 new_results=3 requests=\d+ reason=none$/);
   const r2 = await run(["--live", "--per-provider", "1", ...CAP], e.deps);
   assert.match(r2.out, /DONE: nothing recoverable left \(6 of 6 model\(s\) tested, 0 hard-blocked\)/);
@@ -226,7 +226,7 @@ test("a run where every request is rate-limited records nothing and says saturat
   const sat = r.lines.at(-1);
   assert.match(sat, /^SATURATION saturated=yes recoverable=8 hard=0 new_results=0 requests=\d+ reason=zero-new$/);
   assert.match(r.out, /sweep verdict: RECOVERABLE 8 of 8 \((rate|rate-paused) \d+, (rate|rate-paused) \d+\)/);
-  assert.match(r.out, /saturation of this run: (\d+) request\(s\) sent: \1 ended rate-limited or over quota \(100% of \1\), \1 ended rate, error, timeout or quota \(100% of \1\); 0 new record\(s\); saturated: yes \(no new result in this run\)/);
+  assert.match(r.out, /saturation of this run: (\d+) request\(s\) sent: \1 ended rate-limited or over quota \(100% of \1\), \1 ended rate, error, timeout, quota or empty \(a thinking-only answer\) \(100% of \1\); 0 new record\(s\); saturated: yes \(no new result in this run\)/);
   assert.deepEqual(loadFidelity(e.out).held, {}, "a rate limit is the moment's: never a hold");
 });
 
@@ -1480,10 +1480,10 @@ test("the flags --saturate-gain, --saturate-yield and --saturate-runs are valida
   }
 });
 
-test("meta.history: cleanMeta keeps at most the last 5 well-formed runs and drops the malformed ones; an old meta without history reads as no history; it survives save and load", () => {
+test("meta.history: cleanMeta keeps at most the last 12 well-formed runs and drops the malformed ones; an old meta without history reads as no history; it survives save and load", () => {
   const good = (i) => entry(i, 100, { rateShare: 0.123456 });
-  const m = cleanMeta({ recoverable: 3, scope: SC, at: NOW.toISOString(), history: [good(1), good(2), good(3), good(4), good(5), good(6), good(7)] });
-  assert.deepEqual(m.history.map((h) => h.newTested), [3, 4, 5, 6, 7], "the last five");
+  const m = cleanMeta({ recoverable: 3, scope: SC, at: NOW.toISOString(), history: Array.from({ length: 14 }, (_, i) => good(i + 1)) });
+  assert.deepEqual(m.history.map((h) => h.newTested), [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], "the last twelve");
   assert.equal(m.history[0].rateShare, 0.123, "rounded");
   const junk = [null, "x", [], { ...good(1), scope: "ZZZ" }, { ...good(1), at: "nope" }, { ...good(1), asked: -1 }, { ...good(1), newTested: 1.5 }, { ...good(1), rateShare: 2 }, { ...good(1), rateShare: "0.1" }, { at: NOW.toISOString() }, good(9)];
   assert.deepEqual(cleanMeta({ recoverable: 3, scope: SC, at: NOW.toISOString(), history: junk }).history.map((h) => h.newTested), [9], "only the well-formed one");
@@ -1496,7 +1496,7 @@ test("meta.history: cleanMeta keeps at most the last 5 well-formed runs and drop
   assert.ok(Buffer.byteLength(JSON.stringify(cleanMeta({ recoverable: 3, scope: SC, at: NOW.toISOString(), history: Array.from({ length: 5 }, (_, i) => good(i)) }))) < 1200, "small");
 });
 
-test("runGain (pure): newly tested = not tested before, tested now (x included); a first strike is not tested, resolving one is; a partial record is not counted; deepened = a tested model that gained a level the run asked for", () => {
+test("runGain (pure): newly tested = not tested before, tested now (x included); a first strike is not tested, resolving one is; a partial record IS counted (its L1+L2 verdicts); deepened = a tested model that gained a level the run asked for", () => {
   const before = { "a/strike": record("fnnn", { strikes: 1, sl: 1 }), "a/tested": record("ppnn"), "a/deep": record("pppn", { sp: "p", er: "p" }), "a/same": record("ppnn", { sp: "p", er: "p" }) };
   const after = {
     ...before,
@@ -1504,12 +1504,12 @@ test("runGain (pure): newly tested = not tested before, tested now (x included);
     "a/newx": record("ffnn", { strikes: 2, sl: 1 }),                // a confirmed failure is tested too
     "a/newstrike": record("fnnn", { strikes: 1, sl: 1 }),           // a provisional first strike is not
     "a/strike": record("ffnn", { strikes: 2, sl: 1 }),              // resolving a strike IS
-    "a/part": record("ppnn", { sp: "p", er: "p" }),                 // saved as a partial record: not counted
+    "a/part": record("ppnn", { sp: "p", er: "p" }),                 // saved as a partial record (stopped at a later level): its L1+L2 verdicts make it tested
     "a/tested": record("ppnn", { sp: "p", er: "p" }),               // gained spawn and the error result
     "a/deep": record("pppn", { sp: "p", er: "p", big: "p" }),       // gained the big step
   };
-  assert.deepEqual(runGain(before, after, { levels: [1, 2, 6, 7], partial: new Set(["a/part"]) }), { newTested: 3, deepened: 1 }, "levels 1,2,6,7: new, newx, strike resolved; a/tested gained 6 and 7; a/deep gained only 5, which was not asked");
-  assert.deepEqual(runGain(before, after, { levels: [1, 2, 5, 6, 7], partial: new Set(["a/part"]) }), { newTested: 3, deepened: 2 }, "asked for 5 too: a/deep counts");
+  assert.deepEqual(runGain(before, after, { levels: [1, 2, 6, 7] }), { newTested: 4, deepened: 1 }, "levels 1,2,6,7: new, newx, part, strike resolved; a/tested gained 6 and 7; a/deep gained only 5, which was not asked");
+  assert.deepEqual(runGain(before, after, { levels: [1, 2, 5, 6, 7] }), { newTested: 4, deepened: 2 }, "asked for 5 too: a/deep counts");
   assert.deepEqual(runGain(before, before, { levels: [1, 2, 6, 7] }), { newTested: 0, deepened: 0 });
   assert.ok(testedState(record("ppnn")) && !testedState(record("fnnn", { strikes: 1, sl: 1 })) && !testedState(undefined) && testedState(record("ffnn", { strikes: 2, sl: 1 })));
 });
@@ -1554,15 +1554,16 @@ test("CLI: a second low-yield run of the same scope is saturated by diminishing 
   assert.equal(parseLine((await runRaw(["--live", "--per-provider", "2", "--tf-max-tokens-per-provider", "1000000"], e3.deps)).lines.at(-1)).reason, "diminishing", "the default gain of 1% also holds (0.5%); the thresholds are not part of the scope, so the seeded history counts");
 });
 
-test("CLI: a run of ANOTHER scope starts a fresh comparison: history of a different scope is not compared and is dropped", async () => {
+test("CLI: a run of ANOTHER scope starts a fresh comparison: history of a different scope is not compared (and is kept, for its own loop)", async () => {
   const e = bigWorld();
   seedHistory(e, [hist1({ scope: scopeOf(parseArgs(["--only", "pa"])) }), hist1({ scope: scopeOf(parseArgs(["--only", "pa"])) })], ["--only", "pa"]);       // the meta itself is of the other scope too: the no-shrink fallback has nothing to compare with
   const r = await runRaw(BIG, e.deps);
   const l = parseLine(r.lines.at(-1));
   assert.deepEqual([l.saturated, l.reason], ["no", "none"], "two low runs of another scope do not count");
   const meta = loadFidelity(e.out).meta;
-  assert.equal(meta.history.length, 1, "the other scope's entries are gone, this run starts the history");
-  assert.equal(meta.history[0].scope, scopeOf(parseArgs(BIG)));
+  assert.equal(meta.history.length, 3, "the other scope's two entries are kept; this run adds its own");
+  assert.equal(meta.history.at(-1).scope, scopeOf(parseArgs(BIG)));
+  assert.equal(historyOf(meta.history, scopeOf(parseArgs(BIG))).length, 1, "and only its own entry counts for this scope");
 });
 
 test("CLI: a lift, a named model, a forced or retried pass is not recorded and does not reset the history; --release-holds keeps it", async () => {
@@ -1701,4 +1702,162 @@ test("CLI: over three runs a provider that keeps rate limiting never makes a mod
   const stuckLine = dry.out.split("\n").find((l) => l.startsWith("sweep verdict"));
   assert.doesNotMatch(stuckLine, /STUCK/, "rate is not a stuck reason and the paused ones never count");
   assert.match(stuckLine, /rate-paused \d+/);
+});
+
+// ================================================================ round 4 (final review)
+
+// ---------------------------------------------------------------- 1: a partial record's L1+L2 is newly tested
+
+test("round 4 / 1: 100 fresh models given L1+L2 and stopped at L6 by a rate limit are 100 newly tested; two such runs are never 'diminishing'", async () => {
+  const rows = Array.from({ length: 100 }, (_, i) => many(`pq${i}`, 1));
+  const e = cliEnv(rows, { answer: (c) => (["6", "2e"].includes(kindOf(c)) ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
+  const argv = ["--live", "--tf-max-tokens-per-provider", "1000000"];
+  const r1 = await runRaw(argv, e.deps);
+  assert.equal(r1.code === 0 || r1.code === 3, true, r1.err);
+  const h1 = loadFidelity(e.out).meta.history;
+  assert.deepEqual([h1[0].asked, h1[0].newTested, h1[0].testedTotal], [100, 100, 100], "their L1+L2 verdicts made them tested");
+  assert.notEqual(parseLine(r1.lines.at(-1)).reason, "diminishing");
+  const r2 = await runRaw(argv, e.deps);
+  const h2 = loadFidelity(e.out).meta.history;
+  assert.deepEqual([h2.at(-1).newTested, h2.at(-1).testedTotal], [0, 100], "the second run adds nothing: they were tested already");
+  assert.notEqual(parseLine(r2.lines.at(-1)).reason, "diminishing", "rate limits everywhere end it as zero-new, not as convergence");
+  assert.equal(parseLine(r2.lines.at(-1)).reason, "zero-new");
+  assert.deepEqual(series([entry(100, 100, { testedTotal: 100 }), entry(100, 100, { testedTotal: 200 })]).map((x) => x[0]), [false, false]);
+});
+
+// ---------------------------------------------------------------- 2: empty answers fail; a starved run is not converged
+
+const sseT = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+const thinkingOnly = () => ok(stream(sseT("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }) + sseT("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hmm" } }) + sseT("content_block_stop", { type: "content_block_stop", index: 0 }), ev.stop("max_tokens", 100000)));
+
+test("round 4 / 2: empty (thinking-only) answers count toward the failing share; when it fires and most asked models produced no record the run says STARVED, with the resume-later action, not 'converged'", async () => {
+  const e = cliEnv([many("pa", 200)], { answer: (c) => (["pa/m0", "pa/m1", "pa/m2", "pa/m3", "pa/m4"].includes(c.body.model) ? goodModel(c) : thinkingOnly()) });
+  const r = await runRaw(["--live", "--per-provider", "2", "--tf-max-tokens-per-provider", "5000000"], e.deps);
+  assert.equal(r.code === 0 || r.code === 3, true, r.err);
+  const l = parseLine(r.lines.at(-1));
+  assert.deepEqual([l.saturated, l.reason, l.new_results], ["yes", "failing", "5"], r.out.slice(-1800));
+  assert.match(r.out, /starved: 195 of 200 asked model\(s\) produced no record \(reasoning-budget 195\)/);
+  assert.match(r.out, /next: resume later \(195 recoverable model\(s\)\): most asked models got no usable answer/);
+  assert.doesNotMatch(r.out, /converged/);
+  assert.match(r.out, /ended rate, error, timeout, quota or empty \(a thinking-only answer\)/);
+});
+
+test("round 4 / 2 (pure): diminishing with asked 200, newTested 5 twice and mostly no record: starved text and resume later; with most asked models recorded: converged", () => {
+  const v = { recoverable: 150, hard: 0 };
+  const hist = [entry(5, 200, { testedTotal: 1000 })], now2 = entry(5, 200, { testedTotal: 1005 });
+  const sat = saturation({ requests: 400, rate: 0, failing: 100, newResults: 5, recoverable: 150, history: hist, thisRun: now2 });
+  assert.equal(sat.reason, "diminishing");
+  const starved = saturationLines(v, sat, null, { history: [...hist, now2], starved: { asked: 200, noRecord: 195, reasons: { empty: 120, "reasoning-budget": 60, rate: 15 } } }).join("\n");
+  assert.match(starved, /starved: 195 of 200 asked model\(s\) produced no record \(empty 120, reasoning-budget 60, rate 15\)/);
+  assert.match(starved, /next: resume later \(150 recoverable model\(s\)\)/);
+  assert.doesNotMatch(starved, /converged/);
+  const fine = saturationLines(v, sat, null, { history: [...hist, now2], starved: { asked: 200, noRecord: 60, reasons: { error: 60 } } }).join("\n");
+  assert.match(fine, /next: converged: the 150 remaining/);
+  assert.doesNotMatch(fine, /starved:/);
+  assert.doesNotMatch(saturationLines(v, sat, null, { history: [now2] }).join("\n"), /starved:/, "no data: no claim");
+});
+
+// ---------------------------------------------------------------- 3: the history is written unfiltered, capped per scope and overall
+
+test("round 4 / 3: appendHistory keeps at most 5 entries per scope and 12 in all, in order; alternating loops of two scopes each reach diminishing on their own series", () => {
+  const A = "aaaaaa111111", B = "bbbbbb222222", C = "cccccc333333";
+  let h = [];
+  for (let i = 0; i < 30; i++) h = appendHistory(h, entry(i, 100, { scope: i % 2 ? A : B }));
+  assert.ok(h.length <= 12, String(h.length));
+  assert.equal(historyOf(h, A).length, 5);
+  assert.equal(historyOf(h, B).length, 5);
+  assert.deepEqual(h.map((x) => x.newTested), [...h.map((x) => x.newTested)].sort((a, b) => a - b), "order kept");
+  h = [];
+  for (let i = 0; i < 20; i++) h = appendHistory(h, entry(i, 100, { scope: [A, B, C][i % 3] }));
+  assert.ok(h.length <= 12 && h.at(-1).newTested === 19, "the newest is always kept");
+  assert.deepEqual(appendHistory(null, entry(1, 10)).map((x) => x.newTested), [1]);
+  let hist = [];
+  const verdicts = [];
+  for (const [scope, e] of [[A, entry(3, 300, { scope: A })], [B, entry(2, 300, { scope: B })], [A, entry(2, 300, { scope: A })], [B, entry(1, 300, { scope: B })], [A, entry(1, 300, { scope: A })]]) {
+    const r = saturation({ requests: 100, newResults: 2, recoverable: 50, history: historyOf(hist, scope), thisRun: e });
+    verdicts.push([scope === A ? "A" : "B", r.reason]);
+    hist = appendHistory(hist, e);
+  }
+  assert.deepEqual(verdicts, [["A", null], ["B", null], ["A", "diminishing"], ["B", "diminishing"], ["A", "diminishing"]], "each scope compares only with its own runs");
+});
+
+test("round 4 / 3: through the CLI a run of one scope does not disturb the other scope's history, and each scope's second low run is diminishing", async () => {
+  const A = BIG, B = [...BIG, "--only", "pa,pb"];
+  for (const [run1, other] of [[A, B], [B, A]]) {
+    const e = bigWorld();
+    const cur = loadFidelity(e.out);
+    const hA = hist1({ scope: scopeOf(parseArgs(A)) }), hB = entry(1, 77, { testedTotal: 200, recoverable: 40, scope: scopeOf(parseArgs(B)) });
+    saveFidelity(e.out, cur.models, { now: NOW, meta: { recoverable: 40, scope: scopeOf(parseArgs(other)), at: hoursAgo(5), history: [hA, hB] } });
+    const r = await runRaw(run1, e.deps);
+    assert.equal(parseLine(r.lines.at(-1)).reason, "diminishing", r.out.slice(-600));
+    const meta = loadFidelity(e.out).meta;
+    assert.equal(meta.history.length, 3);
+    assert.deepEqual(historyOf(meta.history, scopeOf(parseArgs(other))).map((x) => x.asked), [run1 === A ? 77 : 50], "the other scope's entry is untouched");
+  }
+});
+
+// ---------------------------------------------------------------- 4: a 400 auth sentence is anchored and is evidence about the model only
+
+test("round 4 / 4: the auth sentence is anchored to the start of the message and must be its whole subject: schema sentences that contain the words do not read as auth", async () => {
+  for (const [status, msg] of [[400, "tool_choice: missing credentials field in tool schema"], [400, "authentication required for tool x"], [400, "Missing credentials field in tool schema"], [400, "tools.0: invalid credentials schema"], [400, "unauthorized_tool_name must match ^[a-z_]+$"],
+    [422, "tools.2.input_schema: expected an api key property"], [400, "Invalid parameter: the API key field is missing in the request body schema"], [400, "tool x: unknown key in properties"],
+    [400, "tools.0.input_schema: invalid credentials"], [400, "Schema error: Unauthorized"], [400, "Request failed validation: missing api key"]]) {
+    assert.notEqual((await kindRes(status, msg)).s, "auth", `${status}: ${msg}`);
+  }
+  for (const [status, msg] of [[400, "Invalid API key provided."], [400, "Incorrect API key"], [400, "Unauthorized"], [422, "Invalid API key provided: sk-xxxx"], [400, "Error: Invalid API key"], [400, "Authentication failed."], [401, "Invalid API key provided."], [403, "Unauthorized"], [401, "tool_choice: missing credentials field"]]) {
+    assert.equal((await kindRes(status, msg)).s, "auth", `${status}: ${msg}`);
+  }
+});
+
+test("round 4 / 4: a 400 auth sentence is evidence about THAT MODEL: one model alone holds nothing, two distinct models hold the provider; a 401 still holds it at the first answer", async () => {
+  const bad400 = () => http(400, "Invalid API key provided.");
+  const one = cliEnv([many("pa", 1)], { answer: bad400 });
+  await run(["--live", "--per-provider", "1"], one.deps);
+  const s1 = loadFidelity(one.out);
+  assert.deepEqual(s1.held, {}, "one model's 400: no provider hold");
+  assert.equal(s1.pending["pa/m0"].r, "auth", "but that model is auth-blocked");
+  const two = cliEnv([many("pa", 4)], { answer: bad400 });
+  await run(["--live", "--per-provider", "1"], two.deps);
+  assert.equal(calls(two.f).length, 2, "two distinct models asked, then the provider is held");
+  const s2 = loadFidelity(two.out);
+  assert.equal(s2.held.pa.r, "auth");
+  assert.deepEqual([s2.pending["pa/m2"].r, s2.pending["pa/m3"].r], ["canary-auth", "canary-auth"]);
+  const mixed = cliEnv([many("pa", 3)], { answer: (c) => (c.body.model === "pa/m0" ? bad400() : goodModel(c)) });
+  await run(["--live", "--per-provider", "1"], mixed.deps);
+  const s3 = loadFidelity(mixed.out);
+  assert.deepEqual(s3.held, {}, "the provider answered for the other models: no hold");
+  assert.equal(s3.pending["pa/m0"].r, "auth");
+  const k401 = cliEnv([many("pa", 4)], { answer: () => http(401, "Invalid API key provided.") });
+  await run(["--live", "--per-provider", "1"], k401.deps);
+  assert.equal(calls(k401.f).length, 1, "a 401 holds the provider at the first answer");
+  assert.equal(loadFidelity(k401.out).held.pa.r, "auth");
+});
+
+// ---------------------------------------------------------------- 5: how many of the recoverable and hard-blocked are already tested at L1+L2
+
+test("round 4 / 5: the verdict says how many of the RECOVERABLE and of the HARD-BLOCKED models are tested at L1+L2, each with its denominator", async () => {
+  const rows = [many("pa", 5), many("pb", 3)];
+  const store = { "pa/m0": record("ppnn"), "pa/m1": record("ppnn"), "pa/m2": record("ppnn"), "pb/m0": record("ppnn") };
+  const e = cliEnv(rows, { store, held: { pb: { r: "auth", at: hoursAgo(1) } } });
+  const r = await runRaw([], e.deps);
+  assert.match(r.out, /RECOVERABLE 5 of 8 \(/);
+  assert.match(r.out, /HARD-BLOCKED 3 of 8 \(auth 3;/);
+  assert.match(r.out, /of which tested at L1\+L2 \(a record with both verdicts\): RECOVERABLE 3 of 5, HARD-BLOCKED 1 of 3/);
+  const none = cliEnv([many("pa", 1)], { store: { "pa/m0": record("ppnn", { sp: "p", er: "p" }) } });
+  assert.doesNotMatch((await runRaw([], none.deps)).out, /of which tested at L1\+L2/, "nothing recoverable or hard: nothing to split");
+});
+
+// ---------------------------------------------------------------- 6: a queue with nothing counted recoverable is not 'done'
+
+test("round 4 / 6: a dry run with a queue but nothing recoverable (--force) is saturated=unknown reason=queued, never done", async () => {
+  const store = Object.fromEntries([0, 1, 2].map((i) => [`pa/m${i}`, record("ppnn", { sp: "p", er: "p" })]));
+  const e = cliEnv([many("pa", 3)], { store });
+  const plain = await runRaw([], e.deps);
+  assert.match(plain.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=0 new_results=0 requests=0 reason=done$/);
+  const forced = await runRaw(["--force"], e.deps);
+  assert.match(forced.out, /this run: 3 model\(s\) queued of 3/);
+  assert.match(forced.lines.at(-1), /^SATURATION saturated=unknown recoverable=0 hard=0 new_results=0 requests=0 reason=queued$/);
+  assert.match(forced.out, /nothing is counted recoverable but 3 model\(s\) are queued/);
+  assert.equal(saturationLines({ recoverable: 0, hard: 0 }, null, "dry", { queued: 2 }).at(-1), "SATURATION saturated=unknown recoverable=0 hard=0 new_results=0 requests=0 reason=queued");
+  assert.equal(saturationLines({ recoverable: 0, hard: 0 }, null, "dry", { queued: 0 }).at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=0 requests=0 reason=done");
 });

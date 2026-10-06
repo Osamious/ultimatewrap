@@ -58,7 +58,7 @@ import { acquireLock } from "./bench-lock.mjs";
 import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
-  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_MAX,
+  presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -175,7 +175,7 @@ export function parseArgs(argv) {
   }
   if (!(o.saturateGain > 0 && o.saturateGain <= 100)) return { error: `--saturate-gain needs a percent above 0 and at most 100 (the newly tested share of the tested total under which a run adds little; default ${SATURATE_GAIN})` };
   if (!(o.saturateYield > 0 && o.saturateYield <= 100)) return { error: `--saturate-yield needs a percent above 0 and at most 100 (the share of the models asked that gained a tested model or a level, under which a run adds little; default ${SATURATE_YIELD})` };
-  if (!(Number.isInteger(o.saturateRuns) && o.saturateRuns >= 1 && o.saturateRuns <= HISTORY_MAX)) return { error: `--saturate-runs needs a whole number from 1 to ${HISTORY_MAX} (how many runs in a row must add little; default ${SATURATE_RUNS})` };
+  if (!(Number.isInteger(o.saturateRuns) && o.saturateRuns >= 1 && o.saturateRuns <= HISTORY_PER_SCOPE)) return { error: `--saturate-runs needs a whole number from 1 to ${HISTORY_PER_SCOPE} (how many runs in a row must add little; default ${SATURATE_RUNS})` };
   o.explicit = explicit;
   return o;
 }
@@ -505,6 +505,7 @@ export function verdictLines(v, { partial = false, queued = 0 } = {}) {
   const L = [`sweep verdict: RECOVERABLE ${num(v.recoverable)} ${of} (${fmt(v.byRecoverable)}${stuck}) | HARD-BLOCKED ${num(v.hard)} ${of} (${fmt(v.byHard)}; lift only with --recheck-hard/--release-holds) | TESTED ${num(v.tested)} ${of}${tested}${v.owner ? ` | NEEDS-OWNER ${num(v.owner)} ${of} (${Object.entries(v.byOwner).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}: ${OWNER_ACTION[k] ?? "owner action"}`).join("; ")}; a re-run alone changes nothing)` : ""}`,
     `  population: ${num(v.total)} model(s) of the ledger that are not excluded (${num(v.excluded)} more are excluded: not free, not probe-ok, relay, ...); recoverable + hard-blocked + tested${v.owner ? " + needs-owner" : ""} = ${num(v.total)}`];
   for (const [pv, x] of Object.entries(v.stuckWhy ?? {}).slice(0, 6)) if (x.why) L.push(show(`  stuck on ${pv}: "${x.why}" (${x.n} of its ${x.total} stuck model(s) say so; the provider's own words)`, 260));
+  if ((v.recoverable || v.hard) && v.recoverableTested !== undefined) L.push(`  of which tested at L1+L2 (a record with both verdicts): RECOVERABLE ${num(v.recoverableTested)} of ${num(v.recoverable)}, HARD-BLOCKED ${num(v.hardTested)} of ${num(v.hard)}`);
   const since = Object.entries(v.oldestSince ?? {}).sort(([, a], [, b]) => Date.parse(a) - Date.parse(b)).map(([k, t]) => `${k} ${t.slice(0, 10)}`).join(", ");
   if (since) L.push(`  oldest since, per reason (the first time that reason was recorded, among the ${num(v.recoverable + v.hard + v.owner)} model(s) not tested): ${since}`);
   if (v.strikeOutOfLevels) L.push(`  note: ${num(v.strikeOutOfLevels)} first strike(s) failed at a level this run does not ask; they count as tested here and are asked again by a run that includes that level`);
@@ -529,16 +530,20 @@ export function trendLine(entries) {
  */
 export function saturationLines(v, sat, mode = sat ? null : "dry", extra = {}) {
   const pc = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : "n/a");
-  const state = mode === "aborted" ? "unknown" : mode === "none" ? "yes" : sat ? (sat.saturated ? "yes" : "no") : v.recoverable === 0 ? "yes" : "unknown";
-  const reason = mode === "aborted" ? "unknown" : mode === "none" ? (v.recoverable === 0 ? "done" : "scope-exhausted") : sat ? (sat.saturated ? sat.reason : "none") : v.recoverable === 0 ? "done" : "unknown";
+  const queued = !sat && mode === "dry" && v.recoverable === 0 && (extra.queued ?? 0) > 0;            // a dry run with nothing counted recoverable but models queued (--force): not done
+  const state = mode === "aborted" || queued ? "unknown" : mode === "none" ? "yes" : sat ? (sat.saturated ? "yes" : "no") : v.recoverable === 0 ? "yes" : "unknown";
+  const reason = mode === "aborted" ? "unknown" : queued ? "queued" : mode === "none" ? (v.recoverable === 0 ? "done" : "scope-exhausted") : sat ? (sat.saturated ? sat.reason : "none") : v.recoverable === 0 ? "done" : "unknown";
   const L = [];
   if (mode === "aborted") L.push("saturation: not judged, the run was interrupted or stopped early (a partial run says nothing about the loop); run again");
   else if (mode === "none") L.push(`saturation: this run sent nothing; ${v.recoverable === 0 ? "nothing is recoverable, so a loop should stop" : `scope-exhausted: ${num(v.recoverable)} recoverable model(s) are outside this run's scope/levels (nothing queueable under what was asked), so a loop on this scope should stop`}`);
-  else if (sat) L.push(`saturation of this run: ${num(sat.requests)} request(s) sent: ${num(sat.rate)} ended rate-limited or over quota (${pc(sat.rate, sat.requests)} of ${num(sat.requests)}), ${num(sat.failing)} ended rate, error, timeout or quota (${pc(sat.failing, sat.requests)} of ${num(sat.requests)}); ${num(sat.newResults)} new record(s); saturated: ${sat.saturated ? `yes (${sat.why})` : "no"} (yes = nothing recoverable is left, or no new record, or at least ${Math.round(SATURATION_FAIL_SHARE * 100)}% of the requests failed, or diminishing returns over the last runs)`);
-  else L.push(`saturation: not measured in a dry run (nothing was sent); ${v.recoverable === 0 ? "nothing is recoverable, so a loop should stop" : "run with --live to measure it"}`);
+  else if (sat) L.push(`saturation of this run: ${num(sat.requests)} request(s) sent: ${num(sat.rate)} ended rate-limited or over quota (${pc(sat.rate, sat.requests)} of ${num(sat.requests)}), ${num(sat.failing)} ended rate, error, timeout, quota or empty (a thinking-only answer) (${pc(sat.failing, sat.requests)} of ${num(sat.requests)}); ${num(sat.newResults)} new record(s); saturated: ${sat.saturated ? `yes (${sat.why})` : "no"} (yes = nothing recoverable is left, or no new record, or at least ${Math.round(SATURATION_FAIL_SHARE * 100)}% of the requests failed, or diminishing returns over the last runs)`);
+  else L.push(`saturation: not measured in a dry run (nothing was sent); ${queued ? `nothing is counted recoverable but ${num(extra.queued)} model(s) are queued (a forced or retried pass): not done` : v.recoverable === 0 ? "nothing is recoverable, so a loop should stop" : "run with --live to measure it"}`);
   if (sat?.saturated && (sat.reason === "diminishing" || sat.reason === "failing")) {
+    const st = extra.starved, starved = !!st && st.asked > 0 && st.noRecord / st.asked > 0.5;
+    if (starved) L.push(`  starved: ${num(st.noRecord)} of ${num(st.asked)} asked model(s) produced no record (${Object.entries(st.reasons).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).slice(0, 6).map(([k, n]) => `${k} ${num(n)}`).join(", ") || "no answer"})`);
     L.push(sat.rateShare >= 0.5
       ? `  next: resume later when rate limits clear (${num(v.recoverable)} recoverable model(s); ${Math.round(sat.rateShare * 100)}% of this run's ${num(sat.requests)} request(s) were rate-limited or over quota)`
+      : starved ? `  next: resume later (${num(v.recoverable)} recoverable model(s)): most asked models got no usable answer, so the run learned little about them; this is not convergence`
       : `  next: converged: the ${num(v.recoverable)} remaining recoverable model(s) are stuck (error/timeout/quota/optional-flaky); a re-run is unlikely to change them, review them`);
   }
   const trend = trendLine(extra.history);
@@ -730,7 +735,7 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     t.done ??= {};
     doneBy?.set(t.key, t.done);                      // what this model has learned so far: kept when a later level stops it (see partialRecord)
     // a provider whose first answer was a dead key, an empty balance or a missing model costs nothing more; one that keeps rate-limiting is left for the next run
-    const ps = (prov[t.provider] ??= { rateStreak: 0, paused: false, blocked: null, answered: false, goneModels: new Set(), payModels: new Set(), episodes: 0 });
+    const ps = (prov[t.provider] ??= { rateStreak: 0, paused: false, blocked: null, answered: false, goneModels: new Set(), payModels: new Set(), authModels: new Set(), episodes: 0 });
     if (ps.blocked) return { s: "skip", w: `canary-${ps.blocked}` };
     if (ps.paused) return { s: "skip", w: ps.paused === "quota" ? "quota-paused" : "rate-paused" };
     const tele = [];
@@ -766,7 +771,11 @@ function makeProbe({ o, gw, fetchImpl, ac, spend, lift, telemetry, prov, clamped
     // gone), so a provider that has answered before (a confirmed record from an earlier run) is never paused or held on those grounds: the model is pending pay / gone and the provider goes on. Without
     // any answer yet, a provider is paused only on EVIDENCE: two distinct models out of credit, or FOUR distinct models gone (the first four asked are spread over its queue), and none has answered.
     const known = (confirmed[t.provider] ?? 0) > 0;
-    if (sx === "auth" && !ps.answered) ps.blocked = "auth";
+    // AUTH: a 401 or 403 is the key's state, so the first answer decides for the provider. A 400 or 422 (or a stream error) whose sentence says the credentials are wrong is evidence about THAT MODEL only: the
+    // provider is held on two distinct models and no answer, like pay.
+    const strongAuth = sx === "auth" && [401, 403].includes(r.inconclusive?.http);
+    if (sx === "auth" && !ps.answered && (strongAuth || (ps.authModels.add(t.key), ps.authModels.size >= 2))) ps.blocked = "auth";
+    else if (sx === "auth") { /* one model's refusal: that model only */ }
     else if (!ps.answered && !known) {
       if (sx === "pay") { ps.payModels.add(t.key); if (ps.payModels.size >= 2) ps.blocked = "pay"; }
       else if (sx === "gone") { ps.goneModels.add(t.key); if (ps.goneModels.size >= GONE_EVIDENCE) ps.blocked = "gone"; }
@@ -878,7 +887,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (o.only && !p.set.models.some((m) => selectOnly([m], o.only).length)) { console.error(`tool-fidelity: --only ${show(o.only.join(","), 80)} matches no probe-ok model`); return 1; }
   console.log(text);
   if (stored.dropped) console.log(`  note: ${num(stored.dropped)} stored record(s) could not be read by this version; they stay in the file and count as untested`);
-  if (!o.live) { console.log("\nno request was made. Re-run with --live to probe."); for (const l of saturationLines(p.verdict, null, "dry", { history: (stored.meta?.history ?? []).filter((h) => h.scope === scopeOf(o)) })) console.log(l); return 0; }
+  if (!o.live) { console.log("\nno request was made. Re-run with --live to probe."); for (const l of saturationLines(p.verdict, null, "dry", { history: historyOf(stored.meta?.history, scopeOf(o)), queued: p.queued.length })) console.log(l); return 0; }
   const refusal = liveRefusal(o, p);
   if (refusal) { console.error(`tool-fidelity: refused: ${refusal}`); return 2; }
   if (!p.kept.length) { console.log("tool-fidelity: nothing to probe."); return noRun(p); }
@@ -928,8 +937,8 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       else if (x.answered && held[pv] && !x.blocked && !namedOnly.has(pv)) delete held[pv];
     }
   };
-  let ledgerLines = [], verdict = null, testedTotal = 0, runEntry = null, recordable = false;
-  const scopeNow = scopeOf(o), scopedHistory = (stored.meta?.history ?? []).filter((h) => h.scope === scopeNow);        // the earlier runs of THIS scope
+  let ledgerLines = [], verdict = null, testedTotal = 0, runEntry = null, recordable = false, starved = null;
+  const scopeNow = scopeOf(o), allHistory = stored.meta?.history ?? [], scopedHistory = historyOf(allHistory, scopeNow);        // the earlier runs of THIS scope are the only ones the rule compares
   // the coverage ledger and the verdict from the CURRENT store, pending and holds (built before the final save: the verdict's recoverable count goes into the file's meta block)
   const buildLedger = () => {
     try {
@@ -1039,14 +1048,18 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     pending = updatePending(pending, { queue, recorded: got, store, now: now(), keepKeys: new Set([...p.set.models.map((m) => m.key), ...p.set.relay]),
       reasonOf: (k) => capReasonOf(p, k) ?? why.get(k) ?? "not-run", whyOf: (k) => whyBy.get(k) ?? null, flaky: flakyKeys });
     // a provider that ANSWERED in this run (a manual recheck reached it): its stale auth and canary-* entries (models that were skipped, never asked) are not hard blocks any more
-    for (const [pv, x] of Object.entries(prov)) if (x.answered && !x.blocked && !namedOnly.has(pv)) for (const k of Object.keys(pending)) if (k.startsWith(`${pv}/`) && /^(canary-|auth$)/.test(pending[k].r)) delete pending[k];
+    for (const [pv, x] of Object.entries(prov)) if (x.answered && !x.blocked && !namedOnly.has(pv)) for (const k of Object.keys(pending)) if (k.startsWith(`${pv}/`) && !stats.started.has(k) && /^(canary-|auth$)/.test(pending[k].r)) delete pending[k];       // (an entry this run just wrote for a model it ASKED is that model's own evidence: it stays)
     buildLedger();
     if (verdict && !ac.signal.aborted && !stoppedEarly) {
       // The run's record for the diminishing-returns rule. A lift, a named model, a forced or retried pass is a different population: it is not recorded and does not touch the history.
       recordable = !(o.retryAccounts || o.recheckHard || p.namedLifts?.length || o.force || o.retryFailed);
-      const g = runGain(stored.models, store, { levels: o.levels, partial: partialKeys }), tot0 = telemetry.total(), st0 = telemetry.statuses;
+      const g = runGain(stored.models, store, { levels: o.levels }), tot0 = telemetry.total(), st0 = telemetry.statuses;
+      // the models this run asked that produced no record at all (and why): a run that learns little because the answers did not come is STARVED, not converged
+      const askedKeys = [...stats.started], noRec = askedKeys.filter((k) => store[k] === stored.models[k]);
+      starved = { asked: askedKeys.length, noRecord: noRec.length, reasons: {} };
+      for (const k of noRec) { const rs = why.get(k) ?? "no level ran"; starved.reasons[rs] = (starved.reasons[rs] ?? 0) + 1; }
       runEntry = { at: now().toISOString(), scope: scopeNow, asked: stats.started.size, newTested: g.newTested, deepened: g.deepened, rateShare: tot0.n ? ((st0.rate ?? 0) + (st0.quota ?? 0)) / tot0.n : 0, testedTotal, recoverable: verdict.recoverable };
-      meta = { recoverable: verdict.recoverable, scope: scopeNow, at: runEntry.at, history: recordable ? [...scopedHistory, runEntry].slice(-HISTORY_MAX) : (stored.meta?.history ?? []) };
+      meta = { recoverable: verdict.recoverable, scope: scopeNow, at: runEntry.at, history: recordable ? appendHistory(allHistory, runEntry) : allHistory };
     }
     if (recorded || JSON.stringify(pending) !== before || JSON.stringify(held) !== heldBefore || JSON.stringify(meta) !== metaBefore) {
       saved = false;
@@ -1120,9 +1133,9 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     const prevRecoverable = o.retryAccounts || o.recheckHard || p.namedLifts?.length || stored.meta?.scope !== scopeOf(o) ? null : stored.meta.recoverable;
     for (const line of verdictLines(verdict, { partial })) console.log(line);
     const rec = recordable && !partial;
-    const sat = saturation({ requests: tot.n, rate: rate + (st.quota ?? 0), failing: rate + (st.error ?? 0) + (st.timeout ?? 0) + (st.quota ?? 0), newResults: recorded, recoverable: verdict.recoverable, prevRecoverable,
+    const sat = saturation({ requests: tot.n, rate: rate + (st.quota ?? 0), failing: rate + (st.error ?? 0) + (st.timeout ?? 0) + (st.quota ?? 0) + (st.empty ?? 0), newResults: recorded, recoverable: verdict.recoverable, prevRecoverable,
       history: rec ? scopedHistory : null, thisRun: rec ? runEntry : null, runs: o.saturateRuns, gain: o.saturateGain, yieldPct: o.saturateYield });
-    for (const line of saturationLines(verdict, sat, partial ? "aborted" : null, { history: rec ? [...scopedHistory, runEntry].slice(-HISTORY_MAX) : scopedHistory })) console.log(line);
+    for (const line of saturationLines(verdict, sat, partial ? "aborted" : null, { history: rec ? [...scopedHistory, runEntry].slice(-HISTORY_PER_SCOPE) : scopedHistory, starved })) console.log(line);
   } else console.log(`SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=${recorded} requests=${telemetry.total().n} reason=unknown`);
   return code;
 }

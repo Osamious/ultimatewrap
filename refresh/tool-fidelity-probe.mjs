@@ -134,7 +134,10 @@ const ROUTE_WORDS = /must be called (via|through|at|using)|should be called (via
 // plan and billing details" is pay) or when the status is 402.
 // A refusal whose OWN sentence says the credentials are wrong is the account's state, whatever the status (some providers answer a bad key with a 400): `auth`, never a schema verdict (a strike) and
 // never an answer. Only the key/token/credentials words count: "unknown key in properties" is a schema sentence and is not matched.
-const AUTH_SENTENCE = /(invalid|incorrect|wrong|missing|expired|revoked|bad)[ _-]+(api[ _-]*key|apikey|access[ _-]*token|auth(entication)?[ _-]*(token|key)|credentials?)|api[ _-]*key[ _-]+(is[ _-]+)?(invalid|incorrect|missing|not[ _-]+valid)|unauthori[sz]ed|authentication[ _-]+(failed|error|required)|not[ _-]+authenticated/i;
+// The sentence must START with the phrase and the phrase must be its whole subject ("Invalid API key provided.", "Unauthorized"): "tool_choice: missing credentials field in tool schema" and "authentication required
+// for tool x" are schema sentences. On a 400 or 422 it is evidence about THAT MODEL only (the provider is held on two distinct models, like pay); a 401 or 403 keeps the first-answer rule.
+const AUTH_PHRASE = "(?:(?:invalid|incorrect|wrong|missing|expired|revoked|bad)[ _-]+(?:api[ _-]*key|apikey|access[ _-]*token|auth(?:entication)?[ _-]*(?:token|key)|credentials?)|(?:your[ _-]+)?api[ _-]*key[ _-]+(?:is[ _-]+)?(?:invalid|incorrect|missing|not[ _-]+valid)|unauthori[sz]ed|authentication[ _-]+(?:failed|error)|not[ _-]+authenticated)";
+const AUTH_SENTENCE = new RegExp(`^\\W*(?:(?:error|authentication_error|invalid_request_error)[: -]+)?${AUTH_PHRASE}(?:\\s+(?:request|provided|supplied|found|detected|specified))*[.!]?\\s*(?:$|[:,;(\\-]|\\s+(?:please|check|see|for|at|in|and)\\b)`, "i");
 const QUOTA_WORDS = /quota|daily limit|per[ -]day|limit reached|allowance/i;
 const MONEY_WORDS = /wallet|credit|balance|recharge|top[ -]?up|payment|funds|billing|\bplan\b/i;
 const RATE_SENTENCE = /rate[ -]?limit|too many requests|requests? per|tokens per|per[ -](minute|second|hour)|\b[rt]pm\b|try again in|retry (after|in)|resets? in/i;       // a rate limit, or a limit with a wait time, is its own (soft) reading, `rate`
