@@ -36,7 +36,7 @@ test("--plan prints every scenario with what it must prove, the client, and the 
 });
 
 test("the plan names the exact router bytes, and a test pins that constant to router/uw-router.next.cjs (a router change voids the plan and any approval)", () => {
-  assert.equal(S.ROUTER_SHA256, "5da75baa60dadb3aa24ff281d4c5ac460f38067428f8f9067826c7bf516f1182");
+  assert.equal(S.ROUTER_SHA256, "e6a9afac8940ba25d9b87e8a1ad4a7b75feb66619131f3b52427841eba9bf35e");
   assert.equal(sha(fs.readFileSync(NEXT_ROUTER_SRC)), S.ROUTER_SHA256, "the router file in the working tree is the one the suite was written for");
   assert.ok(S.planLines().some((l) => l.includes(S.ROUTER_SHA256)));
   const changed = S.planLines().map((l) => l.replace(S.ROUTER_SHA256, "0".repeat(64)));
@@ -765,85 +765,77 @@ test("runSandbox and runSelftest pass the second token that matches the orchestr
 
 // ====================================================================================== fix round 2 (the first replay run: no scenario was a router defect; the HARNESS read stale status, hid cooling state and fed the router wrong shapes)
 /**
- * A WINDOWS-SHAPED virtual sandbox: a clock the sleeps advance, an in-memory scratch tree, a router that flushes status.json at most every 5 s, and a process table with creation times. As in production the table the harness
- * queries is FILTERED (names node|ccr), so a process behind cmd.exe or a shell is invisible to it, while ancestorsOf walks the UNFILTERED table. Processes: the sandbox daemon (100) holding the gateway and web ports, its core
- * worker child (500) holding the core port, a LIVE CCR daemon (900) holding the live ports, the orchestrator (700, a node process under a hidden cmd.exe 710 under a hidden claude.exe 720).
- * Stopping the core worker makes CCR respawn it (a new pid, created later) after `respawnMs`. Options break one rule each. Nothing here stops a real process: stopVerified only edits the table.
+ * A WINDOWS-SHAPED virtual sandbox: a clock the sleeps advance, an in-memory scratch tree, a router that flushes status.json at most every 5 s, a process table with creation times, and a FAKE sandbox web RPC.
+ * The RPC knows ONLY getConfig and saveConfig (any other method, restartGateway and startGateway included, is recorded in V.badRpc and throws), and a saveConfig that changes `Providers` makes CCR replace its core worker
+ * (a new pid, created later, after `respawnMs`): as in CCR 3.0.22, whose `_E(old, new)` test starts a new worker when Providers differ and which never respawns a worker that was merely killed. The REAL guard
+ * functions (assertPayloadIsolated, assertIsolatedConfig) check every payload and result. There is no seam that can stop a process: d.sys has no stop function at all. Options break one rule each.
  */
-const CLI = "C:\\npm\\node_modules\\@musistudio\\claude-code-router\\dist\\main\\cli.js", DIST = "C:\\npm\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
-const DAEMON_CMD = `"C:\\nvm4w\\nodejs\\node.exe" ${CLI} serve --daemon-child --no-open`;                     // the live and the sandbox daemon have the SAME command line
-const workerCmd = (dir, dist = DIST) => `"C:\\nvm4w\\nodejs\\node.exe" --require ${dir}\\gateway-proxy-preload.cjs ${dist}\\gateway-bootstrap.js`;
+const DAEMON_CMD = `"C:\\nvm4w\\nodejs\\node.exe" C:\\ccr\\dist\\main\\cli.js serve --daemon-child --no-open`;                     // the live and the sandbox daemon have the SAME command line
+const workerCmd = (dir) => `"C:\\nvm4w\\nodejs\\node.exe" --require ${dir}\\gateway-proxy-preload.cjs C:\\ccr\\dist\\main\\gateway-bootstrap.js`;
+const sandboxConfig = async () => {
+  const { GATEWAY_PORT, GATEWAY_CORE_PORT, SCRATCH_SETTINGS } = await import("../harness/config.mjs");
+  const { SCRATCH_ROUTER, SANDBOX_PORTS } = await import("../harness/subagent-sandbox-spec.mjs");
+  const { STUB_MODELS } = await import("../harness/stub-upstream.mjs");
+  return { gateway: { host: "127.0.0.1", port: GATEWAY_PORT, corePort: GATEWAY_CORE_PORT }, HOST: "127.0.0.1", PORT: GATEWAY_PORT, CUSTOM_ROUTER_PATH: SCRATCH_ROUTER,
+    Router: { fallback: { mode: "off", models: [] }, rules: [] }, Providers: [{ name: "uwstub", api_base_url: `http://127.0.0.1:${SANDBOX_PORTS.stub}`, models: [...STUB_MODELS] }],
+    profile: { enabled: true, claudeCode: { settingsFile: SCRATCH_SETTINGS }, profiles: [{ id: "p", agent: "claude-code", enabled: true, scope: "global", settingsFile: SCRATCH_SETTINGS }] } };
+};
 async function virtualSandbox(o = {}) {
-  const { respawn = true, respawnMs = 1500, daemonReplaced = false, newParent = 100, readyAfter = 2, dyingRewritesCooling = true, coreRow = {}, extraRows = [], realOwners = {}, liveSvcText = null, baseline = { ccrPids: [900], liveServicePid: 900 },
-    daemonKnown = true, webHolder = 100, ccrFound = true, appdata = "C:\\Users\\osami\\AppData\\Roaming", listens = null, probeFail = [], coreHolderOverride, ancestorsOverride, onRead = null, beforeStop = null, staysAlive = false, daemonCmd = DAEMON_CMD, orchRow = {}, installCli = CLI, workerDist = DIST, realMap = null } = o;
-  const { SCRATCH_STATE_DIR, LIVE_SERVICE_JSON, SANDBOX_PORTS, REAL_PORTS, CCR_CONFIG_DIR } = await import("../harness/subagent-sandbox-spec.mjs");
+  const { respawn = true, respawnMs = 0, daemonReplaced = false, newParent = 100, readyAfter = 2, dyingRewritesCooling = true, daemonKnown = true, listenFail = false,
+    failSave = null, cfgTweak = null, guardHook = null, tripwireHook = null } = o;
+  const { SCRATCH_STATE_DIR, SANDBOX_PORTS } = await import("../harness/subagent-sandbox-spec.mjs");
+  const guard = await import("../harness/guard.mjs");
   const mem = new Map(), r = (p) => path.resolve(p), T0 = 1_800_000_000_000, iso = (ms) => new Date(ms).toISOString();
-  const V = { now: T0, statusAt: -1e15, reqs: [], core: 500, daemon: 100, nextCore: 501, stopped: [], respawnAt: null, answered: 0, rpc: 0, log: [], reads: 0, T0, iso };
+  const V = { now: T0, statusAt: -1e15, reqs: [], core: 500, daemon: 100, nextCore: 501, respawnAt: null, answered: 0, rpc: [], badRpc: [], saves: [], log: [], progress: [], T0, iso, cfg: await sandboxConfig(), respawns: 0, guardCalls: [], tripwire: 0 };
   V.all = [
-    { pid: 720, ppid: 1, name: "claude.exe", cmd: "claude.exe", created: iso(T0 - 9e6) }, { pid: 710, ppid: 720, name: "cmd.exe", cmd: "cmd.exe /c node harness\\subagent-scenarios.mjs", created: iso(T0 - 8e6) },
-    { pid: 700, ppid: 710, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: iso(T0 - 7e6), ...orchRow },
-    { pid: 900, ppid: 1, name: "node.exe", cmd: DAEMON_CMD, created: iso(T0 - 6e6) },
-    { pid: 100, ppid: 1, name: "node.exe", cmd: daemonCmd, created: iso(T0 - 5e5) },
-    { pid: 500, ppid: 100, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR, workerDist), created: iso(T0 - 4e5), ...coreRow }, ...extraRows,
+    { pid: 700, ppid: 710, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: iso(T0 - 7e6) },
+    { pid: 100, ppid: 1, name: "node.exe", cmd: DAEMON_CMD, created: iso(T0 - 5e5) },
+    { pid: 500, ppid: 100, name: "node.exe", cmd: workerCmd(path.join(SCRATCH_STATE_DIR, "..")), created: iso(T0 - 4e5) },
   ];
   const statusFile = r(path.join(SCRATCH_STATE_DIR, "status.json")), coolFile = r(path.join(SCRATCH_STATE_DIR, "cooling.json"));
-  if (liveSvcText != null) mem.set(r(LIVE_SERVICE_JSON), liveSvcText);
   const flush = () => { V.statusAt = V.now; mem.set(statusFile, JSON.stringify({ updatedAt: iso(V.now), counters: { req: V.reqs.length }, cooling: [] })); };
+  const replaceWorker = () => { V.all = V.all.filter((x) => x.pid !== V.core); V.core = V.nextCore++; V.respawns += 1; V.answered = 0; V.all.push({ pid: V.core, ppid: newParent, name: "node.exe", cmd: workerCmd("C:\\x"), created: iso(V.now + 1) }); if (daemonReplaced) V.daemon = 101; };
+  const realGuard = { assertPayloadIsolated: (...a) => { V.guardCalls.push(a[1]); guardHook?.(V.guardCalls.length); return guard.assertPayloadIsolated(...a); }, assertIsolatedConfig: (c) => guard.assertIsolatedConfig(c) };
   const d = {
-    fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true,
-      ...(realMap ? { realpathSync: Object.assign((p) => realMap(String(p)), { native: (p) => realMap(String(p)) }) } : {}) },
+    fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true },
+    guard: realGuard,
     sys: {
       selfPid: 700,
       readText: (p) => mem.get(r(p)) ?? null,
-      processes: () => { V.log.push("processes"); V.reads += 1; const rows = V.all.filter((x) => /node|ccr/i.test(x.name)).map((x) => ({ ...x })); if (onRead) onRead(V.reads, V); return rows; },
-      listenerProbe: (port) => {
-        V.log.push(`probe:${port}`);
-        if (probeFail.includes(port)) return { ok: false };
-        if (port === SANDBOX_PORTS.core) { V.coreProbes = (V.coreProbes ?? 0) + 1; return { ok: true, pid: typeof coreHolderOverride === "function" ? coreHolderOverride(V.coreProbes, V) : coreHolderOverride !== undefined ? coreHolderOverride : V.core }; }
-        if (port === SANDBOX_PORTS.web) return { ok: true, pid: webHolder };
-        if (REAL_PORTS.includes(port)) return { ok: true, pid: realOwners[port] ?? 900 };
-        return { ok: true, pid: null };
-      },
-      listenPortsOf: (pid) => listens ?? (pid === 900 ? REAL_PORTS.map((p) => ({ addr: "127.0.0.1", port: p })) : [{ addr: "127.0.0.1", port: SANDBOX_PORTS.core }]),
-      ancestorsOf: (pid) => { if (ancestorsOverride) return ancestorsOverride; const out = []; for (let p = pid, i = 0; i < 40; i++) { const row = V.all.find((x) => x.pid === p); if (!row || !row.ppid || row.ppid === 1) break; out.push(row.ppid); p = row.ppid; } return out; },
-      stopVerified: (snap) => {                                                              // identify AND stop in one step: nothing real is touched
-        V.log.push(`stop:${snap.pid}`);
-        if (beforeStop) beforeStop(snap, V);
-        const row = V.all.find((x) => x.pid === snap.pid);
-        if (!row) throw new Error("IDENTITY: no process row");
-        if (row.created !== snap.created) throw new Error("IDENTITY: creation time differs");
-        if (row.cmd !== snap.cmd) throw new Error("IDENTITY: command line differs");
-        V.stopped.push(snap.pid);
-        if (staysAlive) return;
-        V.all = V.all.filter((x) => x.pid !== snap.pid);
-        if (snap.pid === V.core) { V.core = undefined; V.respawnAt = V.now + respawnMs; }
-      },
+      processes: () => V.all.map((x) => ({ ...x })),
+      listenerProbe: (port) => { V.log.push(`probe:${port}`); if (listenFail) return { ok: false }; return port === SANDBOX_PORTS.core ? { ok: true, pid: V.core ?? null } : { ok: true, pid: null }; },
     },
     resolveWebPort: () => ({ port: SANDBOX_PORTS.web, pid: V.daemon }),
-    ccrInstall: () => (ccrFound ? { found: true, cli: installCli } : { found: false, reason: "test" }),
-    env: appdata === null ? {} : { APPDATA: appdata },
-    rpc: async () => { V.rpc += 1; throw new Error("the config RPC must not be used to replace a worker"); },
+    rpc: async (method, args = []) => {
+      V.rpc.push(method);
+      if (method === "getConfig") { const cfg = structuredClone(V.cfg); cfgTweak?.(cfg, V); return cfg; }
+      if (method === "saveConfig") {
+        const [cfg, opts] = args; V.saves.push({ cfg: structuredClone(cfg), opts });
+        if (failSave === V.saves.length) throw new Error("saveConfig failed: scripted");
+        const providersChanged = JSON.stringify(cfg.Providers) !== JSON.stringify(V.cfg.Providers);
+        V.cfg = structuredClone(cfg);
+        if (providersChanged && respawn) { V.all = V.all.filter((x) => x.pid !== V.core); V.core = undefined; V.respawnAt = V.now + respawnMs; if (respawnMs === 0) replaceWorker(); }
+        return structuredClone(cfg);
+      }
+      V.badRpc.push(method); throw new Error(`the fake sandbox RPC does not know ${method}`);
+    },
     now: () => V.now,
     sleep: async (ms) => {
       V.now += ms;
-      if (V.core === undefined && respawn && V.respawnAt !== null && V.now >= V.respawnAt) {
-        V.core = V.nextCore++; V.respawnAt = null; V.answered = 0;
-        V.all.push({ pid: V.core, ppid: newParent, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR, workerDist), created: iso(V.now) });
-        if (daemonReplaced) V.daemon = 101;
-      }
+      if (V.core === undefined && respawn && V.respawnAt !== null && V.now >= V.respawnAt) { V.respawnAt = null; replaceWorker(); }
     },
     fetch: async (url, init) => {
       const h = init.headers, aux = !JSON.parse(init.body).tools;
       V.reqs.push({ aux, agent: h["x-claude-code-agent-id"] ?? null });
       if (V.now - V.statusAt >= 5000) flush();                                          // the router flushes at most every 5 s
       V.answered += 1;
-      if (dyingRewritesCooling && V.answered === 1 && V.stopped.length) mem.set(coolFile, "{\"v\":1,\"models\":{}}");      // the dying worker rewrites cooling.json on its way out
-      const status = V.stopped.length && V.answered <= readyAfter ? 503 : 200;
+      if (dyingRewritesCooling && V.answered === 1 && V.respawns) mem.set(coolFile, "{\"v\":1,\"models\":{}}");      // the dying worker rewrites cooling.json on its way out
+      const status = V.respawns && V.answered <= readyAfter ? 503 : 200;
       return { status, text: async () => "", headers: { forEach() {} } };
     },
   };
   const notes = [];
-  const c = { d, key: "k", stub: { records: [] }, launchEnv: {}, baseline, daemonPid: () => (daemonKnown ? 100 : undefined), out: (l) => notes.push(l) };
+  const c = { d, key: "k", stub: { records: [] }, launchEnv: {}, daemonPid: () => (daemonKnown ? 100 : undefined), out: (l) => { notes.push(l); V.progress.push(l); }, tripwire: { assert: (l) => { V.tripwire += 1; tripwireHook?.(l, V); } }, fallback: { mode: "off", models: [] } };
   return { V, d, c, mem, coolFile, statusFile, notes };
 }
 const prims = (v, extra = {}) => S.sandboxPrims(v.c, extra);
@@ -894,48 +886,6 @@ test("H1 scenario 3 reads no record COUNT (the status flush sends an aux request
   assert.ok(f.w.records.some((r) => /uwsc-s3n-1$/.test(r.headers["x-claude-code-agent-id"] ?? "")), "and so is the next agent's request");
 });
 
-const REFUSAL = /^REFUSED to stop the sandbox core worker, nothing was stopped: /;
-test("process stop (round 4): the order is probes first, the process table LAST and read twice before the stop, then each target is identified AND stopped in ONE step (stopVerified), then the table is read to see it is gone; the config RPC is never used", async () => {
-  const v = await virtualSandbox();
-  const r = await prims(v).restartWorker();
-  assert.deepEqual([r.pidBefore, r.pidAfter, r.changed, r.ready], [500, 501, true, true]);
-  assert.deepEqual(v.V.stopped, [500], "exactly the core worker was stopped");
-  assert.equal(v.V.rpc, 0);
-  assert.equal(v.mem.has(v.coolFile), false, "cooling.json is gone again");
-  const log = v.V.log, firstRead = log.indexOf("processes"), lastProbeBeforeStop = Math.max(...log.slice(0, log.indexOf("stop:500")).map((x, i) => (x.startsWith("probe:") ? i : -1)));
-  assert.ok(log.slice(0, firstRead).every((x) => x.startsWith("probe:")) && log.slice(0, firstRead).length >= 6, "every port probe comes BEFORE the first table read (core, web and the four live ports)");
-  const beforeStop = log.slice(0, log.indexOf("stop:500"));
-  assert.equal(beforeStop.filter((x) => x === "processes").length, 2, "the table is read twice before the stop");
-  assert.equal(beforeStop.at(-1), "processes", "and the LAST thing before the stop is a table read");
-  assert.ok(lastProbeBeforeStop < beforeStop.lastIndexOf("processes"));
-  assert.equal(log[log.indexOf("stop:500") + 1], "processes", "after the stop the table is read to see the process is gone");
-});
-
-test("process stop (round 4): the stale parent id of the ORCHESTRATOR (node harness\\subagent-scenarios.mjs) and of an unrelated `node some-mcp-server.js` is the reproduced defect: the old descendant rule returned [] for both; now stopRefusals refuses both, and restartWorker never stops them", async () => {
-  const stale = [{ pid: 700, ppid: 500, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: new Date(1_800_000_000_000 - 7e6).toISOString() },
-    { pid: 801, ppid: 500, name: "node.exe", cmd: "node some-mcp-server.js", created: new Date(1_800_000_000_000 - 3e6).toISOString() }];
-  const v = await virtualSandbox({ extraRows: [stale[1]], orchRow: { ppid: 500 }, ancestorsOverride: [710, 720] });      // the orchestrator's RECORDED parent is the worker's pid (stale after pid reuse); its real chain is 710, 720
-  const rows = v.V.all.filter((x) => /node/i.test(x.name));
-  const common = { rows, selfPid: 700, ancestors: [710, 720], underPid: 500, mode: "descendant" };
-  const orch = S.stopRefusals({ ...common, pid: 700 }), mcp = S.stopRefusals({ ...common, pid: 801 });
-  assert.ok(orch.includes("it is the orchestrator itself") && orch.some((x) => /not a CCR process/.test(x)) && orch.some((x) => /BEFORE its recorded parent 500/.test(x)), orch.join(" | "));
-  assert.ok(mcp.some((x) => /not a CCR process \(node some-mcp-server\.js\)/.test(x)) && mcp.some((x) => /BEFORE its recorded parent 500/.test(x)), mcp.join(" | "));
-  // the real flow: both look like descendants by their recorded parent, neither is PROVABLY one, so neither is stopped and the worker is
-  const r = await prims(v).restartWorker();
-  assert.equal(r.changed, true); assert.deepEqual(v.V.stopped, [500]);
-  assert.ok(v.notes.some((l) => /ignored 700, 801 .*stale parent id/.test(l)), v.notes.join("|"));
-  assert.ok(v.V.all.some((x) => x.pid === 700) && v.V.all.some((x) => x.pid === 801), "both are still there");
-  // a child that IS younger than the worker (a valid link) but is not a CCR process: fail closed
-  const mcp2 = await virtualSandbox({ extraRows: [{ pid: 802, ppid: 500, name: "node.exe", cmd: "node some-mcp-server.js", created: new Date(1_800_000_000_000 - 1e5).toISOString() }] });
-  await assert.rejects(() => prims(mcp2).restartWorker(), (e) => REFUSAL.test(e.message) && /its descendant 802: .*not a CCR process \(node some-mcp-server\.js\)/.test(e.message));
-  assert.deepEqual(mcp2.V.stopped, []);
-  // and a valid child that is the orchestrator itself
-  const me = await virtualSandbox({ extraRows: [{ pid: 803, ppid: 500, name: "node.exe", cmd: "node claude-code-router x", created: new Date(1_800_000_000_000 - 1e5).toISOString() }], ancestorsOverride: [710, 720] });
-  me.d.sys.selfPid = 803;
-  await assert.rejects(() => prims(me).restartWorker(), /its descendant 803: it is the orchestrator itself/);
-  assert.deepEqual(me.V.stopped, []);
-});
-
 test("descentProof: a link is trusted only when the child is YOUNGER than its parent, both times are known, and every parent is in the table (a process behind cmd.exe is not proved)", () => {
   const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
   const rows = [{ pid: 1, ppid: 0, created: t(0) }, { pid: 2, ppid: 1, created: t(10) }, { pid: 3, ppid: 2, created: t(20) }];
@@ -945,119 +895,6 @@ test("descentProof: a link is trusted only when the child is YOUNGER than its pa
   assert.match(S.descentProof([rows[0], { pid: 3, ppid: 2, created: t(20) }], 3, 1).why, /parent 2 is not in the process table .*cmd\.exe/);
   assert.match(S.descentProof([rows[0], { pid: 2, ppid: 1 }], 2, 1).why, /creation time is missing/);
   assert.equal(S.descentProof(rows, 1, 1).ok, false, "a pid does not descend from itself");
-});
-
-test("process stop (round 4): every refusal throws BEFORE anything is stopped and names the rule (live service.json pid, baseline, live port owner, a link that cannot be proved, a worker behind cmd.exe, a non-CCR command, an unknown daemon, a daemon that is not the daemon-child, a daemon off the web port, a foreign listener, a descendant that owns a live port or is the live pid, the orchestrator, an ancestor, the daemon itself, no holder)", async () => {
-  const young = new Date(1_800_000_000_000 - 1e5).toISOString(), kid = { pid: 600, ppid: 500, name: "node.exe", cmd: "node claude-code-router child", created: young };
-  const cases = [
-    ["the live service.json pid", { liveSvcText: JSON.stringify({ pid: 500 }) }, /it is the pid in the live service\.json/],
-    ["the baseline's live service.json pid", { baseline: { ccrPids: [900], liveServicePid: 500 } }, /it is the pid in the live service\.json/],
-    ["the baseline set of live CCR pids", { baseline: { ccrPids: [900, 500], liveServicePid: 900 } }, /it is in the baseline set of LIVE CCR pids/],
-    ["a LIVE port owner", { realOwners: { 3456: 500 } }, /it owns live port\(s\) 3456/],
-    ["a worker whose parent link cannot be proved (it sits behind cmd.exe)", { coreRow: { ppid: 710 } }, /its parent 710 is not in the process table \(a process behind cmd\.exe/],
-    ["a worker created BEFORE its recorded parent (pid reuse)", { coreRow: { created: new Date(1_800_000_000_000 - 9e5).toISOString() } }, /was created BEFORE its recorded parent 100/],
-    ["a command line that is not CCR", { coreRow: { cmd: "notepad.exe" } }, /its command line is not a CCR process \(notepad\.exe\)/],
-    ["an unknown daemon", { daemonKnown: false }, /the sandbox daemon pid is not known/],
-    ["a daemon whose command line is not the daemon-child (M3)", { daemonCmd: "node claude-code-router something-else" }, /the sandbox daemon's command line is not the CCR daemon-child/],
-    ["the daemon not holding the web port", { webHolder: 7 }, /does not hold the sandbox web port/],
-    ["a listener outside the sandbox", { listens: [{ addr: "0.0.0.0", port: 39457 }] }, /it listens outside the sandbox: .*not loopback/],
-    ["a descendant that owns a live port", { extraRows: [kid], realOwners: { 4517: 600 } }, /its descendant 600: it owns live port\(s\) 4517/],
-    ["a descendant that is the live service.json pid", { extraRows: [kid], liveSvcText: JSON.stringify({ pid: 600 }) }, /its descendant 600: it is the pid in the live service\.json/],
-    ["the core holder is the orchestrator itself", { coreHolderOverride: 700 }, /it is the orchestrator itself/],
-    ["the core holder is an ANCESTOR of the orchestrator", { ancestorsOverride: [500, 710] }, /it is an ancestor of the orchestrator/],
-    ["a torn live service.json", { liveSvcText: "{torn" }, /the live service\.json cannot be read \(\(unparseable\)\)/],
-    ["a failed probe of a live port", { probeFail: [3456] }, /the probe of live port 3456 failed, so who owns it is not known/],
-    ["a failed probe of the web port", { probeFail: [39458] }, /the probe of sandbox web port 39458 failed/],
-    ["a failed probe of the core port (no holder is known)", { probeFail: [39457] }, /the probe of sandbox core port 39457 failed|no process holds the sandbox core port/],
-    ["no baseline at all", { baseline: null }, /the baseline of live CCR pids was not handed over/],
-    ["a baseline without ccrPids", { baseline: { liveServicePid: null } }, /the baseline of live CCR pids was not handed over/],
-    ["an unreadable baseline service.json pid", { baseline: { ccrPids: [900], liveServicePid: "(unparseable)" } }, /the baseline's live service\.json pid is unreadable/],
-    ["a baseline pid that is missing altogether", { baseline: { ccrPids: [900] } }, /the baseline's live service\.json pid is unreadable \(\)/],
-    ["an EMPTY live set while a live service.json was recorded", { baseline: { ccrPids: [], liveServicePid: 900 } }, /lists no live CCR pid but recorded a live service\.json pid 900/],
-  ];
-  for (const [label, opts, re] of cases) {
-    const v = await virtualSandbox(opts);
-    await assert.rejects(() => prims(v).restartWorker(), (e) => /^REFUSED to stop the sandbox core worker, nothing was stopped: /.test(e.message) && re.test(e.message), label);
-    assert.deepEqual(v.V.stopped, [], `${label}: NOTHING was stopped`);
-  }
-  const daemon = await virtualSandbox({ coreHolderOverride: 100 });
-  await assert.rejects(() => prims(daemon).restartWorker(), /it is the sandbox daemon itself/);
-  assert.deepEqual(daemon.V.stopped, []);
-  const none = await virtualSandbox({ coreHolderOverride: null });
-  await assert.rejects(() => prims(none).restartWorker(), /no process holds the sandbox core port/);
-  const noSeam = await virtualSandbox(); delete noSeam.d.sys.stopVerified;
-  await assert.rejects(() => prims(noSeam).restartWorker(), /the system seam has no stopVerified/);
-});
-
-test("process stop (round 4): an EMPTY live set is accepted only when the baseline recorded no live service.json, and says so", async () => {
-  const v = await virtualSandbox({ baseline: { ccrPids: [], liveServicePid: null } });
-  const r = await prims(v).restartWorker();
-  assert.equal(r.changed, true);
-  assert.ok(v.notes.some((l) => /recorded NO live CCR process and no live service\.json/.test(l)), v.notes.join("|"));
-});
-
-test("process stop (round 4): pid reuse. A process table that changes between the two reads (same pid, other creation time or command line) refuses; a pid reused AFTER the second read is refused by the single-step identify-and-stop; a stop that leaves the process in the table throws; nothing else is ever stopped", async () => {
-  const swapped = await virtualSandbox({ onRead: (n, V) => { if (n === 1) { const row = V.all.find((x) => x.pid === 500); row.created = new Date(1_800_000_000_000 - 3e5).toISOString(); } } });
-  await assert.rejects(() => prims(swapped).restartWorker(), (e) => REFUSAL.test(e.message) && /changed between the two reads of the process table/.test(e.message));
-  assert.deepEqual(swapped.V.stopped, []);
-  const recmd = await virtualSandbox({ onRead: (n, V) => { if (n === 1) V.all.find((x) => x.pid === 500).cmd += " --other"; } });
-  await assert.rejects(() => prims(recmd).restartWorker(), /changed between the two reads/);
-  assert.deepEqual(recmd.V.stopped, []);
-  const moved = await virtualSandbox({ coreHolderOverride: (n, V) => (n === 1 ? V.core : 999) });                          // the port changed hands between the first probe and the re-probe before the stop
-  await assert.rejects(() => prims(moved).restartWorker(), (e) => REFUSAL.test(e.message) && /the holder of the sandbox core port changed from 500 before the stop/.test(e.message));
-  assert.deepEqual(moved.V.stopped, []);
-  const late = await virtualSandbox({ beforeStop: (snap, V) => { const row = V.all.find((x) => x.pid === snap.pid); row.created = new Date(1_800_000_000_000 - 1e5).toISOString(); row.cmd = "notepad.exe"; } });   // reused between the second read and the stop
-  await assert.rejects(() => prims(late).restartWorker(), /IDENTITY: creation time differs/);
-  assert.deepEqual(late.V.stopped, [], "the one-step stop refused: nothing was killed");
-  const alive = await virtualSandbox({ staysAlive: true });
-  await assert.rejects(() => prims(alive).restartWorker(), /the stop of pid 500 did not take effect: it is still in the process table/);
-  const gone = await virtualSandbox({ onRead: (n, V) => { if (n === 2) V.all = V.all.filter((x) => x.pid !== 500); } });                  // the worker vanished by itself between the reads
-  await assert.rejects(() => prims(gone).restartWorker(), /IDENTITY: no process row/);       // gone after the second read: the one-step stop finds no process to identify
-  assert.deepEqual(gone.V.stopped, []);
-});
-
-test("process stop (round 4): the cmd.exe case is documented fail-closed: a worker whose parent is a hidden cmd.exe is refused with that reason (the node/ccr table cannot prove the link)", async () => {
-  const v = await virtualSandbox({ coreRow: { ppid: 710 } });
-  await assert.rejects(() => prims(v).restartWorker(), /its parent 710 is not in the process table \(a process behind cmd\.exe or a shell is invisible to the node\/ccr table, so the link cannot be proved\)/);
-  assert.deepEqual(v.V.stopped, []);
-});
-
-test("stopRefusals is pure: the same rules over plain data (an empty list means the process may be stopped); the daemon is never a target", () => {
-  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
-  const scratch = "C:\\scratch\\appdata\\claude-code-router", real = "C:\\Users\\me\\AppData\\Roaming\\claude-code-router", dist = "C:\\ccr\\claude-code-router\\dist\\main";
-  const rows = [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${dist}\\gateway-bootstrap.js`, created: t(10) }];
-  const good = { rows, pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: real, distDir: dist }, selfPid: 7, ancestors: [8] };
-  assert.deepEqual(S.stopRefusals(good), []);
-  assert.ok(S.stopRefusals({ ...good, pid: 100, coreHolder: 100 }).some((x) => /daemon itself/.test(x)));
-  assert.deepEqual(S.stopRefusals({ ...good, coreHolder: 7 }), ["it does not hold the sandbox core port"]);
-  assert.deepEqual(S.stopRefusals({ ...good, expect: null }), ["no command-line expectation (scratch config path, real appdata path, installed CCR dist) was supplied"], "without an expectation a worker is never accepted");
-  assert.ok(S.stopRefusals({ ...good, expect: { ...good.expect, distDir: "" } }).some((x) => /no command-line expectation/.test(x)));
-  assert.deepEqual(S.stopRefusals({ rows, pid: 500, mode: "descendant", underPid: 100, selfPid: 7 }), []);
-  assert.deepEqual(S.stopRefusals({ pid: undefined }), ["no process holds the sandbox core port"]);
-  assert.ok(S.stopRefusals({ ...good, selfPid: 500 }).includes("it is the orchestrator itself"));
-  assert.ok(S.stopRefusals({ ...good, ancestors: [500] }).includes("it is an ancestor of the orchestrator"));
-  assert.ok(S.stopRefusals({ ...good, probeFailed: ["live port 3456"] }).some((x) => /probe of live port 3456 failed/.test(x)));
-});
-
-test("H2 after the stop: no respawn within 30 s, a REPLACED daemon, a new holder that cannot be proved under the daemon and a worker that never answers are each an ERROR of the run (an infrastructure fault, never a router verdict)", async () => {
-  const none = await virtualSandbox({ respawn: false });
-  await assert.rejects(() => prims(none).freshWorker(), /was stopped but no new process took the core port within 30 s: CCR did not respawn it/);
-  assert.deepEqual(none.V.stopped, [500]);
-  const rep = await virtualSandbox({ daemonReplaced: true });
-  await assert.rejects(() => prims(rep).freshWorker(), /the sandbox daemon itself was replaced \(pid 100 -> 101\)/);
-  const stray = await virtualSandbox({ newParent: 1 });
-  await assert.rejects(() => prims(stray).freshWorker(), /does not provably descend from the sandbox daemon 100: its parent 1 is not in the process table/);
-  const dead = await virtualSandbox({ readyAfter: 1e9 });
-  await assert.rejects(() => prims(dead).freshWorker(), /did not answer a request within 20 s/);
-});
-
-test("H2 reset: a clean worker is NOT restarted, a dirty one is replaced, and a refusal reaches the caller", async () => {
-  const ok = await virtualSandbox(), w = prims(ok);
-  await w.reset(); assert.deepEqual(ok.V.stopped, [], "reset on a clean worker stops nothing");
-  w.markDirty(); await w.reset(); assert.deepEqual(ok.V.stopped, [500], "a dirty reset replaced the worker");
-  const live = await virtualSandbox({ liveSvcText: JSON.stringify({ pid: 500 }) }), q = prims(live);
-  q.markDirty(); await assert.rejects(() => q.reset(), /REFUSED/);
-  assert.deepEqual(live.V.stopped, []);
 });
 
 test("the PowerShell of the real stop and probe PARSES (never run here), identifies before it kills, and compares the creation time, the command line and the handle's start time; the pure parsers read their outputs", async () => {
@@ -1202,155 +1039,150 @@ test("H4 the sandbox has ONE provider: two DISTINCT failing models cool the prov
   assert.ok(g.w.cooling.has("uwstub/m-free") && g.w.cooling.has("uwstub/m-big"), "the shipped scenario ends with both cooled (step 2)");
 });
 
-// ====================================================================================== round 5 (sec-s5 re-verification: four small fixes)
-const young = (ms) => new Date(1_800_000_000_000 - ms).toISOString();
-test("F4 stop ORDER is pinned: every descendant (deepest first) is stopped BEFORE the worker, the worker is stopped LAST, and nothing it owned is left behind; reversing the order, or stopping only the worker, fails", async () => {
-  const kids = [{ pid: 600, ppid: 500, name: "node.exe", cmd: "node claude-code-router child", created: young(1e5) }, { pid: 601, ppid: 600, name: "node.exe", cmd: "node claude-code-router grandchild", created: young(5e4) }];
-  const v = await virtualSandbox({ extraRows: kids });
-  const r = await prims(v).restartWorker();
-  assert.deepEqual(v.V.stopped, [601, 600, 500], "the grandchild first, then the child, the worker LAST");
-  assert.deepEqual(v.V.log.filter((x) => x.startsWith("stop:")), ["stop:601", "stop:600", "stop:500"]);
-  assert.ok(!v.V.all.some((x) => x.pid === 600 || x.pid === 601), "no descendant of the old worker is left");
-  assert.equal(r.changed, true);
+// ====================================================================================== fix round 4 (the fourth replay run: CCR 3.0.22 never respawns a killed core worker; the worker is replaced by CCR itself through a sandbox config save)
+const stubModels = (cfg) => cfg.Providers.find((p) => p.name === "uwstub").models;
+
+test("R4-1 the worker is replaced by TWO sandbox config saves (add m-x1 to uwstub, then remove it), each with applyProfile false, through getConfig/saveConfig only; the core pid changes twice; no process is stopped (the seam has no stop function)", async () => {
+  const v = await virtualSandbox(), w = prims(v);
+  assert.equal(v.d.sys.stopVerified, undefined); assert.equal(v.d.sys.listenPortsOf, undefined);
+  const r = await w.restartWorker();
+  assert.deepEqual(r, { pidBefore: 500, pidMid: 501, pidAfter: 502, changed: true, ready: true, saves: 2 });
+  assert.equal(v.V.saves.length, 2);
+  assert.deepEqual(v.V.saves.map((s) => s.opts), [{ applyProfile: false }, { applyProfile: false }], "applyProfile false on both: no global profile apply");
+  assert.ok(stubModels(v.V.saves[0].cfg).includes("m-x1") && stubModels(v.V.saves[0].cfg).length === 4, "the first save ADDS m-x1");
+  assert.ok(!stubModels(v.V.saves[1].cfg).includes("m-x1") && stubModels(v.V.saves[1].cfg).length === 3, "the second REMOVES it: three stub models as before");
+  assert.deepEqual(v.V.rpc, ["getConfig", "saveConfig", "getConfig", "saveConfig"], "no other RPC method");
+  assert.deepEqual(v.V.badRpc, [], "restartGateway and startGateway are never called");
+  assert.equal(v.V.respawns, 2); assert.equal(v.V.core, 502);
+  assert.equal(v.V.tripwire, 2, "the tripwire ran after each save");
+  assert.equal(v.mem.has(v.coolFile), false, "cooling.json (rewritten by the dying worker) is deleted again once the new worker answers");
+  assert.ok(!/Router\.fallback/.test(JSON.stringify(v.V.saves.map((s) => s.cfg.Router))) || v.V.saves.every((s) => s.cfg.Router.fallback.mode === "off"), "the fallback is untouched");
 });
 
-test("F2 the orchestrator's ancestors fail LOUD: an empty or unreadable list refuses (a node process always has a parent), and the query text stops on error", async () => {
-  for (const [label, anc] of [["empty", []], ["not a list", null], ["junk", ["x"]]]) {
-    const v = await virtualSandbox({ ancestorsOverride: anc });
-    v.d.sys.ancestorsOf = () => anc;
-    await assert.rejects(() => prims(v).restartWorker(), (e) => REFUSAL.test(e.message) && /the orchestrator's ancestors could not be read/.test(e.message), label);
-    assert.deepEqual(v.V.stopped, [], label);
-  }
-  const thrown = await virtualSandbox(); thrown.d.sys.ancestorsOf = () => { throw new Error("CIM query failed"); };
-  await assert.rejects(() => prims(thrown).restartWorker(), /CIM query failed/);
-  assert.deepEqual(thrown.V.stopped, []);
-  const E = await import("../harness/subagent-e2e.mjs"), text = E.PS_ANCESTORS(1234);
-  assert.ok(/ErrorActionPreference = 'Stop'/.test(text) && /Get-CimInstance Win32_Process -ErrorAction Stop/.test(text) && !/SilentlyContinue/.test(text), "a failed CIM query throws, it does not yield an empty table");
+test("R4-2 holder-change polling: a slow respawn is waited for (a progress line every 5 s), up to 60 s per save; the wait is 60 s, not 30", async () => {
+  assert.equal(S.WORKER_POLL_MS * S.WORKER_WAIT_POLLS, 60000);
+  const slow = await virtualSandbox({ respawnMs: 23000 });
+  const t0 = slow.V.now, r = await prims(slow).restartWorker();
+  assert.equal(r.changed, true); assert.ok(slow.V.now - t0 >= 46000, `two waits of about 23 s (${slow.V.now - t0} ms virtual)`);
+  assert.ok(slow.V.progress.filter((l) => /^worker restart: after the add save: the core port 39457 is held by nobody, waiting for a process other than 500 \(\d+ s of 60 s\)/.test(l)).length >= 4, "progress lines while waiting");
+  const edge = await virtualSandbox({ respawnMs: 59000 });
+  assert.equal((await prims(edge).restartWorker()).changed, true, "59 s is still inside the window (it would have timed out at 30 s)");
 });
 
-test("F3 the worker is told apart from the LIVE one by its command line: the daemons are identical, so the worker must name the SCRATCH config path, must not name the real Roaming claude-code-router path, and must run a script under the installed CCR dist; a refusal prints the first 120 characters and the missing expectation", async () => {
-  const REAL = "C:\\Users\\osami\\AppData\\Roaming\\claude-code-router";
-  const live = await virtualSandbox({ coreRow: { cmd: `"C:\\nvm4w\\nodejs\\node.exe" --require ${REAL}\\gateway-proxy-preload.cjs ${DIST}\\gateway-bootstrap.js` } });
-  await assert.rejects(() => prims(live).restartWorker(), (e) => REFUSAL.test(e.message) && /its command line names the REAL claude-code-router appdata path C:\\Users\\osami\\AppData\\Roaming\\claude-code-router/.test(e.message) && /does not contain the SANDBOX config path .*first 120 characters of its command line: "C:\\nvm4w\\nodejs\\node\.exe" --require C:\\Users\\osami/.test(e.message));
-  assert.deepEqual(live.V.stopped, []);
-  const elsewhere = await virtualSandbox({ coreRow: { cmd: `node C:\\evil\\x.js ${DIST}\\gateway-bootstrap.js --scratch C:\\x\\claude-code-router` } });          // the dist path is only a SUBSTRING of the command line
-  await assert.rejects(() => prims(elsewhere).restartWorker(), (e) => /its script c:\\evil\\x\.js is not under the installed CCR dist/.test(e.message) && /does not contain the SANDBOX config path/.test(e.message));
-  const sibling = await virtualSandbox({ coreRow: { cmd: `node --require %SCRATCH%\\gateway-proxy-preload.cjs ${DIST}-evil\\gateway-bootstrap.js` } });                      // a prefix of the dir NAME is not under the dir
-  await assert.rejects(() => prims(sibling).restartWorker(), /is not under the installed CCR dist/);
-  for (const [label, opts, re] of [["CCR install unknown", { ccrFound: false }, /the installed CCR \(its dist directory\) is not known/], ["real APPDATA unknown", { appdata: null }, /the real APPDATA is not known/]]) {
-    const v = await virtualSandbox(opts);
-    await assert.rejects(() => prims(v).restartWorker(), (e) => REFUSAL.test(e.message) && re.test(e.message), label);
-    assert.deepEqual(v.V.stopped, [], label);
-  }
-  const kid = await virtualSandbox({ extraRows: [{ pid: 600, ppid: 500, name: "node.exe", cmd: `node claude-code-router --require ${REAL}\\x.cjs`, created: young(1e5) }] });
-  await assert.rejects(() => prims(kid).restartWorker(), /its descendant 600: its command line names the REAL claude-code-router appdata path/);
-  assert.deepEqual(kid.V.stopped, []);
-  const ok = await virtualSandbox(); assert.equal((await prims(ok).restartWorker()).changed, true, "the faithful sandbox worker passes");
-});
-
-test("scriptOf reads the script a node command line runs, skipping flags and the value of --require", () => {
-  assert.equal(S.scriptOf('"C:\\nvm4w\\nodejs\\node.exe" --require C:\\a\\p.cjs C:\\ccr\\dist\\main\\gateway-bootstrap.js --x'), "c:\\ccr\\dist\\main\\gateway-bootstrap.js");
-  assert.equal(S.scriptOf("node -r pre.cjs --max-old-space-size=4096 C:/ccr/dist/main/cli.js serve"), "c:\\ccr\\dist\\main\\cli.js");
-  assert.equal(S.scriptOf("node"), ""); assert.equal(S.scriptOf(""), "");
-});
-
-test("F5 the worker's OWN listener list must contain the sandbox core port: an empty list (a failed query) or a list without it refuses", async () => {
-  for (const [label, listens] of [["empty", []], ["another sandbox port only", [{ addr: "127.0.0.1", port: 39456 }]], ["an ephemeral port only", [{ addr: "127.0.0.1", port: 50123 }]]]) {
-    const v = await virtualSandbox({ listens });
-    await assert.rejects(() => prims(v).restartWorker(), (e) => REFUSAL.test(e.message) && /its OWN listener list \(.*\) does not contain the sandbox core port 39457/.test(e.message), label);
-    assert.deepEqual(v.V.stopped, [], label);
-  }
-  const both = await virtualSandbox({ listens: [{ addr: "127.0.0.1", port: 39457 }, { addr: "127.0.0.1", port: 50123 }] });
-  assert.equal((await prims(both).restartWorker()).changed, true, "the core port plus an ephemeral one is the normal shape");
-  assert.ok(S.stopRefusals({ rows: [], pid: 5, listens: { bad: [], rec: [] }, corePort: 39457 }).some((x) => /OWN listener list \(empty\)/.test(x)));
-});
-
-// ====================================================================================== fix round 3 (the third replay run: the core-worker stop refused a REAL worker; one failed reset leaked cooling into the next scenarios)
-const LINK = "C:\\nvm4w\\nodejs", TARGET = "C:\\Users\\osami\\AppData\\Local\\nvm\\v25.0.0", PKG = "\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
-const linkToTarget = (p) => (p.toLowerCase().startsWith(LINK.toLowerCase() + "\\") ? TARGET + p.slice(LINK.length) : p);
-
-test("R3-1 the real shape: ccr is found through the nvm4w LINK (C:\\nvm4w\\nodejs) while the process table shows the link's TARGET; the stop is accepted (this was refused: the strings share no prefix)", async () => {
-  const opts = { installCli: `${LINK}${PKG}\\cli.js`, workerDist: `${TARGET}${PKG}`, realMap: linkToTarget };
-  const v = await virtualSandbox(opts);
-  const r = await prims(v).restartWorker();
-  assert.equal(r.changed, true); assert.deepEqual(v.V.stopped, [500]);
-  // the defect, reproduced: without the link being resolved the same strings do not match, so the stop is refused with the reported reason
-  const old = await virtualSandbox({ ...opts, realMap: null });
-  await assert.rejects(() => prims(old).restartWorker(), /its script c:\\users\\osami\\appdata\\local\\nvm\\v25\.0\.0\\node_modules\\@musistudio\\claude-cod.* is not under the installed CCR dist/);
-  assert.deepEqual(old.V.stopped, []);
-});
-
-test("R3-2 canonPath and insideDir: case, slashes, `..`, trailing separators, the \\\\?\\ prefix; STRICTLY inside, on a segment boundary", () => {
-  const c = (x) => S.canonPath(x);
-  assert.equal(c("C:/Dist/Main/"), "c:\\dist\\main"); assert.equal(c("\\\\?\\C:\\a\\b"), "c:\\a\\b"); assert.equal(c("C:\\a\\b\\..\\c"), "c:\\a\\c"); assert.equal(c(""), "");
-  assert.equal(S.insideDir("c:\\d\\x.js", "c:\\d"), true);
-  for (const [child, dir] of [["c:\\d-evil\\x.js", "c:\\d"], ["c:\\d", "c:\\d"], ["c:\\d\\", "c:\\d"], ["", "c:\\d"], ["c:\\d\\x.js", ""], ["d:\\d\\x.js", "c:\\d"]]) assert.equal(S.insideDir(child, dir), false, `${child} in ${dir}`);
-});
-
-test("R3-3 the dist rule still refuses: a sibling that shares the prefix, another drive, another package, a `..` escape, the dist directory itself, a script outside; and still accepts case and slash variants", () => {
-  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
-  const scratch = "C:\\scratch\\appdata\\claude-code-router", real = "C:\\Users\\me\\AppData\\Roaming\\claude-code-router", dist = "C:\\ccr\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
-  const withScript = (script) => [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${script}`, created: t(10) }];
-  const run = (script, over = {}) => S.stopRefusals({ rows: withScript(script), pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: real, distDir: dist, ...over }, selfPid: 7, ancestors: [8] });
-  const notUnder = (r) => r.some((x) => /is not under the installed CCR dist/.test(x));
-  assert.deepEqual(run(`${dist}\\gateway-bootstrap.js`), []);
-  assert.deepEqual(run(`${dist.toUpperCase().replace(/\\/g, "/")}/Gateway-Bootstrap.js`), [], "case and slashes");
-  assert.deepEqual(run(`${dist}\\gateway-bootstrap.js`, { distDir: `${dist}\\` }), [], "a trailing separator on the pinned dir");
-  for (const [label, script] of [["sibling with the same prefix", `${dist}-evil\\gateway-bootstrap.js`], ["another drive", `D:${dist.slice(2)}\\gateway-bootstrap.js`], ["another package", dist.replace("claude-code-router", "other-package") + "\\gateway-bootstrap.js"],
-    ["a .. escape", `${dist}\\..\\..\\evil.js`], ["a .. escape back in then out", `${dist}\\sub\\..\\..\\evil.js`], ["the dist directory itself", dist], ["a script elsewhere", "C:\\evil\\x.js"]]) assert.ok(notUnder(run(script)), label);
-  assert.ok(notUnder(run(`${dist}\\gateway-bootstrap.js`, { distDir: dist.replace("claude-code-router", "other-package") })), "the pinned dir is another package");
-});
-
-test("R3-4 on a real filesystem: a junction in front of the install is resolved on BOTH sides (accepted), and a junction INSIDE the dist that leads outside is refused", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uw-canon-"));
-  try {
-    const realDist = path.join(root, "real", "node_modules", "pkg", "dist", "main"), outside = path.join(root, "outside");
-    fs.mkdirSync(realDist, { recursive: true }); fs.mkdirSync(outside);
-    fs.writeFileSync(path.join(realDist, "gateway-bootstrap.js"), "//"); fs.writeFileSync(path.join(outside, "gateway-bootstrap.js"), "//");
-    try { fs.symlinkSync(path.join(root, "real"), path.join(root, "link"), "junction"); fs.symlinkSync(outside, path.join(realDist, "escape"), "junction"); } catch { return; }       // no link support here: nothing to prove
-    const scratch = "C:\\scratch\\appdata\\claude-code-router", t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
-    const run = (script, distDir) => S.stopRefusals({ rows: [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${script}`, created: t(10) }],
-      pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: "C:\\r\\claude-code-router", distDir }, selfPid: 7, ancestors: [8] });
-    const linkDist = path.join(root, "link", "node_modules", "pkg", "dist", "main");
-    assert.deepEqual(run(path.join(realDist, "gateway-bootstrap.js"), linkDist), [], "the install spelled through the link, the process through the target");
-    assert.deepEqual(run(path.join(linkDist, "gateway-bootstrap.js"), realDist), [], "and the other way round");
-    assert.ok(run(path.join(realDist, "escape", "gateway-bootstrap.js"), linkDist).some((x) => /is not under the installed CCR dist/.test(x)), "a script that LOOKS inside the dist but resolves outside is refused");
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
-
-test("R3-5 a failed reset keeps the worker DIRTY: the next reset tries again (a refusal used to clear the flag, so cooling leaked into every later scenario); a run that throws marks the worker dirty too", async () => {
-  const live = await virtualSandbox({ liveSvcText: JSON.stringify({ pid: 500 }) }), q = prims(live);
+test("R4-3 no new holder within 60 s: the call throws naming the wait, the RESTORE save is still sent (the config is never left edited), and the worker stays dirty so the next reset tries again", async () => {
+  const v = await virtualSandbox({ respawn: false }), w = prims(v);
+  const t0 = v.V.now;
+  await assert.rejects(() => w.restartWorker(), /the sandbox core worker was not replaced: no process other than 500 held the core port within 60 s of the add save/);
+  assert.ok(v.V.now - t0 >= 60000, "it waited the whole 60 s");
+  assert.equal(v.V.saves.length, 2, "add AND restore were sent"); assert.ok(!stubModels(v.V.cfg).includes("m-x1"), "and the sandbox config is back to three stub models");
+  const d2 = await virtualSandbox({ respawn: false }), q = prims(d2);
   q.markDirty();
-  await assert.rejects(() => q.reset(), /REFUSED/);
-  await assert.rejects(() => q.reset(), /REFUSED/, "the second reset must not skip the replacement");
-  const ok = await virtualSandbox(), w = prims(ok);
-  w.markDirty(); await w.reset(); await w.reset();
-  assert.deepEqual(ok.V.stopped, [500], "after a successful replacement the flag is cleared: no second stop");
-  let dirty = 0;
-  const res = await S.runScenarios({ reset: async () => { throw new Error("REFUSED to stop"); }, markDirty: () => { dirty += 1; } }, { only: ["4", "5"] });
-  assert.deepEqual(res.map((r) => r.result.verdict), ["FAIL", "FAIL"]);
-  assert.equal(dirty, 2, "each throwing run marked the worker dirty");
+  await assert.rejects(() => q.reset(), /was not replaced/); const first = d2.V.saves.length;
+  await assert.rejects(() => q.reset(), /was not replaced/); assert.ok(d2.V.saves.length > first, "the second reset tried again: the flag was not cleared by the failure");
+  const none = await virtualSandbox({ listenFail: true });
+  await assert.rejects(() => prims(none).restartWorker(), /no process holds the sandbox core port 39457/);
+  assert.deepEqual(none.V.saves, [], "nothing was saved when the holder is not known");
 });
 
-test("R3-6 fail-closed guards: a drive-root, '.', 'c:' or empty dist and a dist under 3 segments refuse; a relative or rooted-without-drive script refuses; the real-shaped link and target still accepts", async () => {
-  assert.equal(S.insideDir(S.canonPath("c:/a/x.js"), S.canonPath("c:/")), true, "the probe that motivates the depth guard: insideDir alone accepts anything on a drive root");
-  assert.deepEqual(["C:\\a\\b", "\\\\host\\share\\a", "c:\\"].map(S.absoluteLocal), [true, true, true]);          // a drive root is absolute: the DEPTH guard is what refuses it
-  assert.deepEqual(["\\x.js", "c:x.js", "harness\\x.js", ".", "", undefined].map(S.absoluteLocal), [false, false, false, false, false, false]);
-  assert.deepEqual(["c:", "c:\\a\\b", "c:\\a\\b\\c", "\\\\host\\share", "\\\\host\\share\\a\\b\\c", ""].map(S.depthBelowRoot), [0, 2, 3, 0, 3, 0]);
-  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
-  const scratch = "C:\\scratch\\appdata\\claude-code-router", real = "C:\\Users\\me\\AppData\\Roaming\\claude-code-router";
-  const run = (script, distDir) => S.stopRefusals({ rows: [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${script}`, created: t(10) }],
-    pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: real, distDir }, selfPid: 7, ancestors: [8] });
-  const DEEP = "C:\\ccr\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
-  assert.deepEqual(run(`${DEEP}\\gateway-bootstrap.js`, DEEP), []);
-  for (const dist of ["C:\\", "c:/", "C:", ".", "", "C:\\a", "C:\\a\\b", "\\\\host\\share\\a\\b"]) assert.ok(run("C:\\a\\x.js", dist).length > 0, `dist ${JSON.stringify(dist)} refuses`);
-  assert.ok(run("C:\\a\\b\\x.js", "C:\\a\\b").some((x) => /too shallow/.test(x)), "two segments is not a package directory");
-  assert.ok(run("C:\\a\\x.js", "C:\\").some((x) => /too shallow|not under/.test(x)) && run("C:\\a\\x.js", "C:\\").some((x) => /too shallow/.test(x)), "a drive root names the depth guard, not only the prefix test");
-  for (const script of ["harness\\x.js", "\\x.js", "c:x.js", "..\\x.js"]) assert.ok(run(script, DEEP).some((x) => /is not an absolute path/.test(x)), `script ${script}`);
-  assert.ok(run(`${DEEP}\\gateway-bootstrap.js`, "relative\\dist\\main").some((x) => /pinned CCR dist .* is not an absolute path/.test(x)));
-  const v = await virtualSandbox({ installCli: `${LINK}${PKG}\\cli.js`, workerDist: `${TARGET}${PKG}`, realMap: linkToTarget });
-  assert.equal((await prims(v).restartWorker()).changed, true, "the real shape (link and target, deep dist) is still accepted");
-  const shallow = await virtualSandbox({ installCli: "C:\\cli.js", workerDist: "C:\\", realMap: null });
-  await assert.rejects(() => prims(shallow).restartWorker(), /too shallow/);
-  assert.deepEqual(shallow.V.stopped, []);
+test("R4-4 the RESTORE save fails: the call throws saying the config still lists the extra stub model, and the worker stays dirty", async () => {
+  const v = await virtualSandbox({ failSave: 2 }), w = prims(v);
+  await assert.rejects(() => w.restartWorker(), /the RESTORE save failed \(saveConfig failed: scripted\), so the sandbox config still lists the extra stub model/);
+  assert.equal(v.V.saves.length, 2);
+  const d2 = await virtualSandbox({ failSave: 2 }), q = prims(d2);
+  q.markDirty();
+  await assert.rejects(() => q.reset(), /RESTORE save failed/);
+  await assert.rejects(() => q.reset(), /RESTORE save failed|was not replaced/, "still dirty: reset tries again");
+  const add = await virtualSandbox({ failSave: 1 });
+  await assert.rejects(() => prims(add).restartWorker(), /the sandbox core worker was not replaced: the add save failed/);
+  assert.equal(add.V.saves.length, 2, "the restore is still attempted after a failed add");
 });
+
+test("R4-5 every save goes through assertPayloadIsolated (allowProviders) BEFORE it is sent and assertIsolatedConfig after; an isolation violation sends nothing more and stops the whole RUN (runScenarios rethrows it)", async () => {
+  const v = await virtualSandbox(); await prims(v).restartWorker();
+  assert.deepEqual(v.V.guardCalls, [{ allowProviders: true }, { allowProviders: true }], "both payloads were checked, Providers allowed only for the stub provider");
+  const hook = await virtualSandbox({ guardHook: (n) => { if (n === 1) throw new Error("ISOLATION VIOLATION: scripted"); } });
+  await assert.rejects(() => prims(hook).restartWorker(), /ISOLATION VIOLATION: scripted/);
+  assert.equal(hook.V.saves.length, 0, "the refused payload was never sent, and the restore is not tried after a violation");
+  const g2 = await virtualSandbox({ guardHook: (n) => { if (n === 2) throw new Error("ISOLATION VIOLATION: restore payload"); } });
+  await assert.rejects(() => prims(g2).restartWorker(), /ISOLATION VIOLATION: restore payload/); assert.equal(g2.V.saves.length, 1);
+  const trip = await virtualSandbox({ tripwireHook: () => { throw new Error("ISOLATION VIOLATION: tripwire"); } });
+  await assert.rejects(() => prims(trip).restartWorker(), /ISOLATION VIOLATION: tripwire/);
+  const tw = await virtualSandbox({ guardHook: (n) => { if (n === 1) throw new Error("ISOLATION VIOLATION: through the suite"); } });
+  const w = prims(tw); w.markDirty();
+  await assert.rejects(() => S.runScenarios({ ...w, reset: () => w.reset() }, { only: ["4"] }), /ISOLATION VIOLATION: through the suite/, "not one scenario's FAIL: the run stops");
+  assert.equal(S.isFatalRun(Object.assign(new Error("x"), { name: "RpcTimeoutError" })), true); assert.equal(S.isFatalRun(Object.assign(new Error("x"), { name: "RefusalError" })), true);
+  assert.equal(S.isFatalRun(new Error("the sandbox core worker was not replaced: x")), false, "an ordinary failure of the replacement is one scenario's FAIL");
+});
+
+test("R4-6 a payload that names a non-sandbox path or port refuses before anything is sent: a live port, the live settings file, another router path, a provider that is not the stub", async () => {
+  const { LIVE_SETTINGS } = await import("../harness/config.mjs");
+  const cases = [
+    ["live gateway port", (cfg) => { cfg.gateway.port = 3456; cfg.PORT = 3456; }, /ISOLATION VIOLATION/],
+    ["live core port", (cfg) => { cfg.gateway.corePort = 3457; }, /ISOLATION VIOLATION/],
+    ["live settings file", (cfg) => { cfg.profile.profiles[0].settingsFile = LIVE_SETTINGS; }, /ISOLATION VIOLATION/],
+    ["blank settings file", (cfg) => { cfg.profile.profiles[0].settingsFile = ""; }, /ISOLATION VIOLATION/],
+    ["another router path", (cfg) => { cfg.CUSTOM_ROUTER_PATH = "C:\\Users\\me\\.uw\\spike\\uw-router.cjs"; }, /CUSTOM_ROUTER_PATH is not the scratch copy/],
+    ["a provider that is not the stub", (cfg) => { cfg.Providers.push({ name: "other", api_base_url: "https://example.invalid", models: ["x"] }); }, /a provider other than the sandbox stub/],
+    ["the stub provider pointing at a live port", (cfg) => { cfg.Providers[0].api_base_url = "http://127.0.0.1:3456"; }, /a provider other than the sandbox stub/],
+    ["an enabled Router rule", (cfg) => { cfg.Router.rules = [{ id: "r", enabled: true }]; }, /an enabled Router\.rules entry exists/],
+    ["a fallback chain naming a live model", (cfg) => { cfg.Router.fallback = { mode: "model-chain", models: ["anthropic/claude-sonnet-5-5"] }; }, /a fallback model is not a uwstub\/\* selector/],
+  ];
+  for (const [label, tweak, re] of cases) {
+    const v = await virtualSandbox({ cfgTweak: tweak });
+    await assert.rejects(() => prims(v).restartWorker(), re, label);
+    assert.equal(v.V.saves.length, 0, `${label}: nothing was sent`);
+    assert.deepEqual(v.V.badRpc, [], label);
+  }
+});
+
+test("R4-7 after the replacement: the sandbox daemon must be the same one, the new holder must provably descend from it, and the worker must ANSWER; a replaced daemon, an unprovable holder and a worker that never answers all throw", async () => {
+  const daemon = await virtualSandbox({ daemonReplaced: true });
+  await assert.rejects(() => prims(daemon).restartWorker(), /the sandbox daemon itself was replaced \(pid 100 -> 101\)/);
+  const orphan = await virtualSandbox({ newParent: 999 });
+  await assert.rejects(() => prims(orphan).restartWorker(), /does not provably descend from the sandbox daemon 100: its parent 999 is not in the process table/);
+  const stranger = await virtualSandbox({ newParent: 700 });
+  await assert.rejects(() => prims(stranger).restartWorker(), /does not provably descend from the sandbox daemon 100/, "a holder under another process (the orchestrator) is not the daemon's child");
+  const dumb = await virtualSandbox({ readyAfter: 1e9 }), w = prims(dumb);
+  const r = await w.restartWorker();
+  assert.equal(r.ready, false, "40 polls of 500 ms: the call reports it, freshWorker turns it into an error");
+  await assert.rejects(() => w.freshWorker(), /did not answer a request within 20 s after its replacement/);
+  const unknown = await virtualSandbox({ daemonKnown: false });
+  await assert.rejects(() => prims(unknown).restartWorker(), /the sandbox daemon pid is not known/);
+  assert.equal(unknown.V.saves.length, 0);
+});
+
+test("R4-8 reset and the runners use this path: a dirty reset performs the two saves and clears the flag only after they succeeded; a clean reset saves nothing; a throwing run marks the worker dirty; the harness has no process-stopping code and calls no restartGateway/startGateway", async () => {
+  const v = await virtualSandbox(), w = prims(v);
+  await w.reset(); assert.equal(v.V.saves.length, 0, "a clean worker is not replaced");
+  w.markDirty(); await w.reset(); assert.equal(v.V.saves.length, 2, "a dirty one is: two saves"); await w.reset(); assert.equal(v.V.saves.length, 2, "and the flag was cleared after the success");
+  assert.equal(v.V.respawns, 2);
+  let dirty = 0;
+  const res = await S.runScenarios({ reset: async () => { throw new Error("the sandbox core worker was not replaced: x"); }, markDirty: () => { dirty += 1; } }, { only: ["4", "5"] });
+  assert.deepEqual(res.map((r) => r.result.verdict), ["FAIL", "FAIL"]); assert.equal(dirty, 2, "each throwing run marked the worker dirty");
+  const code = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-scenarios.mjs"), "utf8")
+    .split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n").replace(/\n\s*"how the scenarios read the router[^\n]*/, "")
+    .replace(/export function killTree\([^\n]*\n[\s\S]*?\n\}\n/, "");     // killTree (the `claude -p` child this harness spawned itself, killed on a timeout) is the ONE allowed exception: the whole function is cut out before the scan, so a second kill anywhere else is still caught
+  assert.ok(/export function killTree/.test(fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-scenarios.mjs"), "utf8")), "the exception exists: killTree is still there");
+  assert.ok(!/process\.kill|Stop-Process|stopProcess|stopVerified|stopRefusals|descendantsLeafFirst|listenPortsOf|["'`]restartGateway["'`]|["'`]startGateway["'`]|\.rpc\(/.test(code), "no stop seam, no gateway-restart RPC and no direct RPC call in the scenario harness");
+});
+
+test("R4-9 a provider with autoFetchModels refuses before ANY save (CCR would arm a model auto-refresh whose config-change hook runs the global profile apply); the stub provider as the harness creates it (autoFetchModels false, or absent) still passes", async () => {
+  const guard = await import("../harness/guard.mjs");
+  const cfg = await sandboxConfig();
+  assert.doesNotThrow(() => guard.assertPayloadIsolated(cfg, { allowProviders: true }), "no flag: passes");
+  cfg.Providers[0].autoFetchModels = false;
+  assert.doesNotThrow(() => guard.assertPayloadIsolated(cfg, { allowProviders: true }), "false (as buildSandboxConfig writes it): passes");
+  for (const flag of [true, 1, "yes"]) {
+    const bad = structuredClone(cfg); bad.Providers[0].autoFetchModels = flag;
+    assert.throws(() => guard.assertPayloadIsolated(bad, { allowProviders: true }), /autoFetchModels set/, String(flag));
+  }
+  const second = structuredClone(cfg); second.Providers.push({ name: "uwstub2", autoFetchModels: true });
+  assert.throws(() => guard.assertPayloadIsolated(second, { allowProviders: true }), /provider "uwstub2" has autoFetchModels set/, "any provider, not only the first");
+  const v = await virtualSandbox({ cfgTweak: (c2) => { c2.Providers[0].autoFetchModels = true; } });
+  await assert.rejects(() => prims(v).restartWorker(), /ISOLATION VIOLATION.*autoFetchModels set/);
+  assert.equal(v.V.saves.length, 0, "nothing was sent");
+  const ok = await virtualSandbox({ cfgTweak: (c2) => { c2.Providers[0].autoFetchModels = false; } });
+  assert.equal((await prims(ok).restartWorker()).changed, true, "the case it must not break: the stub provider created with the flag false");
+  assert.ok(/autoFetchModels: false/.test(fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-e2e.mjs"), "utf8")), "the e2e stub provider is written with autoFetchModels false");
+});
+

@@ -401,9 +401,9 @@ export function liveServicePid(sys) {
   try { return text == null ? null : Number(JSON.parse(text).pid) || null; } catch { return "(unparseable)"; }
 }
 
-/** The names the LIVE v2 router (G2) writes into state/subagent by design, so a new session or subagent changes them at any moment: its logs (decisions, classify, agents and their rotated .N generations), per-session
+/** The names the LIVE v2 router (G2) writes into state/subagent by design, so a new session or subagent changes them at any moment: its logs (decisions, classify, agents and their rotated .N generations, and the transient claim file `<log>.rot-<pid36>.jsonl` of those three logs only, which v3 rotation renames a log to before it numbers it), per-session
  *  main-<sid>.json and agents-<sid>.jsonl, status.json and status-<worker>.json, cooling.json, its atomic-write temp files (.tmp-<pid>s|a) and any .lock. The sandbox run is never judged on these. */
-export const ROUTER_RUNTIME_RE = /^(agents(-[A-Za-z0-9_-]{1,64})?|decisions|classify)(\.\d+)?\.jsonl$|^main-[A-Za-z0-9_-]{1,64}\.json$|^status(-[0-9a-z]{1,13})?\.json$|^cooling\.json$|\.tmp-\d+[as]\d*$|\.lock$/;
+export const ROUTER_RUNTIME_RE = /^(agents(-[A-Za-z0-9_-]{1,64})?|decisions|classify)(\.\d+)?\.jsonl$|^(agents|decisions|classify)\.rot-[0-9a-z]+\.jsonl$|^main-[A-Za-z0-9_-]{1,64}\.json$|^status(-[0-9a-z]{1,13})?\.json$|^cooling\.json$|\.tmp-\d+[as]\d*$|\.lock$/;
 /** Everything in state/subagent that is NOT router runtime (name:size, sorted): policy.json, shadow.flag and any other or unknown file. A new unknown file, or any size change here, is a difference. */
 const stateSubagentOther = (sys) => (sys.listDir(LIVE_STATE_SUBAGENT) ?? ["(absent)"]).filter((e) => !ROUTER_RUNTIME_RE.test(String(e).replace(/:\d+$/, ""))).join("|");
 

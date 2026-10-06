@@ -22,22 +22,33 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  runE2e, defaults as e2eDefaults, send as e2eSend, waitFor, writeSafe, rmSafe, installRouter, logObj, buildShadowPolicy, policyContentHash, bareOf, modelIs,
+  runE2e, defaults as e2eDefaults, send as e2eSend, waitFor, writeSafe, rmSafe, installRouter, editSandboxConfig, X1_MODEL, logObj, buildShadowPolicy, policyContentHash, bareOf, modelIs,
   ANCHOR, TAG_MODEL, ASKED_MODEL, NOTICE_MARK, X4_AGENT, X4_PARENT,
 } from "./subagent-e2e.mjs";
-import { SANDBOX_PORTS, SCRATCH_ROOT, SCRATCH_STATE_DIR, REPO_ROOT, EXECUTED_FILES as G1_FILES, hashExecutedFiles, CCR_CONFIG_DIR, buildLaunchEnv, resolveCcrInstall, ccrInstallLines, REAL_PORTS, descendantsLeafFirst, liveServicePid, parseListenPorts } from "./subagent-sandbox-spec.mjs";
+import { SANDBOX_PORTS, SCRATCH_ROOT, SCRATCH_STATE_DIR, REPO_ROOT, EXECUTED_FILES as G1_FILES, hashExecutedFiles, CCR_CONFIG_DIR, buildLaunchEnv, resolveCcrInstall, ccrInstallLines, RefusalError } from "./subagent-sandbox-spec.mjs";
+import { STUB_MODELS } from "./stub-upstream.mjs";
 
 export const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SCENARIOS_FILE = "harness/subagent-scenarios.mjs";
 export const APPROVAL_FILE = path.join(HERE, "g1-scenarios-approval.json");           // harness/g1-* is gitignored
 export const APPROVAL_MAX_AGE_MS = 24 * 3600 * 1000;
 /** The router bytes the suite is written for (router/uw-router.next.cjs, the exact bytes G1 passed and the live router has). The plan text carries it, so a router change voids an approval; a test pins it to the file. */
-export const ROUTER_SHA256 = "5da75baa60dadb3aa24ff281d4c5ac460f38067428f8f9067826c7bf516f1182";
+export const ROUTER_SHA256 = "e6a9afac8940ba25d9b87e8a1ad4a7b75feb66619131f3b52427841eba9bf35e";
 export const VERDICTS = Object.freeze(["PASS", "FAIL", "FINDING", "DEGRADED"]);
 const rel = (f) => path.relative(REPO_ROOT, f).replace(/\\/g, "/");
 /** the orchestrator set, this file, and keysync/subagent-policy.mjs (the orchestrator runs it for `last`, see defaultLastText) */
 export const EXECUTED_FILES = Object.freeze([...G1_FILES.map(rel), SCENARIOS_FILE, "keysync/subagent-policy.mjs"]);
 const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
+/** The worker replacement waits for the new core holder up to WORKER_WAIT_POLLS x WORKER_POLL_MS = 60 s (was 30 s) after each of its two saves. */
+export const WORKER_POLL_MS = 500, WORKER_WAIT_POLLS = 120;
+/** The G1 X1 edit: the sandbox stub provider (and only it) gains the model X1_MODEL, or loses it again. `Providers` is part of CCR's own restart test, so a save of either makes CCR stop and respawn its core worker. */
+export function setX1Model(cfg, add) {
+  const p = (cfg.Providers ?? []).find((x) => x && x.name === "uwstub");
+  if (!p) throw new RefusalError("REFUSED: provider uwstub is missing from the sandbox config");
+  p.models = add ? [...STUB_MODELS, X1_MODEL] : [...STUB_MODELS];
+}
+/** An error that must stop the whole run (teardown, evidence), never become one scenario's FAIL: a refusal, a timed-out RPC (it may or may not have been applied), an isolation violation. */
+export const isFatalRun = (e) => !!e && (e.name === "RefusalError" || e.name === "RpcTimeoutError" || /ISOLATION VIOLATION/.test(String(e.message)));
 const clip = (v, n = 80) => String(v ?? "").replace(/[^\x20-\x7e]/g, "?").slice(0, n);
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const asArr = (x) => (Array.isArray(x) ? x : []);
@@ -663,7 +674,7 @@ export async function runScenarios(p, { only = null, runs = null, real = false }
     const n = runs ?? scn.runs, evs = [];
     for (let i = 1; i <= n; i++) {
       try { await p.reset?.(); evs.push(await RUN[scn.id](p, { run: i, real: real && scn.client === "real" })); }     // cooling, an overlay record and a rollback flag of an earlier scenario must not leak into this one
-      catch (e) { evs.push({ __error: clip(e?.message, 160) }); p.markDirty?.(); }       // a run that threw (or a reset that could not replace the worker) may have left cooling in the worker's memory: the NEXT reset must replace it
+      catch (e) { if (isFatalRun(e)) throw e; evs.push({ __error: clip(e?.message, 160) }); p.markDirty?.(); }     // a run that threw (or a reset that could not replace the worker) may have left cooling in the worker's memory: the NEXT reset must replace it
     }
     const errs = evs.filter((e) => e && e.__error);
     const res = errs.length ? { id: scn.id, verdict: "FAIL", runs: evs.length, passed: evs.length - errs.length, text: `a run threw: ${errs[0].__error}`, rows: [] } : judgeRuns(scn, evs);
@@ -759,34 +770,6 @@ async function defaultLiveRequestsFor(sessionIds, sinceMs) {
   } finally { open.close?.(); }
 }
 
-const normCmd = (x) => String(x ?? "").replace(/\//g, "\\").toLowerCase();
-/**
- * A path in ONE comparable form: separators turned to backslashes, `.` and `..` segments resolved, the `\\?\` prefix and trailing separators cut, lower case, and, when the path exists on disk, its REAL path first
- * (a symlink, a junction or an 8.3 name turned into the target the process was really started from). The installed CCR is found through PATH, and PATH may hold a link (nvm4w: C:\nvm4w\nodejs is a symlink to the
- * versioned nvm directory) while the process table shows the target: both sides of the dist comparison go through this function, so they agree whichever spelling either one has. A path that is not on disk is only normalised.
- */
-export function canonPath(x, fsx = fs) {
-  let r = String(x ?? "");
-  if (!r) return "";
-  try { const rp = fsx.realpathSync; const real = (rp?.native ?? rp)?.call(fsx, r); if (typeof real === "string" && real) r = real; } catch { /* not on disk: only normalised */ }
-  return path.win32.normalize(r.replace(/\//g, "\\")).replace(/^\\\\\?\\/, "").replace(/\\+$/, "").toLowerCase();
-}
-/** An absolute path with a root of its own: a drive letter (`C:\x`) or a UNC share (`\\host\share\x`). `\x` (rooted on the current drive), `c:x` (drive-relative) and `x\y` are not. */
-export const absoluteLocal = (x) => { const s = String(x ?? "").replace(/\//g, "\\"); return path.win32.isAbsolute(s) && /^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)/.test(s); };
-/** The number of path segments below the root of a CANONICAL path (the drive, or `\\host\share`): `c:` is 0, `c:\a\b` is 2. */
-export const depthBelowRoot = (canon) => { const s = String(canon ?? ""); const rest = /^\\\\/.test(s) ? s.replace(/^\\\\[^\\]*\\?[^\\]*/, "") : s.replace(/^[a-z]:/i, ""); return rest.split("\\").filter(Boolean).length; };
-/** `child` lies STRICTLY inside `dir` (both canonical): on a path-segment boundary, so a sibling that merely shares the prefix (dist-evil) is not inside. */
-export const insideDir = (child, dir) => !!child && !!dir && child.startsWith(dir + "\\") && child.length > dir.length + 1;
-/** The script a node command line runs: the first argument after the executable that is not a flag and not the value of --require, -r, --import or --loader (normalised). */
-export function scriptOf(cmd) {
-  const toks = [...String(cmd).matchAll(/"([^"]*)"|(\S+)/g)].map((m) => m[1] ?? m[2]);
-  for (let i = 1; i < toks.length; i++) {
-    if (["--require", "-r", "--import", "--loader", "--experimental-loader"].includes(toks[i])) { i += 1; continue; }
-    if (toks[i].startsWith("-")) continue;
-    return normCmd(toks[i]);
-  }
-  return "";
-}
 /**
  * Does `pid` descend from `ancestor` by parent links that SURVIVE the creation-time test? Windows does not invalidate a stale ParentProcessId when a pid is reused, so a link child -> parent is trusted only when the child
  * was created AFTER that parent, both creation times are known, and every parent on the way is in the table. A process behind cmd.exe or a shell is invisible to the node/ccr table: its link cannot be proved, so it is NOT
@@ -810,63 +793,6 @@ export function descentProof(rows, pid, ancestor) {
   return { ok: false, why: "the parent chain is deeper than 32" };
 }
 
-/**
- * Why a process must NOT be stopped when the suite replaces the sandbox's router worker (an empty list = it may be). Pure over what it is given, so a fake sandbox can drive every refusal.
- * Always: not the orchestrator itself and not one of its ancestors; not in the baseline set of LIVE CCR pids; not the live service.json pid (now or at the baseline); owns none of the live ports 3456/3457/3458/4517
- * (and no live-port probe failed); a CCR command line; a known creation time.
- * mode "core": a descendant of the verified sandbox daemon by creation-time-ordered links (never the daemon itself), the holder of the sandbox core port, the daemon identified as a CCR `daemon-child` that holds the
- * sandbox web port (as the harness's teardown requires), listening on sandbox ports only. mode "descendant" (a process under the core worker): a creation-time-ordered descent from `underPid`.
- * rows: process table {pid, ppid, name, cmd, created}; realOwners: {livePort: pid | null}; probeFailed: names of probes that failed; listens: parseListenPorts() of the process.
- */
-export function stopRefusals({ mode = "core", rows = [], pid, selfPid = null, ancestors = [], baselinePids = [], liveSvcPids = [], realOwners = {}, probeFailed = [], underPid = null, daemonPid = null, coreHolder = null, webHolder = null, listens = null, corePort = null, expect = null } = {}) {
-  if (!Number.isInteger(pid)) return ["no process holds the sandbox core port"];
-  const why = [], row = rows.find((r) => r.pid === pid);
-  if (selfPid != null && pid === selfPid) why.push("it is the orchestrator itself");
-  if (asArr(ancestors).includes(pid)) why.push("it is an ancestor of the orchestrator");
-  if (baselinePids.includes(pid)) why.push("it is in the baseline set of LIVE CCR pids");
-  if (liveSvcPids.includes(pid)) why.push("it is the pid in the live service.json");
-  const held = REAL_PORTS.filter((p) => realOwners[p] === pid);
-  if (held.length) why.push(`it owns live port(s) ${held.join(",")}`);
-  if (probeFailed.length) why.push(`the probe of ${probeFailed.join(", ")} failed, so who owns it is not known`);
-  if (!row) why.push("it is not in the process table");
-  else {
-    if (!/claude-code-router/i.test(String(row.cmd))) why.push(`its command line is not a CCR process (${clip(row.cmd, 60)})`);
-    if (!Number.isFinite(Date.parse(String(row.created)))) why.push("its creation time is unknown");
-  }
-  const cmdN = row ? normCmd(row.cmd) : "";
-  if (expect?.realDir && cmdN.includes(normCmd(expect.realDir))) why.push(`its command line names the REAL claude-code-router appdata path ${expect.realDir}: it belongs to the live install`);
-  if (mode === "descendant") {
-    const pr = descentProof(rows, pid, underPid);
-    if (!pr.ok) why.push(`it is not provably a descendant of pid ${underPid}: ${pr.why}`);
-    return why;
-  }
-  if (!Number.isInteger(daemonPid)) why.push("the sandbox daemon pid is not known");
-  else {
-    const dr = rows.find((r) => r.pid === daemonPid);
-    if (pid === daemonPid) why.push("it is the sandbox daemon itself (only its core worker child may be replaced)");
-    else { const pr = descentProof(rows, pid, daemonPid); if (!pr.ok) why.push(`it is not provably a descendant of the sandbox daemon ${daemonPid}: ${pr.why}`); }
-    if (!dr || !/claude-code-router/i.test(String(dr.cmd)) || !/daemon-child/i.test(String(dr.cmd))) why.push("the sandbox daemon's command line is not the CCR daemon-child");
-    if (webHolder !== daemonPid) why.push("the sandbox daemon does not hold the sandbox web port (the daemon identity is not confirmed)");
-  }
-  if (coreHolder !== pid) why.push("it does not hold the sandbox core port");
-  if (listens?.bad?.length) why.push(`it listens outside the sandbox: ${listens.bad.join("; ")}`);
-  if (!listens || corePort == null || !asArr(listens.rec).includes(corePort)) why.push(`its OWN listener list (${asArr(listens?.rec).join(",") || "empty"}) does not contain the sandbox core port ${corePort ?? "?"} (an empty list proves nothing)`);
-  // the live and the sandbox daemons have IDENTICAL command lines, so the worker is told apart by what its command line names: the SCRATCH config path, never the real Roaming one, and a script under the installed CCR dist
-  if (!expect?.scratchDir || !expect?.realDir || !expect?.distDir) why.push("no command-line expectation (scratch config path, real appdata path, installed CCR dist) was supplied");
-  else if (row) {
-    const first = `first 120 characters of its command line: ${clip(row.cmd, 120)}`;
-    if (!cmdN.includes(normCmd(expect.scratchDir))) why.push(`its command line does not contain the SANDBOX config path ${expect.scratchDir} (${first})`);
-    // BOTH sides in canonical form (real path, resolved `..`, lower case): the install path comes from PATH (a link), the command line from the process table (the link's target). Strictly inside, on a segment boundary.
-    // Fail closed before comparing: a RELATIVE script token would be realpath'ed against the orchestrator's cwd, a drive root, `.` or an empty pin would make "inside the dist" mean "anywhere on the drive", and a dist
-    // shallower than 3 segments below the drive is not a package directory.
-    const canon = typeof expect.canon === "function" ? expect.canon : canonPath, rawScript = scriptOf(row.cmd), script = canon(rawScript), dist = canon(expect.distDir);
-    if (!absoluteLocal(rawScript)) why.push(`its script ${clip(rawScript || "(none)", 80)} is not an absolute path (a relative one would be resolved against this process's working directory)`);
-    if (!absoluteLocal(expect.distDir)) why.push(`the pinned CCR dist ${clip(expect.distDir || "(none)", 80)} is not an absolute path`);
-    else if (depthBelowRoot(dist) < 3) why.push(`the pinned CCR dist ${clip(expect.distDir, 80)} is too shallow (${clip(dist || "(empty)", 60)}): fewer than 3 path segments below the drive, so it is not a package directory`);
-    if (!insideDir(script, dist)) why.push(`its script ${clip(script || "(none)", 80)} is not under the installed CCR dist ${expect.distDir} (${first})`);
-  }
-  return why;
-}
 
 /** The primitives over a live sandbox (the e2e context `c`). Not unit-tested against a gateway: its effects are unit-checked through the injected `d` (a fake filesystem and fake spawn). */
 export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [], rollbackFn = null, real = false, identity = null, liveRequestsFor = defaultLiveRequestsFor } = {}) {
@@ -911,62 +837,40 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
     resume: async () => { rmSafe(d, state("shadow.flag")); },
     feedOverlay: async (model, st) => { writeSafe(d, path.join(SCRATCH_STATE_DIR, "..", "observed.json"), JSON.stringify({ schema: 1, writtenAt: new Date(d.now()).toISOString(), feed: "ok", models: { [model]: { s: st, t: 0, a: Math.floor(d.now() / 1000), l: 1 } } })); return true; },
     lastOut: lastText,
-    // The config swap (two Router.fallback edits) did NOT make CCR respawn its core worker in the second replay, so the worker is replaced by a STOP of the sandbox's core worker child (the holder of the sandbox core port); CCR
-    // respawns it. Nothing is stopped unless every rule of stopRefusals holds, for the worker and for each descendant that provably descends from it; otherwise the call throws. The order is: probes first, the process table
-    // LAST (twice: the second read, right before the stop, must show the same targets with the same creation times and command lines), then each target is identified AND stopped in ONE step (stopVerified holds a handle, compares
-    // the snapshot, kills, confirms the exit), then the table is read again to see the targets are gone.
+    // WHY NOT A KILL. CCR 3.0.22 never respawns a dead core worker: its exit handler only sets the gateway state to "error" (dist cli.js handleCoreGatewayTermination), and nothing starts it again until `start(config)` runs.
+    // `start()` runs when a saved config differs in something `_E(old, new)` compares (ports, observability, proxy, agent, Providers, plugins, ...) and it begins with `stop()`, which ends the old worker itself, then spawns a
+    // new one. A Router.fallback swap is outside `_E` (a hot update, no respawn), but a Providers edit is inside it: so the worker is replaced the way G1 X1 does it, by adding a model to the sandbox stub provider and removing
+    // it again, each save through the SANDBOX web RPC with applyProfile false (editSandboxConfig: payload checked before it is sent, the persisted result after, only the stub provider allowed, tripwire after).
+    // restartGateway and startGateway are NEVER called (they apply the global profile with no opt-out) and no process is stopped by this harness: CCR replaces its own worker. Two saves, so two respawns.
     restartWorker: async () => {
-      const sys = d.sys, core = SANDBOX_PORTS.core, refuse = (m) => { throw new Error(`REFUSED to stop the sandbox core worker, nothing was stopped: ${m}`); };
-      for (const fn of ["processes", "listenerProbe", "ancestorsOf", "stopVerified"]) if (typeof sys[fn] !== "function") refuse(`the system seam has no ${fn}`);
-      const b = c.baseline;
-      if (!b || !Array.isArray(b.ccrPids)) refuse("the baseline of live CCR pids was not handed over (an unknown live set is never treated as empty)");
-      if (b.liveServicePid !== null && !Number.isInteger(b.liveServicePid)) refuse(`the baseline's live service.json pid is unreadable (${clip(b.liveServicePid, 20)})`);
-      if (b.ccrPids.length === 0) { if (b.liveServicePid !== null) refuse(`the baseline lists no live CCR pid but recorded a live service.json pid ${b.liveServicePid}`); c.out?.("process stop: the baseline recorded NO live CCR process and no live service.json before the run, so an empty live set is accepted"); }
-      const liveNow = liveServicePid(sys);
-      if (liveNow !== null && !Number.isInteger(liveNow)) refuse(`the live service.json cannot be read (${clip(liveNow, 20)})`);
-      const liveSvcPids = [liveNow, b.liveServicePid].filter(Number.isInteger);
+      const sys = d.sys, core = SANDBOX_PORTS.core, fail = (m) => { throw new Error(`the sandbox core worker was not replaced: ${m}`); };
+      for (const fn of ["processes", "listenerProbe"]) if (typeof sys[fn] !== "function") fail(`the system seam has no ${fn}`);
       const daemonPid = typeof c.daemonPid === "function" ? c.daemonPid() : c.daemonPid;
-      const coreP = sys.listenerProbe(core), webP = sys.listenerProbe(SANDBOX_PORTS.web), realP = REAL_PORTS.map((p) => [p, sys.listenerProbe(p)]);
-      const probeFailed = [[`sandbox core port ${core}`, coreP], [`sandbox web port ${SANDBOX_PORTS.web}`, webP], ...realP.map(([p, x]) => [`live port ${p}`, x])].filter(([, x]) => !x?.ok).map(([n]) => n);
-      const pidBefore = coreP?.ok ? coreP.pid : null;
-      const realOwners = Object.fromEntries(realP.map(([p, x]) => [p, x?.ok ? x.pid : undefined]));
-      const listens = Number.isInteger(pidBefore) ? parseListenPorts(sys.listenPortsOf?.(pidBefore) ?? []) : null;
-      const selfPid = sys.selfPid, ancestors = sys.ancestorsOf(selfPid);
-      if (!Array.isArray(ancestors) || ancestors.length < 1 || !ancestors.every(Number.isInteger)) refuse(`the orchestrator's ancestors could not be read (a node process always has a parent; got ${clip(JSON.stringify(ancestors), 40)}): the orchestrator and its parents cannot be protected`);
-      const install = d.ccrInstall?.(), appdata = d.env?.APPDATA;
-      if (!install?.found || !install.cli) refuse("the installed CCR (its dist directory) is not known");
-      if (!appdata) refuse("the real APPDATA is not known, so the live claude-code-router path cannot be excluded");
-      const expect = { scratchDir: CCR_CONFIG_DIR, realDir: path.join(String(appdata), "claude-code-router"), distDir: path.dirname(install.cli), canon: (x) => canonPath(x, d.fs) };
-      const evaluate = () => {                                                                // the table is read HERE, last
-        const rows = sys.processes(), why = [], targets = [], skipped = [];
-        const common = { rows, selfPid, ancestors, baselinePids: b.ccrPids, liveSvcPids, realOwners, probeFailed };
-        why.push(...stopRefusals({ ...common, mode: "core", pid: pidBefore, daemonPid, coreHolder: pidBefore, webHolder: webP?.ok ? webP.pid : null, listens, corePort: core, expect }));
-        if (Number.isInteger(pidBefore)) {
-          for (const k of descendantsLeafFirst(rows, pidBefore)) {                           // every row whose recorded parent chain reaches the worker; deepest first
-            if (!descentProof(rows, k, pidBefore).ok) { skipped.push(k); continue; }       // a stale parent id (pid reuse) or an unprovable link: NOT this worker's descendant, never stopped
-            const w = stopRefusals({ ...common, mode: "descendant", pid: k, underPid: pidBefore, expect });
-            if (w.length) why.push(`its descendant ${k}: ${w.join(", ")}`); else targets.push(k);
-          }
+      if (!Number.isInteger(daemonPid)) fail("the sandbox daemon pid is not known, so the new worker cannot be tied to it");
+      const holder = () => { const h = sys.listenerProbe(core); return h?.ok && Number.isInteger(h.pid) ? h.pid : null; };
+      const pidBefore = holder();
+      if (pidBefore === null) fail(`no process holds the sandbox core port ${core}`);
+      const awaitNew = async (from, what) => {                                              // up to 60 s, a progress line every 5 s
+        for (let i = 1; i <= WORKER_WAIT_POLLS; i++) {
+          await d.sleep(WORKER_POLL_MS);
+          const h = holder();
+          if (h !== null && h !== from) return h;
+          if (i % 10 === 0) c.out?.(`worker restart: ${what}: the core port ${core} is held by ${h ?? "nobody"}, waiting for a process other than ${from} (${i * WORKER_POLL_MS / 1000} s of ${WORKER_WAIT_POLLS * WORKER_POLL_MS / 1000} s)`);
         }
-        const snap = (pid) => { const r = rows.find((x) => x.pid === pid); return { pid, ppid: r?.ppid, created: r?.created, cmd: r?.cmd }; };
-        return { why, skipped, targets: [...targets, ...(Number.isInteger(pidBefore) ? [pidBefore] : [])].map(snap) };
+        return null;
       };
-      const first = evaluate();
-      if (first.why.length) refuse(`pid ${pidBefore ?? "?"}: ${first.why.join("; ")}`);
-      const again = sys.listenerProbe(core);
-      if (!again?.ok || again.pid !== pidBefore) refuse(`the holder of the sandbox core port changed from ${pidBefore} before the stop`);
-      const second = evaluate();
-      if (second.why.length) refuse(`pid ${pidBefore}, at the second read: ${second.why.join("; ")}`);
-      const key = (s) => `${s.pid}|${s.ppid}|${s.created}|${s.cmd}`;
-      if (first.targets.map(key).join("\n") !== second.targets.map(key).join("\n")) refuse("the targets (pid, parent, creation time, command line) changed between the two reads of the process table");
-      if (first.skipped.length) c.out?.(`process stop: ignored ${first.skipped.join(", ")} (a stale parent id or an unprovable link: not a descendant of the worker, never stopped)`);
-      for (const t of second.targets) sys.stopVerified(t);                                  // leaf first, the core worker last; each call identifies and stops in one step and throws on any mismatch or a process that stays
-      const left = sys.processes().filter((r) => second.targets.some((t) => t.pid === r.pid && t.created === r.created));
-      if (left.length) throw new Error(`the stop of pid ${left.map((r) => r.pid).join(", ")} did not take effect: it is still in the process table`);
-      let pidAfter;
-      for (let i = 0; i < 60 && !pidAfter; i++) { await d.sleep(500); const h = sys.listenerProbe(core); if (h?.ok && h.pid && h.pid !== pidBefore) pidAfter = h.pid; }
-      if (!pidAfter) throw new Error(`the sandbox core worker (pid ${pidBefore}) was stopped but no new process took the core port within 30 s: CCR did not respawn it`);
-      // the layout may have changed: the daemon must be the SAME one (the isolation proof pins its pid), and the new holder must provably descend from it
+      let pidMid = null, problem = null;
+      try { await editSandboxConfig(c, "scn-restart-add", (cfg) => setX1Model(cfg, true)); }
+      // A fatal error in the add edit (isolation violation, refusal, timed-out RPC) is rethrown WITHOUT a restore, on purpose: nothing more is sent to a daemon whose isolation is in doubt. The sandbox config may keep m-x1;
+      // that is harmless (teardown scrubs Providers[]) and R4-5 pins it.
+      catch (e) { if (isFatalRun(e)) throw e; problem = `the add save failed: ${clip(e?.message, 120)}`; }
+      if (!problem) { pidMid = await awaitNew(pidBefore, "after the add save"); if (pidMid === null) problem = `no process other than ${pidBefore} held the core port within ${WORKER_WAIT_POLLS * WORKER_POLL_MS / 1000} s of the add save`; }
+      try { await editSandboxConfig(c, "scn-restart-restore", (cfg) => setX1Model(cfg, false)); }       // always tried: the sandbox config is never left edited
+      catch (e) { if (isFatalRun(e)) throw e; throw new Error(`the sandbox core worker was not replaced cleanly: ${problem ? `${problem}; ` : ""}the RESTORE save failed (${clip(e?.message, 120)}), so the sandbox config still lists the extra stub model`); }
+      if (problem) fail(problem);
+      const pidAfter = await awaitNew(pidMid, "after the restore save");
+      if (pidAfter === null) fail(`no process other than ${pidMid} held the core port within ${WORKER_WAIT_POLLS * WORKER_POLL_MS / 1000} s of the restore save`);
+      // the daemon must be the SAME one (the isolation proof pins its pid) and the new holder must provably descend from it
       const web = d.resolveWebPort();
       if (web.pid !== daemonPid) throw new Error(`the sandbox daemon itself was replaced (pid ${daemonPid} -> ${web.pid}) while its core worker was: the isolation proof pins the daemon pid, so the run cannot go on`);
       const proof = descentProof(sys.processes(), pidAfter, daemonPid);
@@ -975,7 +879,7 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
       let ready = false;
       for (let i = 0; i < 40 && !ready; i++) { const r = await prims.send("aux", { model: ASKED_MODEL, agentId: "uwsc-ready", session: "uwsc-ready", messages: 1 }); ready = r.status === 200; if (!ready) await d.sleep(500); }
       rmSafe(d, state("cooling.json"));
-      return { pidBefore, pidAfter, changed: pidAfter !== pidBefore, ready };
+      return { pidBefore, pidMid, pidAfter, changed: pidAfter !== pidBefore, ready, saves: 2 };
     },
     freshWorker: async () => {
       const r = await prims.restartWorker();
@@ -1027,7 +931,7 @@ export function planLines() {
     "`--real yes` is a SEPARATE, RISKIER mode with its own consent (--approve-plan --real yes): a real headless Claude Code (`claude -p`) is started for scenarios 1, 2, 3 and 11 only (the others, and the free-mode variant of 2 and the cooldown steering of 3, stay replays). It is pointed at the sandbox by environment only (the sandbox's whitelist launch environment with HOME, USERPROFILE, APPDATA, LOCALAPPDATA, TEMP and CLAUDE_CONFIG_DIR under the scratch root, ANTHROPIC_BASE_URL and a sandbox-only key, a scratch working directory, a canary settings.json in the sandbox claude-config, --setting-sources user and --strict-mcp-config when the launcher has them). The approval pins the launcher's path, sha256 and --version. After the run the suite checks that the real ~/.claude.json and ~/.claude/projects hold nothing for the scratch directory, that the child wrote under the sandbox claude-config, and that no request carrying its session id reached the live gateway (result RC). That the real ~/.claude is never touched cannot be verified offline.",
     "scenarios (what each must prove; client: REAL = the client's own behaviour is measured with --real yes, REPLAY = the shapes are enough):",
     ...SCENARIOS.map((s) => `  ${s.id.padStart(2)} ${s.title} [${s.client === "real" ? "REAL with --real yes, else replay" : "REPLAY"}, ${s.runs} run${s.runs === 1 ? "" : "s"}]: ${s.proves}`),
-    "how the scenarios read the router (stated so a result can be trusted): (a) every counter and the cooling list come from a FRESH status: the router flushes status.json at most every 5 s, so the suite waits 5.1 s after its last request, sends one helper-shaped (aux) request, waits for the write and then reads; the router's own agent and decision logs are read as a second witness where one exists (a handoff line with its rsrc and reason, the first sticky-hit line). (b) MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes (and hands off to) main's model before it spreads (plan 6.2, router decide). Scenarios 3 and 10 therefore keep main OUTSIDE the set (10 names a main model no row has, so its main request may be refused by the gateway: only the router's lesson from it counts), while scenarios 2 and 7 keep it in the set on purpose (their handoff target is main's model). Whether that shortcut is wanted is an owner decision still open; the suite documents it, it does not judge it. (c) A router worker that served earlier scenarios is REPLACED before the next one when an earlier scenario left state in it (cooling in memory and, for a provider key, for two minutes; open log files; a Router.fallback config swap was tried first and did not make CCR respawn the worker, so it is not used), by a STOP of the sandbox's core worker child (the process that holds the sandbox core port): CCR respawns it, the suite waits (30 s at most) for a NEW pid on the core port, checks that the sandbox daemon is the same one and that the new holder provably descends from it, polls a request until it answers 200, and deletes cooling.json again (the dying worker can rewrite it). This is the only destructive act on a process the suite makes, and its rules are fail-closed (anything unknown refuses, the run throws, nothing is stopped): (1) the baseline of LIVE CCR pids must have been handed over (an empty one is accepted only when no live service.json was recorded, and the run says so), the live service.json must be readable (a torn one refuses) and is compared with the one recorded at the baseline; (2) every port probe is STRICT: a probe that failed is not 'no listener' and refuses; (3) the target is never the orchestrator itself and never one of its ancestors (read from the unfiltered process table, parent first; the query stops on error, and an empty or unreadable list refuses, because a node process always has a parent); (4) it is not in the baseline set of live CCR pids, not the live service.json pid, owns none of 3456/3457/3458/4517, has a CCR command line and a known creation time, listens on sandbox ports only, holds the sandbox core port, and the sandbox core port is IN its own listener list (an empty list proves nothing); the live and the sandbox daemons have IDENTICAL command lines, so the worker is told apart by what its command line names: the SCRATCH config path (harness/scratch/appdata/claude-code-router) must appear, the real Roaming claude-code-router path must not (this also applies to every descendant), and its script must lie under the installed CCR dist directory (a path prefix, not a substring anywhere); a refusal prints the first 120 characters of the command line and the missing expectation; (5) it must PROVABLY descend from the sandbox daemon: every parent link is trusted only when the child was created LATER than its parent (Windows does not invalidate a stale parent id after pid reuse) and every parent is in the node/ccr process table (a worker behind cmd.exe or a shell cannot be proved and is refused), the daemon is never the target and must be a CCR daemon-child that holds the sandbox web port; (6) a descendant of the worker with a proved link must itself pass rules 3 and 4 (CCR command line included) or the whole stop is refused; a process whose recorded parent is the worker but whose link fails the creation-time test is NOT a descendant and is never stopped; (7) the process table is read LAST, after the probes, and twice: the second read, right before the stop, must show the same targets with the same parent, creation time and command line; (8) each target is identified AND stopped in ONE step (a handle is taken, its creation time, command line and the handle's own start time are compared with the verified snapshot, any difference refuses, then the handle is killed and the exit is awaited and confirmed; no silent failure), deepest first with the core worker LAST (a descendant is never left behind, and the worker is never stopped before the processes under it), and the table is read again to see the targets are gone. The probe reads 'no listener' from the error id CmdletizationQuery_NotFound or, failing that, from English text: on another locale a free port can read as a failed probe, which refuses (fail closed). The isolation proof reports a changed core pid as a RECORD, never a failure. A scenario that needs a clean cooling list checks that it is empty first; a worker that cannot be replaced is an error of the run, not a router verdict. (d) The sandbox has ONE provider: two distinct failing models within five minutes also cool the provider key and demote every row, so scenario 3 cools exactly one model before the all-limited step.",
+    "how the scenarios read the router (stated so a result can be trusted): (a) every counter and the cooling list come from a FRESH status: the router flushes status.json at most every 5 s, so the suite waits 5.1 s after its last request, sends one helper-shaped (aux) request, waits for the write and then reads; the router's own agent and decision logs are read as a second witness where one exists (a handoff line with its rsrc and reason, the first sticky-hit line). (b) MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes (and hands off to) main's model before it spreads (plan 6.2, router decide). Scenarios 3 and 10 therefore keep main OUTSIDE the set (10 names a main model no row has, so its main request may be refused by the gateway: only the router's lesson from it counts), while scenarios 2 and 7 keep it in the set on purpose (their handoff target is main's model). Whether that shortcut is wanted is an owner decision still open; the suite documents it, it does not judge it. (c) A router worker that served earlier scenarios is REPLACED before the next one when an earlier scenario left state in it (cooling in memory and, for a provider key, for two minutes; open log files). The suite STOPS NO PROCESS to do it: CCR 3.0.22 never respawns a dead core worker (its exit handler only sets the gateway to the error state), and a Router.fallback swap is a hot update that does not respawn it either, so the worker is replaced by CCR itself the way G1 X1 does it: the sandbox stub provider uwstub gains one model (m-x1) and loses it again, two saves through the SANDBOX web RPC with applyProfile false; a saved Providers change makes CCR stop its core worker and start a new one. Each save goes through the same checks as every G1 config edit (the payload is checked for isolation BEFORE it is sent, the persisted result AFTER, only the uwstub provider at the sandbox stub address may exist, the tripwire runs after it), restartGateway and startGateway are never called (they apply the global profile with no opt-out), and an isolation violation, a refusal or a timed-out RPC stops the whole run. After each save the suite waits (60 s at most, a progress line every 5 s) for a process other than the previous one to hold the sandbox core port, then checks that the sandbox daemon is the same one and that the new holder provably descends from it (every parent link is trusted only when the child was created later than its parent, and every parent is in the node/ccr process table), polls a request until it answers 200, and deletes cooling.json again (the dying worker can rewrite it). If the restore save fails, or the holder does not change, the call throws and the worker stays marked for replacement; the restore is attempted even after a failed wait, so the sandbox config is not left edited. Every replacement is two saves and two core respawns. The isolation proof reports a changed core pid as a RECORD, never a failure. A scenario that needs a clean cooling list checks that it is empty first; a worker that cannot be replaced is an error of the run, not a router verdict. (d) The sandbox has ONE provider: two distinct failing models within five minutes also cool the provider key and demote every row, so scenario 3 cools exactly one model before the all-limited step.",
     "chaos checks (same sandbox):",
     ...CHAOS.map((s) => `  ${s.id} ${s.title} [REPLAY, ${s.runs} run]: ${s.proves}`),
     "verdicts: PASS; FAIL (anything wrong: the suite is NOT OK); FINDING (allowed ONLY for scenarios 2, 7 and C4: a named thing could not be shown here: no retry signal reached the router, no worker restart could be made, one worker); DEGRADED (scenario 11 ONLY: one failure then avoidance, the behaviour the quality bar promises, never a seamless handoff). Every line that is not a PASS says it is not G3 evidence, and the exit code is non-zero for a FINDING anywhere else.",

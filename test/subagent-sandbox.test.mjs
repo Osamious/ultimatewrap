@@ -502,7 +502,7 @@ test("synthetic shadow policy: deterministic for a fixed clock, three stub model
   assert.equal(p.minRouter, compiled.minRouter);
   for (const k of ["owner", "builtFrom", "counts", "main", "sticky", "inject", "lists"]) assert.deepEqual(keys(p[k]), keys(compiled[k]).filter((x) => k !== "counts" || !COMPILER_ONLY.counts.includes(x)), `keys of ${k}`);
   assert.ok(compiled.lists.prov && typeof compiled.lists.prov === "object" && Object.keys(compiled.lists.prov).length > 0 && Object.values(compiled.lists.prov).every((l) => Array.isArray(l)), "prov is keyed by provider, as in the synthetic file");
-  assert.deepEqual(keys(p.models[0]), keys(compiled.models[0]), "row keys");
+  assert.deepEqual(keys(p.models[0]), keys(compiled.models[0]).filter((k) => k !== "bk"), "row keys (bk, the optional proven-size field, is the one additive row key the synthetic policy does not carry)");
   for (const [a, b] of [[p.owner, compiled.owner]]) for (const k of Object.keys(b)) assert.equal(typeof a[k], typeof b[k], `owner.${k} type`);
   assert.match(compiled.models[0].i, /^\$[\d.]+\/\$[\d.]+$/, "the compiler's price text format");
   assert.match(p.models[0].i, /^\$[\d.]+\/\$[\d.]+$/, "the synthetic row uses the same price text format");
@@ -1315,7 +1315,7 @@ test("fingerprint: holds hashes, pids and names only; diff names what changed (t
 });
 // The LIVE v2 router (G2) writes into state/subagent all the time; the isolation proof must not go RED on that, but must on anything a run must never change.
 const RUNTIME_NAMES = ["agents-d2e51e39-fb60-42f2-a847-b70dc99f0a25.jsonl", "agents.jsonl", "agents.3.jsonl", "main-b3e07c44.json", "status.json", "status-jbw.json", "decisions.jsonl", "decisions.1.jsonl", "classify.jsonl",
-  "classify.1.jsonl", "cooling.json", "status-jbw.json.tmp-123s", "main-x.json.tmp-9a4", "cooling.json.tmp-77s", "something.lock"];
+  "classify.1.jsonl", "cooling.json", "status-jbw.json.tmp-123s", "main-x.json.tmp-9a4", "cooling.json.tmp-77s", "something.lock", "classify.rot-1f.jsonl", "decisions.rot-abc9.jsonl", "agents.rot-z.jsonl"];
 /** A live state/subagent as a mutable map name -> {size, text}; the fake sys serves listDir (name:size) and sha256File from it. */
 function liveStateSys(files) {
   const sys = fakeSys({
@@ -1335,7 +1335,7 @@ async function stateCheck(files, mutate) {
 }
 test("proof (state/subagent): the live router's own runtime churn is GREEN, a changed policy.json, a toggled shadow.flag or a new unknown file is RED", async () => {
   for (const n of RUNTIME_NAMES) assert.ok(ROUTER_RUNTIME_RE.test(n), `${n} is router runtime`);
-  for (const n of ["policy.json", "shadow.flag", "policy.json.bak", "agentsx.jsonl", "main-.json", "status-.json", "statusx.json", "notes.txt", "observed.json", "cooling.json.bak", "decisions.jsonl.old", "classify.txt"]) assert.ok(!ROUTER_RUNTIME_RE.test(n), `${n} is NOT router runtime`);
+  for (const n of ["policy.json", "shadow.flag", "policy.json.bak", "agentsx.jsonl", "main-.json", "status-.json", "statusx.json", "notes.txt", "observed.json", "cooling.json.bak", "decisions.jsonl.old", "classify.txt", "classify.evil.jsonl", "classify.rot-.jsonl", "classify.rot-ZZZ.jsonl", "settings.rot-1.jsonl", "agents-abc.rot-1.jsonl", "classify.rot-1f.jsonl.old", "classify.rot-1f.1.jsonl", "main.rot-1.jsonl", "policy.rot-1.jsonl"]) assert.ok(!ROUTER_RUNTIME_RE.test(n), `${n} is NOT router runtime`);
   // churn: every runtime name appears, vanishes, grows, a new session's files show up: still GREEN
   let r = await stateCheck(baseLive(), (m) => {
     for (const n of RUNTIME_NAMES) m.set(n, { size: 999, text: "new" });

@@ -197,6 +197,8 @@ export function assertPayloadIsolated(cfg, { allowProviders = false } = {}) {
     if (target.toLowerCase() === LIVE_SETTINGS.toLowerCase()) fail(`profile "${p.id}" targets LIVE settings`);
     if (target.toLowerCase() !== SCRATCH_SETTINGS.toLowerCase()) fail(`profile "${p.id}" settingsFile "${p.settingsFile}" is not the scratch file`);
   }
+  // CCR's saveConfig arms a model auto-refresh loop for a provider with autoFetchModels, and its onConfigChanged runs the global profile apply with no applyProfile opt-out: refused for EVERY provider, whatever allowProviders says.
+  for (const p of cfg.Providers ?? []) if (p && p.autoFetchModels) fail(`provider "${p.name}" has autoFetchModels set: CCR's model auto-refresh would run the global profile apply (no applyProfile opt-out) on a config change`);
   if (!allowProviders && (cfg.Providers?.length ?? 0) > 0) {
     fail(`payload carries ${cfg.Providers.length} provider(s). A model-carrying save triggers CCR's ` +
       `Claude-desktop-app sync (dist gate is model-availability only). Pass {allowProviders:true} once ` +
