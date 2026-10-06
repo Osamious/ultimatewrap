@@ -187,6 +187,33 @@ const TRANSIENT_WORDS = /overload|rate.?limit|too many|try again|timed? ?out|una
 const LIMIT_WORDS = /per[ -]minute|per[ -]second|per[ -]day|tokens? per|requests? per|\btpm\b|\brpm\b|rate[ -]?limit|too many requests|quota|try again (in|later)|retry (in|after)/i;
 // A refusal that is about the request's SIZE.
 const SIZE_WORDS = /too (large|big|long)|entity too large|payload|request size|content[ -]length|body (is )?too|exceeds? (the )?(maximum|max|limit|size)|maximum (context|request|content|body)|context[ -]?(length|window)|input is too|prompt is too|too many tokens|reduce the (length|size)/i;
+/**
+ * PROVIDER-STATED LIMITS. A size refusal whose own sentence states the limit ("This model's maximum context length is 32768 tokens. However, you requested 47046 tokens", "prompt is too long: 250000 tokens > 200000
+ * maximum", "inputs tokens + max_new_tokens must be <= 8193", "exceeds the maximum number of tokens allowed (32768)") is parsed BEFORE the text is clipped and redacted: the limit, in TOKENS, or null. An estimate of the
+ * request ("Estimated input tokens: 103,620"), a rate limit (tokens per minute), an output limit (max_tokens, completion tokens) and a number under 1,000 or over 20,000,000 are never a context limit.
+ * The record keeps it as `ctxStated` (tokens) and lowers `capBelow` to the byte figure `STATED_BYTES_PER_TOKEN` converts it to.
+ */
+export const STATED_BYTES_PER_TOKEN = 3;       // a conservative bound: ordinary English and code run 3.5 to 4.5 bytes per token, JSON schemas fewer; 3 never lets a request through that the stated limit would refuse
+const STATED_RES = [
+  /maximum context (?:length|window|size)\s*(?:of|is|:|=)\s*(\d[\d,_]*)/i,
+  /context (?:length|window|size|limit)\s*(?:of|is|:|=)\s*(\d[\d,_]*)\s*(?:tokens?)?/i,
+  /exceeds? (?:the )?(?:model's )?(?:maximum|max|limit)[^.\d(]{0,50}\(?\s*(\d[\d,_]*)/i,
+  /\d[\d,_]*\s*tokens?\s*>\s*(\d[\d,_]*)\s*(?:maximum|max)/i,
+  /(?:supports?|allows?|accepts?) (?:a |an )?(?:maximum|max|at most|up to)(?: context| input)?(?: length| window)? of (\d[\d,_]*)\s*tokens/i,
+  /tokens?[^.\d]{0,60}must be\s*(?:<=|\u2264|at most|no more than|less than or equal to)\s*(\d[\d,_]*)/i,
+];
+export function statedLimit(text) {
+  const t = String(text ?? "");
+  if (!t || LIMIT_WORDS.test(t)) return null;                                            // a rate limit or an allowance is not a context limit
+  if (/completion tokens|max_tokens|output tokens/i.test(t) && !/context|input|prompt/i.test(t)) return null;
+  for (const re of STATED_RES) {
+    const m = re.exec(t);
+    if (!m) continue;
+    const n = Number(m[1].replace(/[,_]/g, ""));
+    if (Number.isInteger(n) && n >= 1000 && n <= 20_000_000) return n;
+  }
+  return null;
+}
 // The provider saying the model or its route cannot take tools at all: a verdict about the model, even when it comes as a 404.
 const NOTOOLS = /no endpoints? (found )?(that )?(support|supporting)\w* (tool|function)|(does(n'?t| not)|do(n'?t| not)) support (tool|function)|(tools?|function[ -]?calling|tool[ -]use) (is |are )?(not|un)supported|unsupported.{0,20}\btools?\b|tool use is not (available|supported)|tools? (is|are) not (available|enabled)/i;
 // A 400 that names the cache_control marker, and one that names the tool NAME (its length or pattern).
@@ -474,7 +501,8 @@ function httpVerdict(kind, status, text, ra) {
     if (isAvailabilityText(text) || (status === 400 && kind !== "5" && !namesRequest(msg400))) return inconclusive("error", why, { ...extra, reason: "upstream-unavailable", hint: clip(msg400).slice(0, 120) });
     if (CC_WORDS.test(text) && (kind === "3a" || kind === "3b" || kind === "5")) return fail(why, { kind: "schema", ccFail: true });
     const size = status === 413 || SIZE_WORDS.test(text) || kind === "5";       // a refusal only at the big step, after the 157 KB step was accepted, is about size
-    return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
+    const stated = size && kind !== "3a" ? statedLimit(msg400 || text) : null;                      // read BEFORE `why` is clipped
+    return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(stated ? { ctxStated: stated } : {}), ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
   }
   const cls = classifyHttp(status, text);
   // HTTP 402 is `pay` by its status alone (a gateway's opaque sentence is kept), but a 402 whose OWN sentence is only about availability ("Upstream request failed.") and has no money word is not evidence about
@@ -611,7 +639,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     const b = await ask("3b");
     if (b.aborted) return b;
     if (b.v === "i") return stop(b);
-    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), ...(b.w ? { w: b.w } : {}), bytes: b.bytes, ...marks };
+    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), ...(b.w ? { w: b.w } : {}), ...(b.ctxStated ? { ctxStated: b.ctxStated } : {}), bytes: b.bytes, ...marks };
     if (b.v === "p" && b.l4) done[4] = { v: b.l4, ...(b.l4why ? { why: b.l4why } : {}), ...(b.l4w ? { w: b.l4w } : {}), bytes: b.bytes };
     return null;
   };
@@ -619,7 +647,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     const r = await ask("5");
     if (r.aborted) return r;
     if (r.v === "i") return stop(r);
-    done[5] = row(r, { bytes: r.bytes, ...(r.cc ? { cc: r.cc } : {}) });
+    done[5] = row(r, { bytes: r.bytes, ...(r.cc ? { cc: r.cc } : {}), ...(r.ctxStated ? { ctxStated: r.ctxStated } : {}) });
     return null;
   };
 

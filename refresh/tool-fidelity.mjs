@@ -22,6 +22,8 @@
 //   capBelow  bytes: the provider REFUSED a request of about this size or larger (an observed upper bound; the compiler lowers the
 //             model's payload cap `pb` to it, so big requests skip the model and small subagents may still use it). Written only for a
 //             refusal about SIZE (413, a body naming size or context length, any refusal at the big step), never for a rate limit.
+//   ctxStated the context limit the PROVIDER STATED in a size refusal, in tokens ("maximum context length is 32768 tokens"); capBelow is then at most capBelowFor(ctxStated * STATED_BYTES_PER_TOKEN)
+//   (capBelow is an UPPER bound of what is refused, never a proven size: the size a model is KNOWN to take is `maxBytes`, see provenBytes). Class: a model whose L4 failed with ZERO calls (l4w "0 call of 2") is t, not v.
 //   strikes   1 | 2 and sl 1..3: TWO STRIKES. A first failure at level sl (L1, L2, or L3 for a reason that is not size) is only
 //             PROVISIONAL: lvr keeps what it was (nnnn for a model never tested), strikes is 1, and the model stays queued for one retry.
 //             The second failure at the same level CONFIRMS it (strikes 2, the `f` is written). A confirmed L1/L2 failure is class x; a
@@ -49,7 +51,7 @@ import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { RELAY_KEY_ID, isTier } from "../menu/tiers.mjs";
 import { SUBSTITUTE_FLOOR, funnel } from "../menu/subagent-funnel.mjs";
 import { isFree, UNPRICED_PER_M } from "./bench.mjs";
-import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText, namesRequest, hasMoneyWords } from "./tool-fidelity-probe.mjs";
+import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText, namesRequest, hasMoneyWords, statedLimit, STATED_BYTES_PER_TOKEN } from "./tool-fidelity-probe.mjs";
 export { NOT_FREE_REASON };
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 
@@ -65,7 +67,7 @@ export const BIG_LEVEL = 5;                          // the ~400 KB step, a leve
 
 const LVR_RE = /^[pfn]{4}$/;
 const FX_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "l3w", "spw", "xw", "pt"]);
+const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "l3w", "spw", "xw", "pt", "ctxStated"]);
 const NOTE_FIELDS = ["afw", "l4w", "l3w", "spw"];                                      // short reasons of non-blocking marker failures (printable ASCII, at most 60 characters): what differed, never a verdict
 export const GATEWAY_WHY = GATEWAY_WORDS;                                  // the reason text of a failure caused by the gateway's own request translation
 const noteOk = (x) => typeof x === "string" && /^[ -~]{1,60}$/.test(x);
@@ -89,12 +91,14 @@ export const lvOf = (lvr) => { const k = contiguous(lvr); return k >= 4 ? 4 : k 
  * did not pass). One refinement: L3 failed, CONFIRMED (two strikes) and NOT about size (no capBelow) is `x` too: the model cannot take the real
  * tool set. A size refusal is never `x`: it caps the payload instead. A lone lvr string has no strikes, so it never gets that refinement.
  */
+/** L4 failed with ZERO tool calls (`l4w` "0 call of 2"): the 157 KB and big requests passed on "something well formed", but the model never called a tool there. N >= 1 calls (a serial caller) is not this. */
+export const zeroCallL4 = (o) => o?.lvr?.[3] === "f" && /^0 call/.test(String(o.l4w ?? ""));
 export function classOf(r) {
   const o = typeof r === "string" ? { lvr: r } : r;
   const lvr = o.lvr;
   if (lvr[0] === "n") return "u";
   const k = contiguous(lvr);
-  if (k >= 3) return o.fc === "p" ? "t" : "v";               // a model that took the tool call only when it was FORCED is not clean: t at best
+  if (k >= 3) return o.fc === "p" || zeroCallL4(o) ? "t" : "v";               // a model that took the tool call only when it was FORCED is not clean: t at best; one whose parallel-call check answered ZERO calls never called a tool at 157 KB: t too
   if (k === 2) return lvr[2] === "f" && o.strikes >= 2 && o.sl === 3 && !o.capBelow ? "x" : "t";
   return "x";
 }
@@ -114,6 +118,12 @@ export const rankInV = (rec) => [{ p: 0, n: 1, f: 2 }[rec.big ?? "n"] ?? 1, { p:
 /** The payload cap an observed refusal sets, in bytes, or 0 for none. `maxBytes` is a lower bound and never sets one. */
 export const payloadCapOf = (rec) => (Number.isInteger(rec?.capBelow) && rec.capBelow > 0 ? rec.capBelow : 0);
 /** Just under the size that was refused, to a round figure: 156,892 bytes gives 150,000. */
+/**
+ * What a model is PROVEN to take, in bytes: the largest request it ANSWERED (`maxBytes`, 0 when nothing above L2 was answered). `capBelow` is only an upper bound of what is refused (the refused size rounded down, or the
+ * stated limit converted), so a compiled payload cap must not claim more than this when nothing between the proven size and the refusal was tested: a model that passed 157 KB and was refused at the 400 KB
+ * big step has capBelow 390000 but is proven only to 156873.
+ */
+export const provenBytes = (rec) => (Number.isInteger(rec?.maxBytes) && rec.maxBytes > 0 ? rec.maxBytes : 0);
 export const capBelowFor = (bytes) => Math.max(10000, Math.floor((bytes - 1) / 10000) * 10000);
 
 // ------------------------------------------------------------------ the cleaner
@@ -137,11 +147,14 @@ export function cleanFidelity(raw) {
   if (d3 !== undefined && !/^[abi]$/.test(d3)) return null;
   for (const k of NOTE_FIELDS) if (raw[k] !== undefined && !noteOk(raw[k])) return null;
   if (raw.xw !== undefined && raw.xw !== "gateway") return null;
-  const d = classOf({ lvr, strikes, sl, capBelow, fc: raw.fc });
-  if (lv !== lvOf(lvr) || t !== d || ok !== (d === "v" || d === "t")) return null;
+  if (raw.ctxStated !== undefined && !(Number.isInteger(raw.ctxStated) && raw.ctxStated >= 1000 && raw.ctxStated <= 20_000_000)) return null;
+  const d = classOf({ lvr, strikes, sl, capBelow, fc: raw.fc, l4w: raw.l4w });
+  // a record stored before the zero-call rule has class v where the rule says t: it is read as t (a stored class is derived, never trusted) and `loadFidelity` lists it as `reclassed`
+  const legacyV = t === "v" && d === "t" && zeroCallL4(raw);
+  if (lv !== lvOf(lvr) || (t !== d && !legacyV) || ok !== (d === "v" || d === "t")) return null;
   const w = why ? redactClip(why, WHY_CHARS) : "";
-  return { lv, lvr, t, ok, ...(w ? { why: w } : {}), at, fx, maxBytes, ...(alias ? { alias: true } : {}),
-           ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
+  return { lv, lvr, t: d, ok, ...(w ? { why: w } : {}), at, fx, maxBytes, ...(alias ? { alias: true } : {}),
+           ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(raw.ctxStated ? { ctxStated: raw.ctxStated } : {}), ...(strikes ? { strikes, sl } : {}),
            ...Object.fromEntries(COPY_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(d3 ? { d3 } : {}),
            ...Object.fromEntries(NOTE_FIELDS.filter((k) => raw[k] !== undefined).map((k) => [k, raw[k]])), ...(raw.xw ? { xw: raw.xw } : {}) };
 }
@@ -164,14 +177,14 @@ export function loadFidelity(file = REAL_FILE) {
   let raw;
   try { raw = JSON.parse(text); } catch { return { ok: false, reason: "corrupt" }; }
   if (!raw || raw.kind !== KIND || raw.schema !== SCHEMA || !raw.models || typeof raw.models !== "object" || Array.isArray(raw.models)) return { ok: false, reason: "schema" };
-  const models = {}, rejected = {};
+  const models = {}, rejected = {}, reclassed = [];
   let dropped = 0;
   for (const [k, v] of Object.entries(raw.models)) {
     const rec = keyOk(k) ? cleanFidelity(v) : null;
-    if (rec) models[k] = rec;
+    if (rec) { models[k] = rec; if (v?.t !== rec.t) reclassed.push(k); }
     else { dropped += 1; if (keyOk(k)) rejected[k] = v; }
   }
-  return { ok: true, models, rejected, pending: cleanPending(raw.pending), held: cleanHeld(raw.held), meta: cleanMeta(raw.meta), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
+  return { ok: true, models, rejected, reclassed, pending: cleanPending(raw.pending), held: cleanHeld(raw.held), meta: cleanMeta(raw.meta), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
 }
 
 // ------------------------------------------------------------------ writing
@@ -414,15 +427,20 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     }
   }
 
-  let capBelow = prior?.capBelow;
-  for (const l of [3, BIG_LEVEL]) if (ran(l) && done[l].v === "f" && done[l].kind === "size") capBelow = Math.min(capBelow ?? Infinity, capBelowFor(done[l].bytes ?? 0));
+  let capBelow = prior?.capBelow, ctxStated = prior?.ctxStated;
+  for (const l of [3, BIG_LEVEL]) if (ran(l) && done[l].v === "f" && done[l].kind === "size") {
+    capBelow = Math.min(capBelow ?? Infinity, capBelowFor(done[l].bytes ?? 0));
+    // the provider STATED its limit in its sentence: kept as `ctxStated` (tokens), and the cap falls to what that limit allows in bytes (a conservative conversion)
+    const st = done[l].ctxStated;
+    if (Number.isInteger(st) && st >= 1000) { ctxStated = Math.min(ctxStated ?? Infinity, st); capBelow = Math.min(capBelow, capBelowFor(ctxStated * STATED_BYTES_PER_TOKEN)); }
+  }
   const passedBytes = Math.max(0, ...[3, 4, BIG_LEVEL].filter((l) => ran(l) && done[l].v === "p").map((l) => done[l].bytes ?? 0));
-  if (capBelow && passedBytes > capBelow) capBelow = undefined;           // a pass beyond the recorded refusal contradicts it
+  if (capBelow && passedBytes > capBelow) { capBelow = undefined; ctxStated = undefined; }           // a pass beyond the recorded refusal contradicts it
   let big = prior?.big;
   if (ran(BIG_LEVEL)) big = done[BIG_LEVEL].v;
   if (lvr[2] !== "p") { big = undefined; if (m.d3 === "i") m.d3 = undefined; }     // the big step is only meaningful after an L3 pass
 
-  const t = classOf({ lvr, strikes, sl, capBelow, fc: m.fc });
+  const t = classOf({ lvr, strikes, sl, capBelow, fc: m.fc, l4w: m.l4w });
   // the reason shown: the failed level of this probe's strike, else the first failed level of the record (this probe's words, or the stored ones)
   let why = "";
   if (F) why = `L${F}: ${done[F].why ?? ""}`;
@@ -437,7 +455,7 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     at: now.toISOString(), fx: ran(3) || ran(4) || !hadBig ? fixtureId : prior.fx,
     maxBytes: Math.max(prior?.maxBytes ?? 0, passedBytes),
     ...(alias ? { alias: true } : {}),
-    ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(strikes ? { strikes, sl } : {}),
+    ...(big === "p" || big === "f" ? { big } : {}), ...(capBelow ? { capBelow } : {}), ...(ctxStated ? { ctxStated } : {}), ...(strikes ? { strikes, sl } : {}),
     ...Object.fromEntries(COPY_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])), ...(m.d3 ? { d3: m.d3 } : {}),
     ...Object.fromEntries(NOTE_FIELDS.filter((k) => m[k] !== undefined).map((k) => [k, m[k]])),
     ...(xw ? { xw } : {}),
@@ -1228,12 +1246,15 @@ const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
  *   owner        row-cost, priced-over-row-cap, route-shape: a re-run changes nothing until the owner changes a flag or a route
  * `confirmed` is `confirmedProviders(store)` (see `hardState`), `pending` the stored pending map, `store` the records (a first strike is recoverable). `oldestSince` is, per reason, the oldest date it was first
  * recorded among the models that are not tested (the cool-down a re-run has had). Pure: `{total, tested, complete, incomplete, byMissing, recoverable, byRecoverable, stuck, byStuck, hard, byHard, owner, byOwner, excluded, oldestSince}`;
- * total = tested + recoverable + hard + owner.
+ * total = tested + recoverable + hard + owner + deepen + account (deepen: pay on a model with a passing L1+L2 record; account: gone on a provider whose models passed in the 24 h before, see ACCOUNT_STATE_*).
  */
+/** The account-state rule for `gone`: at least this many models of the provider PASSED L1+L2 within this window before its first gone entry, and they are at least this share of its gone entries. */
+export const ACCOUNT_STATE_MIN_PASSED = 5, ACCOUNT_STATE_SHARE = 0.5, ACCOUNT_STATE_WINDOW_MS = 24 * 3600 * 1000, ACCOUNT_STATE_MIN_GONE = 5;      // (and at least this many gone entries: one gone model on a provider with many passers is a missing model)
 const SCHEDULING_REASONS = new Set(["cap", "cap-too-big", "not-run", "spend"]);
 export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS, levels = null, optional = [] }) {
   const strikeOut = new Set();
-  const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4 };
+  const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4, deepen: 4, account: 4 };
+  const passedPair = (r) => !!r && typeof r.lvr === "string" && r.lvr.startsWith("pp");
   const by = new Map(), missing = new Map();
   const put = (key, s, reason, since = null, runs = 0) => { const cur = by.get(key); if (!cur || RANK[s] > RANK[cur.s]) by.set(key, { s, reason, since, runs }); };
   const prov = (k) => k.slice(0, k.indexOf("/"));
@@ -1268,17 +1289,41 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
   for (const o of optional) {
     const cur = by.get(o.key);
     if (!cur || cur.s !== "tested") continue;
-    if (o.held) { put(o.key, "hard", HELD_STATES.includes(o.held) ? o.held : "gone", null); continue; }
+    if (o.held) { const hs = HELD_STATES.includes(o.held) ? o.held : "gone"; put(o.key, hs === "pay" && passedPair(store?.[o.key]) ? "deepen" : "hard", hs, null); continue; }
     const st = pending?.[o.key];
     let reason = st ? st.r : "optional-not-run";
     if (o.plan === "queued" && st && (SCHEDULING_REASONS.has(st.r) || OWNER_REASONS.has(st.r))) reason = "optional-not-run";               // queued this run: not 'cap'
     else if (o.plan === "cap" && !(st && TRIED_REASONS.has(st.r))) reason = "cap";
     const since = st ? st.since ?? st.at : null, runs = st ? st.rn ?? st.n : 0;
     const h = hardState(reason, prov(o.key), confirmed);
-    if (h) put(o.key, "hard", h, since, runs);
+    if (h) put(o.key, h === "pay" && passedPair(store?.[o.key]) ? "deepen" : "hard", h, since, runs);       // pay on a model that HAS a passing L1+L2 record: it cannot deepen, its class is untouched
     else if (OWNER_REASONS.has(reason)) put(o.key, "owner", reason, since, runs);
     else put(o.key, "recoverable", reason, since, runs);
   }
+  // ACCOUNT-STATE: a `gone` on a provider with at least ACCOUNT_STATE_MIN_GONE gone entries where at least ACCOUNT_STATE_MIN_PASSED models PASSED L1+L2 in the 24 hours before its first gone entry, and those passers are at least ACCOUNT_STATE_SHARE of its gone entries, is the
+  // account (an entitlement, a credit) and not a missing model: still sticky and lifted with --recheck-hard gone, but counted apart.
+  const goneBy = new Map(), passersBy = new Map();
+  for (const [k, x] of by) {
+    if (x.s !== "hard" || x.reason !== "gone") continue;
+    const g = goneBy.get(prov(k)) ?? { n: 0, since: null, keys: [] };
+    g.n += 1; g.keys.push(k);
+    const t = Date.parse(x.since ?? pending?.[k]?.since ?? pending?.[k]?.at ?? "");
+    if (Number.isFinite(t) && (g.since === null || t < g.since)) g.since = t;
+    goneBy.set(prov(k), g);
+  }
+  if (goneBy.size) for (const [k, r] of Object.entries(store ?? {})) if (goneBy.has(prov(k)) && passedPair(r)) { (passersBy.get(prov(k)) ?? passersBy.set(prov(k), []).get(prov(k))).push(Date.parse(r.at)); }
+  const accountProviders = [];
+  for (const [pv, g] of goneBy) {
+    if (g.since === null) continue;
+    const passed = (passersBy.get(pv) ?? []).filter((t) => t <= g.since && t >= g.since - ACCOUNT_STATE_WINDOW_MS).length;
+    if (g.n < ACCOUNT_STATE_MIN_GONE || passed < ACCOUNT_STATE_MIN_PASSED || passed < g.n * ACCOUNT_STATE_SHARE) continue;
+    accountProviders.push({ provider: pv, gone: g.n, passed });
+    for (const k of g.keys) by.set(k, { ...by.get(k), s: "account" });
+  }
+  const byAccount = {};
+  for (const x of accountProviders) byAccount[x.provider] = x.gone;
+  const payKeys = Object.entries(pending ?? {}).filter(([, v]) => v && /^(canary-)?pay$/.test(v.r)).map(([k]) => k);
+  const strikeOutKeys = [...strikeOut].filter((k) => by.get(k)?.s === "tested");
   const tally = (s, f = () => true) => { const o = {}; for (const v of by.values()) if (v.s === s && f(v)) o[v.reason] = (o[v.reason] ?? 0) + 1; return o; };
   const count = (s, f = () => true) => [...by.values()].filter((v) => v.s === s && f(v)).length;
   const isStuck = (v) => STUCK_REASONS.has(v.reason) && v.runs >= stuckRuns;
@@ -1301,8 +1346,8 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
   for (const [pv, e] of Object.entries(stuckBy)) { const top = [...e.sentences].sort((a, b) => b[1] - a[1])[0]; stuckWhy[pv] = { total: e.total, ...(top ? { why: top[0], n: top[1] } : {}) }; }
   const testedOf = (s) => [...by].filter(([k, x]) => x.s === s && testedState(store?.[k])).length;
   const v = { recoverableTested: testedOf("recoverable"), hardTested: testedOf("hard"), stuckWhy, tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
-    stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), strikeOutOfLevels: [...strikeOut].filter((k) => by.get(k)?.s === "tested").length, hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
-  return { total: v.tested + v.recoverable + v.hard + v.owner, ...v };
+    stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), strikeOutOfLevels: [...strikeOut].filter((k) => by.get(k)?.s === "tested").length, hard: count("hard"), byHard: tally("hard"), deepen: count("deepen"), byDeepen: tally("deepen"), account: count("account"), byAccount, accountProviders, payEntries: payKeys.length, payOnTested: payKeys.filter((k) => passedPair(store?.[k])).length, strikeOutList: strikeOutKeys.map((k) => ({ key: k, sl: store?.[k]?.sl })), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
+  return { total: v.tested + v.recoverable + v.hard + v.owner + v.deepen + v.account, ...v };
 }
 
 /**
@@ -1465,6 +1510,26 @@ export function payHoldsOnBareEvidence(held, pending) {
   }
   return Object.entries(held ?? {}).filter(([p, h]) => h?.r === "pay" && !by[p]?.money).map(([p]) => ({ provider: p, entries: (by[p]?.avail ?? 0) + (by[p]?.other ?? 0) + (by[p]?.none ?? 0), availabilityOnly: by[p]?.avail ?? 0, otherSentence: by[p]?.other ?? 0, noSentence: by[p]?.none ?? 0 })).sort((a, b) => (a.provider < b.provider ? -1 : 1));
 }
+/**
+ * One-time migration: the stored `why` of a size refusal still holds the numbers the provider stated ("maximum context length is 32768 tokens"). For every record whose `why` states a limit (`statedLimit`) that the
+ * record does not carry yet, `ctxStated` is set and `capBelow` lowered to capBelowFor(tokens * STATED_BYTES_PER_TOKEN). A record that PASSED a request larger than that cap is a conflict (the statement and the
+ * proof disagree): listed, not changed. Pure: `{store, changed: [{key, tokens, capBelow: [old, new], t: [old, new]}], conflicts: [{key, tokens, cap, maxBytes}]}`.
+ */
+export function migrateStatedLimits(store) {
+  const out = {}, changed = [], conflicts = [];
+  for (const [key, rec] of Object.entries(store ?? {})) {
+    const tokens = statedLimit(rec.why ?? "");
+    if (!tokens || rec.ctxStated === tokens) { out[key] = rec; continue; }
+    const cap = Math.min(rec.capBelow ?? Infinity, capBelowFor(tokens * STATED_BYTES_PER_TOKEN));
+    if ((rec.maxBytes ?? 0) > cap) { conflicts.push({ key, tokens, cap, maxBytes: rec.maxBytes }); out[key] = rec; continue; }
+    const next = { ...rec, ctxStated: tokens, capBelow: cap };
+    const t = classOf({ lvr: next.lvr, strikes: next.strikes, sl: next.sl, capBelow: next.capBelow, fc: next.fc, l4w: next.l4w });
+    next.t = t; next.ok = t === "v" || t === "t";
+    changed.push({ key, tokens, capBelow: [rec.capBelow ?? null, cap], t: [rec.t, t] });
+    out[key] = next;
+  }
+  return { store: out, changed, conflicts };
+}
 export const STALE_AFW = /^(file_path: (newline|backslash)|replace_all: missing|start_line: missing)/;
 export function migrateTransient(store) {
   const out = {}, cleared = [], tagged = [], afReset = [];
@@ -1482,7 +1547,7 @@ export function migrateTransient(store) {
       const base = { ...rest, lvr, lv: lvOf(lvr) };
       delete base.xw;
       if (tr.level === 6) { delete base.sp; delete base.spw; }
-      if (tr.level <= 3) { delete base.big; delete base.d3; delete base.capBelow; delete base.l4w; delete base.l3w; }
+      if (tr.level <= 3) { delete base.big; delete base.d3; delete base.capBelow; delete base.ctxStated; delete base.l4w; delete base.l3w; }
       if (tr.level <= 2) for (const k of ["af", "afw", "fc", "br", "er", "nm", "cc", "sp"]) delete base[k];
       const keepsNothing = lvr === "nnnn" && base.sp === undefined && ["af", "nm", "cc", "br", "er", "fc"].every((k) => base[k] === undefined);
       cleared.push({ key, kind, shape: tr.shape, level: tr.level, removed: keepsNothing, ...(tr.reopen ? { reopen: true } : {}) });
@@ -1519,6 +1584,7 @@ export function summaryOf(rec) {
   if (rec.d3 === "a") out.notes.push("L3 failed at the constructs request (3a), before the 157 KB request");
   if (rec.d3 === "b") out.notes.push("L3 failed at the 157 KB request (3b)");
   if (rec.capBelow) out.notes.push(`refuses requests of about ${rec.capBelow} bytes and more`);
+  if (rec.ctxStated) out.notes.push(`the provider states a context limit of ${rec.ctxStated} tokens`);
   if (rec.strikes === 1) out.notes.push(`failed once at L${rec.sl}: asked again`);
   const sym = (v) => (v === "p" ? "+" : v === "f" ? "-" : "?");
   out.text = `${rec.lvr} big${sym(out.big)} sp${sym(out.sp)} af${sym(out.af)} nm${sym(out.nm)} cc${sym(out.cc)} br${sym(out.br)} er${sym(out.er)}`;

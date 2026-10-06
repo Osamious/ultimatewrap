@@ -59,6 +59,7 @@ import {
   REAL_FILE, KIND, SCHEMA, DEFAULT_TOKENS_PER_PROVIDER, DEFAULT_LEVELS, loadFidelity, saveFidelity, probeSet, fidelityCounts, queueFor, selectOnly, limitEntries,
   estimate, paidFallback, applyProviderCap, buildRecord, loadPolicy, loadTiers, POLICY_FILE, selectCandidates, ledgerUniverses, coverage, coverageLines, updatePending,
   presetUnion, drawSample, l3Rates, envelope, LIFTABLE_TIERS, BIG_MIN_CTX, liftDeepProbes, clampDeep, HELD_STATES, TRIED_REASONS, activeHolds, confirmedProviders, holdIsWrong, releaseHolds, untestedTable, HELD_PLAN, migrateCanary, cleanHeld, migrateStrikes, migrateTransient, gatewayInsights, migrateAvailabilityPay, payHoldsOnBareEvidence, restrictToFree, NOT_FREE_REASON, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, levelCosts, wallEstimate, orderCosts, DEEP_REASON, DEEP_TIERS, hardState, recheckCovers, sweepVerdict, saturation, SATURATION_FAIL_SHARE, namedKeys, STUCK_RUNS, OWNER_STICKY, OWNER_COST, runGain, testedState, SATURATE_GAIN, SATURATE_YIELD, SATURATE_RUNS, HISTORY_PER_SCOPE, HISTORY_TOTAL, appendHistory, historyOf,
+  migrateStatedLimits, ACCOUNT_STATE_MIN_PASSED, ACCOUNT_STATE_SHARE, ACCOUNT_STATE_MIN_GONE,
 } from "./tool-fidelity.mjs";
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 import { probeModel, PROBE_MAX_TOKENS, ESCALATED_MAX_TOKENS, TIMEOUTS_MS, TIMEOUT_CAPS_MS, TIMEOUT_FACTOR, timeoutsFor, BUDGETS, kindSize, deepAllowed } from "./tool-fidelity-probe.mjs";
@@ -105,6 +106,8 @@ export function parseArgs(argv) {
     else if (a === "--merge-unsaved") o.mergeUnsaved = true;
     else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
     else if (a === "--reset-transient") o.resetTransient = true;
+    else if (a === "--reclass-l4") o.reclassL4 = true;
+    else if (a === "--stated-limits") o.statedLimits = true;
     else if (a === "--only-gateway") o.onlyGateway = true;
     else if (a === "--retry-accounts") o.retryAccounts = true;
     else if (a === "--reset-canary") o.resetCanary = true;
@@ -506,6 +509,69 @@ async function resetTransient(o, outFile, deps) {
   finally { got.release(); }
 }
 
+/**
+ * `--reclass-l4`: a record whose L4 failed with ZERO calls (`l4w` "0 call of 2") is class t, not v (the reader derives the class: a record stored as v is READ as t and listed here). Dry by default (lists them);
+ * `--live` writes the derived class under the lock. It touches nothing else. A record with no stored `l4w` (written before the note existed) cannot be told apart and stays as it was.
+ */
+async function reclassL4Cmd(o, outFile, deps) {
+  const cur = loadFidelity(outFile);
+  if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was changed`); return 1; }
+  const list = cur.reclassed ?? [];
+  const nopb = Object.entries(cur.models).filter(([, r]) => r.lvr?.[3] === "f" && r.t === "v").length;
+  console.log(`tool-fidelity: ${num(list.length)} of ${num(Object.keys(cur.models).length)} record(s) stored as v have an L4 that failed with ZERO calls and are class t: ${list.length ? show(list.join(", "), 600) : "none"}`);
+  console.log(`  (${num(nopb)} other record(s) of class v have L4 failed with at least one call, or with no stored note: they stay v)`);
+  if (!o.live) { console.log("nothing was written. Re-run with --reclass-l4 --live to write the derived class."); return 0; }
+  if (!list.length) { console.log("tool-fidelity: nothing to change"); return 0; }
+  const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
+  if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  try {
+    const fresh = loadFidelity(outFile);
+    if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
+    (deps.saveImpl ?? saveFidelity)(outFile, fresh.models, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending: fresh.pending });
+    console.log(`tool-fidelity: ${num((fresh.reclassed ?? []).length)} record(s) written as class t in ${path.basename(outFile)}`);
+    return 0;
+  } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
+  finally { got.release(); }
+}
+
+/**
+ * `--stated-limits`: a size refusal whose stored `why` still holds the limit the PROVIDER stated ("maximum context length is 32768 tokens") gets `ctxStated` and a `capBelow` of at most capBelowFor(tokens * 3). Dry by
+ * default (lists what it would change and the conflicts); `--live` applies it under the lock. A record that passed a request above that cap is a conflict and is not changed.
+ */
+async function statedLimitsCmd(o, outFile, deps) {
+  const cur = loadFidelity(outFile);
+  if (!cur.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is ${cur.reason}; nothing was changed`); return 1; }
+  const m = migrateStatedLimits(cur.models);
+  console.log(`tool-fidelity: ${num(m.changed.length)} of ${num(Object.keys(cur.models).length)} record(s) hold a limit the provider stated in their stored sentence (${m.conflicts.length} conflict(s) with a proven pass, not changed)`);
+  for (const x of m.changed.slice(0, 20)) console.log(show(`  ${x.key}: states ${num(x.tokens)} tokens; capBelow ${x.capBelow[0] ?? "none"} -> ${x.capBelow[1]} bytes; class ${x.t[0]} -> ${x.t[1]}`, 220));
+  for (const x of m.conflicts.slice(0, 20)) console.log(show(`  CONFLICT ${x.key}: states ${num(x.tokens)} tokens (cap ${x.cap} bytes) but a request of ${x.maxBytes} bytes was answered`, 220));
+  if (!o.live) { console.log("nothing was written. Re-run with --stated-limits --live to apply it."); return 0; }
+  if (!m.changed.length) { console.log("tool-fidelity: nothing to change"); return 0; }
+  const got = acquireLock({ ...(deps.lockFile ? { file: deps.lockFile } : {}), ...(deps.isAlive ? { isAlive: deps.isAlive } : {}), ...(deps.findRunning ? { findRunning: deps.findRunning } : {}), mode: "tool-fidelity", maxMinutes: o.maxMinutes });
+  if (!got.ok) { console.error(`tool-fidelity: ${got.message}`); return EXIT_BUSY; }
+  try {
+    const fresh = loadFidelity(outFile);
+    if (!fresh.ok) { console.error(`tool-fidelity: ${path.basename(outFile)} is now ${fresh.reason}; nothing was changed`); return 1; }
+    const again = migrateStatedLimits(fresh.models);
+    (deps.saveImpl ?? saveFidelity)(outFile, again.store, { live: true, now: (deps.now ?? (() => new Date()))(), preserve: fresh.rejected ?? {}, pending: fresh.pending });
+    console.log(`tool-fidelity: ${num(again.changed.length)} record(s) updated in ${path.basename(outFile)}`);
+    return 0;
+  } catch (e) { console.error(`tool-fidelity: could not save (${e?.message ?? e}); nothing was changed`); return 1; }
+  finally { got.release(); }
+}
+
+/** The first strikes that failed at a level the run does not ask (DEFAULT_LEVELS is 1, 2, 6, 7: an L3 first strike never retries under it): up to 10 named, with the exact command that asks them. */
+export function strikeCommand(v) {
+  const list = v.strikeOutList ?? [];
+  if (!list.length) return [];
+  const sls = [...new Set(list.map((x) => x.sl).filter((l) => Number.isInteger(l)))].sort((a, b) => a - b);
+  const provs = [...new Set(list.map((x) => x.key.slice(0, x.key.indexOf("/"))))].sort();
+  const levels = [...new Set([1, 2, ...sls])].sort((a, b) => a - b).join("");
+  const cmd = `node refresh/tool-fidelity-cli.mjs --live --levels ${levels}${sls.some((l) => l >= 3 && l <= 5) ? " --l3 yes" : ""} --only ${provs.join(",")} --max-spend 5 --tf-max-tokens-per-provider 5000000`;
+  return [`  first strikes the default levels never retry: ${num(list.length)} model(s), failed at ${sls.map((l) => "L" + l).join(", ")}: ${show(list.slice(0, 10).map((x) => x.key + " (L" + x.sl + ")").join(", "), 500)}${list.length > 10 ? `, ... and ${list.length - 10} more` : ""}`,
+    `  ask them with: ${show(cmd, 600)}`];
+}
+
 /** The held-providers block (dry run and report): who is held, why, since when, until when, and what that frees. */
 export function heldLines(p, o) {
   const h = p.heldInfo ?? [];
@@ -538,17 +604,19 @@ export function verdictLines(v, { partial = false, queued = 0, tripwire = null }
   const of = `of ${num(v.total)}`;
   const stuck = v.stuck ? `; of which STUCK ${num(v.stuck)} (${fmt(v.byStuck)}; the same soft reason ${STUCK_RUNS} or more runs in a row, still recoverable)` : "";
   const tested = v.tested ? ` (complete for every level it is eligible for ${num(v.complete)} of ${num(v.tested)}; tested but optional levels not run: ${num(v.incomplete)} of ${num(v.tested)} model(s)${v.incomplete ? `, ${num(Object.values(v.byMissing).reduce((a, n) => a + n, 0))} level gap(s) (a model can have more than one): ${fmt(v.byMissing)}` : ""})` : "";
-  const L = [`sweep verdict: RECOVERABLE ${num(v.recoverable)} ${of} (${fmt(v.byRecoverable)}${stuck}) | HARD-BLOCKED ${num(v.hard)} ${of} (${fmt(v.byHard)}; lift only with --recheck-hard/--release-holds) | TESTED ${num(v.tested)} ${of}${tested}${v.owner ? ` | NEEDS-OWNER ${num(v.owner)} ${of} (${Object.entries(v.byOwner).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}: ${OWNER_ACTION[k] ?? "owner action"}`).join("; ")}; a re-run alone changes nothing)` : ""}`,
-    `  population: ${num(v.total)} model(s) of the ledger that are not excluded (${num(v.excluded)} more are excluded: not free, not probe-ok, relay, ...); recoverable + hard-blocked + tested${v.owner ? " + needs-owner" : ""} = ${num(v.total)}`];
+  const L = [`sweep verdict: RECOVERABLE ${num(v.recoverable)} ${of} (${fmt(v.byRecoverable)}${stuck}) | HARD-BLOCKED ${num(v.hard)} ${of} (${fmt(v.byHard)}; lift only with --recheck-hard/--release-holds) | TESTED ${num(v.tested)} ${of}${tested}${v.owner ? ` | NEEDS-OWNER ${num(v.owner)} ${of} (${Object.entries(v.byOwner).sort(([ka, a], [kb, b]) => b - a || (ka < kb ? -1 : 1)).map(([k, n]) => `${k} ${num(n)}: ${OWNER_ACTION[k] ?? "owner action"}`).join("; ")}; a re-run alone changes nothing)` : ""}${v.deepen ? ` | DEEPEN-BLOCKED ${num(v.deepen)} ${of} (pay on a model that already has a passing L1+L2 record: it cannot deepen, its class stands; non-queued by a normal run, lift only with --recheck-hard pay)` : ""}${v.account ? ` | ACCOUNT-STATE ${num(v.account)} ${of} (gone on a provider where models passed L1+L2 in the 24 h before: an entitlement or a credit, not a missing model; non-queued by a normal run, lift only with --recheck-hard gone)` : ""}`,
+    `  population: ${num(v.total)} model(s) of the ledger that are not excluded (${num(v.excluded)} more are excluded: not free, not probe-ok, relay, ...); recoverable + hard-blocked + tested${v.owner ? " + needs-owner" : ""}${v.deepen ? " + deepen-blocked" : ""}${v.account ? " + account-state" : ""} = ${num(v.total)}`];
+  if (v.payOnTested) L.push(`  pay entries: ${num(v.payOnTested)} of ${num(v.payEntries)} pending pay entr${v.payEntries === 1 ? "y" : "ies"} are on models that already have a passing L1+L2 record (they cannot deepen and their class t stands; ${num(v.deepen)} of them are counted DEEPEN-BLOCKED above, the rest ask no level that needs them in this run)`);
+  for (const a of (v.accountProviders ?? []).slice(0, 8)) L.push(show(`  account-state: ${a.provider}: ${num(a.gone)} gone, and ${num(a.passed)} of its models PASSED L1+L2 in the 24 h before the first gone (the rule: at least ${ACCOUNT_STATE_MIN_GONE} gone entries, at least ${ACCOUNT_STATE_MIN_PASSED} passers, and passers at least ${Math.round(ACCOUNT_STATE_SHARE * 100)}% of the gone entries); sticky, lift with --recheck-hard gone,${a.provider}`, 260));
   for (const [pv, x] of Object.entries(v.stuckWhy ?? {}).slice(0, 6)) if (x.why) L.push(show(`  stuck on ${pv}: "${x.why}" (${x.n} of its ${x.total} stuck model(s) say so; the provider's own words)`, 260));
   if ((v.recoverable || v.hard) && v.recoverableTested !== undefined) L.push(`  of which tested at L1+L2 (a record with both verdicts): RECOVERABLE ${num(v.recoverableTested)} of ${num(v.recoverable)}, HARD-BLOCKED ${num(v.hardTested)} of ${num(v.hard)}`);
   if (tripwire?.models.size) L.push(show(`  NOTE: spend tripwire: ${tripLine(tripwire)}; the rest of those providers' models are pending spend-tripwire (NEEDS-OWNER: a normal run does not ask them; accept the cost, then --recheck-hard spend-tripwire[,provider], or name a model with --only)`, 400));
   const since = Object.entries(v.oldestSince ?? {}).sort(([, a], [, b]) => Date.parse(a) - Date.parse(b)).map(([k, t]) => `${k} ${t.slice(0, 10)}`).join(", ");
   if (since) L.push(`  oldest since, per reason (the first time that reason was recorded, among the ${num(v.recoverable + v.hard + v.owner)} model(s) not tested): ${since}`);
-  if (v.strikeOutOfLevels) L.push(`  note: ${num(v.strikeOutOfLevels)} first strike(s) failed at a level this run does not ask; they count as tested here and are asked again by a run that includes that level`);
+  if (v.strikeOutOfLevels) L.push(`  note: ${num(v.strikeOutOfLevels)} first strike(s) failed at a level this run does not ask; they count as tested here and are asked again by a run that includes that level`, ...strikeCommand(v));
   if (!v.recoverable && partial) L.push("  (the run was interrupted or stopped early: no DONE is claimed)");
   else if (!v.recoverable && queued) L.push(`  (nothing is counted recoverable, but ${num(queued)} model(s) are queued: no DONE is claimed)`);
-  else if (!v.recoverable) L.push(`DONE: nothing recoverable left (${num(v.tested)} of ${num(v.total)} model(s) tested, ${num(v.hard)} hard-blocked${v.owner ? `, ${num(v.owner)} need the owner` : ""})`);
+  else if (!v.recoverable) L.push(`DONE: nothing recoverable left (${num(v.tested)} of ${num(v.total)} model(s) tested, ${num(v.hard)} hard-blocked${v.deepen ? `, ${num(v.deepen)} deepen-blocked` : ""}${v.account ? `, ${num(v.account)} account-state` : ""}${v.owner ? `, ${num(v.owner)} need the owner` : ""})`);
   return L;
 }
 
@@ -585,7 +653,7 @@ export function saturationLines(v, sat, mode = sat ? null : "dry", extra = {}) {
   }
   const trend = trendLine(extra.history);
   if (trend) L.push(`  ${trend}`);
-  L.push(`SATURATION saturated=${state} recoverable=${v.recoverable} hard=${v.hard} new_results=${sat ? sat.newResults : 0} requests=${sat ? sat.requests : 0} reason=${reason}`);
+  L.push(`SATURATION saturated=${state} recoverable=${v.recoverable} hard=${v.hard} new_results=${sat ? sat.newResults : 0} requests=${sat ? sat.requests : 0} reason=${reason} deepen_blocked=${v.deepen ?? 0} account_state=${v.account ?? 0}`);
   return L;
 }
 
@@ -900,6 +968,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (o.mergeUnsaved) return mergeUnsaved(o, outFile, deps);
   if (o.resetAwkwardJson) return resetAwkward(o, outFile, deps);
   if (o.resetTransient) return resetTransient(o, outFile, deps);
+  if (o.reclassL4) return reclassL4Cmd(o, outFile, deps);
+  if (o.statedLimits) return statedLimitsCmd(o, outFile, deps);
   if (o.resetCanary) return resetCanary(o, outFile, deps);
   if (o.resetGoneHolds || o.releaseHolds) return releaseCommand(o, outFile, deps);
   const loaded = deps.snapshot ?? loadSnapshot();
@@ -1189,7 +1259,7 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
     const sat = saturation({ requests: tot.n, rate: rate + (st.quota ?? 0), failing: rate + (st.error ?? 0) + (st.timeout ?? 0) + (st.quota ?? 0) + (st.empty ?? 0), newResults: recorded, recoverable: verdict.recoverable, prevRecoverable,
       history: rec ? scopedHistory : null, thisRun: rec ? runEntry : null, runs: o.saturateRuns, gain: o.saturateGain, yieldPct: o.saturateYield });
     for (const line of saturationLines(verdict, sat, partial ? "aborted" : null, { history: rec ? [...scopedHistory, runEntry].slice(-HISTORY_PER_SCOPE) : scopedHistory, starved })) console.log(line);
-  } else console.log(`SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=${recorded} requests=${telemetry.total().n} reason=unknown`);
+  } else console.log(`SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=${recorded} requests=${telemetry.total().n} reason=unknown deepen_blocked=unknown account_state=unknown`);
   if (!saved) return 1;                                                  // a failed save is the loudest fact of the run: it outranks the 3 (the records are in the side file)
   return Math.max(code, toolSweepExit({ gaveUp: false, signal: signalStop || ac.signal.aborted || interrupts > 0, requests: telemetry.total().n, records: recorded, outcomes: other }));
 }
