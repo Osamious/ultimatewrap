@@ -663,7 +663,7 @@ export async function runScenarios(p, { only = null, runs = null, real = false }
     const n = runs ?? scn.runs, evs = [];
     for (let i = 1; i <= n; i++) {
       try { await p.reset?.(); evs.push(await RUN[scn.id](p, { run: i, real: real && scn.client === "real" })); }     // cooling, an overlay record and a rollback flag of an earlier scenario must not leak into this one
-      catch (e) { evs.push({ __error: clip(e?.message, 160) }); }
+      catch (e) { evs.push({ __error: clip(e?.message, 160) }); p.markDirty?.(); }       // a run that threw (or a reset that could not replace the worker) may have left cooling in the worker's memory: the NEXT reset must replace it
     }
     const errs = evs.filter((e) => e && e.__error);
     const res = errs.length ? { id: scn.id, verdict: "FAIL", runs: evs.length, passed: evs.length - errs.length, text: `a run threw: ${errs[0].__error}`, rows: [] } : judgeRuns(scn, evs);
@@ -760,6 +760,23 @@ async function defaultLiveRequestsFor(sessionIds, sinceMs) {
 }
 
 const normCmd = (x) => String(x ?? "").replace(/\//g, "\\").toLowerCase();
+/**
+ * A path in ONE comparable form: separators turned to backslashes, `.` and `..` segments resolved, the `\\?\` prefix and trailing separators cut, lower case, and, when the path exists on disk, its REAL path first
+ * (a symlink, a junction or an 8.3 name turned into the target the process was really started from). The installed CCR is found through PATH, and PATH may hold a link (nvm4w: C:\nvm4w\nodejs is a symlink to the
+ * versioned nvm directory) while the process table shows the target: both sides of the dist comparison go through this function, so they agree whichever spelling either one has. A path that is not on disk is only normalised.
+ */
+export function canonPath(x, fsx = fs) {
+  let r = String(x ?? "");
+  if (!r) return "";
+  try { const rp = fsx.realpathSync; const real = (rp?.native ?? rp)?.call(fsx, r); if (typeof real === "string" && real) r = real; } catch { /* not on disk: only normalised */ }
+  return path.win32.normalize(r.replace(/\//g, "\\")).replace(/^\\\\\?\\/, "").replace(/\\+$/, "").toLowerCase();
+}
+/** An absolute path with a root of its own: a drive letter (`C:\x`) or a UNC share (`\\host\share\x`). `\x` (rooted on the current drive), `c:x` (drive-relative) and `x\y` are not. */
+export const absoluteLocal = (x) => { const s = String(x ?? "").replace(/\//g, "\\"); return path.win32.isAbsolute(s) && /^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)/.test(s); };
+/** The number of path segments below the root of a CANONICAL path (the drive, or `\\host\share`): `c:` is 0, `c:\a\b` is 2. */
+export const depthBelowRoot = (canon) => { const s = String(canon ?? ""); const rest = /^\\\\/.test(s) ? s.replace(/^\\\\[^\\]*\\?[^\\]*/, "") : s.replace(/^[a-z]:/i, ""); return rest.split("\\").filter(Boolean).length; };
+/** `child` lies STRICTLY inside `dir` (both canonical): on a path-segment boundary, so a sibling that merely shares the prefix (dist-evil) is not inside. */
+export const insideDir = (child, dir) => !!child && !!dir && child.startsWith(dir + "\\") && child.length > dir.length + 1;
 /** The script a node command line runs: the first argument after the executable that is not a flag and not the value of --require, -r, --import or --loader (normalised). */
 export function scriptOf(cmd) {
   const toks = [...String(cmd).matchAll(/"([^"]*)"|(\S+)/g)].map((m) => m[1] ?? m[2]);
@@ -839,8 +856,14 @@ export function stopRefusals({ mode = "core", rows = [], pid, selfPid = null, an
   else if (row) {
     const first = `first 120 characters of its command line: ${clip(row.cmd, 120)}`;
     if (!cmdN.includes(normCmd(expect.scratchDir))) why.push(`its command line does not contain the SANDBOX config path ${expect.scratchDir} (${first})`);
-    const script = scriptOf(row.cmd), dist = normCmd(expect.distDir).replace(/\\+$/, "") + "\\";
-    if (!script.startsWith(dist)) why.push(`its script ${clip(script || "(none)", 80)} is not under the installed CCR dist ${expect.distDir} (${first})`);
+    // BOTH sides in canonical form (real path, resolved `..`, lower case): the install path comes from PATH (a link), the command line from the process table (the link's target). Strictly inside, on a segment boundary.
+    // Fail closed before comparing: a RELATIVE script token would be realpath'ed against the orchestrator's cwd, a drive root, `.` or an empty pin would make "inside the dist" mean "anywhere on the drive", and a dist
+    // shallower than 3 segments below the drive is not a package directory.
+    const canon = typeof expect.canon === "function" ? expect.canon : canonPath, rawScript = scriptOf(row.cmd), script = canon(rawScript), dist = canon(expect.distDir);
+    if (!absoluteLocal(rawScript)) why.push(`its script ${clip(rawScript || "(none)", 80)} is not an absolute path (a relative one would be resolved against this process's working directory)`);
+    if (!absoluteLocal(expect.distDir)) why.push(`the pinned CCR dist ${clip(expect.distDir || "(none)", 80)} is not an absolute path`);
+    else if (depthBelowRoot(dist) < 3) why.push(`the pinned CCR dist ${clip(expect.distDir, 80)} is too shallow (${clip(dist || "(empty)", 60)}): fewer than 3 path segments below the drive, so it is not a package directory`);
+    if (!insideDir(script, dist)) why.push(`its script ${clip(script || "(none)", 80)} is not under the installed CCR dist ${expect.distDir} (${first})`);
   }
   return why;
 }
@@ -861,7 +884,7 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
     reset: async () => {
       for (const f of ["cooling.json", "shadow.flag"]) rmSafe(d, state(f));
       rmSafe(d, path.join(SCRATCH_STATE_DIR, "..", "observed.json"));
-      if (dirty) { dirty = false; await prims.freshWorker(); }                             // a restart that did not change the pid would leave the cooling of the last scenario in memory: that is an error, not a result
+      if (dirty) { await prims.freshWorker(); dirty = false; }                             // a restart that did not change the pid would leave the cooling of the last scenario in memory: that is an error, not a result
     },
     policy: async (p) => writeSafe(d, state("policy.json"), JSON.stringify(p)),
     writeState: async (f, text) => writeSafe(d, state(f), text),
@@ -913,7 +936,7 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
       const install = d.ccrInstall?.(), appdata = d.env?.APPDATA;
       if (!install?.found || !install.cli) refuse("the installed CCR (its dist directory) is not known");
       if (!appdata) refuse("the real APPDATA is not known, so the live claude-code-router path cannot be excluded");
-      const expect = { scratchDir: CCR_CONFIG_DIR, realDir: path.join(String(appdata), "claude-code-router"), distDir: path.dirname(install.cli) };
+      const expect = { scratchDir: CCR_CONFIG_DIR, realDir: path.join(String(appdata), "claude-code-router"), distDir: path.dirname(install.cli), canon: (x) => canonPath(x, d.fs) };
       const evaluate = () => {                                                                // the table is read HERE, last
         const rows = sys.processes(), why = [], targets = [], skipped = [];
         const common = { rows, selfPid, ancestors, baselinePids: b.ccrPids, liveSvcPids, realOwners, probeFailed };

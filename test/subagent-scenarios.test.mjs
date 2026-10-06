@@ -772,10 +772,10 @@ test("runSandbox and runSelftest pass the second token that matches the orchestr
  */
 const CLI = "C:\\npm\\node_modules\\@musistudio\\claude-code-router\\dist\\main\\cli.js", DIST = "C:\\npm\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
 const DAEMON_CMD = `"C:\\nvm4w\\nodejs\\node.exe" ${CLI} serve --daemon-child --no-open`;                     // the live and the sandbox daemon have the SAME command line
-const workerCmd = (dir) => `"C:\\nvm4w\\nodejs\\node.exe" --require ${dir}\\gateway-proxy-preload.cjs ${DIST}\\gateway-bootstrap.js`;
+const workerCmd = (dir, dist = DIST) => `"C:\\nvm4w\\nodejs\\node.exe" --require ${dir}\\gateway-proxy-preload.cjs ${dist}\\gateway-bootstrap.js`;
 async function virtualSandbox(o = {}) {
   const { respawn = true, respawnMs = 1500, daemonReplaced = false, newParent = 100, readyAfter = 2, dyingRewritesCooling = true, coreRow = {}, extraRows = [], realOwners = {}, liveSvcText = null, baseline = { ccrPids: [900], liveServicePid: 900 },
-    daemonKnown = true, webHolder = 100, ccrFound = true, appdata = "C:\\Users\\osami\\AppData\\Roaming", listens = null, probeFail = [], coreHolderOverride, ancestorsOverride, onRead = null, beforeStop = null, staysAlive = false, daemonCmd = DAEMON_CMD, orchRow = {} } = o;
+    daemonKnown = true, webHolder = 100, ccrFound = true, appdata = "C:\\Users\\osami\\AppData\\Roaming", listens = null, probeFail = [], coreHolderOverride, ancestorsOverride, onRead = null, beforeStop = null, staysAlive = false, daemonCmd = DAEMON_CMD, orchRow = {}, installCli = CLI, workerDist = DIST, realMap = null } = o;
   const { SCRATCH_STATE_DIR, LIVE_SERVICE_JSON, SANDBOX_PORTS, REAL_PORTS, CCR_CONFIG_DIR } = await import("../harness/subagent-sandbox-spec.mjs");
   const mem = new Map(), r = (p) => path.resolve(p), T0 = 1_800_000_000_000, iso = (ms) => new Date(ms).toISOString();
   const V = { now: T0, statusAt: -1e15, reqs: [], core: 500, daemon: 100, nextCore: 501, stopped: [], respawnAt: null, answered: 0, rpc: 0, log: [], reads: 0, T0, iso };
@@ -784,13 +784,14 @@ async function virtualSandbox(o = {}) {
     { pid: 700, ppid: 710, name: "node.exe", cmd: "node harness\\subagent-scenarios.mjs --run", created: iso(T0 - 7e6), ...orchRow },
     { pid: 900, ppid: 1, name: "node.exe", cmd: DAEMON_CMD, created: iso(T0 - 6e6) },
     { pid: 100, ppid: 1, name: "node.exe", cmd: daemonCmd, created: iso(T0 - 5e5) },
-    { pid: 500, ppid: 100, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR), created: iso(T0 - 4e5), ...coreRow }, ...extraRows,
+    { pid: 500, ppid: 100, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR, workerDist), created: iso(T0 - 4e5), ...coreRow }, ...extraRows,
   ];
   const statusFile = r(path.join(SCRATCH_STATE_DIR, "status.json")), coolFile = r(path.join(SCRATCH_STATE_DIR, "cooling.json"));
   if (liveSvcText != null) mem.set(r(LIVE_SERVICE_JSON), liveSvcText);
   const flush = () => { V.statusAt = V.now; mem.set(statusFile, JSON.stringify({ updatedAt: iso(V.now), counters: { req: V.reqs.length }, cooling: [] })); };
   const d = {
-    fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true },
+    fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true,
+      ...(realMap ? { realpathSync: Object.assign((p) => realMap(String(p)), { native: (p) => realMap(String(p)) }) } : {}) },
     sys: {
       selfPid: 700,
       readText: (p) => mem.get(r(p)) ?? null,
@@ -819,7 +820,7 @@ async function virtualSandbox(o = {}) {
       },
     },
     resolveWebPort: () => ({ port: SANDBOX_PORTS.web, pid: V.daemon }),
-    ccrInstall: () => (ccrFound ? { found: true, cli: CLI } : { found: false, reason: "test" }),
+    ccrInstall: () => (ccrFound ? { found: true, cli: installCli } : { found: false, reason: "test" }),
     env: appdata === null ? {} : { APPDATA: appdata },
     rpc: async () => { V.rpc += 1; throw new Error("the config RPC must not be used to replace a worker"); },
     now: () => V.now,
@@ -827,7 +828,7 @@ async function virtualSandbox(o = {}) {
       V.now += ms;
       if (V.core === undefined && respawn && V.respawnAt !== null && V.now >= V.respawnAt) {
         V.core = V.nextCore++; V.respawnAt = null; V.answered = 0;
-        V.all.push({ pid: V.core, ppid: newParent, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR), created: iso(V.now) });
+        V.all.push({ pid: V.core, ppid: newParent, name: "node.exe", cmd: workerCmd(CCR_CONFIG_DIR, workerDist), created: iso(V.now) });
         if (daemonReplaced) V.daemon = 101;
       }
     },
@@ -1262,4 +1263,94 @@ test("F5 the worker's OWN listener list must contain the sandbox core port: an e
   const both = await virtualSandbox({ listens: [{ addr: "127.0.0.1", port: 39457 }, { addr: "127.0.0.1", port: 50123 }] });
   assert.equal((await prims(both).restartWorker()).changed, true, "the core port plus an ephemeral one is the normal shape");
   assert.ok(S.stopRefusals({ rows: [], pid: 5, listens: { bad: [], rec: [] }, corePort: 39457 }).some((x) => /OWN listener list \(empty\)/.test(x)));
+});
+
+// ====================================================================================== fix round 3 (the third replay run: the core-worker stop refused a REAL worker; one failed reset leaked cooling into the next scenarios)
+const LINK = "C:\\nvm4w\\nodejs", TARGET = "C:\\Users\\osami\\AppData\\Local\\nvm\\v25.0.0", PKG = "\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
+const linkToTarget = (p) => (p.toLowerCase().startsWith(LINK.toLowerCase() + "\\") ? TARGET + p.slice(LINK.length) : p);
+
+test("R3-1 the real shape: ccr is found through the nvm4w LINK (C:\\nvm4w\\nodejs) while the process table shows the link's TARGET; the stop is accepted (this was refused: the strings share no prefix)", async () => {
+  const opts = { installCli: `${LINK}${PKG}\\cli.js`, workerDist: `${TARGET}${PKG}`, realMap: linkToTarget };
+  const v = await virtualSandbox(opts);
+  const r = await prims(v).restartWorker();
+  assert.equal(r.changed, true); assert.deepEqual(v.V.stopped, [500]);
+  // the defect, reproduced: without the link being resolved the same strings do not match, so the stop is refused with the reported reason
+  const old = await virtualSandbox({ ...opts, realMap: null });
+  await assert.rejects(() => prims(old).restartWorker(), /its script c:\\users\\osami\\appdata\\local\\nvm\\v25\.0\.0\\node_modules\\@musistudio\\claude-cod.* is not under the installed CCR dist/);
+  assert.deepEqual(old.V.stopped, []);
+});
+
+test("R3-2 canonPath and insideDir: case, slashes, `..`, trailing separators, the \\\\?\\ prefix; STRICTLY inside, on a segment boundary", () => {
+  const c = (x) => S.canonPath(x);
+  assert.equal(c("C:/Dist/Main/"), "c:\\dist\\main"); assert.equal(c("\\\\?\\C:\\a\\b"), "c:\\a\\b"); assert.equal(c("C:\\a\\b\\..\\c"), "c:\\a\\c"); assert.equal(c(""), "");
+  assert.equal(S.insideDir("c:\\d\\x.js", "c:\\d"), true);
+  for (const [child, dir] of [["c:\\d-evil\\x.js", "c:\\d"], ["c:\\d", "c:\\d"], ["c:\\d\\", "c:\\d"], ["", "c:\\d"], ["c:\\d\\x.js", ""], ["d:\\d\\x.js", "c:\\d"]]) assert.equal(S.insideDir(child, dir), false, `${child} in ${dir}`);
+});
+
+test("R3-3 the dist rule still refuses: a sibling that shares the prefix, another drive, another package, a `..` escape, the dist directory itself, a script outside; and still accepts case and slash variants", () => {
+  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
+  const scratch = "C:\\scratch\\appdata\\claude-code-router", real = "C:\\Users\\me\\AppData\\Roaming\\claude-code-router", dist = "C:\\ccr\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
+  const withScript = (script) => [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${script}`, created: t(10) }];
+  const run = (script, over = {}) => S.stopRefusals({ rows: withScript(script), pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: real, distDir: dist, ...over }, selfPid: 7, ancestors: [8] });
+  const notUnder = (r) => r.some((x) => /is not under the installed CCR dist/.test(x));
+  assert.deepEqual(run(`${dist}\\gateway-bootstrap.js`), []);
+  assert.deepEqual(run(`${dist.toUpperCase().replace(/\\/g, "/")}/Gateway-Bootstrap.js`), [], "case and slashes");
+  assert.deepEqual(run(`${dist}\\gateway-bootstrap.js`, { distDir: `${dist}\\` }), [], "a trailing separator on the pinned dir");
+  for (const [label, script] of [["sibling with the same prefix", `${dist}-evil\\gateway-bootstrap.js`], ["another drive", `D:${dist.slice(2)}\\gateway-bootstrap.js`], ["another package", dist.replace("claude-code-router", "other-package") + "\\gateway-bootstrap.js"],
+    ["a .. escape", `${dist}\\..\\..\\evil.js`], ["a .. escape back in then out", `${dist}\\sub\\..\\..\\evil.js`], ["the dist directory itself", dist], ["a script elsewhere", "C:\\evil\\x.js"]]) assert.ok(notUnder(run(script)), label);
+  assert.ok(notUnder(run(`${dist}\\gateway-bootstrap.js`, { distDir: dist.replace("claude-code-router", "other-package") })), "the pinned dir is another package");
+});
+
+test("R3-4 on a real filesystem: a junction in front of the install is resolved on BOTH sides (accepted), and a junction INSIDE the dist that leads outside is refused", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uw-canon-"));
+  try {
+    const realDist = path.join(root, "real", "node_modules", "pkg", "dist", "main"), outside = path.join(root, "outside");
+    fs.mkdirSync(realDist, { recursive: true }); fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(realDist, "gateway-bootstrap.js"), "//"); fs.writeFileSync(path.join(outside, "gateway-bootstrap.js"), "//");
+    try { fs.symlinkSync(path.join(root, "real"), path.join(root, "link"), "junction"); fs.symlinkSync(outside, path.join(realDist, "escape"), "junction"); } catch { return; }       // no link support here: nothing to prove
+    const scratch = "C:\\scratch\\appdata\\claude-code-router", t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
+    const run = (script, distDir) => S.stopRefusals({ rows: [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${script}`, created: t(10) }],
+      pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: "C:\\r\\claude-code-router", distDir }, selfPid: 7, ancestors: [8] });
+    const linkDist = path.join(root, "link", "node_modules", "pkg", "dist", "main");
+    assert.deepEqual(run(path.join(realDist, "gateway-bootstrap.js"), linkDist), [], "the install spelled through the link, the process through the target");
+    assert.deepEqual(run(path.join(linkDist, "gateway-bootstrap.js"), realDist), [], "and the other way round");
+    assert.ok(run(path.join(realDist, "escape", "gateway-bootstrap.js"), linkDist).some((x) => /is not under the installed CCR dist/.test(x)), "a script that LOOKS inside the dist but resolves outside is refused");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("R3-5 a failed reset keeps the worker DIRTY: the next reset tries again (a refusal used to clear the flag, so cooling leaked into every later scenario); a run that throws marks the worker dirty too", async () => {
+  const live = await virtualSandbox({ liveSvcText: JSON.stringify({ pid: 500 }) }), q = prims(live);
+  q.markDirty();
+  await assert.rejects(() => q.reset(), /REFUSED/);
+  await assert.rejects(() => q.reset(), /REFUSED/, "the second reset must not skip the replacement");
+  const ok = await virtualSandbox(), w = prims(ok);
+  w.markDirty(); await w.reset(); await w.reset();
+  assert.deepEqual(ok.V.stopped, [500], "after a successful replacement the flag is cleared: no second stop");
+  let dirty = 0;
+  const res = await S.runScenarios({ reset: async () => { throw new Error("REFUSED to stop"); }, markDirty: () => { dirty += 1; } }, { only: ["4", "5"] });
+  assert.deepEqual(res.map((r) => r.result.verdict), ["FAIL", "FAIL"]);
+  assert.equal(dirty, 2, "each throwing run marked the worker dirty");
+});
+
+test("R3-6 fail-closed guards: a drive-root, '.', 'c:' or empty dist and a dist under 3 segments refuse; a relative or rooted-without-drive script refuses; the real-shaped link and target still accepts", async () => {
+  assert.equal(S.insideDir(S.canonPath("c:/a/x.js"), S.canonPath("c:/")), true, "the probe that motivates the depth guard: insideDir alone accepts anything on a drive root");
+  assert.deepEqual(["C:\\a\\b", "\\\\host\\share\\a", "c:\\"].map(S.absoluteLocal), [true, true, true]);          // a drive root is absolute: the DEPTH guard is what refuses it
+  assert.deepEqual(["\\x.js", "c:x.js", "harness\\x.js", ".", "", undefined].map(S.absoluteLocal), [false, false, false, false, false, false]);
+  assert.deepEqual(["c:", "c:\\a\\b", "c:\\a\\b\\c", "\\\\host\\share", "\\\\host\\share\\a\\b\\c", ""].map(S.depthBelowRoot), [0, 2, 3, 0, 3, 0]);
+  const t = (ms) => new Date(1_800_000_000_000 + ms).toISOString();
+  const scratch = "C:\\scratch\\appdata\\claude-code-router", real = "C:\\Users\\me\\AppData\\Roaming\\claude-code-router";
+  const run = (script, distDir) => S.stopRefusals({ rows: [{ pid: 100, ppid: 1, cmd: "x claude-code-router daemon-child", created: t(0) }, { pid: 500, ppid: 100, cmd: `node --require ${scratch}\\p.cjs ${script}`, created: t(10) }],
+    pid: 500, daemonPid: 100, coreHolder: 500, webHolder: 100, listens: { bad: [], rec: [39457] }, corePort: 39457, expect: { scratchDir: scratch, realDir: real, distDir }, selfPid: 7, ancestors: [8] });
+  const DEEP = "C:\\ccr\\node_modules\\@musistudio\\claude-code-router\\dist\\main";
+  assert.deepEqual(run(`${DEEP}\\gateway-bootstrap.js`, DEEP), []);
+  for (const dist of ["C:\\", "c:/", "C:", ".", "", "C:\\a", "C:\\a\\b", "\\\\host\\share\\a\\b"]) assert.ok(run("C:\\a\\x.js", dist).length > 0, `dist ${JSON.stringify(dist)} refuses`);
+  assert.ok(run("C:\\a\\b\\x.js", "C:\\a\\b").some((x) => /too shallow/.test(x)), "two segments is not a package directory");
+  assert.ok(run("C:\\a\\x.js", "C:\\").some((x) => /too shallow|not under/.test(x)) && run("C:\\a\\x.js", "C:\\").some((x) => /too shallow/.test(x)), "a drive root names the depth guard, not only the prefix test");
+  for (const script of ["harness\\x.js", "\\x.js", "c:x.js", "..\\x.js"]) assert.ok(run(script, DEEP).some((x) => /is not an absolute path/.test(x)), `script ${script}`);
+  assert.ok(run(`${DEEP}\\gateway-bootstrap.js`, "relative\\dist\\main").some((x) => /pinned CCR dist .* is not an absolute path/.test(x)));
+  const v = await virtualSandbox({ installCli: `${LINK}${PKG}\\cli.js`, workerDist: `${TARGET}${PKG}`, realMap: linkToTarget });
+  assert.equal((await prims(v).restartWorker()).changed, true, "the real shape (link and target, deep dist) is still accepted");
+  const shallow = await virtualSandbox({ installCli: "C:\\cli.js", workerDist: "C:\\", realMap: null });
+  await assert.rejects(() => prims(shallow).restartWorker(), /too shallow/);
+  assert.deepEqual(shallow.V.stopped, []);
 });
