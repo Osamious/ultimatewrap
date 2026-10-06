@@ -1115,11 +1115,29 @@ test("R13: explain describes the REAL rule: the lead rank band, its band id, the
   assert.equal(e.status, 0, e.err);
   assert.match(e.out, /^band: \d+ \(equal tool tier, health, ctx preference and price class/m);
   assert.match(e.out, /^fallback: a cooling model .*demoted, never removed.*LOWER tool tier only if it is tested \(v, then t\), never an untested u/m);
-  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band\)=\d, health: latest status ok \(band\)=0, ctx preference \(band\)=0, price class 2b \(band\)=\d, first strike=0, sweep demotion \(blocked by the sweep, never excluded\)=\d, big step \(v only\)=\d, L4 \(v only\)=\d, forced-choice only \(fc\)=\d, argument fidelity failed \(af\)=\d, tool_result use failed \(er, br\)=\d, ttft quantile bucket=\d, ctx class=\d, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d, spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)=\d/);
+  assert.match(e.out, /rank: position \d+ of \d+.*keys tool tier \(band; v, t, u, then a model the sweep found out of credit or without a key\)=\d, health: latest status ok \(band\)=0, ctx preference \(band\)=0, price class 2b \(band\)=\d, first strike=0, sweep demotion \(blocked by the sweep, never excluded\)=\d, big step \(v only\)=\d, forced-choice only \(fc\)=\d, argument fidelity failed \(af\)=\d, tool_result use failed \(er, br\)=\d, L4 \(v only\)=\d, ttft quantile bucket=\d, ctx class=\d, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d, spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)=\d/);
   const low = cli(["explain", "fx-free-a/fxa-big:free", ...s.F]);
   assert.match(low.out, /would be chosen as the substitute never, for any provider in the set/, "an unverified row behind a verified band: never");
   assert.equal(SET(s, "--banded", "no").status, 0);
   const off = cli(["explain", "fx-free-a/fxa-big:free", ...s.F]);
   assert.match(off.out, /banding is OFF: the old pool, not limited to one band/);
   assert.match(off.out, /would be chosen as the substitute when main is on: fx-free-a/, "the old pool reaches past the band");
+});
+
+test("explain (sanity pass 3): a stated context, a proven payload cap, a known-failing row (below the untested) and a stuck error are each named in plain words", () => {
+  const s = setup();
+  const at = new Date(Date.now() - 3 * 86400000).toISOString(), later = new Date(Date.now() - 86400000).toISOString();
+  wr(path.join(s.dir, "tool-fidelity.json"), { schema: 1, models: {
+    "fx-free-a/fxa-alpha": { t: "t", lvr: "ppnn", at, ctxStated: 32768, capBelow: 150000, maxBytes: 0 },
+    "fx-free-a/fxa-beta": { t: "v", lvr: "pppp", at, big: "f", capBelow: 390000, maxBytes: 156873 },
+    "fx-free-a/fxa-gamma": { t: "t", lvr: "ppnn", at } },
+  pending: { "fx-free-a/fxa-gamma": { r: "pay", n: 2, at: later }, "fx-free-a/fxa-big:free": { r: "error", n: 26, rn: 26, at: later, why: "Failed to reach upstream provider." } } });
+  const a = cli(["explain", "fx-free-a/fxa-alpha", ...s.F]).out;
+  assert.match(a, /^stated context: the provider itself stated 32,768 tokens of context in a refusal; the ctx above is that, or the smaller known one$/m);
+  assert.match(a, /^payload cap: 96KB \(band .*; source ctxStated: 3 bytes for each of the 32,768 tokens of context the provider stated\)$/m);
+  assert.match(cli(["explain", "fx-free-a/fxa-beta", ...s.F]).out, /source proven: the largest request it answered, because its big step was refused and a refusal size is not a proof\)/);
+  const g = cli(["explain", "fx-free-a/fxa-gamma", ...s.F]).out;
+  assert.match(g, /^known failing: its credit or key failed at .*, after its last pass, so it is listed as tier u \(recorded tier t\) and ranks BELOW the untested models: a model known to fail ranks under one nobody has tested$/m);
+  assert.match(g, /tool tier: u \(tool-fidelity\)/);
+  assert.match(cli(["explain", "fx-free-a/fxa-big:free", ...s.F]).out, /^ANSWER: .* the tool sweep saw the same error on 26 runs in a row \(at least 10\), last at /m);
 });

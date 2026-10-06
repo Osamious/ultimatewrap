@@ -1267,7 +1267,7 @@ test("explain: an INFERRED ctx is named as such, a seeded known issue is named w
   assert.match(e.out, /^ctx: 128,000 \(INFERRED \(c\?\) from a same-name sibling: a 128k floor-only prior, never the asked floor or a ranking class above 128k; ctx UNPROVEN: the only proof is the 400 KB big step \(about 100k tokens\), the router's per-request fit check decides\)/m);
   const e256 = await run(["explain", "fx-free-b/sib-model:free", "--ctx", "256k", ...s.F]);
   assert.match(e256.out, /would NOT be allowed under mode dynamic, source all-providers, ctx 256k: it has less than 256k of known context and the context floor is 256k/);
-  assert.match(e.out, /^rank: position \d+ of \d+.*first strike=0, sweep demotion \(blocked by the sweep, never excluded\)=\d, big step \(v only\)=\d, L4 \(v only\)=\d, forced-choice only \(fc\)=\d, argument fidelity failed \(af\)=\d, tool_result use failed \(er, br\)=\d, ttft quantile bucket=\d, ctx class=4, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d, spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)=\d/m);
+  assert.match(e.out, /^rank: position \d+ of \d+.*first strike=0, sweep demotion \(blocked by the sweep, never excluded\)=\d, big step \(v only\)=\d, forced-choice only \(fc\)=\d, argument fidelity failed \(af\)=\d, tool_result use failed \(er, br\)=\d, L4 \(v only\)=\d, ttft quantile bucket=\d, ctx class=4, price 2b=\d, recency \(order only, calendar-dependent\)=\d, alias=\d, spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)=\d/m);
 });
 
 test("wizard: the context question offers the hard floors and the soft preferences, prints the rows per floor above it, and answer 2 and 3 keep their old meaning (prefer-1m, 1m)", async () => {
@@ -1342,4 +1342,19 @@ test("status and show: the classifier log is read across its three files (classi
   const big = row("2026-10-05T10:00:00.000Z", "d2e51e39") + "\n";
   fs.writeFileSync(path.join(s.state, "classify.jsonl"), big.repeat(Math.ceil((9 * 1024 * 1024) / big.length)));
   for (const cmd of [STATUS, (x) => run(["show", ...x.F])]) assert.match((await cmd(s)).out, /^ {0,2}classifier log: read 8\.5 MiB of 9\.\d MiB kept \(3 of 3 files\); TRUNCATED: only the newest 8\.5 MiB of 9\.\d MiB of classify\.jsonl was read, so older lines are not counted$/m);
+});
+
+test("show and status (sanity pass 3): when the compile says some unverified rows are blocked by a recorded state or are tested aliases, the lines say so with the split; an all-untested set keeps the 'not tool-tested' wording; stuck errors are named in the unreachable line", async () => {
+  const s = setup();
+  const r = await SET(s, ...DYN);
+  assert.equal(r.status, 0, r.err);
+  assert.match((await SHOW(s)).out, /^ {0,2}11 of 14 eligible models are not tool-tested \(a subagent on one may fail when it uses tools\)$/m, "nothing blocked: the plain wording");
+  const c = rd(s.compiled);
+  wr(s.compiled, { ...c, counts: { ...c.counts, unverified: 11, unverifiedBlocked: 2, unverifiedAlias: 1, unreachable: 3, unreachableStuck: 1, benchOk: 9 }, unreachable: [{ s: "pa/a", r: "gone", n: null, at: "2026-10-06T00:00:00.000Z", source: "pending" }] });
+  for (const cmd of [SHOW, STATUS]) {
+    const o = (await cmd(s)).out;
+    assert.match(o, /11 of 14 (eligible models are unverified for tools \(2 blocked by a recorded state, see explain; 1 tested alias, never above unverified; 8 not tested; a subagent on one may fail when it uses tools\)|unverified: 2 blocked by a recorded state, see explain; 1 tested alias, never above unverified; 8 not tested\))/);
+    assert.ok(!/are not tool-tested/.test(o), "the old wording is gone once a split exists");
+  }
+  assert.match((await SHOW(s)).out, /3 of 9 bench-ok models left out: the tool sweep found them gone and no confirmed pass exists; 1 of them is on the same error for 10\+ runs in a row, not gone \(an --allow pin does not override it\)/);
 });

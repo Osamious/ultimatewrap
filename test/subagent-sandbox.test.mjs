@@ -493,7 +493,7 @@ test("synthetic shadow policy: deterministic for a fixed clock, three stub model
   const { compiled } = pol.compile(g, owner, { now: () => new Date("2026-10-03T00:00:00Z") });
   // revision 11 (policy-side fix round): the compiler grew ADDITIVE keys the router never reads (a `reprobe` list, and counts for the non-agent drop, known issues, inferred ctx, re-probe and rows per ctx floor); the harness
   // synthetic policy is a hash-pinned router INPUT and is left as it is, so the shape comparison ignores exactly these
-  const COMPILER_ONLY = { top: ["reprobe", "accountStateRows", "unreachable", "demoted", "gatewayCompat", "providerPatterns", "reprobeSkipped"], counts: ["nonAgent", "knownBad", "ctxInferred", "reprobe", "accountStateRows", "ctxStats", "unreachable", "demoted", "gatewayCompat", "ctxUnproven", "benchOk", "providerPatterns", "reprobeSkipped"] };
+  const COMPILER_ONLY = { top: ["reprobe", "accountStateRows", "unreachable", "demoted", "gatewayCompat", "providerPatterns", "reprobeSkipped"], counts: ["nonAgent", "knownBad", "ctxInferred", "reprobe", "accountStateRows", "ctxStats", "unreachable", "demoted", "gatewayCompat", "ctxUnproven", "benchOk", "providerPatterns", "reprobeSkipped", "unreachableStuck", "unverifiedBlocked", "unverifiedAlias"] };
   const keys = (o) => Object.keys(o).sort();
   assert.deepEqual(keys(p).filter((k) => k !== "synthetic"), keys(compiled).filter((k) => !COMPILER_ONLY.top.includes(k)), "top-level keys (synthetic: true is the one documented extra; the compiler-only additive keys are ignored)");
   assert.equal(p.contentHash, pol.hashOf(p), "the router verifies contentHash, so the synthetic file carries the compiler's real hash of its own content");
