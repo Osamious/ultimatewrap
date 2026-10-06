@@ -2294,3 +2294,47 @@ test("round 7: --retry-failed --l3 yes --only <provider> asks the stored empty-3
   const y = loadFidelity(e.out).models["cc/y0"];
   assert.deepEqual([y.t, y.lvr[2], y.pt, y.strikes, y.l3w], ["v", "p", "f", undefined, undefined]);
 });
+
+// ================================================================ round 8: --recheck-pattern clears a stored pt f
+
+test("round 8: --recheck-pattern asks L3 again, patterns ON, of the models whose stored pt is f ONLY; a pass writes pt p and drops the f; a re-confirmed failure keeps pt f; --force on an L3 run does the same; it is its own pass", async () => {
+  const BADP = JSON.stringify("[^\\0]").slice(1, -1);
+  let fixed = true;
+  const gw = (c) => (!fixed && JSON.stringify(c.body.tools ?? []).includes(BADP) && ["3a", "3b", "5"].includes(kindOf(c)) ? ok(stream(ev.stop("end_turn", 0))) : goodModel(c));
+  const rows = [{ provider: "cc", keyId: "k.cc.free", models: [m("x0"), m("x1"), m("z0"), m("w0")] }];
+  const store = () => ({ "cc/x0": record("pppp", { pt: "f" }), "cc/x1": record("pppp", { pt: "f" }), "cc/z0": record("pppp", { pt: "p" }), "cc/w0": record("pppp") });
+  const args = ["--recheck-pattern", "--l3", "yes", "--only", "cc", "--max-spend", "5", "--tf-max-tokens-per-provider", "5000000"];
+  const e = cliEnv(rows, { answer: gw, store: store() });
+  const p = planOf(e, args, { store: store() });
+  assert.deepEqual(keys(p), ["cc/x0", "cc/x1"], "only the models whose stored pt is f");
+  assert.deepEqual(p.queued.map((x) => x.todo.join()), ["3", "3"]);
+  const dry = await runRaw(args, e.deps);
+  assert.match(dry.out, /recheck-pattern \(patterns on\)/);
+  // the gateway is fixed: the full requests pass, pt p, the f is gone
+  const hasPat = (c) => JSON.stringify(c.body.tools ?? []).includes(BADP);
+  const r = await runRaw(["--live", ...args], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.equal(calls(e.f).filter((c) => ["3a", "3b"].includes(kindOf(c))).every(hasPat), true, "every pattern-bearing request carried its patterns");
+  const st = loadFidelity(e.out).models;
+  assert.deepEqual(["cc/x0", "cc/x1"].map((k) => [st[k].pt, st[k].t]), [["p", "v"], ["p", "v"]]);
+  assert.equal(st["cc/z0"].pt, "p", "untouched");
+  assert.equal(calls(e.f).some((c) => c.body.model === "cc/w0" || c.body.model === "cc/z0"), false);
+  // still silent: the failure is re-confirmed and pt f stays; the class is unchanged
+  fixed = false;
+  const e2 = cliEnv(rows, { answer: gw, store: store() });
+  const r2 = await runRaw(["--live", ...args], e2.deps);
+  assert.equal(r2.code, 0, r2.err + r2.out);
+  const st2 = loadFidelity(e2.out).models;
+  assert.deepEqual(["cc/x0", "cc/x1"].map((k) => [st2[k].pt, st2[k].t]), [["f", "v"], ["f", "v"]]);
+  // --force on an L3 run: the patterns go out whatever is stored
+  fixed = true;
+  const e3 = cliEnv(rows, { answer: gw, store: store() });
+  const r3 = await runRaw(["--live", "--force", "--levels", "123", "--l3", "yes", "--only", "cc/x0", "--max-spend", "5", "--tf-max-tokens-per-provider", "5000000"], e3.deps);
+  assert.equal(r3.code, 0, r3.err + r3.out);
+  assert.equal(calls(e3.f).filter((c) => kindOf(c) === "3a").every(hasPat), true);
+  assert.equal(loadFidelity(e3.out).models["cc/x0"].pt, "p");
+  // its own pass
+  const bad = await runRaw(["--recheck-pattern", "--force"], e.deps);
+  assert.match(bad.err, /--recheck-pattern is a pass of its own/);
+  assert.equal(bad.code, 2);
+});

@@ -402,7 +402,8 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     if (ran(4)) m.l4w = done[4].v === "f" && noteOk(done[4].w) ? done[4].w : undefined;
     if (ran(2)) m.br = done[2].br;
     if (ran(7)) m.er = done[7].v;
-    for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc; if (ran(l) && done[l].pt) m.pt = done[l].pt === "f" || m.pt === "f" ? "f" : done[l].pt; }       // pt: f wins
+    for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc;  }
+    { const pts = [3, BIG_LEVEL].filter((l) => ran(l) && done[l].pt).map((l) => done[l].pt); if (pts.length) m.pt = pts.includes("f") ? "f" : "p"; }       // what THIS probe saw replaces the stored marker (a recheck drops an old f); f wins between its own levels
     if (ran(3)) m.d3 = done[3].v === "f" ? (String(done[3].why ?? "").startsWith("[3a]") ? "a" : "b") : done[3].implied ? "i" : undefined;
     if (ran(6)) {
       m.spw = done[6].v === "f" && noteOk(done[6].w) ? done[6].w : undefined;
@@ -540,10 +541,15 @@ export const failedLevels = (rec) => [...[1, 2].filter((l) => rec.lvr[l - 1] !==
  * at). `retryFailed` asks again ONLY the models of class x, and only the levels that failed: a record that passed is never touched. Deep levels of a provider that is not free are
  * clamped later, by `clampDeep` and by the engine itself.
  */
-export function queueFor(set, store, levels = DEFAULT_LEVELS, { force = false, retryFailed = false } = {}) {
+export function queueFor(set, store, levels = DEFAULT_LEVELS, { force = false, retryFailed = false, recheckPattern = false } = {}) {
   const out = [];
   for (const m of set.models) {
     const prior = store[m.key] ?? null;
+    if (recheckPattern) {                                                  // --recheck-pattern: ONLY the models whose stored pt is f, L3 (and the big step when it was run), asked with the patterns on
+      const todo = prior?.pt === "f" ? [3, ...(prior.big === "p" || prior.big === "f" ? [5] : [])] : [];
+      if (todo.length) out.push({ ...m, todo, prior });
+      continue;
+    }
     if (retryFailed) {
       const todo = prior && prior.t === "x" ? failedLevels(prior) : [];
       if (todo.length) out.push({ ...m, todo, prior });

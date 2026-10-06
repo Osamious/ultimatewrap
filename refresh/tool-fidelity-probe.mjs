@@ -555,7 +555,7 @@ export const deepAllowed = (tier, lift = null) => tier === "free" || (!!lift && 
  * again once with `ESCALATED_MAX_TOKENS` (and the model's later requests use it: `state`, kept by the caller across the engine's retries, holds `{maxTokens, escalated, noCc}`).
  * Still empty after the bump: inconclusive `empty` with `reason: "reasoning-budget"`, never a failure.
  */
-export async function probeModel({ levels, prior = "nnnn", flags = null, done = {}, state = {}, tier = null, lift = null, order = "l3-first", ctx = 0, tele = [], ...conn }) {
+export async function probeModel({ levels, prior = "nnnn", flags = null, done = {}, state = {}, tier = null, lift = null, order = "l3-first", ctx = 0, tele = [], recheckPattern = false, ...conn }) {
   let requests = 0;
   const deep = deepAllowed(tier, lift);
   const want = [...new Set(levels)].sort((a, b) => a - b);
@@ -567,7 +567,10 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
   const passed = (n) => (done[n]?.v ?? (prior[n - 1] === "p" ? "p" : "n")) === "p";
   const kindBudget = (k) => Math.max(conn.maxTokens ?? BUDGETS[k], state.maxTokens ?? 0);
   if (flags?.cc === "f") state.noCc = true;
-  if (flags?.pt === "f") { state.noPat = true; state.patFail = true; }           // the pattern construct made an answer empty before: the model is not sent it again
+  // pt f stored: the pattern construct made an answer empty before, the model is not sent it again; pt p stored: the full request passed at L3. `recheckPattern` (--recheck-pattern, or --force on an L3 run) ignores
+  // both: the model starts with the patterns ON and the stored marker is replaced by what this run sees.
+  if (!recheckPattern && flags?.pt === "f") { state.noPat = true; state.patFail = true; }
+  if (!recheckPattern && flags?.pt === "p") state.fullPassed = new Set(["3a", "3b"]);
   const CAPPED = { v: "i", s: "error", why: `the request ceiling of ${MAX_MODEL_REQUESTS} for one model was reached`, capped: true };
   const spent = (r) => { requests += r.reqs ?? 1; state.requests = (state.requests ?? 0) + (r.reqs ?? 1); };
   const askBase = async (kind) => {
@@ -614,14 +617,31 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
   const emptyStop = (r) => /^stop=end_turn\b/.test(r.w ?? "") && /\bout=0\b/.test(r.w ?? "");
   const ask = async (kind) => {
     const r = await askBase(kind);
-    if (r.aborted || r.v !== "f" || !r.empty || !PATTERN_KINDS.has(kind) || state.noPat || !emptyStop(r) || (state.patAsked ??= new Set()).has(kind)) return r;
-    state.patAsked.add(kind);
+    // a pattern-bearing request that passed WITH its patterns is remembered: the pattern is not the cause of a later empty answer
+    if (r.v === "p" && PATTERN_KINDS.has(kind) && !state.noPat) (state.fullPassed ??= new Set()).add(kind);
+    if (r.aborted || r.v !== "f" || !r.empty || !PATTERN_KINDS.has(kind) || state.noPat || !emptyStop(r) || state.patAsked?.has(kind)) return r;
+    if (kind === "3b" && state.fullPassed?.has("3a")) return r;              // 3a passed with the patterns: they are not the cause, no extra ask
+    if (kind === "5" && state.fullPassed?.has("3b")) return r;
+    (state.patAsked ??= new Set()).add(kind);
     state.noPat = true;
     const again = await askBase(kind);
     if (again.aborted) return again;
-    if (again.v === "p") { state.patFail = true; return { ...again, pt: "f" }; }
-    state.noPat = false;
-    return again.v === "i" ? again : r;
+    if (again.v !== "p") {
+      state.noPat = false;
+      // the extra ask could not be answered for a reason that is about the extra ask (the request ceiling, a timeout): the ORIGINAL failure stands, as if it had not been asked
+      return again.v === "i" && !again.capped && again.s !== "timeout" ? again : r;
+    }
+    if (kind === "3a") {
+      // FLAKE CONTROL: the stripped request passed; the FULL request is asked once more (patterns back on, the markers as they were). If it passes now the first empty answer was a flake: the level passes with no pt
+      // (pt p) and the patterns stay on. If it is empty again (or cannot be asked) the pattern is confirmed: pt f. 3b and the big step do not repeat this check; they inherit the verdict.
+      state.noPat = false;
+      const third = await askBase("3a");
+      if (third.aborted) return third;
+      if (third.v === "p") { (state.fullPassed ??= new Set()).add("3a"); return third; }
+      state.noPat = true;
+    }
+    state.patFail = true;
+    return { ...again, pt: "f" };
   };
   const stop = (r) => (r.slow
     ? { inconclusive: { s: "timeout", reason: "slow", secs: r.secs, why: r.why }, requests, tele }
