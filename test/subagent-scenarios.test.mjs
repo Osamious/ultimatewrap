@@ -1266,3 +1266,47 @@ test("R6-5 the REAL scenarios against a fake client: scenario 3 names the agent 
   assert.deepEqual(fed, ["uwstub/m-big"], "the overlay marks the model the real agent landed on, not a fixed m-free");
   assert.equal(r11[0].result.verdict, "DEGRADED", r11[0].result.text);
 });
+
+// ====================================================================================== fix round 7 (run 10: the real client DENIED the subagent tool: its rule is named Task, the allowlist said Agent)
+const claudeArgs = (supports = { settingSources: true, strictMcp: true }) => S.claudeInvocation({ prompt: S.REAL_PROMPT, maxTurns: 4, key: "sandbox-key", launchEnv: { PATH: "C:\\bin", SystemRoot: "C:\\Windows", ComSpec: "C:\\Windows\\cmd.exe" }, scratchRoot: path.join(os.tmpdir(), "uw-scn-scratch"), supports }).args;
+
+test("R7-1 the real client's argv carries EXACTLY one narrow allowance: --allowedTools Task,Agent (the subagent tool under both names), the default permission mode, and no bypass of any kind; the list is one token so the variadic flag cannot swallow a later flag or the prompt", () => {
+  assert.deepEqual([...S.REAL_ALLOWED_TOOLS], ["Task", "Agent"]);
+  for (const supports of [{ settingSources: true, strictMcp: true }, {}]) {
+    const a = claudeArgs(supports);
+    assert.equal(a.filter((x) => x === "--allowedTools").length, 1, "one allowlist");
+    assert.equal(a[a.indexOf("--allowedTools") + 1], "Task,Agent");
+    assert.deepEqual(a.slice(0, 2), ["-p", S.REAL_PROMPT], "the prompt is the -p positional, ahead of every variadic flag");
+    const after = a.slice(a.indexOf("--allowedTools") + 2);
+    assert.ok(after.every((x) => /^--(setting-sources|strict-mcp-config)$|^user$/.test(x)), `only the isolation flags follow: ${after}`);
+    for (const x of a) assert.ok(!/permission|bypass|acceptEdits|dontAsk|dangerously|disallowed|\*|Bash|Edit|Write|Read|\(/i.test(x.replace(S.REAL_PROMPT, "")), `no bypass, no wider tool in ${x}`);
+  }
+  assert.ok(S.REAL_ALLOWED_TOOLS.every((t) => /^[A-Za-z]+$/.test(t)), "plain tool names: no pattern, no argument rule");
+});
+
+test("R7-2 source level: the harness never passes a permission mode or a bypass, and names --allowedTools in exactly one place; the plan states the allowance and says the stub's subagent answer is text only", () => {
+  const dir = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness");
+  for (const f of ["subagent-scenarios.mjs", "subagent-e2e.mjs", "subagent-sandbox-spec.mjs", "stub-upstream.mjs"]) {
+    const code = fs.readFileSync(path.join(dir, f), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n").replace(/\n\s*"[^\n]*",?\s*(?=\n)/g, "");
+    assert.ok(!/--dangerously-skip-permissions|--allow-dangerously-skip-permissions|bypassPermissions|acceptEdits|dontAsk|--permission-mode|permissionMode/i.test(code), `${f}: no permission mode, no bypass`);
+    if (f === "subagent-scenarios.mjs") assert.equal((code.match(/"--allowedTools"/g) ?? []).length, 1, "one --allowedTools in the code");
+  }
+  const plan = S.planLines().join("\n");
+  assert.match(plan, /DEFAULT mode plus ONE narrow allowance, --allowedTools Task,Agent/); assert.match(plan, /every other tool stays denied, no permission mode and no bypass of any kind is ever passed, the stub answers a spawned subagent with text only/);
+  assert.match(plan, /run 10 saw the client deny the spawn/);
+});
+
+test("R7-3 a verdict that PASSED still names the tools the real client had denied (names only), a clean client and a replay add nothing; a FAIL keeps the full diagnostic suffix", async () => {
+  const mk = (denials) => { const f = fakeWorld({}); f.prims.claude = async () => { await f.prims.send("main", { model: ANCHOR, session: "real-s" }); await f.prims.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentId: "real-agent", session: "real-s", messages: 3, agentTool: false });
+    return { code: 0, text: JSON.stringify({ subtype: "success", num_turns: 2, result: "done", permission_denials: denials.map((n) => ({ tool_name: n, tool_input: { command: "SECRET" } })) }) }; }; return f; };
+  const denied = await S.runScenarios(mk(["Bash", "Read"]).prims, { only: ["1"], real: true });
+  assert.equal(denied[0].result.verdict, "PASS", denied[0].result.text);
+  assert.match(denied[0].result.text, /\[the real client had these tools denied: Bash, Read\]$/); assert.ok(!denied[0].result.text.includes("SECRET"));
+  const clean = await S.runScenarios(mk([]).prims, { only: ["1"], real: true });
+  assert.equal(clean[0].result.verdict, "PASS"); assert.ok(!/denied/.test(clean[0].result.text));
+  const replay = await S.runScenarios(fakeWorld({}).prims, { only: ["1"] });
+  assert.ok(!/denied/.test(replay[0].result.text));
+  const task = mk(["Task"]); task.prims.claude = async () => ({ code: 0, text: JSON.stringify({ subtype: "success", num_turns: 2, result: "stub-ok", permission_denials: [{ tool_name: "Task" }] }) });
+  const fail = await S.runScenarios(task.prims, { only: ["1"], real: true });
+  assert.equal(fail[0].result.verdict, "FAIL"); assert.match(fail[0].result.text, /the client: exit 0, success, turns 2, denied tools \[Task\], answer "stub-ok"/, "run 10's line");
+});
