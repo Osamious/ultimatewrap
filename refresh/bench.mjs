@@ -900,6 +900,9 @@ export async function runSweep({
     if (now() - startedAt >= maxMs) { stop = "time"; abortLive(false); break; }
     const wakeP = new Promise((r) => { wake = r; });
 
+    // ONE clock reading per pass: a provider skipped below as not ready yet (readyAt > tNow) must also read as not ready when the wake time is worked out, or a clock tick between the two readings
+    // leaves it with no wake timer at all and the run parks until the max-minutes backstop.
+    const tNow = now();
     // Round-robin passes until a full pass launches nothing or the slots are full.
     let progressed = true;
     while (progressed && inflightTotal < concurrency) {
@@ -908,7 +911,7 @@ export async function runSweep({
         const ps = providers[(cursor + n) % providers.length];
         if (!ps.queue.length) continue;
         if (ps.inflight >= (ps.completed === 0 || cooling(ps) ? 1 : perProvider)) continue;
-        if (now() < readyAt(ps)) continue;
+        if (tNow < readyAt(ps)) continue;
         const t = takeNext(ps);
         if (!t || t === DELAY) continue;
         launch(ps, t);
@@ -921,7 +924,7 @@ export async function runSweep({
     if (!queued && inflightTotal === 0) break;
 
     let wakeAt = Number.isFinite(maxMs) ? startedAt + maxMs : Infinity;
-    for (const p of providers) if (p.queue.length && readyAt(p) > now()) wakeAt = Math.min(wakeAt, readyAt(p));
+    for (const p of providers) if (p.queue.length && readyAt(p) > tNow) wakeAt = Math.min(wakeAt, readyAt(p));
     if (gatewayCheck && Number.isFinite(outageIdleMs) && inflightTotal > 0) wakeAt = Math.min(wakeAt, lastOkAt + outageIdleMs);
     let timer = null;
     // (setTimeout cannot take more than 2^31-1 ms; a longer wait is just re-armed on wake)
