@@ -283,7 +283,7 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   carries `hasSid`, a session id was present, and `ua`, the client class `claude-cli`, `sdk`, `other`
   or `none`, never the raw header; it rotates at 8 MiB and keeps two older files: 3 files and 24 MiB for one writer, plus at most
   about 200 KiB a file for every router worker that appends, since each checks the size every 50
-  lines; a worker whose file another worker rotated reopens the path at its next check) and `cooling.json`; `shadow.flag` is the pause (the router stats it on
+  lines; a worker whose file another worker rotated reopens the path at its next check; plus a stray claim file after a crash, removed on the next rotation after 10 minutes) and `cooling.json`; `shadow.flag` is the pause (the router stats it on
   every request) and `paused-from.json` remembers what `resume` should restore.
 - **Main's own model first (router v3).** With banding on (the default), a subagent that needs a
   substitute takes main's own model first only when that model is in the LEAD rank band of the

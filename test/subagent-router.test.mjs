@@ -3848,6 +3848,22 @@ test("R-v3 F5: a rotation another worker already did shifts NO generation: the c
   assert.equal(e.counters().logDropped ?? 0, 0, "and the log stayed up");
 });
 
+test("R-v3 F7: a rotation removes a STRAY claim file older than 10 minutes, keeps a fresh one (another worker mid-rotation) and touches no other name", async () => {
+  const e = env(POL(), { slot: null });
+  const f = (n) => path.join(e.state, n), MiB = 1024 * 1024;
+  const plant = (n, ageMs) => { fs.writeFileSync(f(n), "stray\n"); const t = new Date(Date.now() - ageMs); fs.utimesSync(f(n), t, t); };
+  plant("classify.rot-zz.jsonl", 3600000);                                                     // a crashed rotation, an hour old: removed
+  plant("classify.rot-yy.jsonl", 60000);                                                       // another worker mid-rotation, a minute old: kept
+  plant("decisions.rot-zz.jsonl", 3600000);                                                    // another log's stray: not this rotation's business
+  plant("classify.rotx.jsonl", 3600000); plant("classify.rot-zz.txt", 3600000); plant("classify.2x.jsonl", 3600000); plant("notes.jsonl", 3600000);
+  fs.writeFileSync(f("classify.jsonl"), (JSON.stringify({ pad: "x".repeat(1000) }) + "\n").repeat(Math.ceil(8.1 * MiB / 1010)));
+  for (let i = 0; i < 50; i++) { e.tick(100); await e.route(aux(HAIKU, { agent: `s${i}` }), CFG, {}); }
+  assert.ok(fs.existsSync(f("classify.1.jsonl")), "the rotation happened");
+  assert.ok(!fs.existsSync(f("classify.rot-zz.jsonl")), "the old stray claim file is gone");
+  for (const n of ["classify.rot-yy.jsonl", "decisions.rot-zz.jsonl", "classify.rotx.jsonl", "classify.rot-zz.txt", "classify.2x.jsonl", "notes.jsonl"]) assert.ok(fs.existsSync(f(n)), `${n} is untouched`);
+  assert.ok(![...fs.readdirSync(e.state)].some((n) => /^classify\.rot-/.test(n) && n !== "classify.rot-yy.jsonl" && n !== "classify.rot-zz.txt"), "no claim file of this rotation is left");
+});
+
 // =====================================================================================================================
 // Latency harness (O4a). The measurements live HERE, once, and are used twice: by the loose-ceiling tests of this suite (a machine under load must not fail a build) and by the strict
 // standalone script test/perf/subagent-router-perf.mjs (the plan's numbers, best of 3 batches, run on a quiet machine). Importing this file with UW_HELPERS_ONLY=1 registers no test.

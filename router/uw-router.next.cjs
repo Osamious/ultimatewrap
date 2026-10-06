@@ -65,7 +65,7 @@ const POLICY_MAX = 1024 * 1024;
 const STICKY_TTL = 6 * 3600 * 1000, STICKY_ABS = 24 * 3600 * 1000, TOUCH_MS = 600000;
 const MAIN_TTL_DEFAULT = 6 * 3600 * 1000, MAIN_RECHECK_MS = 5000, FUTURE_SLACK_MS = 5 * 60 * 1000;
 const CAPS = { sticky: 512, stickySession: 128, main: 64, mainStatus: 8, auxModels: 16, byModel: 64, seen: 2048, journals: 512, learned: 512 };
-const LOG_MAX = 1024 * 1024, CLASS_MAX = 8 * 1024 * 1024;         // R-v3: classify.jsonl rotates at 8 MiB and keeps 2 generations: 3 files, 24 MiB for one writer, plus at most 50 lines (200 KiB) a file for every worker that appends (each checks the size on its own 50th append; a worker whose file another worker rotated reopens the path at that check)
+const LOG_MAX = 1024 * 1024, CLASS_MAX = 8 * 1024 * 1024;         // R-v3: classify.jsonl rotates at 8 MiB and keeps 2 generations: 3 files, 24 MiB for one writer, plus at most 50 lines (200 KiB) a file for every worker that appends (each checks the size on its own 50th append; a worker whose file another worker rotated reopens the path at that check), plus a stray claim file after a crash, removed by the next rotation after 10 minutes
 const BIG_REQ = 200 * 1024, BK_MAX = 64 * 1024 * 1024;           // R-v3: ABOVE 200 KB (204,800 bytes, content-length > 204800) a row with an UNKNOWN payload cap ranks lowest in a substitute pick; a row field bk (bytes the tool sweep proved the model accepts) above BK_MAX is garbage and ignored
 const LINE_MAX = 4096, ASKED_MAX = 160;                           // a client-controlled string is never stored, keyed or logged unbounded
 const JOURNAL_COMPACT = 64 * 1024, JOURNAL_MAX = 1024 * 1024;
@@ -342,8 +342,19 @@ function dropped() { count("logDropped"); warn("LOG_DROPPED", "log lines were dr
 function closeFd(st, kind) { const f = st.fds[kind]; st.fds[kind] = null; if (f) { try { seam.fs.closeSync(f.fd); } catch { /* already closed */ } } }
 // R-v3 (F5): the file is CLAIMED first by a rename to a name of this worker (atomic: only one of several workers that saw the size gets it; a loser's rename fails with ENOENT and it
 // rotates nothing, so no generation is shifted for nothing), then the generations shift and the claimed file becomes generation 1.
+// A claim file left behind by a crash between the claim and the last rename (or an EPERM there) is removed by the next rotation once it is older than 10 minutes (by mtime; a younger
+// one is another worker mid-rotation and is kept). Only names of the form <base>.rot-<id>.jsonl are ever looked at.
+const STRAY_MS = 600000;
 function rotate(file, gens) {
   const base = file.replace(/\.jsonl$/, ""), claim = `${base}.rot-${process.pid.toString(36)}.jsonl`;
+  try {
+    const dir = path.dirname(file), pre = `${path.basename(base)}.rot-`;
+    for (const n of seam.fs.readdirSync(dir)) {
+      if (!n.startsWith(pre) || !/^[A-Za-z0-9_-]+\.rot-[0-9a-z]{1,13}\.jsonl$/.test(n)) continue;
+      const f = path.join(dir, n);
+      try { if (Date.now() - seam.fs.statSync(f).mtimeMs > STRAY_MS) seam.fs.unlinkSync(f); } catch { /* gone, or not ours to remove: ignore */ }
+    }
+  } catch { /* an unreadable directory: rotation goes on */ }
   try { seam.fs.renameSync(file, claim); } catch (e) { if (e && e.code === "ENOENT") return; throw e; }   // another worker rotated it already
   for (let i = gens; i >= 2; i--) { try { seam.fs.renameSync(`${base}.${i - 1}.jsonl`, `${base}.${i}.jsonl`); } catch { /* generation missing */ } }
   seam.fs.renameSync(claim, `${base}.1.jsonl`);
