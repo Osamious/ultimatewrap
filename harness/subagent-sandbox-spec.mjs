@@ -329,7 +329,7 @@ export const SIDE_EFFECTS = [
   { id: "claude-3p", what: "%LOCALAPPDATA%\\Claude-3p (desktop-app sync target)", mode: "prevent+detect", how: "LOCALAPPDATA redirected; the tripwire fingerprints ONLY the configLibrary folder: the NAME of every entry and the sha256 of the CONTENT of every *.json in it (<id>.json, which CCR's sync rewrites on every sync, and _meta.json). NO LONGER covered by the tripwire (the app rewrites them while it runs, so they would cry wolf): config.json, claude_desktop_config.json, other Claude-3p files edited in place, top-level or nested names, model-catalog/. Those are covered by the preload guard (writes under Claude-3p are denied in the daemon tree), the LOCALAPPDATA redirect, and assertDesktopSyncLandedInScratch (the desktop sync must land in scratch)" },
   { id: "downloads", what: "~/Downloads listing (exportData writes provider keys there)", mode: "detect", how: "tripwire compares the recursive NAME listing (a new file trips it; sizes and mtimes are ignored, so a download in progress does not)" },
   { id: "llmkeys", what: "~/.llmkeys (vault files, registry.json, subagent-policy.json)", mode: "prevent+detect", how: "never read or written by any step; listing (names, sizes) and sha256 of registry.json and subagent-policy.json compared" },
-  { id: "uw-state", what: "C:\\Users\\osami\\.uw\\state (incl. state/subagent)", mode: "prevent+detect", how: "every orchestrator write goes through safeWritePath (scratch root only); the router copy derives its state dir from its own location (scratch); state/subagent listing compared" },
+  { id: "uw-state", what: "C:\\Users\\osami\\.uw\\state (incl. state/subagent)", mode: "prevent+detect", how: "every orchestrator write goes through safeWritePath (scratch root only); the router copy derives its state dir from its own location (scratch); in state/subagent the compiled policy.json (sha256), shadow.flag (presence and content, sha256) and every file that is NOT router runtime (name and size; a new unknown file is a difference) are compared, while the LIVE v2 router's own runtime files (decisions*/classify*/agents* logs and journals, main-*.json, status*.json, cooling.json, .tmp-* and *.lock) are ignored by rule because live sessions write them all the time" },
   { id: "uw-catalog", what: "C:\\Users\\osami\\.uw\\catalog listing", mode: "detect", how: "listing (names, sizes) compared" },
   { id: "claude-config-dir", what: "~/.claude other files (history, projects, sessions)", mode: "prevent", how: "not watched (live sessions write there constantly); protected only by the guard write-deny in the daemon tree and by USERPROFILE/HOME/CLAUDE_CONFIG_DIR redirects" },
   { id: "network-egress-update-checks", what: "any non-loopback connect or DNS (update checks, telemetry)", mode: "prevent", how: `guard denies non-loopback connect, DNS and ports outside ${PORT_RANGE.join("-")} in every node process of the daemon tree; violations.log must be empty` },
@@ -401,6 +401,12 @@ export function liveServicePid(sys) {
   try { return text == null ? null : Number(JSON.parse(text).pid) || null; } catch { return "(unparseable)"; }
 }
 
+/** The names the LIVE v2 router (G2) writes into state/subagent by design, so a new session or subagent changes them at any moment: its logs (decisions, classify, agents and their rotated .N generations), per-session
+ *  main-<sid>.json and agents-<sid>.jsonl, status.json and status-<worker>.json, cooling.json, its atomic-write temp files (.tmp-<pid>s|a) and any .lock. The sandbox run is never judged on these. */
+export const ROUTER_RUNTIME_RE = /^(agents(-[A-Za-z0-9_-]{1,64})?|decisions|classify)(\.\d+)?\.jsonl$|^main-[A-Za-z0-9_-]{1,64}\.json$|^status(-[0-9a-z]{1,13})?\.json$|^cooling\.json$|\.tmp-\d+[as]\d*$|\.lock$/;
+/** Everything in state/subagent that is NOT router runtime (name:size, sorted): policy.json, shadow.flag and any other or unknown file. A new unknown file, or any size change here, is a difference. */
+const stateSubagentOther = (sys) => (sys.listDir(LIVE_STATE_SUBAGENT) ?? ["(absent)"]).filter((e) => !ROUTER_RUNTIME_RE.test(String(e).replace(/:\d+$/, ""))).join("|");
+
 /** A flat object of named values; diffFingerprint compares two of them. Never holds a secret: hashes, pids, names and sizes only. */
 export function fingerprintLive(sys) {
   const settings = sys.readText(LIVE_SETTINGS);
@@ -412,7 +418,7 @@ export function fingerprintLive(sys) {
     credTargetsSha: sys.credSha(), proxySha: sys.proxySha(), supervisor: sys.supervisorState(),   // user PATH, Downloads and Claude-3p are compared by the tripwire
     llmkeysListing: (sys.listDir(LIVE_LLMKEYS) ?? ["(absent)"]).join("|"),
     registrySha: sys.sha256File(path.join(LIVE_LLMKEYS, "registry.json")), ownerPolicySha: sys.sha256File(path.join(LIVE_LLMKEYS, "subagent-policy.json")),
-    stateSubagent: (sys.listDir(LIVE_STATE_SUBAGENT) ?? ["(absent)"]).join("|"), catalogListing: (sys.listDir(LIVE_CATALOG) ?? ["(absent)"]).join("|"),
+    stateSubagentOther: stateSubagentOther(sys), policySha: sys.sha256File(path.join(LIVE_STATE_SUBAGENT, "policy.json")), shadowFlagSha: sys.sha256File(path.join(LIVE_STATE_SUBAGENT, "shadow.flag")), catalogListing: (sys.listDir(LIVE_CATALOG) ?? ["(absent)"]).join("|"),
   };
   for (const p of REAL_PORTS) fp[`listener:${p}`] = sys.listenerPid(p) ?? null;
   return fp;
@@ -529,7 +535,7 @@ export async function proveIsolation(ctx, deps) {
     const d = diff.filter((x) => x.startsWith("listener:"));
     return { ok: d.length === 0, detail: d.length ? d.join("; ") : REAL_PORTS.map((p) => `${p}=${now[`listener:${p}`] ?? "-"}`).join(" ") };
   });
-  await add("live settings.json, service.json, credentials, PATH, ~/.llmkeys, state/subagent, catalog, Downloads, Claude-3p unchanged", () => {
+  await add("live settings.json, service.json, credentials, PATH, ~/.llmkeys, state/subagent (policy.json, shadow.flag and non-runtime files; the live router's own runtime files are ignored), catalog, Downloads, Claude-3p unchanged", () => {
     const d = diff.filter((x) => !x.startsWith("listener:"));
     return { ok: d.length === 0, detail: d.length ? d.join("; ") : "no change" };
   });

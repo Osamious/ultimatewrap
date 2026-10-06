@@ -25,12 +25,13 @@ function fingerprint() {
   const home = os.homedir(), out = {};
   // sa-H: the LIVE router (and the keysync sweeps beside it) write their own logs, status files and per-session state into state/subagent while this suite runs, so those are not what a test could have
   // touched: they are left out (names only, by the router's own file-name rules). policy.json, shadow.flag, the owner files and everything else a CLI command writes stay fingerprinted.
-  const LIVE_ROUTER_OUT = /^((agents|classify|decisions)(\.\d+)?\.jsonl|status(-[A-Za-z0-9_-]{1,64})?\.json|(main|agents)-[A-Za-z0-9_-]{1,64}\.(json|jsonl)|[^\\/]*\.tmp-[^\\/]*)$/;
+  const LIVE_ROUTER_OUT = /^((agents|classify|decisions)(\.\d+)?\.jsonl|status(-[A-Za-z0-9_-]{1,64})?\.json|(main|agents)-[A-Za-z0-9_-]{1,64}\.(json|jsonl)|cooling\.json|[^\\/]*\.lock|[^\\/]*\.tmp-[^\\/]*)$/;
   const walk = (d) => { let es; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const e of es) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else if (LIVE_ROUTER_OUT.test(e.name) && d.endsWith(path.join(".uw", "state", "subagent"))) continue; else { try { const s = fs.statSync(f); out[f] = `${s.size}:${s.mtimeMs}`; } catch { /* raced */ } } } };
   walk(path.join(home, ".llmkeys"));
   walk(path.join(home, ".uw", "state", "subagent"));
-  for (const f of ["accuracy.json", "tool-fidelity.json", "autorebuild.json"]) { try { const s = fs.statSync(path.join(home, ".uw", "state", f)); out[f] = `${s.size}:${s.mtimeMs}`; } catch { out[f] = "absent"; } }
+  // tool-fidelity.json (and its lock, temp and backup side files) is rewritten by the live tool-fidelity sweep, and bench.lock by every bench run, so neither is fingerprinted; only the files below are
+  for (const f of ["accuracy.json", "autorebuild.json"]) { try { const s = fs.statSync(path.join(home, ".uw", "state", f)); out[f] = `${s.size}:${s.mtimeMs}`; } catch { out[f] = "absent"; } }
   const svc = path.join(process.env.APPDATA ?? "", "claude-code-router", "service.json");
   try { const s = fs.statSync(svc); out[svc] = `${s.size}:${s.mtimeMs}`; } catch { out[svc] = "absent"; }
   return out;

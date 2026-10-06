@@ -19,7 +19,7 @@ import {
   NEXT_ROUTER_SRC, SCRATCH_ROUTER, SCRATCH_STATE_DIR, LIVE_SETTINGS, LIVE_SERVICE_JSON, GUARD_LOADED_LOG, VIOLATIONS_LOG, TAKEOVER_FILE,
   PRELOAD_ARG, RefusalError, formatLine, parseLine, evaluateRun, REQUIRED, fingerprintLive, diffFingerprint, describeFingerprint, baselineOf, proveIsolation,
   assertIsolationProven, parseListenPorts, PROTECTED_ROOTS, SANDBOX_PORTS, REAL_PORTS, SCRATCH_SETTINGS, EVIDENCE_ROOT, APPROVAL_FILE, PRECREATE_DIRS, START_CREATES, MUST_BE_ABSENT, ENV_DIR_VARS,
-  treeOf, liveServicePid, realish, CCR_CONFIG_DIR, hashExecutedFiles, EXECUTED_FILES, descendantsLeafFirst, BOOTSTRAP_LIVE_SAFE, resolveCcrInstall, ccrInstallLines, approvalUsedFile, isApprovalUsedFile, distOf, isUnder, PROOF_RETRY, isTransientNetError,
+  treeOf, liveServicePid, realish, LIVE_STATE_SUBAGENT, ROUTER_RUNTIME_RE, CCR_CONFIG_DIR, hashExecutedFiles, EXECUTED_FILES, descendantsLeafFirst, BOOTSTRAP_LIVE_SAFE, resolveCcrInstall, ccrInstallLines, approvalUsedFile, isApprovalUsedFile, distOf, isUnder, PROOF_RETRY, isTransientNetError,
 } from "../harness/subagent-sandbox-spec.mjs";
 import {
   parseArgs, runE2e, renderPlan, planOf, buildRequest, findProfileKey, buildShadowPolicy, realSys, evalA0Probe, evalE4, evalE5, evalE12, evalE7, evalE13, evalA1,
@@ -1312,6 +1312,67 @@ test("fingerprint: holds hashes, pids and names only; diff names what changed (t
   assert.equal(liveServicePid(fakeSys({ readText: () => "{torn" })), "(unparseable)");
   assert.equal(liveServicePid(fakeSys({ readText: () => null })), null);
   assert.equal(typeof realSys().proxySha, "function");
+});
+// The LIVE v2 router (G2) writes into state/subagent all the time; the isolation proof must not go RED on that, but must on anything a run must never change.
+const RUNTIME_NAMES = ["agents-d2e51e39-fb60-42f2-a847-b70dc99f0a25.jsonl", "agents.jsonl", "agents.3.jsonl", "main-b3e07c44.json", "status.json", "status-jbw.json", "decisions.jsonl", "decisions.1.jsonl", "classify.jsonl",
+  "classify.1.jsonl", "cooling.json", "status-jbw.json.tmp-123s", "main-x.json.tmp-9a4", "cooling.json.tmp-77s", "something.lock"];
+/** A live state/subagent as a mutable map name -> {size, text}; the fake sys serves listDir (name:size) and sha256File from it. */
+function liveStateSys(files) {
+  const sys = fakeSys({
+    listDir: (p) => (norm(p) === norm(LIVE_STATE_SUBAGENT) ? [...files.keys()].map((n) => `${n}:${files.get(n).size}`).sort() : null),
+    sha256File: (p) => { const n = path.basename(p); return norm(path.dirname(p)) === norm(LIVE_STATE_SUBAGENT) && files.has(n) ? `h:${files.get(n).text}` : "(absent)"; },
+  });
+  return sys;
+}
+const baseLive = () => new Map([["policy.json", { size: 25987, text: "P1" }], ...RUNTIME_NAMES.slice(0, 6).map((n) => [n, { size: 10, text: "r" }])]);
+async function stateCheck(files, mutate) {
+  const sys = liveStateSys(files);
+  const ctx = { spec: buildSpec({ PATH: "x" }), baseline: baselineOf(sys), phase: "pre-provider", daemonPid: undefined, selfPid: 1, stage: "t" };
+  mutate(files);
+  const r = await proveIsolation(ctx, { sys, tripwire: { assert() {} } });
+  const c = r.checks.find((x) => /state[/]subagent/.test(x.name));
+  return { c, others: r.checks.filter((x) => !x.ok && x !== c) };
+}
+test("proof (state/subagent): the live router's own runtime churn is GREEN, a changed policy.json, a toggled shadow.flag or a new unknown file is RED", async () => {
+  for (const n of RUNTIME_NAMES) assert.ok(ROUTER_RUNTIME_RE.test(n), `${n} is router runtime`);
+  for (const n of ["policy.json", "shadow.flag", "policy.json.bak", "agentsx.jsonl", "main-.json", "status-.json", "statusx.json", "notes.txt", "observed.json", "cooling.json.bak", "decisions.jsonl.old", "classify.txt"]) assert.ok(!ROUTER_RUNTIME_RE.test(n), `${n} is NOT router runtime`);
+  // churn: every runtime name appears, vanishes, grows, a new session's files show up: still GREEN
+  let r = await stateCheck(baseLive(), (m) => {
+    for (const n of RUNTIME_NAMES) m.set(n, { size: 999, text: "new" });
+    m.delete("agents.jsonl"); m.set("agents-aaaaaaaa-bbbb.jsonl", { size: 5, text: "z" }); m.set("main-zzzz.json", { size: 84, text: "z" });
+  });
+  assert.equal(r.c.ok, true, r.c.detail); assert.equal(r.others.length, 0);
+  // RED: policy.json content changed (same size), then size changed
+  r = await stateCheck(baseLive(), (m) => m.set("policy.json", { size: 25987, text: "P2" })); assert.equal(r.c.ok, false); assert.match(r.c.detail, /policySha/);
+  r = await stateCheck(baseLive(), (m) => m.set("policy.json", { size: 25988, text: "P1" })); assert.equal(r.c.ok, false); assert.match(r.c.detail, /stateSubagentOther/);
+  // RED: policy.json removed; shadow.flag appears, then changes content
+  r = await stateCheck(baseLive(), (m) => m.delete("policy.json")); assert.equal(r.c.ok, false);
+  r = await stateCheck(baseLive(), (m) => m.set("shadow.flag", { size: 20, text: "auto:x" })); assert.equal(r.c.ok, false); assert.match(r.c.detail, /shadowFlagSha/);
+  const withFlag = () => { const m = baseLive(); m.set("shadow.flag", { size: 20, text: "auto:x" }); return m; };
+  r = await stateCheck(withFlag(), (m) => m.set("shadow.flag", { size: 20, text: "auto:y" })); assert.equal(r.c.ok, false);
+  r = await stateCheck(withFlag(), (m) => m.delete("shadow.flag")); assert.equal(r.c.ok, false);
+  // RED: a NEW unknown file, and a new file that only looks like a runtime one
+  r = await stateCheck(baseLive(), (m) => m.set("sandbox-leak.json", { size: 1, text: "x" })); assert.equal(r.c.ok, false); assert.match(r.c.detail, /sandbox-leak\.json/);
+  r = await stateCheck(baseLive(), (m) => m.set("policy.json.bak", { size: 1, text: "x" })); assert.equal(r.c.ok, false);
+  // the folder disappearing is a difference too
+  const sys0 = liveStateSys(baseLive()); const b0 = fingerprintLive(sys0);
+  assert.notDeepEqual(b0.stateSubagentOther, fingerprintLive(fakeSys()).stateSubagentOther);
+});
+test("proof (state/subagent) mutation: a fingerprint that ignores EVERYTHING in the folder, or ignores NOTHING, fails the same table", async () => {
+  const table = async (fpState) => {
+    const verdicts = [];
+    const run = async (files, mutate) => { const a = fpState(files); mutate(files); const b = fpState(files); verdicts.push(a === b); };
+    await run(baseLive(), (m) => { for (const n of RUNTIME_NAMES) m.set(n, { size: 999, text: "new" }); });   // must be equal (GREEN)
+    await run(baseLive(), (m) => m.set("policy.json", { size: 25987, text: "P2" }));                               // must differ
+    await run(baseLive(), (m) => m.set("sandbox-leak.json", { size: 1, text: "x" }));                             // must differ
+    await run(baseLive(), (m) => m.set("shadow.flag", { size: 20, text: "a" }));                                   // must differ
+    return verdicts.join();
+  };
+  const want = "true,false,false,false";
+  const real = (files) => { const f = fingerprintLive(liveStateSys(files)); return JSON.stringify([f.stateSubagentOther, f.policySha, f.shadowFlagSha]); };
+  assert.equal(await table(real), want);
+  assert.notEqual(await table(() => "x"), want);                                                                  // ignore everything
+  assert.notEqual(await table((files) => [...files.keys()].map((n) => `${n}:${files.get(n).size}`).sort().join("|")), want);   // ignore nothing (the old listing)
 });
 test("proof: a failing check names itself, a thrown check is a failed check (the proof never throws), assertIsolationProven refuses", async () => {
   const sys = fakeSys();
