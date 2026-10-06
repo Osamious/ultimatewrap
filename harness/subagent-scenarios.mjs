@@ -138,7 +138,7 @@ const J = {};
 J["1"] = (ev) => {
   const rs = messagesOf(ev.records), subs = rs.filter(isSub);
   if (modelIs(ev.asked, ev.policy) || modelIs(ev.policy, ev.asked)) return R("FAIL", `set up wrongly: the policy's model ${clip(ev.policy)} equals the asked model ${clip(ev.asked)}`);
-  if (!subs.length) return R("FAIL", `no subagent request (an agent id and tools) reached the stub among ${plural(rs.length, "request")}: the spawn never happened, nothing is proved`);
+  if (!subs.length) return R("FAIL", `no subagent request (an agent id and tools) reached the stub among ${plural(rs.length, "request")}: the spawn never happened, nothing is proved (${diagOf(ev)})`);
   const wrong = subs.filter((r) => !modelIs(r.model, ev.policy));
   if (wrong.length) return R("FAIL", `${wrong.length} of ${subs.length} subagent requests did not reach the policy's model ${clip(ev.policy)} (the stub received ${[...new Set(wrong.map((r) => clip(r.model)))].join(", ")})`);
   const aids = subs.map(aidOf);
@@ -166,6 +166,7 @@ const judgeFreeVariant = (f) => {
 };
 J["2"] = (ev) => {
   const free = judgeFreeVariant(ev.free);
+  if (!ev.aid) return R("FAIL", `no subagent request (an agent id) reached the stub: the client never spawned the agent, so no 429 was provoked (${diagOf(ev)})`);
   const mine = messagesOf(ev.records).filter((r) => aidOf(r) === ev.aid);
   const first = mine.find((r) => modelIs(r.model, ev.chosen));
   if (!first) return R("FAIL", `the agent never reached the chosen free model ${clip(ev.chosen)} at the stub (saw ${[...new Set(mine.map((r) => clip(r.model)))].join(", ") || "nothing"}): the 429 was never provoked`);
@@ -192,6 +193,7 @@ J["2"] = (ev) => {
 J["3"] = (ev) => {
   const mine = messagesOf(ev.records).filter((r) => aidOf(r) === ev.aid), max = ev.maxRequests ?? 8, ceil = ev.ceilingMs ?? 20000;
   const st = ev.steer;
+  if (ev.aid === "" || ev.aid === undefined) return R("FAIL", `the real client never spawned the agent that was to meet the limit, so nothing was limited (${diagOf(ev)})`);
   if (!st || asArr(st.models).length < 3) return R("FAIL", "the steering check did not run: with a cooling model nothing shows the cooldown ladder steers the next agent away");
   const bad = asArr(st.models).filter((m) => !modelIs(m, st.healthy));
   if (bad.length) return R("FAIL", `${bad.length} of ${st.models.length} agents decided while ${asArr(st.cooled).map(clip).join(", ")} were cooling were NOT served the one healthy model ${clip(st.healthy)} (they got ${[...new Set(bad.map(clip))].join(", ")}): the cooldown did not steer them`);
@@ -298,7 +300,7 @@ J["10"] = (ev) => {
 };
 /** 11: daily cap. ev: {client, aid, failed, recordsForFirst, chosen, nextModels (the models six NEW agents were served: one agent could avoid by chance), overlay}. `failed` is read from the STUB (a 429 with Retry-After was sent to the agent), never from a client exit code. */
 J["11"] = (ev) => {
-  if (!ev.failed) return R("FAIL", "the stub did not answer the first agent with a 429 and a Retry-After (no subagent request, or none answered): the scenario is not set up");
+  if (!ev.failed) return R("FAIL", `the stub did not answer the first agent with a 429 and a Retry-After (no subagent request, or none answered): the scenario is not set up (${diagOf(ev)})`);
   if (ev.recordsForFirst !== 1) return R("FINDING", `${clip(ev.recordsForFirst)} requests reached the stub for the first agent, 1 expected: the client does not fail at once on a long Retry-After (${clip(ev.client)})`);
   const next = asArr(ev.nextModels);
   if (!next.length) return R("FAIL", "the next agents did not reach the stub");
@@ -386,10 +388,10 @@ RUN["1"] = async (p, o) => {
   await p.policy(scenarioPolicy({ rows: ["m-free"] }));
   p.stub.setScript({}); p.stub.clear();
   const sess = `uwsc-s1-${o.run}`;
+  let claude = null;
   if (o.real && p.claude) {
-    let spawned = false;
-    p.stub.setScript({ onMain: (rec) => { if (spawned) return undefined; spawned = true; return { subagent_type: "general-purpose", label: "s1" }; } });
-    await p.claude({ prompt: "Use the Agent tool once to delegate a trivial task, then reply done.", maxTurns: 4 });
+    p.stub.setScript(realScript("s1"));
+    claude = claudeInfo(await p.claude({ prompt: REAL_PROMPT, maxTurns: 4 }));
   } else {
     await p.send("main", { model: ANCHOR, session: sess });
     await SUB(p, { session: sess, agentId: aid, messages: 3 });
@@ -397,12 +399,37 @@ RUN["1"] = async (p, o) => {
   await p.settle();
   const base = await evidenceBase(p, false);
   const realAid = o.real && p.claude ? aidOf(messagesOf(p.stub.records).find(isSub)) : aid;
-  return { client: clientLabel(o, p), policy: "uwstub/m-free", asked: o.real && p.claude ? ANCHOR : ASKED_MODEL, aid: realAid, records: [...p.stub.records], agents: base.agents, lastOut: await rollupLast(p) };
+  return { client: clientLabel(o, p), policy: "uwstub/m-free", asked: o.real && p.claude ? ANCHOR : ASKED_MODEL, aid: realAid, records: [...p.stub.records], agents: base.agents, lastOut: await rollupLast(p), claude };
 };
-const REAL_PROMPT = "Use the Agent tool once to delegate a trivial task, then reply done.";
+export const REAL_MARK = "delegate a trivial task";                 // the harness's own words, inside REAL_PROMPT: they tell the user's turn from every other request the client makes
+export const REAL_PROMPT = `Use the Agent tool once to ${REAL_MARK}, then reply done.`;
 const clientLabel = (o, p) => (o.real && p.claude ? "real claude -p" : o.real ? "replay (real client unavailable: no usable claude launcher)" : "replay");
-/** The stub's scripted spawn for a REAL client run: the first main-shaped request answers with ONE Agent tool call, later ones with text. setScript replaces the whole script, so every real run sets this with its own rules. */
-const spawnOnce = (label = "scn") => { let done = false; return () => { if (done) return undefined; done = true; return { subagent_type: "general-purpose", label }; }; };
+/**
+ * The stub's scripted spawn for a REAL client run, decided by the TURN, not by "the first main-shaped request" (a real client makes several requests of its own, retries, and may repeat the one the user's turn sits in): a
+ * main-shaped request whose messages carry the user's prompt (REAL_MARK) and NO tool_result yet is answered with ONE scripted Agent tool call (a retry of it gets the same answer); every later request, the one that carries the
+ * Agent's tool_result included, is answered with text. setScript replaces the whole script, so every real run sets this with its own rules (`extra`: decide, ...).
+ */
+export const realScript = (label = "scn", extra = {}) => ({ userMarkers: [REAL_MARK], onMain: (rec) => (rec.userMarkers?.[REAL_MARK] && rec.toolResults === 0 ? { subagent_type: "general-purpose", label } : undefined), ...extra });
+/** A stub `decide` for a REAL client: the FIRST request of every agent id gets `step` (429, or {status, retryAfter}); the router's choice of model is not ours to script, so whichever model that agent landed on is the one limited. */
+export const firstRequestOfEachAgent = (step) => { const seen = new Set(); return (rec) => { const a = rec.headers?.["x-claude-code-agent-id"]; if (!a || seen.has(a)) return undefined; seen.add(a); return step; }; };
+const firstSubModel = (records) => { const r = messagesOf(records).find(isSub); return r ? `uwstub/${bareOf(r.model)}` : null; };
+/** What the real client reported (`claude -p --output-format json`), reduced to a few words: exit code, subtype, error flag, turns, the NAMES of denied tools, the first words of its answer. Never the prompt, never a header. */
+export function claudeInfo(r) {
+  if (!r) return null;
+  let j = null; try { j = JSON.parse(String(r.text ?? "")); } catch { /* not JSON: the clipped text says so */ }
+  return { code: r.code ?? null, reason: clip(r.reason ?? "", 80), subtype: clip(j?.subtype ?? "", 40), isError: j?.is_error ?? null, turns: Number.isFinite(j?.num_turns) ? j.num_turns : null,
+    denials: asArr(j?.permission_denials).map((d) => clip(d?.tool_name ?? "?", 30)).slice(0, 5), result: clip(j?.result ?? r.text ?? "", 100), err: clip(r.err ?? "", 100) };
+}
+/** The requests the stub saw, grouped by shape: "11x main/18 tools+Agent/m-main/200 text". The answer to "what did the client do" when no subagent request came. */
+export function shapeDigest(records) {
+  const m = new Map();
+  for (const r of messagesOf(records)) {
+    const tn = asArr(r.toolNames), k = `${aidOf(r) ? "agent" : "main"}/${tn.length} tools${tn.some((n) => /^(agent|task)$/i.test(String(n))) ? "+Agent" : ""}/${clip(bareOf(r.model), 24)}/${r.sent?.status ?? "-"}${r.sent?.kind ? ` ${r.sent.kind}` : ""}${r.toolResults ? ` (${r.toolResults} tool_result)` : ""}`;
+    m.set(k, (m.get(k) ?? 0) + 1);
+  }
+  return [...m].map(([k, n]) => `${n}x ${k}`).join("; ") || "no request";
+}
+const diagOf = (ev) => `stub saw ${shapeDigest(ev.records)}; ${ev.claude ? `the client: exit ${clip(ev.claude.code, 6)}, ${clip(ev.claude.subtype || "no subtype", 30)}, turns ${clip(ev.claude.turns ?? "?", 4)}, denied tools [${asArr(ev.claude.denials).join(", ") || "none"}], answer "${ev.claude.result}"${ev.claude.err ? `, stderr "${ev.claude.err}"` : ""}` : "no client report (replay)"}`;
 const firstSubAid = (p) => aidOf(messagesOf(p.stub.records).find(isSub));
 const limitFree = (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined);
 const OVERLAY_WAIT_MS = 1200;                            // above the router's one-second overlay re-read
@@ -410,12 +437,14 @@ const MAIN_OUTSIDE = "uwstub/m-lead";                    // a main model that is
 const NOT_IN_SET = "uwstub/m-gone";                       // a TAG naming a model the policy does not hold: the router substitutes (the asked model stays a real stub model, so CCR resolves the request)
 RUN["2"] = async (p, o) => {
   const aid = aidFor(o.run, "s2"), sess = `uwsc-s2-${o.run}`, real = !!(o.real && p.claude);
-  await p.policy(scenarioPolicy({ rows: ["m-free", "m-big", "m-main"] }));
-  p.stub.setScript({ decide: limitFree, ...(real ? { onMain: spawnOnce("s2") } : {}) }); p.stub.clear();
+  // replay: main (m-main) is a row, the tag m-free is honoured and limited. REAL client: main's own model would come first (plan 6.2) and the router picks the model, so main is NOT a row and the FIRST request of the agent is
+  // limited, whichever of the two rows it landed on; its retry is handed to the other
+  await p.policy(scenarioPolicy({ rows: real ? ["m-free", "m-big"] : ["m-free", "m-big", "m-main"] }));
+  p.stub.setScript(real ? realScript("s2", { decide: firstRequestOfEachAgent(429) }) : { decide: limitFree }); p.stub.clear();
   if (!real) await p.send("main", { model: ANCHOR, session: sess });
   const status0 = await needCoolingEmpty(p, "scenario 2");
-  let finalOk;
-  if (real) finalOk = (await p.claude({ prompt: REAL_PROMPT, maxTurns: 6 }))?.code === 0;
+  let finalOk, claude = null;
+  if (real) { const cr = await p.claude({ prompt: REAL_PROMPT, maxTurns: 6 }); finalOk = cr?.code === 0; claude = claudeInfo(cr); }
   else {
     await SUB(p, { session: sess, agentId: aid, messages: 3 });                       // the first attempt: the stub answers 429 for the chosen free model
     await SUB(p, { session: sess, agentId: aid, messages: 3, retryCount: 1 });        // the client's retry: the same body again (the `len` signal) with the SDK retry-count header
@@ -433,7 +462,7 @@ RUN["2"] = async (p, o) => {
   await SUB(p, { session: fsess, agentId: faid, messages: 3, retryCount: 1 });
   await p.settle();
   const fbase = await evidenceBase(p);
-  return { client: clientLabel(o, p), aid: real ? aidOf(records.find(isSub)) : aid, chosen: "uwstub/m-free", records, agents: base.agents, lastOut, status0, status1: base.status, finalOk,
+  return { client: clientLabel(o, p), aid: real ? aidOf(records.find(isSub)) : aid, chosen: real ? (firstSubModel(records) ?? "uwstub/m-free") : "uwstub/m-free", records, agents: base.agents, lastOut, status0, status1: base.status, finalOk, claude,
     free: { aid: faid, chosen: "uwstub/m-free", rows: ["uwstub/m-free", "uwstub/m-main"], paid: ["uwstub/m-big"], records: [...p.stub.records], agents: fbase.agents, status0: fstatus0, status1: fbase.status } };
 };
 RUN["3"] = async (p, o) => {
@@ -454,9 +483,10 @@ RUN["3"] = async (p, o) => {
   await p.settle();
   const steer = { models: steerIds.map((id) => stubSub(p, id)[0]?.model).filter(Boolean), healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] };
   // step 2: now EVERY model returns 429 for a subagent, and ONE agent meets it on m-big (m-free is cooling), is retried, and no eligible model is left
-  p.stub.setScript({ decide: (rec) => (rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined), ...(real ? { onMain: spawnOnce("s3") } : {}) }); p.stub.clear();
+  p.stub.setScript({ decide: (rec) => (rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined), ...(real ? realScript("s3") : {}) }); p.stub.clear();
   const status0 = await p.freshStatus(), responses = [], aid = aidFor(o.run, "s3");
-  if (real) { const t0 = p.now(); await p.claude({ prompt: REAL_PROMPT, maxTurns: 6 }); responses.push({ status: 429, ms: p.now() - t0 }); }
+  let claude = null, realAid = aid;
+  if (real) { const t0 = p.now(); claude = claudeInfo(await p.claude({ prompt: REAL_PROMPT, maxTurns: 6 })); responses.push({ status: 429, ms: p.now() - t0 }); realAid = firstSubAid(p); }      // named NOW: the synthetic next agent below is a subagent-shaped request too
   else for (let i = 0; i < 5; i++) { const r = await SUB(p, { session: sess, agentId: aid, messages: 3, model: ANCHOR, tag: NOT_IN_SET, ...(i ? { retryCount: i } : {}) }); responses.push({ status: r.status, ms: r.ms }); }
   await p.settle();
   // routing is never blocked: the NEXT agent is still routed (every row is cooling, so a demoted row is used); read from the stub's records of THAT agent, never from a record count (the status flush sends an aux request of its own)
@@ -464,7 +494,7 @@ RUN["3"] = async (p, o) => {
   await SUB(p, { session: sess, agentId: nextAid, messages: 3, model: ANCHOR, tag: NOT_IN_SET });
   await p.settle();
   const base = await evidenceBase(p);
-  return { client: clientLabel(o, p), aid: real ? firstSubAid(p) : aid, steer, responses, records: [...p.stub.records], agents: base.agents, status0, status1: base.status, nextReached: stubSub(p, nextAid).length > 0 };
+  return { client: clientLabel(o, p), aid: realAid, claude, steer, responses, records: [...p.stub.records], agents: base.agents, status0, status1: base.status, nextReached: stubSub(p, nextAid).length > 0 };
 };
 RUN["4"] = async (p, o) => {
   const sess = `uwsc-s4-${o.run}`;
@@ -598,20 +628,23 @@ RUN["10"] = async (p, o) => {
 RUN["11"] = async (p, o) => {
   const a = aidFor(o.run, "s11a"), b = aidFor(o.run, "s11b"), sess = `uwsc-s11-${o.run}`, real = !!(o.real && p.claude);
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big"] }));
-  p.stub.setScript({ decide: (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? { status: 429, retryAfter: 3600 } : undefined), ...(real ? { onMain: spawnOnce("s11") } : {}) }); p.stub.clear();
+  const cap = { status: 429, retryAfter: 3600 };
+  p.stub.setScript(real ? realScript("s11", { decide: firstRequestOfEachAgent(cap) }) : { decide: (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? cap : undefined) }); p.stub.clear();
   await needCoolingEmpty(p, "scenario 11");
-  if (real) await p.claude({ prompt: REAL_PROMPT, maxTurns: 4 });
+  let claude = null;
+  if (real) claude = claudeInfo(await p.claude({ prompt: REAL_PROMPT, maxTurns: 4 }));
   else { await p.send("main", { model: ANCHOR, session: sess }); await SUB(p, { session: sess, agentId: a, messages: 3 }); }   // the client fails the agent AT ONCE: no second request is sent
   await p.settle();
   const firstAid = real ? firstSubAid(p) : a;
   const firstRecs = firstAid ? stubSub(p, firstAid) : [];                              // never the main request: only requests that carry the agent's own id
   const failed = firstRecs.some((r) => r.sent?.status === 429 && r.sent.retryAfter === 3600);      // read from the STUB's evidence, not from a client exit code
-  const overlay = await p.feedOverlay("uwstub/m-free", "rate");                         // what the observer would write after seeing the 429 in the gateway log
+  const chosen = real ? (firstSubModel(p.stub.records) ?? "uwstub/m-free") : "uwstub/m-free";    // a real agent lands on whichever row the router picked
+  const overlay = await p.feedOverlay(chosen, "rate");                                  // what the observer would write after seeing the 429 in the gateway log
   await p.sleep(OVERLAY_WAIT_MS);                                                       // the router re-reads observed.json at most once a second (overlayView): the first measured agent must come AFTER that
   const nexts = Array.from({ length: 6 }, (_, i) => `${b}-${i}`);                      // six agents: with two rows one agent would avoid the limited model by chance half the time, six all-but-never
   for (const aid of nexts) await SUB(p, { session: sess, agentId: aid, messages: 3, model: "uwstub/m-main", tag: NOT_IN_SET });   // not in the policy: a substitute is picked, and a demoted model is passed over
   await p.settle();
-  return { client: clientLabel(o, p), aid: firstAid, failed, recordsForFirst: firstRecs.length, chosen: "uwstub/m-free", nextModels: nexts.map((aid) => stubSub(p, aid)[0]?.model).filter(Boolean), overlay: !!overlay };
+  return { client: clientLabel(o, p), aid: firstAid, failed, recordsForFirst: firstRecs.length, chosen, claude, records: [...p.stub.records], nextModels: nexts.map((aid) => stubSub(p, aid)[0]?.model).filter(Boolean), overlay: !!overlay };
 };
 const DAY_MS = 86400000;
 RUN.C1 = async (p, o) => {

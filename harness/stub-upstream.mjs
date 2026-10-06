@@ -82,6 +82,9 @@ function normaliseScript(s) {
   if (sc.markers !== undefined) {
     if (!Array.isArray(sc.markers) || sc.markers.length > MARKERS_MAX || sc.markers.some((m) => typeof m !== "string" || m.length < 1 || m.length > 64)) throw new Error(`stub script: markers must be at most ${MARKERS_MAX} strings of 1..64 characters`);
   }
+  if (sc.userMarkers !== undefined) {
+    if (!Array.isArray(sc.userMarkers) || sc.userMarkers.length > MARKERS_MAX || sc.userMarkers.some((m) => typeof m !== "string" || m.length < 1 || m.length > 64)) throw new Error(`stub script: userMarkers must be at most ${MARKERS_MAX} strings of 1..64 characters`);
+  }
   return sc;
 }
 const SYS_SHAPES = (sys) => (typeof sys === "string" ? "string" : Array.isArray(sys) ? "array" : "absent");
@@ -117,6 +120,8 @@ function sseEvents(model, blocks, stop) {
  *   script.sequence       -> per-request steps, consumed in order, one per /v1/messages request (each a status number or {status, retryAfter (seconds), cut}); when it is empty the
  *                            answer is script.status or 200. Steps: 200, 429 with and without retryAfter, 503, 529, 400, 413, 502, {cut: "after-message_start"}
  *   script.decide         -> (rec) => a step (a status number or {status, retryAfter, cut}) for THIS request, or undefined to fall through to the sequence and the default; scripts the failure of one model
+ *   script.userMarkers    -> like markers, but looked for in the request's MESSAGES: rec.userMarkers[<marker>] (true/false); rec.toolResults is always the number of tool_result blocks in the messages. A REAL client's turns are told apart by them
+ *                            (the turn that carries the user's prompt and no tool_result yet is the one to answer with the scripted Agent call; a retry of it gets the same answer). rec.sent.kind is "tool_use" or "text" for a 200 answer
  *   script.markers        -> strings (at most 8, each at most 64 characters) whose presence in the request's SYSTEM is recorded as rec.markers[<marker>] (true/false); the marker text is the
  *                            harness's own, the system text is never stored
  */
@@ -138,7 +143,7 @@ export function createStub({ port = STUB_PORT, script = {}, labelsFile, host = S
       const h = lower(req.headers);
       const rec = { seq: ++seq, t: new Date().toISOString(), method: req.method, path: req.url, bodyBytes: size, bodySha256: null, model: null,
         headers: {}, toolNames: [], agentToolDescription: null, marker: null,
-        systemShape: null, markers: {}, sysBlocks: null, sysCc: [], messagesLen: null, messagesSha256: null, toolsSha256: null, sent: null };
+        systemShape: null, markers: {}, userMarkers: {}, toolResults: null, sysBlocks: null, sysCc: [], messagesLen: null, messagesSha256: null, toolsSha256: null, sent: null };
       for (const k of RECORDED_HEADERS) if (h[k] !== undefined) rec.headers[k] = String(h[k]).slice(0, 256);
       let body = null;
       if (!tooBig) {
@@ -162,6 +167,11 @@ export function createStub({ port = STUB_PORT, script = {}, labelsFile, host = S
         for (const mk of current.markers ?? []) rec.markers[mk] = sysText.includes(mk);
         if (rec.systemShape === "array") { rec.sysBlocks = body.system.length; rec.sysCc = body.system.flatMap((b, i) => (b && typeof b === "object" && b.cache_control !== undefined ? [i] : [])); }
         rec.messagesLen = Array.isArray(body.messages) ? body.messages.length : null;
+        // what turn of the conversation this is, without keeping a word of it: whether the harness's own USER markers occur in the messages (a boolean per marker) and how many tool_result blocks the messages hold
+        const msgs = Array.isArray(body.messages) ? body.messages : [];
+        const msgText = (current.userMarkers ?? []).length ? JSON.stringify(msgs) : "";
+        for (const mk of current.userMarkers ?? []) rec.userMarkers[mk] = msgText.includes(mk);
+        rec.toolResults = msgs.reduce((n, m) => n + (m && Array.isArray(m.content) ? m.content.filter((b) => b && b.type === "tool_result").length : 0), 0);
         rec.messagesSha256 = sha256(JSON.stringify(body.messages ?? null));
         rec.toolsSha256 = sha256(JSON.stringify(body.tools ?? null));
         const m = MARKER_RE.exec(JSON.stringify(body.messages ?? []));
@@ -212,7 +222,9 @@ export function createStub({ port = STUB_PORT, script = {}, labelsFile, host = S
         blocks.push({ type: "tool_use", id: `toolu_stub_${seq}`, name: "Agent",
           input: { description: `scripted spawn ${label}`, subagent_type: String(call.subagent_type ?? "general-purpose"), prompt: `UWGT:${label}:${n}\nscripted task` } });
         stop = "tool_use";
+        rec.sent.kind = "tool_use";
       } else {
+        rec.sent.kind = "text";
         blocks.push({ type: "text", text: current.text ?? "stub-ok" });
       }
       const wantsStream = body.stream === true;

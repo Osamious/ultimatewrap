@@ -660,6 +660,8 @@ test("sandboxPrims with a real client: the canary settings.json is written under
   }
 });
 
+/** The record the stub would hold for the user's turn of a real client: the script's own user markers present, no tool_result yet. */
+const userTurn = (script, over = {}) => ({ userMarkers: Object.fromEntries((script.userMarkers ?? []).map((m) => [m, true])), toolResults: 0, ...over });
 test("--real yes: the client is named truthfully. Without a client (no launcher pinned) the REAL scenarios REPLAY and their lines never read 'real claude -p'; with a client scenarios 1, 2, 3 and 11 call it (each sets onMain so a subagent is spawned), judge the failure from the STUB, name the client, and RC is judged", async () => {
   const f = fakeWorld({});
   const r0 = await S.runScenarios(f.prims, { only: ["1", "2", "3", "11"], real: true });
@@ -669,7 +671,7 @@ test("--real yes: the client is named truthfully. Without a client (no launcher 
   const g = fakeWorld({}); const prompts = [];
   g.prims.claude = async ({ prompt }) => {
     prompts.push(prompt);
-    const spawn = g.w.script.onMain?.({});
+    const spawn = g.w.script.onMain?.(userTurn(g.w.script));
     assert.ok(spawn && spawn.subagent_type, "the scenario's stub script spawns a subagent (onMain), or a real client would never delegate");
     await g.prims.send("main", { model: ANCHOR, session: "real-sess" });
     const sub = (over) => g.prims.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentId: "real-agent", session: "real-sess", messages: 3, agentTool: false, ...over });
@@ -715,7 +717,7 @@ test("real mode: EACH of scenarios 1, 2, 3 and 11 sets onMain in its stub script
   const g = fakeWorld({});
   let current = null;
   g.prims.claude = async () => {
-    const spawn = g.w.script.onMain?.({});
+    const spawn = g.w.script.onMain?.(userTurn(g.w.script));
     seen[current] = !!(spawn && spawn.subagent_type);
     if (!seen[current]) return { code: 0 };                                              // a client with no scripted spawn delegates nothing
     await g.prims.send("main", { model: ANCHOR, session: `real-${current}` });
@@ -1163,4 +1165,104 @@ test("R5-7 quiet gap: a scenario that fails a model and starts less than 5.5 min
   assert.equal(noFail.notes.filter((m) => /quiet gap/.test(m)).length, 0);
   const after = await run({ only: ["7", "3"] });                                                   // 7 runs first by the order: no wait
   assert.equal(after.notes.filter((m) => /quiet gap/.test(m)).length, 0);
+});
+
+// ====================================================================================== fix round 6 (the first REAL-client run: no subagent was ever spawned)
+const agentTool = { name: "Agent", description: "Launch a new agent", input_schema: { type: "object", properties: { description: { type: "string" }, prompt: { type: "string" }, subagent_type: { type: "string" } }, required: ["description", "prompt"] } };
+const userMsg = (text) => ({ role: "user", content: [{ type: "text", text }] });
+const post = async (port, body, headers = {}) => { const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) }); return { status: r.status, text: await r.text() }; };
+
+test("R6-1 the stub tells the turns of a REAL client apart without keeping a word of them: userMarkers (a boolean per marker, looked for in the messages), toolResults (a count) and sent.kind; a bad userMarkers script is refused", async () => {
+  const stub = createStub({ port: 0 }), port = await stub.start();
+  try {
+    stub.setScript({ userMarkers: ["delegate a trivial task"] });
+    await post(port, { model: "m", tools: [agentTool], messages: [userMsg("Use the Agent tool once to delegate a trivial task, then reply done.")] });
+    await post(port, { model: "m", tools: [agentTool], messages: [userMsg("something else"), { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Agent", input: {} }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }, { type: "tool_result", tool_use_id: "t2", content: "x" }] }] });
+    const [a, b] = stub.records;
+    assert.deepEqual(a.userMarkers, { "delegate a trivial task": true }); assert.equal(a.toolResults, 0); assert.equal(a.sent.kind, "text");
+    assert.deepEqual(b.userMarkers, { "delegate a trivial task": false }); assert.equal(b.toolResults, 2);
+    assert.ok(!JSON.stringify(a).includes("then reply done") && !JSON.stringify(a).includes("something else"), "no message text is kept");
+  } finally { await stub.stop(); }
+  for (const bad of [["x".repeat(65)], [""], Array.from({ length: 9 }, (_, i) => `m${i}`), "nope", [1]]) assert.throws(() => createStub({ port: 0, script: { userMarkers: bad } }), /userMarkers must be at most 8 strings of 1\.\.64 characters/);
+});
+
+test("R6-2 the scripted spawn is decided by the TURN: the user's turn with no tool_result gets an Agent tool call (a retry of it the same), a warm-up or any other request gets text, the request that carries the Agent's tool_result gets text; firstRequestOfEachAgent limits only the first request of each agent id", () => {
+  const sc = S.realScript("s1", { decide: S.firstRequestOfEachAgent(429) });
+  assert.deepEqual(sc.userMarkers, ["delegate a trivial task"]); assert.match(S.REAL_PROMPT, /delegate a trivial task/);
+  const turn = (o) => sc.onMain({ userMarkers: { "delegate a trivial task": true }, toolResults: 0, ...o });
+  assert.deepEqual(turn({}), { subagent_type: "general-purpose", label: "s1" });
+  assert.deepEqual(turn({}), { subagent_type: "general-purpose", label: "s1" }, "a retry of the same request is answered the same way (the old once-only flag answered it with text)");
+  assert.equal(turn({ toolResults: 1 }), undefined, "the request that carries the Agent's result");
+  assert.equal(sc.onMain({ userMarkers: { "delegate a trivial task": false }, toolResults: 0 }), undefined, "a warm-up or helper request without the user's prompt");
+  assert.equal(sc.onMain({}), undefined);
+  const d = S.firstRequestOfEachAgent({ status: 429, retryAfter: 3600 }), h = (a) => ({ headers: a ? { "x-claude-code-agent-id": a } : {} });
+  assert.deepEqual(d(h("a1")), { status: 429, retryAfter: 3600 }); assert.equal(d(h("a1")), undefined, "its retry"); assert.deepEqual(d(h("a2")), { status: 429, retryAfter: 3600 }); assert.equal(d(h(null)), undefined, "the main request");
+});
+
+test("R6-3 against the REAL stub, streamed and not: the user's turn is answered with a well-formed Agent tool_use (name, description, prompt, subagent_type, a UWGT marker; SSE with input_json_delta that parses), the warm-up request gets text and does not use the spawn up, a retry gets the tool_use again, the request with the tool_result gets text", async () => {
+  const stub = createStub({ port: 0 }), port = await stub.start();
+  try {
+    stub.setScript(S.realScript("s1"));
+    const turn = [userMsg(S.REAL_PROMPT)];
+    const warm = await post(port, { model: "m", max_tokens: 1, tools: [agentTool], messages: [userMsg("warm up")] });
+    assert.equal(JSON.parse(warm.text).stop_reason, "end_turn", "a request without the user's prompt: text");
+    for (const attempt of [1, 2]) {
+      const j = JSON.parse((await post(port, { model: "m", tools: [agentTool], messages: turn })).text);
+      assert.equal(j.stop_reason, "tool_use", `attempt ${attempt}`);
+      const tu = j.content.find((b) => b.type === "tool_use");
+      assert.equal(tu.name, "Agent"); assert.ok(tu.id && tu.input.description && tu.input.prompt && tu.input.subagent_type === "general-purpose");
+      assert.match(tu.input.prompt, /^UWGT:s1:\d+\n/);
+    }
+    const sse = (await post(port, { model: "m", stream: true, tools: [agentTool], messages: turn })).text;
+    const events = sse.split("\n\n").filter(Boolean).map((e) => ({ type: /^event: (.+)$/m.exec(e)[1], data: JSON.parse(/^data: (.+)$/m.exec(e)[1]) }));
+    assert.deepEqual(events.map((e) => e.type), ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+    assert.equal(events[1].data.content_block.type, "tool_use"); assert.equal(events[1].data.content_block.name, "Agent");
+    const input = JSON.parse(events[2].data.delta.partial_json);
+    assert.ok(input.description && input.prompt && input.subagent_type); assert.equal(events[4].data.delta.stop_reason, "tool_use");
+    const back = [...turn, { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Agent", input }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] }];
+    assert.equal(JSON.parse((await post(port, { model: "m", tools: [agentTool], messages: back })).text).stop_reason, "end_turn", "after the tool_result: text");
+    assert.deepEqual(stub.records.map((r) => r.sent.kind), ["text", "tool_use", "tool_use", "tool_use", "text"]);
+  } finally { await stub.stop(); }
+});
+
+test("R6-4 when no subagent request comes, the verdict says what the client DID: the stub's request shapes (agent or main, tool count, +Agent, model, status, reply kind) and the client's own report (exit, subtype, turns, the NAMES of denied tools, the first words of its answer); claudeInfo reads claude's JSON and survives anything else", () => {
+  const rec = (o) => ({ method: "POST", path: "/v1/messages", headers: {}, toolNames: [], model: "uwstub/m-main", sent: { status: 200, kind: "text" }, toolResults: 0, ...o });
+  const records = [...Array.from({ length: 11 }, () => rec({ toolNames: Array.from({ length: 18 }, (_, i) => (i === 0 ? "Agent" : `T${i}`)) })), rec({ sent: { status: 200, kind: "tool_use" }, toolNames: ["Agent"] }), rec({ toolNames: ["Agent"], toolResults: 1 })];
+  assert.equal(S.shapeDigest(records), "11x main/18 tools+Agent/m-main/200 text; 1x main/1 tools+Agent/m-main/200 tool_use; 1x main/1 tools+Agent/m-main/200 text (1 tool_result)");
+  const claude = S.claudeInfo({ code: 0, text: JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 2, result: "done", permission_denials: [{ tool_name: "Agent", tool_input: { prompt: "SECRET" } }] }), err: "" });
+  assert.deepEqual(claude, { code: 0, reason: "", subtype: "success", isError: false, turns: 2, denials: ["Agent"], result: "done", err: "" });
+  assert.ok(!JSON.stringify(claude).includes("SECRET"), "denied tool NAMES only, never an input");
+  assert.deepEqual(S.claudeInfo({ code: 1, text: "not json \u0001", err: "boom", reason: "timed out" }), { code: 1, reason: "timed out", subtype: "", isError: null, turns: null, denials: [], result: "not json ?", err: "boom" });
+  assert.equal(S.claudeInfo(null), null);
+  const ev = { records, claude, policy: "uwstub/m-free", asked: "uwstub/m-main" };
+  const r1 = ok("1", ev); assert.equal(r1.verdict, "FAIL"); assert.match(r1.text, /the spawn never happened, nothing is proved \(stub saw 11x main\/18 tools\+Agent\/m-main\/200 text; .*the client: exit 0, success, turns 2, denied tools \[Agent\], answer "done"/);
+  assert.match(ok("2", { ...ev, aid: "", chosen: "uwstub/m-free" }).text, /the client never spawned the agent, so no 429 was provoked \(stub saw 11x main/);
+  assert.match(ok("3", { ...ev, aid: "", steer: { models: ["uwstub/m-big", "uwstub/m-big", "uwstub/m-big"], healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] } }).text, /the real client never spawned the agent that was to meet the limit, so nothing was limited \(stub saw/);
+  assert.match(ok("11", { ...ev, failed: false }).text, /scenario is not set up \(stub saw/);
+});
+
+test("R6-5 the REAL scenarios against a fake client: scenario 3 names the agent the real client spawned BEFORE the synthetic next agent exists (a client that spawns nothing is 'never spawned', not a handoffNone mystery); scenario 2 keeps main out of the rows and limits the agent's FIRST request, whichever row it landed on; scenario 11 limits and steers away from the row the agent landed on", async () => {
+  const lazy = fakeWorld({}); lazy.prims.claude = async () => ({ code: 0, text: JSON.stringify({ subtype: "success", num_turns: 1, result: "done" }) });
+  const r3 = await S.runScenarios(lazy.prims, { only: ["3"], real: true });
+  assert.equal(r3[0].result.verdict, "FAIL"); assert.match(r3[0].result.text, /the real client never spawned the agent that was to meet the limit/); assert.match(r3[0].result.text, /the client: exit 0, success, turns 1/);
+  const f = fakeWorld({}), rows = [];
+  const origPolicy = f.prims.policy; f.prims.policy = async (p) => { rows.push(p.models.map((m) => m.s)); return origPolicy(p); };
+  const client = (w, retry = true) => async () => {
+    const script = w.w.script;
+    assert.ok(script.onMain(userTurn(script)), "the real script spawns on the user's turn");
+    await w.prims.send("main", { model: ANCHOR, session: "real-s" });
+    const sub = (over) => w.prims.send("sub", { model: ASKED_MODEL, tag: "uwstub/m-big", agentId: "real-agent", session: "real-s", messages: 3, agentTool: false, ...over });
+    await sub({}); if (retry) await sub({ retryCount: 1 });                                   // a daily cap (Retry-After 3600) fails the agent at once: no retry
+    return { code: 0, text: JSON.stringify({ subtype: "success", num_turns: 3, result: "done" }) };
+  };
+  f.prims.claude = client(f);
+  const r2 = await S.runScenarios(f.prims, { only: ["2"], real: true });
+  assert.ok(rows.some((r) => r.join() === "uwstub/m-free,uwstub/m-big"), `the real scenario 2 policy has two rows and no m-main (${rows.map((r) => r.join("|"))})`);
+  assert.match(r2[0].result.text, /429 on uwstub\/m-big/, `the limited model is the one the agent landed on: ${r2[0].result.text}`);
+  const g = fakeWorld({}), fed = [];
+  const origFeed = g.prims.feedOverlay; g.prims.feedOverlay = async (m, st) => { fed.push(m); return origFeed(m, st); };
+  g.prims.claude = client(g, false);
+  const r11 = await S.runScenarios(g.prims, { only: ["11"], real: true });
+  assert.deepEqual(fed, ["uwstub/m-big"], "the overlay marks the model the real agent landed on, not a fixed m-free");
+  assert.equal(r11[0].result.verdict, "DEGRADED", r11[0].result.text);
 });
