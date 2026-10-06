@@ -1079,6 +1079,8 @@ export function ledgerUniverses({ set, cand = null }) {
  */
 /** Pending reasons that come from an ASK (the model was sent a request and got no verdict): such a model queues behind the ones never asked, and a later `cap` wait does not erase that history. */
 export const TRIED_REASONS = new Set(["rate", "quota", "optional-flaky", "pay", "auth", "gone", "error", "timeout", "empty", "slow", "reasoning-budget", "route-shape", "upstream-unavailable", "request-cap"]);
+/** Pending reasons of models a paused provider was never asked about: not an answer, never counted (see updatePending). */
+export const PAUSED_REASONS = new Set(["rate-paused", "quota-paused"]);
 export function updatePending(pending, { queue, recorded, store, reasonOf, whyOf = null, flaky = null, now = new Date(), keepKeys = null }) {
   const out = { ...pending };
   if (keepKeys) for (const k of Object.keys(out)) if (!keepKeys.has(k)) delete out[k];             // a model that has left the probe set is not pending
@@ -1088,8 +1090,12 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, whyOf
     const isFlaky = !!flaky?.has(e.key);
     if (!isFlaky && (recorded.has(e.key) || r?.strikes === 1)) { delete out[e.key]; continue; }
     const code = isFlaky ? "optional-flaky" : String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
-    if ((code === "cap" || code === "quota-paused") && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;       // never asked this time (the cap, a provider paused on quota): what the last ask said stays           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
-    const prev = out[e.key], same = !!prev && prev.r === code;
+    const prev = out[e.key];
+    if (code === "cap" && prev && TRIED_REASONS.has(prev.r)) continue;                       // it waited for the cap this time: what the last ask said stays, and so does its place in the line
+    // A model that was NEVER ASKED because its provider was paused (`rate-paused`, `quota-paused`) says nothing about the model: it keeps the reason of its last real ask, and an entry that is already one of these
+    // stays as it is, so the pause never grows `n` or `rn`, never counts toward stuck, and the policy funnel (which reads only the real soft and hard reasons) has nothing to demote it for.
+    if (PAUSED_REASONS.has(code) && prev && (TRIED_REASONS.has(prev.r) || prev.r === code)) continue;
+    const same = !!prev && prev.r === code;
     const why = whyOf?.(e.key) ?? (same ? prev.why : undefined);
     out[e.key] = { r: code, n: Math.min(9999, (prev?.n ?? 0) + 1), at: now.toISOString(), since: same ? prev.since ?? prev.at : now.toISOString(),         // since: the first time THIS reason was recorded
       rn: same ? Math.min(9999, (prev.rn ?? prev.n) + 1) : 1,                                                                                         // rn: runs in a row with THIS reason (a legacy entry reads as rn = n)

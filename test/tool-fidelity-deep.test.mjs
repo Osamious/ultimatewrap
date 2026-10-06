@@ -199,7 +199,8 @@ test("RATE PAUSE: three rate limits in a row make the provider WAIT and be tried
   assert.ok(fa.length >= 6 && fa.length <= 12, `fa was asked ${fa.length} times: three, a wait, three more, then left alone`);
   assert.match(r.out, /left alone for the rest of this run, their models stay pending: fa \(rate-limited\)/);
   const st = loadFidelity(e.out);
-  assert.equal(st.pending["fa/a3"].r, "rate");
+  const faReasons = Object.entries(st.pending).filter(([k]) => k.startsWith("fa/")).map(([, v]) => v.r);
+  assert.ok(faReasons.every((x) => x === "rate" || x === "rate-paused") && faReasons.includes("rate") && faReasons.includes("rate-paused"), faReasons.join(","));       // the asked ones: rate; the ones the pause never let in: rate-paused
   assert.ok(st.models["fc/c1"] && st.models["fc/c2"], "the other providers were not held up");
 });
 

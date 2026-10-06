@@ -398,7 +398,7 @@ export function pendingReasonOf(r, entry) {
   if (r.s !== "skip") return r.s;
   if (r.w === "spend-cap") return "spend";
   if (r.w === "row-cost") return entry?.pricedOnFree ? PRICED_OVER_ROW : "row-cost";
-  if (r.w === "rate-paused") return "rate";
+  if (r.w === "rate-paused") return "rate-paused";                // never asked: not a rate answer, and it does not count toward stuck or rn
   if (r.w === "quota-paused") return "quota-paused";                // never asked: not a fresh quota answer, and it does not count toward stuck
   return r.w ?? "skip";
 }

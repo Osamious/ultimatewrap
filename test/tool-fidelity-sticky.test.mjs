@@ -11,7 +11,8 @@ import { pinL12, SWEEP_FAST, freshDir, fakeFetch, goodModel, http, record, kindO
 import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf, trendLine } from "../refresh/tool-fidelity-cli.mjs";
 import { runKind, isQuotaSentence, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { runSweep } from "../refresh/bench.mjs";
-import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { SWEEP_SOFT, SWEEP_HARD } from "../menu/subagent-funnel.mjs";
+import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, PAUSED_REASONS, STUCK_REASONS, OWNER_REASONS, DEFAULT_LEVELS, diminishingReturns, runGain, testedState, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
@@ -224,7 +225,7 @@ test("a run where every request is rate-limited records nothing and says saturat
   const r = await run(["--live", "--per-provider", "1"], e.deps);
   const sat = r.lines.at(-1);
   assert.match(sat, /^SATURATION saturated=yes recoverable=8 hard=0 new_results=0 requests=\d+ reason=zero-new$/);
-  assert.match(r.out, /sweep verdict: RECOVERABLE 8 of 8 \(rate 8\)/);
+  assert.match(r.out, /sweep verdict: RECOVERABLE 8 of 8 \((rate|rate-paused) \d+, (rate|rate-paused) \d+\)/);
   assert.match(r.out, /saturation of this run: (\d+) request\(s\) sent: \1 ended rate-limited or over quota \(100% of \1\), \1 ended rate, error, timeout or quota \(100% of \1\); 0 new record\(s\); saturated: yes \(no new result in this run\)/);
   assert.deepEqual(loadFidelity(e.out).held, {}, "a rate limit is the moment's: never a hold");
 });
@@ -1058,7 +1059,7 @@ test("G: a model a quota pause never asked keeps its previous reason (or is `quo
   assert.deepEqual(out["p/a"], prev["p/a"], "never asked: unchanged (rn does not grow)");
   assert.equal(out["p/b"].r, "quota-paused");
   assert.equal(pendingReasonOf({ s: "skip", w: "quota-paused" }), "quota-paused");
-  assert.equal(pendingReasonOf({ s: "skip", w: "rate-paused" }), "rate");
+  assert.equal(pendingReasonOf({ s: "skip", w: "rate-paused" }), "rate-paused");
   const pend2 = { "pa/b": { r: "quota-paused", n: 9, rn: 9, at: hoursAgo(1) } };
   const v0 = sweepVerdict({ l12: coverage([{ key: "pa/b" }], {}, { pending: pend2 }), pending: pend2 });
   assert.deepEqual([v0.recoverable, v0.stuck], [1, 0], "quota-paused never counts toward stuck, however long");
@@ -1232,14 +1233,14 @@ test("round 3 / 1: six models tested at L1+L2 only, default levels: recoverable 
   // a run that rate-limits L6 and L7 everywhere finds nothing new: still 6 recoverable, no DONE
   const limited = cliEnv(rows, { store, answer: (c) => (["6", "2e"].includes(kindOf(c)) ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
   const r1 = await runRaw(["--live", "--per-provider", "1"], limited.deps);
-  assert.match(r1.out, /RECOVERABLE 6 of 6 \(rate 6\)/);
+  assert.match(r1.out, /RECOVERABLE 6 of 6 \((rate|rate-paused) \d+, (rate|rate-paused) \d+\)/);
   assert.doesNotMatch(r1.out, /DONE:/);
   assert.match(r1.lines.at(-1), /^SATURATION saturated=yes recoverable=6 hard=0 new_results=0 requests=\d+ reason=zero-new$/, "yes because the run recorded nothing new (everything rate-limited), not because nothing is recoverable");
   assert.match(r1.out, /saturated: yes \(no new result in this run\)/);
   // half of them answer: progress, three left
   const mixed = cliEnv([many("pa", 3), many("pb", 3)], { store: Object.fromEntries(["pa", "pb"].flatMap((p) => [0, 1, 2].map((i) => [`${p}/m${i}`, record("ppnn")]))), answer: (c) => (c.body.model.startsWith("pb/") && ["6", "2e"].includes(kindOf(c)) ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
   const r2 = await runRaw(["--live", "--per-provider", "1"], mixed.deps);
-  assert.match(r2.out, /RECOVERABLE 3 of 6 \(rate 3\)/);
+  assert.match(r2.out, /RECOVERABLE 3 of 6 \((rate|rate-paused) \d+(, (rate|rate-paused) \d+)?\)/);
   assert.match(r2.lines.at(-1), /^SATURATION saturated=no recoverable=3 hard=0 new_results=3 requests=\d+ reason=none$/, r2.out);
   // and when they all answer: nothing left, DONE
   const open = cliEnv(rows, { store });
@@ -1633,4 +1634,71 @@ test("CLI: the dry run shows the stored trend of the scope and a parseable line;
   const l2 = parseLine(r2.lines.at(-1));
   assert.deepEqual([l2.saturated, l2.reason], ["yes", "no-shrink"], "no usable history: the recoverable set (40) did not shrink against the previous run's 40");
   assert.match(r2.out, /fallback: this scope has no run history yet/);
+});
+
+// ================================================================ a model a PAUSED provider never asked is not a rate (or quota) answer
+
+test("rate-paused (pure): a model the pause never let in keeps the reason of its last real ask; with none it becomes `rate-paused`, once, and the pause never grows n or rn", () => {
+  const T0 = NOW.toISOString(), later = (d) => new Date(NOW.getTime() + d * DAY);
+  const prev = {
+    "p/rate": { r: "rate", n: 2, rn: 2, at: hoursAgo(30), since: hoursAgo(60), why: "slow down" }, "p/err": { r: "error", n: 4, rn: 4, at: hoursAgo(30), since: hoursAgo(90) },
+    "p/cap": { r: "cap", n: 1, rn: 1, at: hoursAgo(30), since: hoursAgo(30) },
+  };
+  const step = (pending, day, reason = "rate-paused") => updatePending(pending, { queue: ["p/rate", "p/err", "p/cap", "p/new"].map((key) => ({ key })), recorded: new Set(), store: {}, now: later(day), reasonOf: () => reason });
+  const one = step(prev, 0);
+  assert.deepEqual(one["p/rate"], prev["p/rate"], "a rate answer from a real ask stays untouched: rn is not 3");
+  assert.deepEqual(one["p/err"], prev["p/err"], "so does an error");
+  assert.equal(one["p/cap"].r, "rate-paused", "a scheduling reason is replaced");
+  assert.deepEqual([one["p/new"].r, one["p/new"].n, one["p/new"].rn], ["rate-paused", 1, 1]);
+  const two = step(one, 1), three = step(two, 2);
+  assert.deepEqual(three, one, "the pause again, and again: nothing changes (no new at, no n, no rn)");
+  for (const k of ["p/cap", "p/new"]) assert.deepEqual([three[k].n, three[k].rn], [one[k].n, 1]);
+  // the same for a quota pause
+  const q = updatePending({ "p/rate": prev["p/rate"] }, { queue: [{ key: "p/rate" }, { key: "p/new" }], recorded: new Set(), store: {}, now: later(3), reasonOf: (k) => (k === "p/rate" ? "quota-paused" : "quota-paused") });
+  assert.deepEqual(q["p/rate"], prev["p/rate"]);
+  assert.deepEqual(updatePending(q, { queue: [{ key: "p/new" }], recorded: new Set(), store: {}, now: later(4), reasonOf: () => "quota-paused" })["p/new"], q["p/new"]);
+  // a real ask after the pause starts counting from 1 for ITS reason
+  const asked = updatePending(three, { queue: [{ key: "p/new" }], recorded: new Set(), store: {}, now: later(5), reasonOf: () => "rate" });
+  assert.deepEqual([asked["p/new"].r, asked["p/new"].rn], ["rate", 1]);
+  void T0;
+  assert.ok(PAUSED_REASONS.has("rate-paused") && PAUSED_REASONS.has("quota-paused") && PAUSED_REASONS.size === 2);
+});
+
+test("rate-paused is never stuck, never a soft or hard reason of the policy funnel, and is counted as recoverable (not hard) in the verdict", () => {
+  const pending = { "pa/a": { r: "rate-paused", n: 9, rn: 9, at: hoursAgo(1), since: hoursAgo(500) }, "pa/b": { r: "quota-paused", n: 9, rn: 9, at: hoursAgo(1) } };
+  const v = sweepVerdict({ l12: coverage([{ key: "pa/a" }, { key: "pa/b" }], {}, { pending }), pending });
+  assert.deepEqual([v.recoverable, v.hard, v.stuck], [2, 0, 0]);
+  assert.deepEqual(v.byRecoverable, { "rate-paused": 1, "quota-paused": 1 });
+  assert.ok(!STUCK_REASONS.has("rate-paused") && !TRIED_REASONS.has("rate-paused") && !OWNER_REASONS.has("rate-paused") && hardState("rate-paused", "pa") === null);
+  // the funnel reads only the reasons it knows: the paused ones are in neither of its lists, so it ignores them
+  assert.ok(!SWEEP_SOFT.includes("rate-paused") && !SWEEP_HARD.includes("rate-paused") && !SWEEP_SOFT.includes("quota-paused") && !SWEEP_HARD.includes("quota-paused"));
+  assert.ok(SWEEP_SOFT.includes("rate") && SWEEP_SOFT.includes("quota"), "while the real rate and quota answers are soft demote reasons");
+});
+
+test("every skip reason of the sweep maps to what it says: a model a provider pause never asked gets a paused reason; the canary-* hard reasons stay as documented; nothing else is written for a model that was not asked", () => {
+  const map = (w) => pendingReasonOf({ s: "skip", w });
+  assert.deepEqual(["rate-paused", "quota-paused", "canary-pay", "canary-auth", "canary-gone", "spend-cap", "row-cost"].map(map), ["rate-paused", "quota-paused", "canary-pay", "canary-auth", "canary-gone", "spend", "row-cost"]);
+  assert.equal(pendingReasonOf({ s: "rate" }), "rate", "a model that WAS asked and rate limited");
+  assert.equal(pendingReasonOf({ s: "skip", w: "rate-paused" }) === pendingReasonOf({ s: "rate" }), false);
+});
+
+test("CLI: over three runs a provider that keeps rate limiting never makes a model that was only paused accrue rn, n or stuck; only the models it was really asked about count", async () => {
+  const e = cliEnv([many("pa", 10)], { answer: () => http(429, "slow down", { "retry-after": "0" }) });
+  const day = (d) => new Date(NOW.getTime() + d * DAY);
+  const seen = [];
+  for (let d = 0; d < 3; d++) {
+    e.deps.now = () => day(d);
+    const r = await run(["--live", "--per-provider", "1"], e.deps);
+    assert.equal(r.code === 0 || r.code === 3, true, r.err + r.out);
+    seen.push(loadFidelity(e.out).pending);
+  }
+  const paused = (p) => Object.entries(p).filter(([, v]) => v.r === "rate-paused");
+  assert.ok(paused(seen[0]).length > 0, "the pause left some models unasked");
+  for (const p of seen) for (const [, v] of paused(p)) assert.deepEqual([v.n, v.rn], [1, 1], "a paused model never accrues");
+  const asked = (p) => Object.entries(p).filter(([, v]) => v.r === "rate");
+  assert.ok(asked(seen[2]).length > asked(seen[0]).length, "models rotate in: those really asked again keep counting");
+  const dry = await runRaw(["--levels", "12"], e.deps);
+  const stuckLine = dry.out.split("\n").find((l) => l.startsWith("sweep verdict"));
+  assert.doesNotMatch(stuckLine, /STUCK/, "rate is not a stuck reason and the paused ones never count");
+  assert.match(stuckLine, /rate-paused \d+/);
 });
