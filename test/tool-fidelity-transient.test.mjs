@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, goodModel, http, ok, ev, stream, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, freshDir, fakeFetch, goodModel, http, ok, ev, stream, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { probeModel, runKind, afCheck, isAvailabilityText, GATEWAY_WORDS } from "../refresh/tool-fidelity-probe.mjs";
 import { main, parseArgs, plan } from "../refresh/tool-fidelity-cli.mjs";
 import { buildRecord, cleanFidelity, migrateTransient, transientReason, gatewayInsights, saveFidelity, loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
@@ -229,7 +229,7 @@ async function run(argv, deps) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(pinL12(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));

@@ -6,7 +6,7 @@ import { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, freshDir, fakeFetch, ok, http, goodModel, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, plan, printPlan } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
@@ -41,7 +41,7 @@ async function run(argv, deps) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(pinL12(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
@@ -168,7 +168,7 @@ test("the rule cannot be lifted by an environment variable, a config file, or th
   const w = world();
   assert.deepEqual(runIncremental({ snap: w.snap, bench: w.bench, store: {} }).queue, [], "the incremental entry point with no tier data probes nothing");
   const inc = runIncremental({ snap: w.snap, bench: w.bench, store: {}, tiers: w.tiers });
-  assert.ok(inc.queue.length > 0 && inc.queue.every((q) => FREE_ONLY.includes(q.provider) && q.todo.every((l) => l <= 2)), "and with tiers it asks L1 and L2 of the free-labelled providers only");
+  assert.ok(inc.queue.length > 0 && inc.queue.every((q) => FREE_ONLY.includes(q.provider) && q.todo.every((l) => [1, 2, 6, 7].includes(l))), "and with tiers it asks the baseline (L1, L2 and the two small levels, never a big one) of the free-labelled providers only");
   const src = (await import("node:fs")).readFileSync(new URL("../refresh/tool-fidelity-cli.mjs", import.meta.url), "utf8");
   assert.equal(/process\.env/.test(src), false, "the CLI reads no environment variable");
   const lib = (await import("node:fs")).readFileSync(new URL("../refresh/tool-fidelity.mjs", import.meta.url), "utf8");

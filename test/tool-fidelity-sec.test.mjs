@@ -7,7 +7,7 @@ import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, goodModel, http, ok, ev, stream, streamWith, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, freshDir, fakeFetch, goodModel, http, ok, ev, stream, streamWith, kindOf, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { probeModel, runKind, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
 import { main, plan, parseArgs, LIFT_PREVIEW, pendingReasonOf } from "../refresh/tool-fidelity-cli.mjs";
 import { resolveTierRows, loadTiers, loadTiersInfo, describeTiers, TIERS_STALE_DAYS, loadFidelity, saveFidelity, capRecords, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
@@ -165,7 +165,7 @@ async function run(argv, deps) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(pinL12(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));

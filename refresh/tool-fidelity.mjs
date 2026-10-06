@@ -60,7 +60,7 @@ export const KIND = "tool-fidelity";
 export const MAX_FILE_BYTES = 1024 * 1024;           // the size of the file AS WRITTEN: about 7,000 records of about 140 bytes
 export const MAX_READ_BYTES = 4 * 1024 * 1024;       // a file bigger than this is refused on read, never parsed
 export const DEFAULT_TOKENS_PER_PROVIDER = 150000;   // input tokens per provider per invocation (the first free-tier pass)
-export const DEFAULT_LEVELS = Object.freeze([1, 2]);
+export const DEFAULT_LEVELS = Object.freeze([1, 2, 6, 7]);       // the baseline: L1+L2 and the two cheap levels behind them (spawn, error result); `--levels 12` is L1+L2 alone
 export const BIG_LEVEL = 5;                          // the ~400 KB step, a level of its own that is not part of lvr
 
 const LVR_RE = /^[pfn]{4}$/;
@@ -269,6 +269,18 @@ export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, pre
   const all = [...Object.entries(models).map(([k, v]) => ({ k, v, own: true })), ...Object.entries(preserve).filter(([k]) => !(k in models)).map(([k, v]) => ({ k, v, own: false }))];
   const size = new Map(all.map((e) => [e.k, Buffer.byteLength(lineOf(e.k, e.v))]));
   let total = bytesOf([...size.values()], now, pending, held, meta);
+  // The provider's words (`why` of a pending entry) are the first thing to go: a sentence is worth less than a model's record. Oldest entries first, before any record is dropped.
+  let pend = pending, whyStripped = 0;
+  if (pending && total > maxBytes) {
+    pend = { ...pending };
+    const withWhy = Object.keys(pend).filter((k) => pend[k].why !== undefined).sort((a, b) => Date.parse(pend[a].at) - Date.parse(pend[b].at) || (a < b ? -1 : 1));
+    for (const k of withWhy) {
+      if (total <= maxBytes) break;
+      const { why, ...rest } = pend[k];
+      total -= Buffer.byteLength(JSON.stringify(pend[k])) - Buffer.byteLength(JSON.stringify(rest));
+      pend[k] = rest; whyStripped += 1;
+    }
+  }
   const at = (e) => (e.own ? Date.parse(e.v.at) : Infinity);
   const order = [...all].sort((a, b) => {
     const ga = (a.own ? 0 : 2) + (keep && !keep.has(a.k) ? 0 : 1), gb = (b.own ? 0 : 2) + (keep && !keep.has(b.k) ? 0 : 1);
@@ -281,7 +293,7 @@ export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, pre
     total -= n + 2; size.delete(e.k); dropped.add(e.k);
   }
   return { models: Object.fromEntries(all.filter((e) => e.own && !dropped.has(e.k)).map((e) => [e.k, e.v])),
-           preserve: Object.fromEntries(all.filter((e) => !e.own && !dropped.has(e.k)).map((e) => [e.k, e.v])), dropped: [...dropped] };
+           preserve: Object.fromEntries(all.filter((e) => !e.own && !dropped.has(e.k)).map((e) => [e.k, e.v])), dropped: [...dropped], pending: pend, whyStripped };
 }
 
 const wait = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait available */ } };
@@ -303,7 +315,7 @@ function canon(file) {
  *   - an existing file that is not this file (no `kind` marker, another schema, unreadable, too large) is never overwritten.
  * `preserve` holds raw records this reader did not understand: they are written back unchanged unless a valid record replaces them.
  */
-export function saveFidelity(file, models, { live = false, now = new Date(), keep = null, retries = 5, retryMs = 40, writeImpl = writeAtomic, realFile = REAL_FILE, preserve = {}, pending = {}, held, meta } = {}) {
+export function saveFidelity(file, models, { live = false, now = new Date(), keep = null, retries = 5, retryMs = 40, writeImpl = writeAtomic, realFile = REAL_FILE, preserve = {}, pending = {}, held, meta, maxBytes = MAX_FILE_BYTES } = {}) {
   const target = path.resolve(file);
   if (path.basename(target) !== FILE_NAME) throw new Error(`refused: the tool-fidelity writer only writes a file named ${FILE_NAME}, not ${path.basename(target)}`);
   if (canon(target) === canon(realFile) && !live) throw new Error("refused: the real state file is written only by a --live run");
@@ -314,15 +326,15 @@ export function saveFidelity(file, models, { live = false, now = new Date(), kee
   const pend = cleanPending(pending);
   const hold = held === undefined ? cur.held : cleanHeld(held);                  // a writer that does not mention the holds keeps the ones in the file
   const metaV = meta === undefined ? cur.meta : cleanMeta(meta);                  // a writer that does not mention the meta keeps the one in the file
-  const capped = capRecords(good, { keep, preserve: keepRaw, now, pending: pend, held: hold, meta: metaV });
+  const capped = capRecords(good, { keep, preserve: keepRaw, now, pending: pend, held: hold, meta: metaV, maxBytes });
   const entries = [...Object.entries(capped.models), ...Object.entries(capped.preserve)].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  const text = renderFile(entries, now, pend, hold, metaV);
+  const text = renderFile(entries, now, capped.pending ?? pend, hold, metaV);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   for (let i = 0; ; i++) {
     try { writeImpl(target, text); break; }
     catch (e) { if (i >= retries || !/^(EPERM|EBUSY|EACCES)$/.test(e?.code ?? "")) throw e; wait(retryMs * (i + 1)); }
   }
-  return { records: entries.length, preserved: Object.keys(capped.preserve).length, dropped: capped.dropped, bytes: Buffer.byteLength(text) };
+  return { records: entries.length, preserved: Object.keys(capped.preserve).length, dropped: capped.dropped, whyStripped: capped.whyStripped, bytes: Buffer.byteLength(text) };
 }
 
 // ------------------------------------------------------------------ building and merging a record
@@ -1061,7 +1073,7 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, whyOf
     const r = store[e.key];
     if (recorded.has(e.key) || r?.strikes === 1) { delete out[e.key]; continue; }
     const code = String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
-    if (code === "cap" && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
+    if ((code === "cap" || code === "quota-paused") && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;       // never asked this time (the cap, a provider paused on quota): what the last ask said stays           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
     const prev = out[e.key], same = !!prev && prev.r === code;
     const why = whyOf?.(e.key) ?? (same ? prev.why : undefined);
     out[e.key] = { r: code, n: Math.min(9999, (prev?.n ?? 0) + 1), at: now.toISOString(), since: same ? prev.since ?? prev.at : now.toISOString(),         // since: the first time THIS reason was recorded
@@ -1216,7 +1228,18 @@ export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, sto
   const incompleteKeys = testedKeys.filter((k) => missing.get(k)?.length);
   const byMissing = {};
   for (const k of incompleteKeys) for (const m of missing.get(k)) byMissing[OPTIONAL_NAME[m] ?? m] = (byMissing[OPTIONAL_NAME[m] ?? m] ?? 0) + 1;
-  const v = { tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
+  // the provider's own words for the stuck models, one per provider: the most common sentence among its stuck models
+  const stuckBy = {};
+  for (const [k, x] of by) {
+    if (x.s !== "recoverable" || !isStuck(x)) continue;
+    const pv = prov(k), e = (stuckBy[pv] ??= { total: 0, sentences: new Map() });
+    e.total += 1;
+    const w = pending?.[k]?.why;
+    if (w) e.sentences.set(w, (e.sentences.get(w) ?? 0) + 1);
+  }
+  const stuckWhy = {};
+  for (const [pv, e] of Object.entries(stuckBy)) { const top = [...e.sentences].sort((a, b) => b[1] - a[1])[0]; stuckWhy[pv] = { total: e.total, ...(top ? { why: top[0], n: top[1] } : {}) }; }
+  const v = { stuckWhy, tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
     stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), strikeOutOfLevels: [...strikeOut].filter((k) => by.get(k)?.s === "tested").length, hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
   return { total: v.tested + v.recoverable + v.hard + v.owner, ...v };
 }

@@ -298,7 +298,7 @@ test("a result NEVER expires by age: a record from years ago loads, cells and co
   assert.equal(cellOf(r), "4");
   assert.equal(compiledClass(r), "v");
   assert.equal(r.at, "2019-01-01T00:00:00.000Z");
-  assert.deepEqual(queueFor({ models: [{ key: "p/old", provider: "p", id: "old", free: true }] }, { "p/old": r }), [], "an old record is not re-queued either");
+  assert.deepEqual(queueFor({ models: [{ key: "p/old", provider: "p", id: "old", free: true }] }, { "p/old": r }, [1, 2]), [], "an old record is not re-queued either");
 });
 
 test("saveFidelity refuses a wrong file name, an existing file that is not this file, and 'the real file' without --live (the real file is a TEMP file here, by construction)", () => {
@@ -481,10 +481,10 @@ test("the incremental queue: probe-ok models with NO result; an OUTDATED fixture
   const store = { "fa/a1": rec("ppnn"), "fa/a2": rec("ffnn", { strikes: 2, sl: 1 }), "pb/b1": rec("pppp", { fx: "cc-tools-0" }) };
   const c = fidelityCounts(s, store);
   assert.deepEqual([c.withRecord, c.withRecordCurrent, c.outdated, c.queued], [3, 2, 1, 4]);
-  const q = queueFor(s, store);
+  const q = queueFor(s, store, [1, 2]);
   assert.deepEqual(q.map((e) => e.key).sort(), ["fa/a3", "fa/auto", "pb/b2", "pb/b3"], "the 4 without a result");
   assert.ok(q.every((e) => e.todo.join() === "1,2"), "L1 and L2 first");
-  assert.deepEqual(queueFor(s, Object.fromEntries(s.models.map((m) => [m.key, rec("ppnn")]))), [], "everything has a record: nothing is queued, however many runs");
+  assert.deepEqual(queueFor(s, Object.fromEntries(s.models.map((m) => [m.key, rec("ppnn")])), [1, 2]), [], "everything has a record: nothing is queued, however many runs");
   assert.equal(queueFor(s, store, [1, 2], { force: true }).length, 7, "--force asks again");
 });
 
@@ -544,7 +544,7 @@ test("--only and --limit narrow like the bench: provider or provider/model; limi
 test("estimate: L1+L2 is 3 requests per model (the simple call, the argument-fidelity request and L2: ~5.5k tokens, the 20 KB result is in L2); L3 is two requests (3a + 3b, ~41k) and L4 rides in them; the big step is ~100k; free costs nothing; paid is priced in AND out", () => {
   const { snap, bench } = world();
   const set = probeSet(snap, bench);
-  const q = queueFor(set, {});
+  const q = queueFor(set, {}, [1, 2]);
   const e = estimate(q, { maxTokens: 512 });
   assert.equal(e.requests, 21, "3 requests x 7 models");
   assert.ok(e.inTokens > 7 * 5000 && e.inTokens < 7 * 6200, `L1 (~320 tokens) + L2 (~5,200 with the 20 KB result): ${e.inTokens}`);
@@ -575,7 +575,7 @@ test("the unpriced-row price is the highest listed paid price of the WHOLE probe
   const { snap, bench } = world();
   const set = probeSet(snap, bench);
   assert.deepEqual(paidFallback(set.models), { in: 2, out: 8 });
-  const only = selectOnly(queueFor(set, {}), ["pb/b3"]);
+  const only = selectOnly(queueFor(set, {}, [1, 2]), ["pb/b3"]);
   const narrow = estimate(only, { maxTokens: 512 }), whole = estimate(only, { maxTokens: 512, fallback: paidFallback(set.models) });
   assert.ok(narrow.usd < whole.usd, "left to itself a lone unpriced row would fall back to the documented default, far below the set's highest price");
   const b3 = whole.entries[0];

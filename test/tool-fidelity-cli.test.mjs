@@ -7,7 +7,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, ev, stream, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, freshDir, fakeFetch, ev, stream, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs, parseLevels, plan, printPlan, liveRefusal, runIncremental } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, saveFidelity, buildRecord, probeSet, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 import { RELAY_KEY_ID } from "../menu/tiers.mjs";
@@ -46,7 +46,7 @@ async function run(argv, deps, { raw = false } = {}) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(raw ? argv : spendFor(argv), deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(raw ? argv : pinL12(spendFor(argv)), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const probeCalls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
@@ -62,7 +62,7 @@ test("arguments: levels parse as digits 1-7 once each (5 is the big step, 6 spaw
   assert.deepEqual(parseLevels("7531"), [1, 3, 5, 7]);
   for (const bad of ["", "8", "0", "112", "ab", "1 8"]) assert.equal(parseLevels(bad), null, JSON.stringify(bad));
   const o = parseArgs([]);
-  assert.deepEqual([o.live, o.levels, o.tfMaxTokens, o.maxSpend, o.maxRowCost, o.force, o.l3], [false, [1, 2], 150000, 5, 0.1, false, false]);
+  assert.deepEqual([o.live, o.levels, o.tfMaxTokens, o.maxSpend, o.maxRowCost, o.force, o.l3], [false, [1, 2, 6, 7], 150000, 5, 0.1, false, false]);
   assert.ok(parseArgs(["--levels", "9"]).error);
   assert.equal(parseArgs(["--retry-failed"]).retryFailed, true);
   assert.ok(parseArgs(["--retry-failed", "--force"]).error, "they contradict each other");
@@ -369,16 +369,16 @@ test("an interrupted run keeps what finished: records written so far are saved a
 
 test("runIncremental: the function a scheduler can call: the queue is the probe-ok models with no record, inside the per-provider cap", () => {
   const { snapshot, bench } = world();
-  const store = { "fa/a1": record("ppnn"), "pb/b1": record("ffnn", { strikes: 2, sl: 1, fx: "cc-tools-0" }) };
+  const store = { "fa/a1": record("ppnn", { sp: "p", er: "p" }), "pb/b1": record("ffnn", { strikes: 2, sl: 1, fx: "cc-tools-0" }) };       // a1 has every baseline level (L1, L2, spawn, error result)
   const tiers = { fa: "free", pb: "free" };
   assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store }).queue, [], "default-deny: with no tier data nothing is probed");
   assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store, tiers: { fa: "free", pb: "paid" } }).queue.map((e) => e.key).sort(), ["fa/a2", "fa/a3", "fa/auto"], "a paid-key provider is not probed at all, not even L1+L2");
   const r = runIncremental({ snap: snapshot.snap, bench, store, tiers });
   assert.deepEqual(r.queue.map((e) => e.key).sort(), ["fa/a2", "fa/a3", "fa/auto", "pb/b2", "pb/b3"]);
   assert.equal(r.counts.withRecord, 2);
-  assert.deepEqual(r.queue.map((e) => e.todo.join()), r.queue.map(() => "1,2"));
-  const capped = runIncremental({ snap: snapshot.snap, bench, store, tiers, tfMaxTokens: 6000 });
-  assert.equal(capped.queue.length, 2, "one model per provider fits 6,000 tokens (a model is about 5,500)");
+  assert.deepEqual(r.queue.map((e) => e.todo.join()), r.queue.map(() => "1,2,6,7"), "the baseline is L1+L2+L6+L7");
+  const capped = runIncremental({ snap: snapshot.snap, bench, store, tiers, tfMaxTokens: 6600 });
+  assert.equal(capped.queue.length, 2, "one model per provider fits 6,600 tokens (a model is about 6,100)");
   assert.equal(capped.waiting.length, 3);
   assert.deepEqual(runIncremental({ snap: snapshot.snap, bench, store: Object.fromEntries(probeSet(snapshot.snap, bench).models.map((m) => [m.key, store["fa/a1"]])), tiers }).queue, []);
 });

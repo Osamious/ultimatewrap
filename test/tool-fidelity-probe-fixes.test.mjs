@@ -17,10 +17,10 @@ const kinds = (f) => f.calls.map(kindOf);
 const verdicts = (r) => Object.fromEntries(Object.entries(r.done).map(([k, v]) => [k, v.v]));
 const FREE = { tier: "free" };
 
-test("the full ladder on a good model: 1, 1a, 2, 3a, 3b, 5, 6, 2e are the only requests (L4 rides in 3b), and every level has its verdict and markers", async () => {
+test("the full ladder on a good model: 1, 1a, 2, 6, 2e, 3a, 3b, 5 (cheap first) are the only requests (L4 rides in 3b), and every level has its verdict and markers", async () => {
   const f = fakeFetch(goodModel);
   const r = await probeModel({ levels: [1, 2, 3, 4, 5, 6, 7], ...FREE, ...conn(f) });
-  assert.deepEqual(kinds(f), ["1", "1a", "2", "3a", "3b", "5", "6", "2e"]);
+  assert.deepEqual(kinds(f), ["1", "1a", "2", "6", "2e", "3a", "3b", "5"]);
   assert.deepEqual(verdicts(r), { 1: "p", 2: "p", 3: "p", 4: "p", 5: "p", 6: "p", 7: "p" });
   assert.deepEqual([r.done[1].af, r.done[2].br, r.done[3].nm, r.done[3].cc], ["p", "p", "p", "p"]);
   assert.ok(r.done[3].bytes > 150000 && r.done[5].bytes > 390000);
@@ -118,7 +118,7 @@ test("FREE-KEYS-ONLY RULE in the engine: a model whose tier is not `free` (paid,
   }
   const f = fakeFetch(goodModel);
   const free = await probeModel({ levels: [1, 2, 3, 5, 6], prior: "nnnn", tier: "free", ...conn(f) });
-  assert.deepEqual([kinds(f), free.clamped], [["1", "1a", "2", "3a", "3b", "5", "6"], []]);
+  assert.deepEqual([kinds(f), free.clamped], [["1", "1a", "2", "6", "3a", "3b", "5"], []]);
   const lifted = liftDeepProbes({ includeTiers: ["paid"], levelsExplicit: true, levels: [1, 2], live: true, maxSpendExplicit: true, printed: true }).lift;
   const g = fakeFetch(goodModel);
   await probeModel({ levels: [1, 2], tier: "paid", lift: lifted, ...conn(g) });

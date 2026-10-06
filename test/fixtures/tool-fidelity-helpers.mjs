@@ -55,6 +55,12 @@ export const stream = (...parts) => [ev.start(), ...parts].join("");
 /** A stream whose first event reports `inTok` input tokens (the usage a real provider sends). */
 export const streamWith = (inTok, ...parts) => [ev.start(inTok), ...parts].join("");
 
+/**
+ * The default levels of a CLI run are L1+L2+L6+L7 (the baseline); most tests are about caps, holds, ledgers and queues in units of the L1+L2 request cost, so their `main` calls pin `--levels 12`
+ * (unless the test names `--levels`, `--candidates` or `--sample` itself). The tests of the new default say so and do not use this.
+ */
+export const pinL12 = (argv) => (argv.some((a) => a === "--levels" || a === "--candidates" || a === "--sample") ? argv : ["--levels", "12", ...argv]);
+
 /** A fetch that answers every call with `answer(call)` and records the calls: `{url, body, headers}`. */
 export function fakeFetch(answer) {
   const calls = [];

@@ -5,7 +5,7 @@ import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, parseArgs } from "../refresh/tool-fidelity-cli.mjs";
 import {
   probeSet, selectCandidates, presetUnion, loadTiers, envelope, ctxNeededFor, BIG_MIN_CTX, coverage, assertPartition, coverageLines, ledgerUniverses, updatePending, cleanPending, inherited, defaultIdentity, queueFor,
@@ -334,7 +334,7 @@ async function run(argv, deps) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(pinL12(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));

@@ -7,10 +7,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
-import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf } from "../refresh/tool-fidelity-cli.mjs";
-import { runKind, isQuotaSentence } from "../refresh/tool-fidelity-probe.mjs";
-import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { pinL12, freshDir, fakeFetch, goodModel, http, record, kindOf, ev, stream, ok } from "./fixtures/tool-fidelity-helpers.mjs";
+import { main, parseArgs, plan, verdictLines, saturationLines, hardLines, scopeOf, capReasonOf, pendingReasonOf } from "../refresh/tool-fidelity-cli.mjs";
+import { runKind, isQuotaSentence, probeModel, MAX_MODEL_REQUESTS } from "../refresh/tool-fidelity-probe.mjs";
+import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, cleanPending, DEFAULT_LEVELS, capRecords, renderFile, updatePending, TRIED_REASONS, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
@@ -36,12 +36,12 @@ async function run(argv, deps) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(pinL12(argv), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n"), lines: out.join("\n").split("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));
 const byProv = (f) => { const o = {}; for (const c of calls(f)) { const p = c.body.model.split("/")[0]; o[p] = (o[p] ?? 0) + 1; } return o; };
-const planOf = (e, argv, { store = {}, pending = {}, held = {}, nowMs = NOW.getTime() } = {}) => plan({ snap: { rows: e.rows }, bench: e.deps.bench, store, o: parseArgs(argv), tiers: e.deps.tiers, pending, held, nowMs });
+const planOf = (e, argv, { store = {}, pending = {}, held = {}, nowMs = NOW.getTime() } = {}) => plan({ snap: { rows: e.rows }, bench: e.deps.bench, store, o: parseArgs(pinL12(argv)), tiers: e.deps.tiers, pending, held, nowMs });
 const keys = (p) => p.queued.map((x) => x.key).sort();
 const pend = (r, n = 2, h = 1) => ({ r, n, at: hoursAgo(h) });
 
@@ -69,7 +69,7 @@ test("a hold does not expire: 7 days, 400 days later the provider is still left 
 test("--recheck-hard parses reasons and providers; no reason named means all three; junk and an empty list are refused", () => {
   assert.deepEqual(parseArgs(["--recheck-hard", "pay,auth"]).recheckHard, { reasons: ["pay", "auth"], providers: [] });
   assert.deepEqual(parseArgs(["--recheck-hard", "gone,pa,pb"]).recheckHard, { reasons: ["gone"], providers: ["pa", "pb"] });
-  assert.deepEqual(parseArgs(["--recheck-hard", "pa"]).recheckHard, { reasons: ["pay", "auth", "gone", "owner"], providers: ["pa"] });
+  assert.deepEqual(parseArgs(["--recheck-hard", "pa"]).recheckHard, { reasons: ["pay", "auth", "gone"], providers: ["pa"] });
   assert.equal(parseArgs([]).recheckHard, null);
   assert.ok(parseArgs(["--recheck-hard"]).error);
   assert.ok(parseArgs(["--recheck-hard", "pay,bad name!"]).error);
@@ -193,16 +193,16 @@ test("the dry run prints the verdict and a final SATURATION line (saturated=unkn
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /sweep verdict: RECOVERABLE 2 of 6 \(.*\) \| HARD-BLOCKED 3 of 6 \(auth 2, pay 1; lift only with --recheck-hard\/--release-holds\) \| TESTED 1 of 6/);
   assert.match(r.out, /hard-blocked, not asked .*: 1 of 5 model\(s\) in the scope \(pay 1\)/);
-  assert.equal(r.lines.at(-1), "SATURATION saturated=unknown recoverable=2 hard=3 new_results=0");
+  assert.equal(r.lines.at(-1), "SATURATION saturated=unknown recoverable=2 hard=3 new_results=0 requests=0");
   assert.equal(calls(e.f).length, 0);
   const done = cliEnv([many("pa", 2)], { store: { "pa/m0": record("ppnn") }, pending: { "pa/m1": pend("gone") } });
   const d = await run([], done.deps);
   assert.match(d.out, /DONE: nothing recoverable left \(1 of 2 model\(s\) tested, 1 hard-blocked\)/);
-  assert.equal(d.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=1 new_results=0");
+  assert.equal(d.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=1 new_results=0 requests=0");
   const live = await run(["--live"], done.deps);
   assert.match(live.out, /tool-fidelity: nothing to probe\./);
   assert.match(live.out, /DONE: nothing recoverable left/);
-  assert.equal(live.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=1 new_results=0");
+  assert.equal(live.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=1 new_results=0 requests=0");
   assert.equal(calls(done.f).length, 0, "nothing sent: the only untested model is hard-blocked");
 });
 
@@ -212,17 +212,17 @@ test("a live run ends with the verdict, its saturation line and, last, the machi
   assert.equal(r1.code, 0, r1.err + r1.out);
   assert.match(r1.out, /sweep verdict: RECOVERABLE 3 of 6 \(cap 3\) \| HARD-BLOCKED 0 of 6 \(none; lift only with --recheck-hard\/--release-holds\) \| TESTED 3 of 6/);
   assert.match(r1.out, /saturation of this run: \d+ request\(s\) sent: 0 ended rate-limited \(0% of \d+\), 0 ended rate, error or timeout \(0% of \d+\); 3 new record\(s\); saturated: no/);
-  assert.equal(r1.lines.at(-1), "SATURATION saturated=no recoverable=3 hard=0 new_results=3");
+  assert.match(r1.lines.at(-1), /^SATURATION saturated=no recoverable=3 hard=0 new_results=3 requests=\d+$/);
   const r2 = await run(["--live", "--per-provider", "1", ...CAP], e.deps);
   assert.match(r2.out, /DONE: nothing recoverable left \(6 of 6 model\(s\) tested, 0 hard-blocked\)/);
-  assert.equal(r2.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=3");
+  assert.match(r2.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=0 new_results=3 requests=\d+$/);
 });
 
 test("a run where every request is rate-limited records nothing and says saturated=yes with its rate-limited share; the models stay recoverable (rate)", async () => {
   const e = cliEnv([many("pa", 4), many("pb", 4)], { answer: () => http(429, "slow down", { "retry-after": "0" }) });
   const r = await run(["--live", "--per-provider", "1"], e.deps);
   const sat = r.lines.at(-1);
-  assert.match(sat, /^SATURATION saturated=yes recoverable=8 hard=0 new_results=0$/);
+  assert.match(sat, /^SATURATION saturated=yes recoverable=8 hard=0 new_results=0 requests=\d+$/);
   assert.match(r.out, /sweep verdict: RECOVERABLE 8 of 8 \(rate 8\)/);
   assert.match(r.out, /saturation of this run: (\d+) request\(s\) sent: \1 ended rate-limited \(100% of \1\), \1 ended rate, error or timeout \(100% of \1\); 0 new record\(s\); saturated: yes \(no new result in this run\)/);
   assert.deepEqual(loadFidelity(e.out).held, {}, "a rate limit is the moment's: never a hold");
@@ -231,7 +231,7 @@ test("a run where every request is rate-limited records nothing and says saturat
 test("80% failing with some progress is saturated: three providers keep rate-limiting, one records its only model", async () => {
   const e = cliEnv([many("pa", 5), many("pc", 5), many("pd", 5), many("pb", 1)], { answer: (c) => (c.body.model.startsWith("pb/") ? goodModel(c) : http(429, "slow down", { "retry-after": "0" })) });
   const r = await run(["--live", "--per-provider", "1"], e.deps);
-  assert.match(r.lines.at(-1), /^SATURATION saturated=yes recoverable=15 hard=0 new_results=1$/);
+  assert.match(r.lines.at(-1), /^SATURATION saturated=yes recoverable=15 hard=0 new_results=1 requests=\d+$/);
   assert.match(r.out, /saturated: yes \(\d+% of the requests ended rate, error or timeout\)/);
 });
 
@@ -246,7 +246,7 @@ test("live: a pay canary writes a hold; a run 7 days later still sends that prov
   assert.equal(s1.pending["pb/m2"].r, "canary-pay");
   assert.match(r1.out, /HARD-BLOCKED 3 of 6 \(pay 3;/);
   assert.match(r1.out, /pb: pay \(.*\) -- 3 model\(s\) skipped -- held until lifted \(sticky; --recheck-hard or --retry-accounts lifts it\)/);
-  assert.match(r1.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=3 new_results=3$/, "pa answered (3 records) but nothing recoverable is left: the loop stops, hard-blocked 3 left");
+  assert.match(r1.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=3 new_results=3 requests=\d+$/, "pa answered (3 records) but nothing recoverable is left: the loop stops, hard-blocked 3 left");
   open = true;
   e.f.calls.length = 0;
   e.deps.now = () => new Date(NOW.getTime() + 7 * DAY);
@@ -263,7 +263,7 @@ test("live: a pay canary writes a hold; a run 7 days later still sends that prov
   assert.deepEqual(Object.keys(s3.models).filter((k) => k.startsWith("pb/")).sort(), ["pb/m0", "pb/m1", "pb/m2"]);
   assert.deepEqual(s3.held, {}, "a provider that re-answers during a manual recheck clears its hold");
   assert.deepEqual(Object.keys(s3.pending), [], "and nothing stays pending");
-  assert.match(r3.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=0 new_results=3$/);
+  assert.match(r3.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=0 new_results=3 requests=\d+$/);
   assert.match(r3.out, /DONE: nothing recoverable left \(6 of 6 model\(s\) tested, 0 hard-blocked\)/);
 });
 
@@ -276,7 +276,7 @@ test("live: a recheck that is still out of credit writes the hold again (fresh t
   const r = await run(["--live", "--per-provider", "1", "--recheck-hard", "pay"], e.deps);
   assert.equal(calls(e.f).length, 2, "the two-model canary again, no more");
   assert.deepEqual(loadFidelity(e.out).held, { pb: { r: "pay", at: later.toISOString() } });
-  assert.match(r.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=4 new_results=0$/);
+  assert.match(r.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=4 new_results=0 requests=\d+$/);
   e.f.calls.length = 0;
   const again = await run(["--live", "--per-provider", "1"], e.deps);
   assert.equal(calls(e.f).length, 0, "a normal run afterwards asks nothing");
@@ -329,10 +329,10 @@ test("--release-holds --live then a normal run asks the released provider's mode
 
 test("saturationLines: a dry run is unknown unless nothing is recoverable; the machine line is always last and has the four fields", () => {
   const v = { recoverable: 4, hard: 2 };
-  assert.equal(saturationLines(v, null).at(-1), "SATURATION saturated=unknown recoverable=4 hard=2 new_results=0");
-  assert.equal(saturationLines({ recoverable: 0, hard: 2 }, null).at(-1), "SATURATION saturated=yes recoverable=0 hard=2 new_results=0");
+  assert.equal(saturationLines(v, null).at(-1), "SATURATION saturated=unknown recoverable=4 hard=2 new_results=0 requests=0");
+  assert.equal(saturationLines({ recoverable: 0, hard: 2 }, null).at(-1), "SATURATION saturated=yes recoverable=0 hard=2 new_results=0 requests=0");
   const sat = saturation({ requests: 10, rate: 1, failing: 1, newResults: 6, recoverable: 4 });
-  assert.equal(saturationLines(v, sat).at(-1), "SATURATION saturated=no recoverable=4 hard=2 new_results=6");
+  assert.equal(saturationLines(v, sat).at(-1), "SATURATION saturated=no recoverable=4 hard=2 new_results=6 requests=10");
   assert.equal(saturationLines(v, sat).length, 2);
 });
 
@@ -480,26 +480,26 @@ test("the meta block (additive): cleanMeta keeps only a sane recoverable count w
 test("live: the run leaves its recoverable count in the meta block; the next run that does not shrink it is saturated even though it recorded something; one that shrinks it is not; a manual lift ignores the rule", async () => {
   const mk = (metaCount, argv = []) => {
     const e = cliEnv([many("pa", 2)], { answer: (c) => (c.body.model === "pa/m0" ? http(500, "boom") : goodModel(c)), pending: { "pa/m0": pend("error", 5) } });
-    saveFidelity(e.out, {}, { now: NOW, pending: { "pa/m0": pend("error", 5) }, meta: metaCount === null ? null : { recoverable: metaCount, scope: scopeOf(parseArgs(["--live", "--per-provider", "1"])), at: hoursAgo(5) } });
+    saveFidelity(e.out, {}, { now: NOW, pending: { "pa/m0": pend("error", 5) }, meta: metaCount === null ? null : { recoverable: metaCount, scope: scopeOf(parseArgs(pinL12(["--live", "--per-provider", "1"]))), at: hoursAgo(5) } });
     return { e, argv };
   };
   // previous run left 1 recoverable; this run records pa/m1 but pa/m0 (stuck error) is still there: 1 now, no shrink
   const a = mk(1);
   const ra = await run(["--live", "--per-provider", "1"], a.e.deps);
-  assert.match(ra.lines.at(-1), /^SATURATION saturated=yes recoverable=1 hard=0 new_results=1$/, ra.out);
+  assert.match(ra.lines.at(-1), /^SATURATION saturated=yes recoverable=1 hard=0 new_results=1 requests=\d+$/, ra.out);
   assert.match(ra.out, /saturated: yes \(the recoverable set did not shrink: 1 now, 1 at the end of the previous run\)/);
-  assert.deepEqual(loadFidelity(a.e.out).meta, { recoverable: 1, scope: scopeOf(parseArgs(["--live", "--per-provider", "1"])), at: NOW.toISOString() });
+  assert.deepEqual(loadFidelity(a.e.out).meta, { recoverable: 1, scope: scopeOf(parseArgs(pinL12(["--live", "--per-provider", "1"]))), at: NOW.toISOString() });
   // previous run left 2: now 1, it shrank
   const b = mk(2);
   const rb = await run(["--live", "--per-provider", "1"], b.e.deps);
-  assert.match(rb.lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+  assert.match(rb.lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1 requests=\d+$/);
   assert.deepEqual(loadFidelity(b.e.out).meta.recoverable, 1);
   // no previous count on record
   const c = mk(null);
-  assert.match((await run(["--live", "--per-provider", "1"], c.e.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+  assert.match((await run(["--live", "--per-provider", "1"], c.e.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1 requests=\d+$/);
   // a manual lift is allowed to grow the set
   const d = mk(1);
-  assert.match((await run(["--live", "--per-provider", "1", "--retry-accounts"], d.e.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+  assert.match((await run(["--live", "--per-provider", "1", "--retry-accounts"], d.e.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1 requests=\d+$/);
 });
 
 // ---------------------------------------------------------------- 4. tier completeness
@@ -588,19 +588,19 @@ test("finding 2: the previous count is compared only for an equal scope; another
   const live = ["--live", "--per-provider", "1"];
   const mk = (argv, metaCount, scopeArgv = argv, pending = { "pa/m0": pend("error", 5) }) => {
     const e = cliEnv([many("pa", 2)], { answer: (c) => (c.body.model === "pa/m0" ? http(500, "boom") : goodModel(c)) });
-    saveFidelity(e.out, {}, { now: NOW, pending, meta: { recoverable: metaCount, scope: scopeOf(parseArgs(scopeArgv)), at: hoursAgo(5) } });
+    saveFidelity(e.out, {}, { now: NOW, pending, meta: { recoverable: metaCount, scope: scopeOf(parseArgs(pinL12(scopeArgv))), at: hoursAgo(5) } });
     return e;
   };
   // equal scope, no shrink: saturated
   const same = await run(live, mk(live, 1).deps);
-  assert.match(same.lines.at(-1), /^SATURATION saturated=yes recoverable=1 hard=0 new_results=1$/);
+  assert.match(same.lines.at(-1), /^SATURATION saturated=yes recoverable=1 hard=0 new_results=1 requests=\d+$/);
   // a meta written under ANOTHER scope compares with nothing
   const other = await run(live, mk(live, 1, ["--live", "--only", "pb"]).deps);
-  assert.match(other.lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/, other.out);
+  assert.match(other.lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1 requests=\d+$/, other.out);
   // the run's own scope is what is stored
   const e = mk(live, 1);
   await run(live, e.deps);
-  assert.equal(loadFidelity(e.out).meta.scope, scopeOf(parseArgs(live)));
+  assert.equal(loadFidelity(e.out).meta.scope, scopeOf(parseArgs(pinL12(live))));
   // a manual lift compares nothing even under an equal scope
   const lifted = await run([...live, "--recheck-hard", "pay"], mk(live, 1).deps);
   assert.match(lifted.lines.at(-1), /^SATURATION saturated=no /);
@@ -614,7 +614,7 @@ test("finding 2: the previous count is compared only for an equal scope; another
   raw.meta = { recoverable: 1, at: hoursAgo(5) };
   fs.writeFileSync(old.out, JSON.stringify(raw));
   assert.equal(loadFidelity(old.out).meta, null);
-  assert.match((await run(live, old.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+  assert.match((await run(live, old.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1 requests=\d+$/);
 });
 
 test("finding 2: --release-holds and --reset-gone-holds (live) clear the meta: the next run compares with nothing", async () => {
@@ -628,15 +628,15 @@ test("finding 2: --release-holds and --reset-gone-holds (live) clear the meta: t
 
 // ---------------------------------------------------------------- finding 5: partial runs claim nothing
 
-test("finding 5: a live run that sends nothing but has recoverable models says saturated=unknown (yes only when nothing is recoverable)", async () => {
+test("finding 5 / C: a live run that sends nothing because nothing is queueable under its scope says saturated=yes with a scope-exhausted note (a loop on that scope stops)", async () => {
   const e = cliEnv([many("pa", 2), many("pb", 2)], { store: { "pa/m0": record("ppnn"), "pa/m1": record("ppnn") } });
   const r = await run(["--live", "--only", "pa"], e.deps);
   assert.match(r.out, /nothing to probe/);
-  assert.equal(r.lines.at(-1), "SATURATION saturated=unknown recoverable=2 hard=0 new_results=0");
-  assert.match(r.out, /this run sent nothing, so nothing was measured; 2 model\(s\) are recoverable but none could be queued now/);
+  assert.equal(r.lines.at(-1), "SATURATION saturated=yes recoverable=2 hard=0 new_results=0 requests=0");
+  assert.match(r.out, /this run sent nothing; scope-exhausted: 2 recoverable model\(s\) are outside this run's scope\/levels/);
   assert.doesNotMatch(r.out, /DONE:/);
   const done = cliEnv([many("pa", 1)], { store: { "pa/m0": record("ppnn") } });
-  assert.equal((await run(["--live"], done.deps)).lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=0");
+  assert.equal((await run(["--live"], done.deps)).lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=0 requests=0");
 });
 
 test("finding 5: a run stopped early prints saturated=unknown, no DONE, and does not write the meta; exit codes are the sweep's", async () => {
@@ -646,7 +646,7 @@ test("finding 5: a run stopped early prints saturated=unknown, no DONE, and does
   e.deps.fetch = async (url, init) => { await new Promise((r) => setTimeout(r, 15)); return slow(url, init); };
   const r = await run(["--live", "--per-provider", "1"], e.deps);
   assert.match(r.out, /stopped \(/);
-  assert.match(r.lines.at(-1), /^SATURATION saturated=unknown recoverable=\d+ hard=0 new_results=\d+$/);
+  assert.match(r.lines.at(-1), /^SATURATION saturated=unknown recoverable=\d+ hard=0 new_results=\d+ requests=\d+$/);
   assert.match(r.out, /saturation: not judged, the run was interrupted or stopped early/);
   assert.doesNotMatch(r.out, /DONE: nothing recoverable/);
   assert.equal(loadFidelity(e.out).meta, null, "a partial run writes no meta");
@@ -688,7 +688,8 @@ test("finding 14: a model pending route-shape is not queued by a normal run (zer
   const pending = { "pa/m0": pend("route-shape", 3) };
   assert.deepEqual(keys(planOf(e, [], { pending })), ["pa/m1", "pa/m2"]);
   assert.deepEqual(keys(planOf(e, ["--recheck-hard", "owner"], { pending })), ["pa/m0", "pa/m1", "pa/m2"]);
-  assert.deepEqual(keys(planOf(e, ["--recheck-hard", "pa"], { pending })), ["pa/m0", "pa/m1", "pa/m2"], "a provider alone means every reason, owner included");
+  assert.deepEqual(keys(planOf(e, ["--recheck-hard", "pa"], { pending })), ["pa/m1", "pa/m2"], "a provider alone means pay, auth and gone: owner must be named");
+  assert.deepEqual(keys(planOf(e, ["--recheck-hard", "owner,pa"], { pending })), ["pa/m0", "pa/m1", "pa/m2"]);
   assert.deepEqual(keys(planOf(e, ["--recheck-hard", "pay,auth,gone"], { pending })), ["pa/m1", "pa/m2"], "the hard reasons do not lift it");
   assert.deepEqual(keys(planOf(e, ["--retry-accounts"], { pending })), ["pa/m1", "pa/m2"], "--retry-accounts is about accounts");
   const named = planOf(e, ["--only", "pa/m0"], { pending });
@@ -702,7 +703,7 @@ test("finding 14: a model pending route-shape is not queued by a normal run (zer
   const r = await run(["--live"], live.deps);
   assert.match(r.out, /nothing to probe/);
   assert.equal(calls(live.f).length, 0);
-  assert.equal(r.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=0");
+  assert.equal(r.lines.at(-1), "SATURATION saturated=yes recoverable=0 hard=0 new_results=0 requests=0");
   assert.match(r.out, /NEEDS-OWNER 1 of 1 \(route-shape 1: fix the route/);
 });
 
@@ -710,7 +711,7 @@ test("finding 14: row-cost / priced-over-row-cap are not queued while the model 
   const rows = [{ provider: "fa", keyId: "k.fa.free", models: [m("plain"), m("opus", { badge: "PAID", pin: 50, pout: 250 })] }];       // about $0.54 for L1+L2: over the default $0.10 row ceiling
   const e = cliEnv(rows);
   const pending = { "fa/opus": pend("priced-over-row-cap", 2) };
-  const keysOf = (argv) => keys(plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs(argv), tiers: e.deps.tiers, pending, nowMs: NOW.getTime() }));
+  const keysOf = (argv) => keys(plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs(pinL12(argv)), tiers: e.deps.tiers, pending, nowMs: NOW.getTime() }));
   assert.deepEqual(keysOf([]), ["fa/plain"], "over the default row ceiling: not queued");
   assert.deepEqual(keysOf(["--max-row-cost", "1"]), ["fa/opus", "fa/plain"], "the ceiling was raised: it runs");
   assert.deepEqual(keysOf(["--recheck-hard", "owner"]), ["fa/opus", "fa/plain"]);
@@ -785,8 +786,8 @@ test("finding 10: --merge-unsaved folds the side file's held and pending in (the
   const kind = JSON.parse(fs.readFileSync(e.out, "utf8")).kind;
   const side = path.join(e.dir, "tool-fidelity.unsaved.json");
   fs.writeFileSync(side, JSON.stringify({ schema: 1, kind, generatedAt: NOW.toISOString(), models: { "pa/m3": record("ppnn", { at: day(0) }) },
-    pending: { "pa/m0": { r: "error", n: 2, at: day(0) }, "pa/m1": { r: "rate", n: 1, at: day(-2) }, "pa/m2": { r: "timeout", n: 1, at: day(0) }, "pa/m3": { r: "rate", n: 9, at: day(0) } },
-    held: { pb: { r: "auth", at: day(0) }, pc: { r: "gone", at: day(0) } } }));
+    pending: { "pa/m0": { r: "error", n: 2, at: day(0) }, "pa/m1": { r: "rate", n: 1, at: day(-2) }, "pa/m2": { r: "timeout", n: 1, at: day(1) }, "pa/m3": { r: "rate", n: 9, at: day(0) } },
+    held: { pb: { r: "auth", at: day(0) }, pc: { r: "gone", at: day(1) } } }));
   const dry = await run(["--merge-unsaved"], e.deps);
   assert.match(dry.out, /holds 1 record\(s\): 1 would be taken .*; 3 pending entries and 2 hold\(s\) would be folded in \(the newer time wins\)/);
   const live = await run(["--merge-unsaved", "--live"], e.deps);
@@ -804,7 +805,7 @@ test("finding 10: --merge-unsaved folds the side file's held and pending in (the
   const e2 = cliEnv([many("pa", 1)]);
   saveFidelity(e2.out, {}, { live: true, now: NOW });
   const k2 = JSON.parse(fs.readFileSync(e2.out, "utf8")).kind;
-  fs.writeFileSync(path.join(e2.dir, "tool-fidelity.unsaved.json"), JSON.stringify({ schema: 1, kind: k2, generatedAt: NOW.toISOString(), models: {}, pending: { "pa/m0": { r: "rate", n: 1, at: day(0) } }, held: {} }));
+  fs.writeFileSync(path.join(e2.dir, "tool-fidelity.unsaved.json"), JSON.stringify({ schema: 1, kind: k2, generatedAt: NOW.toISOString(), models: {}, pending: { "pa/m0": { r: "rate", n: 1, at: day(1) } }, held: {} }));
   const r2 = await run(["--merge-unsaved", "--live"], e2.deps);
   assert.match(r2.out, /0 record\(s\), 1 pending entry and 0 hold\(s\) merged/);
   assert.equal(loadFidelity(e2.out).pending["pa/m0"].r, "rate");
@@ -831,17 +832,24 @@ test("finding 11: a first strike is recoverable only when its level is one of th
 
 // ---------------------------------------------------------------- finding 13: when a hold is released
 
-test("finding 13: a hold is released only when the provider answered AND now has a confirmed (t or v) record: a provider that answers only with failures stays held", async () => {
+test("D: a provider counts as ANSWERED when the run produced any verdict record for it (t, v or x): every model failing (no tool support) still clears an auth hold and its stale entries", async () => {
   const held = { pb: { r: "auth", at: hoursAgo(3) } };
-  const bad = cliEnv([many("pb", 2)], { held, answer: () => http(400, "tools.0.input_schema: unsupported keyword anyOf") });
-  const r1 = await run(["--live", "--per-provider", "1", "--retry-accounts"], bad.deps);
+  const pending = { "pb/m1": pend("canary-auth", 2) };
+  const bad = cliEnv([many("pb", 2)], { held, pending, answer: () => http(400, "tools.0.input_schema: unsupported keyword anyOf") });
+  const r1 = await run(["--live", "--per-provider", "1", "--recheck-hard", "auth"], bad.deps);
   assert.equal(r1.code === 0 || r1.code === 3, true, r1.err + r1.out);
   const s1 = loadFidelity(bad.out);
   assert.ok(Object.values(s1.models).length === 2 && Object.values(s1.models).every((x) => x.strikes === 1 && x.t !== "t" && x.t !== "v"), "it answered, with failures (first strikes), no confirmed record");
-  assert.deepEqual(Object.keys(s1.held), ["pb"], "no confirmed record: the hold stays");
-  const good = cliEnv([many("pb", 2)], { held });
-  await run(["--live", "--per-provider", "1", "--retry-accounts"], good.deps);
-  assert.deepEqual(loadFidelity(good.out).held, {}, "a confirmed record releases it");
+  assert.deepEqual(s1.held, {}, "the provider answered: the auth hold is cleared");
+  assert.ok(!s1.pending["pb/m1"], "and so is its stale canary entry (the model has a record now)");
+  // a provider that never answered keeps its hold
+  const dead = cliEnv([many("pb", 2)], { held, answer: () => http(401, "bad key") });
+  await run(["--live", "--per-provider", "1", "--recheck-hard", "auth"], dead.deps);
+  assert.equal(loadFidelity(dead.out).held.pb.r, "auth", "no answer: the hold stays (re-stamped)");
+  // holdIsWrong is untouched: a gone hold on a provider with only x records is still a hold the queue honours
+  const gone = cliEnv([many("pd", 2)], { held: { pd: { r: "gone", at: hoursAgo(1) } }, store: { "pd/old": record("ffnn", { strikes: 2, sl: 1 }) } });
+  const p = planOf(gone, [], { held: { pd: { r: "gone", at: hoursAgo(1) } }, store: { "pd/old": record("ffnn", { strikes: 2, sl: 1 }) } });
+  assert.deepEqual(keys(p), [], "an x record is not a confirmed result: the gone hold is not wrong");
 });
 
 test("finding 13: a named model's answer releases only that model's own entry: the provider's hold and its other pending entries stay", async () => {
@@ -911,15 +919,15 @@ test("quota: quota counts toward stuck at rn >= 3 and is listed with its since d
   assert.ok(TRIED_REASONS.has("quota"));
 });
 
-test("quota: a provider that keeps answering quota is left alone for the rest of the run (no wait), its other models stay pending quota; no hold", async () => {
+test("quota / G: a provider that keeps answering quota is left alone for the rest of the run (no wait); the models it was never asked about are `quota-paused` (not a fresh quota answer, not stuck); no hold", async () => {
   const e = cliEnv([many("pa", 8)], { answer: () => http(400, "Daily limit reached for this model") });
   const r = await run(["--live", "--per-provider", "1"], e.deps);
   assert.match(r.out, /left alone for the rest of this run, their models stay pending: pa \(quota exhausted\)/);
   assert.ok(calls(e.f).length <= 4, `${calls(e.f).length} requests: three, then nothing`);
   const st = loadFidelity(e.out);
-  assert.deepEqual(Object.values(st.pending).map((x) => x.r), Array(8).fill("quota"));
+  assert.deepEqual(Object.values(st.pending).map((x) => x.r).sort(), ["quota", "quota", "quota", ...Array(5).fill("quota-paused")].sort());
   assert.deepEqual(st.held, {});
-  assert.match(r.out, /RECOVERABLE 8 of 8 \(quota 8\)/);
+  assert.match(r.out, /RECOVERABLE 8 of 8 \(quota-paused 5, quota 3\)/);
 });
 
 test("quota: `why` is the clipped, redacted sentence (at most 120 characters)", async () => {
@@ -928,4 +936,271 @@ test("quota: `why` is the clipped, redacted sentence (at most 120 characters)", 
   await run(["--live", "--per-provider", "1"], e.deps);
   const why = loadFidelity(e.out).pending["pa/m0"].why;
   assert.ok(why.startsWith("Daily limit reached.") && why.length <= 120, why);
+});
+
+// ================================================================ round 2 (re-review of a880722)
+
+// the same as `run`, but the argv is NOT pinned to L1+L2: these tests are about the new default levels
+async function runRaw(argv, deps) {
+  const out = [], err = [], lg = console.log, er = console.error;
+  console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
+  let code;
+  try { code = await main(argv, deps); } finally { console.log = lg; console.error = er; }
+  return { code, out: out.join("\n"), err: err.join("\n"), lines: out.join("\n").split("\n") };
+}
+const kindsOf = (f) => calls(f).map(kindOf);
+const FREE_TIER = { tier: "free" };
+const probeConn = (f, extra = {}) => ({ fetchImpl: f, url: "http://gw.test/v1/messages", key: "k", model: "p/m", ...extra });
+
+// ---------------------------------------------------------------- A: a bare quota sentence on a 403 is quota, not an auth hold
+
+test("A: a bare quota sentence on a 403 (or a pay-looking status) is `quota`; real auth words stay auth; 402 and money words stay pay", async () => {
+  const table = [
+    [403, "Daily limit reached for free tier", "quota"],
+    [403, "Quota exceeded for this API key", "quota"],
+    [403, "You have used your monthly allowance", "quota"],
+    [403, "Invalid API key", "auth"],
+    [403, "forbidden: this key cannot use this model", "auth"],
+    [403, "Unauthorized", "auth"],
+    [401, "Daily limit reached", "auth"],
+    [401, "Invalid API key", "auth"],
+    [403, "Insufficient balance, billing required", "pay"],
+    [403, "quota exceeded; upgrade your plan", "pay"],
+    [402, "Daily limit reached for free tier", "pay"],
+  ];
+  for (const [status, msg, want] of table) assert.equal(await kindRun(status, msg), want, `${status}: ${msg}`);
+});
+
+test("A: a 403 quota sentence does not hold the provider as auth: the first models are quota (soft), nothing is held", async () => {
+  const e = cliEnv([many("pa", 4)], { answer: () => http(403, "Daily limit reached for free tier") });
+  const r = await run(["--live", "--per-provider", "1"], e.deps);
+  const st = loadFidelity(e.out);
+  assert.deepEqual(st.held, {}, "not an auth hold");
+  assert.ok(Object.values(st.pending).every((x) => x.r === "quota" || x.r === "quota-paused"));
+  assert.doesNotMatch(r.out, /providers needing attention/);
+});
+
+// ---------------------------------------------------------------- C: requests= on the machine line
+
+test("C: the SATURATION line ends with requests=<n>: 0 for a dry run and a run that sent nothing, the requests sent otherwise", async () => {
+  const e = cliEnv([many("pa", 2)]);
+  const dry = await run([], e.deps);
+  assert.match(dry.lines.at(-1), /^SATURATION saturated=unknown recoverable=2 hard=0 new_results=0 requests=0$/);
+  const live = await run(["--live", "--per-provider", "1"], e.deps);
+  const sent = calls(e.f).length;
+  assert.ok(sent > 0);
+  assert.match(live.lines.at(-1), new RegExp(`^SATURATION saturated=yes recoverable=0 hard=0 new_results=2 requests=${sent}$`));
+  const nothing = await run(["--live", "--per-provider", "1"], e.deps);
+  assert.match(nothing.lines.at(-1), /^SATURATION saturated=yes recoverable=0 hard=0 new_results=0 requests=0$/);
+});
+
+// ---------------------------------------------------------------- E: the provider's words go first when the file is over its cap
+
+test("E: over the size cap the provider's words go first: `why` is stripped from the OLDEST pending entries before any model record is dropped", () => {
+  const models = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`fa/m${i}`, record("ppnn", { at: new Date(NOW.getTime() + i).toISOString() })]));
+  const pending = Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`fb/p${i}`, { r: "rate", n: 1, at: new Date(NOW.getTime() + i * 1000).toISOString(), why: "slow down and try again later ".repeat(4).slice(0, 100) }]));
+  const full = Buffer.byteLength(renderFile(Object.entries(models), NOW, pending, null));
+  const r = capRecords(models, { now: NOW, maxBytes: full - 250, pending });
+  assert.deepEqual(r.dropped, [], "no model record is dropped");
+  assert.equal(r.whyStripped, 3, "250 bytes: three sentences of about 110 bytes");
+  assert.deepEqual([0, 1, 2].map((i) => r.pending[`fb/p${i}`].why), [undefined, undefined, undefined], "the oldest lose theirs");
+  assert.deepEqual([3, 4, 5].map((i) => r.pending[`fb/p${i}`].why?.length), [100, 100, 100]);
+  assert.ok(pending["fb/p0"].why, "the input is not changed");
+  assert.equal(r.pending["fb/p0"].r, "rate", "the entry itself stays");
+  // words alone cannot meet a tight cap: every sentence goes first, then records
+  const stripped = Object.fromEntries(Object.entries(pending).map(([k, v]) => [k, { r: v.r, n: v.n, at: v.at }]));
+  const tight = capRecords(models, { now: NOW, maxBytes: Buffer.byteLength(renderFile([], NOW, stripped, null)) + 300, pending });
+  assert.equal(tight.whyStripped, 6);
+  assert.ok(tight.dropped.length > 0 && tight.dropped.length < 10);
+  // no pressure: nothing stripped
+  assert.equal(capRecords(models, { now: NOW, pending }).whyStripped, 0);
+  // through saveFidelity
+  const d = freshDir(), file = path.join(d, FILE_NAME);
+  const full2 = Buffer.byteLength(renderFile(Object.entries(models), NOW, cleanPending(pending), null));       // the size of what saveFidelity really writes (the sentences are cleaned on the way in)
+  const w = saveFidelity(file, models, { now: NOW, pending, maxBytes: full2 - 250 });
+  assert.equal(w.dropped.length, 0);
+  assert.ok(w.whyStripped >= 2 && w.whyStripped <= 3, String(w.whyStripped));
+  assert.ok(w.bytes <= full2 - 250);
+  const back = loadFidelity(file);
+  assert.equal(Object.keys(back.models).length, 10);
+  assert.equal(back.pending["fb/p0"].why, undefined);
+  assert.ok(back.pending["fb/p5"].why.length > 50);
+});
+
+// ---------------------------------------------------------------- F: a released hold does not come back from an old side file
+
+test("F: --merge-unsaved takes a side-only hold or pending entry only if its time is after the state file's own last write; an entry in both files: the newer wins", async () => {
+  const e = cliEnv([many("pa", 3), many("pb", 1), many("pc", 1)]);
+  const plus = (h) => new Date(NOW.getTime() + h * 3600000).toISOString();
+  saveFidelity(e.out, {}, { live: true, now: NOW, held: { pd: { r: "auth", at: plus(-30) } }, pending: { "pa/m2": { r: "rate", n: 1, at: plus(-30) } } });   // pb's hold was released since (it is not in the file)
+  const kind = JSON.parse(fs.readFileSync(e.out, "utf8")).kind;
+  const side = path.join(e.dir, "tool-fidelity.unsaved.json");
+  fs.writeFileSync(side, JSON.stringify({ schema: 1, kind, generatedAt: plus(-40), models: {},
+    held: { pb: { r: "pay", at: plus(-5) }, pc: { r: "gone", at: plus(1) }, pd: { r: "gone", at: plus(-1) } },
+    pending: { "pa/m0": { r: "rate", n: 1, at: plus(-5) }, "pa/m1": { r: "timeout", n: 1, at: plus(1) }, "pa/m2": { r: "error", n: 3, at: plus(-2) } } }));
+  const dry = await run(["--merge-unsaved"], e.deps);
+  assert.match(dry.out, /2 pending entries and 2 hold\(s\) would be folded in/, "pa/m1 and pa/m2 (newer than the file's own entry), pc and pd");
+  const live = await run(["--merge-unsaved", "--live"], e.deps);
+  assert.equal(live.code, 0, live.err + live.out);
+  const st = loadFidelity(e.out);
+  assert.deepEqual(Object.keys(st.held).sort(), ["pc", "pd"], "pb (released since, older than the last write) does not come back; pd is in both files and the side's is newer");
+  assert.equal(st.held.pd.r, "gone");
+  assert.deepEqual(Object.keys(st.pending).sort(), ["pa/m1", "pa/m2"], "pa/m0 (side-only, older than the write) does not come back");
+  assert.equal(st.pending["pa/m2"].r, "error");
+});
+
+// ---------------------------------------------------------------- G: quota-paused and the stuck words
+
+test("G: a model a quota pause never asked keeps its previous reason (or is `quota-paused`, a reason that never counts toward stuck); the provider's words are printed once per stuck provider", () => {
+  const prev = { "p/a": { r: "quota", n: 4, rn: 2, at: hoursAgo(5), since: hoursAgo(50), why: "Daily limit reached" } };
+  const out = updatePending(prev, { queue: [{ key: "p/a" }, { key: "p/b" }], recorded: new Set(), store: {}, now: NOW, reasonOf: () => "quota-paused" });
+  assert.deepEqual(out["p/a"], prev["p/a"], "never asked: unchanged (rn does not grow)");
+  assert.equal(out["p/b"].r, "quota-paused");
+  assert.equal(pendingReasonOf({ s: "skip", w: "quota-paused" }), "quota-paused");
+  assert.equal(pendingReasonOf({ s: "skip", w: "rate-paused" }), "rate");
+  const pend2 = { "pa/b": { r: "quota-paused", n: 9, rn: 9, at: hoursAgo(1) } };
+  const v0 = sweepVerdict({ l12: coverage([{ key: "pa/b" }], {}, { pending: pend2 }), pending: pend2 });
+  assert.deepEqual([v0.recoverable, v0.stuck], [1, 0], "quota-paused never counts toward stuck, however long");
+  const pending = {
+    "pa/m0": { r: "error", n: 3, rn: 3, at: hoursAgo(1), why: "upstream boom" }, "pa/m1": { r: "error", n: 3, rn: 3, at: hoursAgo(1), why: "upstream boom" }, "pa/m2": { r: "timeout", n: 3, rn: 3, at: hoursAgo(1), why: "no answer in 45 s" },
+    "pb/m0": { r: "quota", n: 4, rn: 3, at: hoursAgo(1), why: "Daily limit reached" }, "pc/m0": { r: "error", n: 1, rn: 1, at: hoursAgo(1), why: "fresh" }, "pd/m0": { r: "slow", n: 3, rn: 3, at: hoursAgo(1) },
+  };
+  const universe = Object.keys(pending).map((key) => ({ key }));
+  const v = sweepVerdict({ l12: coverage(universe, {}, { pending }), pending });
+  assert.deepEqual(v.stuckWhy, { pa: { total: 3, why: "upstream boom", n: 2 }, pb: { total: 1, why: "Daily limit reached", n: 1 }, pd: { total: 1 } });
+  const text = verdictLines(v).join("\n");
+  assert.match(text, /stuck on pa: "upstream boom" \(2 of its 3 stuck model\(s\) say so; the provider's own words\)/);
+  assert.match(text, /stuck on pb: "Daily limit reached" \(1 of its 1 stuck/);
+  assert.doesNotMatch(text, /stuck on pc|stuck on pd/, "pc is not stuck; pd has no words to show");
+});
+
+// ---------------------------------------------------------------- H: the cheap levels first
+
+test("H: the levels run in cost order 1, 1a, 2, 6, 7, then 3, 4, 5, whatever order they are listed in; the request ceiling holds", async () => {
+  const f = fakeFetch(goodModel);
+  const r = await probeModel({ levels: [5, 3, 7, 2, 6, 1, 4], ...FREE_TIER, ...probeConn(f) });
+  assert.deepEqual(kindsOf(f), ["1", "1a", "2", "6", "2e", "3a", "3b", "5"]);
+  assert.ok(r.requests <= MAX_MODEL_REQUESTS);
+  const g = fakeFetch(goodModel);
+  await probeModel({ levels: [1, 2, 6, 7], ...FREE_TIER, ...probeConn(g) });
+  assert.deepEqual(kindsOf(g), ["1", "1a", "2", "6", "2e"], "the baseline: five requests, about 6,100 input tokens");
+  // the worst case without a timeout or an escalation: every L1-type request needs its forced retry, 3a and 3b their cache_control retry: still counted, still <= 12
+  const text = (k) => ok(stream(ev.text(0, "no call"), ev.stop()));
+  const h = fakeFetch((c) => (["1", "1a"].includes(kindOf(c)) ? text() : goodModel(c)));
+  const w = await probeModel({ levels: [1, 2, 3, 4, 5, 6, 7], ...FREE_TIER, ...probeConn(h) });
+  assert.ok(w.requests <= MAX_MODEL_REQUESTS, `${w.requests} requests`);
+  assert.deepEqual(kindsOf(h).slice(0, 4), ["1", "1f", "1a", "1af"]);
+});
+
+test("H: a stop at L3 (a rate limit) keeps what finished: L1, L2, spawn and the error result are in `done`, in the record, and not asked again", async () => {
+  const f = fakeFetch((c) => (kindOf(c) === "3a" ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)));
+  const done = {};
+  const r = await probeModel({ levels: [1, 2, 3, 5, 6, 7], done, ...FREE_TIER, ...probeConn(f) });
+  assert.equal(r.inconclusive.s, "rate");
+  assert.deepEqual(["1", "2", "6", "7"].map((l) => done[l]?.v), ["p", "p", "p", "p"], "the cheap levels finished before L3 stopped the model");
+  assert.equal(done[3], undefined);
+  // through the CLI: the partial record is saved, the stopped level waits
+  const e = cliEnv([many("pa", 1)], { answer: (c) => (kindOf(c) === "3a" ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
+  const argv = ["--live", "--levels", "123567", "--l3", "yes", "--only", "pa", "--per-provider", "1", "--tf-max-tokens-per-provider", "1000000"];
+  const r1 = await run(argv, e.deps);
+  const st = loadFidelity(e.out);
+  assert.deepEqual([st.models["pa/m0"]?.lvr, st.models["pa/m0"]?.sp, st.models["pa/m0"]?.er], ["ppnn", "p", "p"], r1.out);
+  assert.equal(st.pending["pa/m0"].r, "rate", "the stopped level stays pending with its reason");
+  assert.match(r1.out, /1 of those 1 record\(s\) are partial/);
+  e.f.calls.length = 0;
+  e.deps.fetch = fakeFetch(goodModel);
+  const r2 = await run(argv, e.deps);
+  assert.equal(r2.code, 0, r2.err + r2.out);
+  assert.deepEqual(kindsOf(e.deps.fetch), ["3a", "3b", "5"], "only the stopped levels are asked again");
+  assert.equal(loadFidelity(e.out).models["pa/m0"].lvr[2], "p");
+  assert.ok(!loadFidelity(e.out).pending["pa/m0"]);
+});
+
+test("H: L1 alone is never saved as a partial record (it would read as tested and L2 would never be asked); a stop before L1+L2 both have a verdict records nothing", async () => {
+  const e = cliEnv([many("pa", 1)], { answer: (c) => (kindOf(c) === "2" ? http(429, "slow down", { "retry-after": "0" }) : goodModel(c)) });
+  await run(["--live", "--per-provider", "1"], e.deps);
+  const st = loadFidelity(e.out);
+  assert.equal(st.models["pa/m0"], undefined, "L1 passed, L2 was rate limited: no record");
+  assert.equal(st.pending["pa/m0"].r, "rate");
+});
+
+test("H: a flaky L6 or L7 (an error, a timeout, an empty answer) does not block L3 or the big step; it is set aside for a later run; a limit or an account state on L6 stops the model as before", async () => {
+  for (const flaky of [http(500, "boom"), http(400, "Upstream request failed.")]) {
+    const f = fakeFetch((c) => (kindOf(c) === "6" ? flaky : goodModel(c)));
+    const done = {};
+    const r = await probeModel({ levels: [1, 2, 3, 5, 6, 7], done, ...FREE_TIER, ...probeConn(f) });
+    assert.equal(r.inconclusive, undefined, "the model got a result");
+    assert.deepEqual([done[3].v, done[5].v, done[7].v, done[6]], ["p", "p", "p", undefined]);
+    assert.deepEqual(r.deferred.map((x) => [x.level, x.s]), [[6, "error"]]);
+    assert.deepEqual(kindsOf(f), ["1", "1a", "2", "6", "2e", "3a", "3b", "5"], "L7 and the big levels went on");
+  }
+  // both small levels flaky: still L3
+  const g = fakeFetch((c) => (["6", "2e"].includes(kindOf(c)) ? http(500, "boom") : goodModel(c)));
+  const d2 = {};
+  const r2 = await probeModel({ levels: [1, 2, 3, 6, 7], done: d2, ...FREE_TIER, ...probeConn(g) });
+  assert.deepEqual([d2[3].v, r2.deferred.map((x) => x.level)], ["p", [6, 7]]);
+  // a rate limit, or an account state, on L6 would hit the next request too: the model stops
+  for (const stopper of [http(429, "slow down"), http(402, "no credit"), http(401, "bad key")]) {
+    const s = fakeFetch((c) => (kindOf(c) === "6" ? stopper : goodModel(c)));
+    const d3 = {};
+    const r3 = await probeModel({ levels: [1, 2, 3, 6, 7], done: d3, ...FREE_TIER, ...probeConn(s) });
+    assert.ok(r3.inconclusive, String(stopper.status));
+    assert.ok(!kindsOf(s).includes("3a"), "L3 was not asked");
+    assert.equal(d3[2].v, "p", "L1 and L2 are kept in done");
+  }
+});
+
+test("H: through the CLI a flaky spawn level leaves a record with L1, L2 and the error result, says so, and the next run asks spawn alone", async () => {
+  let open = false;
+  const e = cliEnv([many("pa", 1)], { answer: (c) => (!open && kindOf(c) === "6" ? http(500, "boom") : goodModel(c)) });
+  const r1 = await runRaw(["--live", "--per-provider", "1"], e.deps);
+  assert.equal(r1.code, 0, r1.err + r1.out);
+  const rec = loadFidelity(e.out).models["pa/m0"];
+  assert.deepEqual([rec.lvr, rec.er, rec.sp], ["ppnn", "p", undefined]);
+  assert.match(r1.out, /1 model\(s\) kept their other levels while a small level was set aside \(spawn 1;/);
+  assert.deepEqual(kindsOf(e.f), ["1", "1a", "2", "6", "2e"]);
+  open = true;
+  e.f.calls.length = 0;
+  const r2 = await runRaw(["--live", "--per-provider", "1"], e.deps);
+  assert.equal(r2.code, 0, r2.err + r2.out);
+  assert.deepEqual(kindsOf(e.f), ["6"], "only the set-aside level");
+  assert.equal(loadFidelity(e.out).models["pa/m0"].sp, "p");
+});
+
+test("H: the default levels are L1+L2+L6+L7 (the baseline); --levels 12 is L1+L2 alone; the ledger's l12 universe still means L1+L2; the big-request gate does not trip on 6 and 7", async () => {
+  assert.deepEqual(parseArgs([]).levels, [1, 2, 6, 7]);
+  assert.deepEqual([...DEFAULT_LEVELS], [1, 2, 6, 7]);
+  assert.deepEqual(parseArgs(["--levels", "12"]).levels, [1, 2]);
+  const e = cliEnv([many("pa", 2)]);
+  const dry = await runRaw([], e.deps);
+  assert.match(dry.out, /levels L1\+L2\+L6\+L7  incremental/);
+  assert.deepEqual(plan({ snap: { rows: e.rows }, bench: e.deps.bench, store: {}, o: parseArgs([]), tiers: e.deps.tiers, nowMs: NOW.getTime() }).queued.map((x) => x.todo.join()), ["1,2,6,7", "1,2,6,7"]);
+  const l12 = await runRaw(["--levels", "12"], e.deps);
+  assert.match(l12.out, /levels L1\+L2  incremental/);
+  assert.deepEqual(plan({ snap: { rows: e.rows }, bench: e.deps.bench, store: {}, o: parseArgs(["--levels", "12"]), tiers: e.deps.tiers, nowMs: NOW.getTime() }).queued.map((x) => x.todo.join()), ["1,2", "1,2"]);
+  // a model with L1+L2 only is tested at l12 and queued for the two small levels alone
+  const p = plan({ snap: { rows: e.rows }, bench: e.deps.bench, store: { "pa/m0": record("ppnn") }, o: parseArgs([]), tiers: e.deps.tiers, nowMs: NOW.getTime() });
+  assert.deepEqual(p.queued.map((x) => [x.key, x.todo.join()]), [["pa/m0", "6,7"], ["pa/m1", "1,2,6,7"]]);
+  assert.equal(p.ledger.l12.counts.tested, 1);
+  // a live default run needs no --l3 yes (6 and 7 are a few hundred tokens), and a model ends complete
+  const live = await runRaw(["--live", "--per-provider", "1"], e.deps);
+  assert.equal(live.code, 0, live.err + live.out);
+  assert.deepEqual(Object.values(loadFidelity(e.out).models).map((x) => [x.lvr, x.sp, x.er]), [["ppnn", "p", "p"], ["ppnn", "p", "p"]]);
+  assert.match(live.out, /TESTED 2 of 2 \(complete for every level it is eligible for 2 of 2;/);
+  const again = await runRaw([], e.deps);
+  assert.match(again.out, /nothing to probe/);
+});
+
+test("H: a timeout on L6 (asked once more at double, then given up) is set aside too: L7 and L3 still run", async () => {
+  const inner = fakeFetch(goodModel);
+  const f = (url, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (body && kindOf({ body }) === "6") return new Promise((_, reject) => init.signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true }));
+    return inner(url, init);
+  };
+  f.calls = inner.calls;
+  const done = {};
+  const r = await probeModel({ levels: [1, 2, 3, 6, 7], done, ...FREE_TIER, ...probeConn(f, { timeouts: { small: 60, "157": 5000, big: 5000 } }) });
+  assert.equal(r.inconclusive, undefined);
+  assert.deepEqual([done[3].v, done[7].v, r.deferred.map((x) => [x.level, x.s])], ["p", "p", [[6, "timeout"]]]);
 });

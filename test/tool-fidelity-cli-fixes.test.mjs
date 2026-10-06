@@ -6,7 +6,7 @@ import fs, { existsSync as rawExists } from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
-import { freshDir, fakeFetch, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
+import { pinL12, freshDir, fakeFetch, ok, http, goodModel, record, kindOf } from "./fixtures/tool-fidelity-helpers.mjs";
 import { main, plan, parseArgs } from "../refresh/tool-fidelity-cli.mjs";
 import { loadFidelity, saveFidelity, cleanFidelity, FILE_NAME, REAL_FILE, KIND } from "../refresh/tool-fidelity.mjs";
 import { funnel } from "../menu/subagent-funnel.mjs";
@@ -39,7 +39,7 @@ async function run(argv, deps, { raw = false } = {}) {
   const out = [], err = [], lg = console.log, er = console.error;
   console.log = (...a) => out.push(a.join(" ")); console.error = (...a) => err.push(a.join(" "));
   let code;
-  try { code = await main(raw ? argv : spendFor(argv), deps); } finally { console.log = lg; console.error = er; }
+  try { code = await main(raw ? argv : pinL12(spendFor(argv)), deps); } finally { console.log = lg; console.error = er; }
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 const calls = (f) => f.calls.filter((c) => !c.url.endsWith("/health"));

@@ -463,7 +463,9 @@ function httpVerdict(kind, status, text, ra) {
     return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
   }
   const cls = classifyHttp(status, text);
-  return inconclusive(cls === "pay" && status !== 402 && isQuotaSentence(extractMessage(text)) ? "quota" : cls, why, extra);
+  // a bare quota sentence is the provider's allowance, whatever status carries it: read as pay (a loose payment word) or, on a 403, as auth ("forbidden"), it is `quota` instead. Real auth words stay auth.
+  const quotaLike = (cls === "pay" || (cls === "auth" && status === 403)) && status !== 402 && isQuotaSentence(extractMessage(text));
+  return inconclusive(quotaLike ? "quota" : cls, why, extra);
 }
 
 /**
@@ -496,6 +498,10 @@ export async function runKind(kind, { fetchImpl = fetch, url, key, model, maxTok
  * frozen capability `liftDeepProbes` hands out; nothing else, no string, no flag, no environment variable, is accepted). An unknown tier is NOT free.
  */
 export const LIFTS = new WeakSet();
+/** The order in which the levels run: cheap first (L6 and L7 need only L1+L2 and cost a few hundred tokens), the big requests last. */
+export const LEVEL_ORDER = Object.freeze([1, 2, 6, 7, 3, 4, 5]);
+/** The inconclusive statuses of L6 or L7 that do not stop the model: they say something about that one request, not about the provider's state. */
+const SETASIDE = new Set(["error", "timeout", "empty"]);
 export const deepAllowed = (tier, lift = null) => tier === "free" || (!!lift && LIFTS.has(lift) && Array.isArray(lift.tiers) && lift.tiers.includes(tier));
 
 /**
@@ -503,6 +509,9 @@ export const deepAllowed = (tier, lift = null) => tier === "free" || (!!lift && 
  * need L1 and L2 passed, L5 needs L3 passed, L6 and L7 need L1 and L2 passed (`prior` is the stored per-level string, `nnnn` for none; `flags` the stored record, for the markers).
  * A model whose key tier is not `free` (and is not lifted: `deepAllowed(tier, lift)`) is not probed AT ALL, at any level including L1 and L2: every asked level is recorded
  * `{v: "n", why: NOT_FREE_REASON, clamped: true}`, zero requests are sent and the result is `{done, requests: 0, clamped: [every level], tele}`. A lifted tier may get any level that was asked.
+ * LEVEL ORDER is by COST, whatever the order the levels are listed in: 1 (with 1a), 2, then 6 (spawn, ~270 input tokens) and 7 (the error result, ~180), then 3, 4 and 5 (40,000 and 100,000). The cheap
+ * levels need only L1+L2, so they are never held behind a big request; and a flaky 6 or 7 (an error, a timeout, an empty answer: something about THAT request) is set aside (`deferred`, asked again by a
+ * later run) and the next level goes on; a limit or an account state (rate, quota, pay, auth, gone) would hit the next request too, so it stops the model as before.
  * `order: "big-first"` with a known `ctx` of at least 200,000 asks the big step before L3: a pass implies L3 (recorded `implied`, the 157 KB requests are skipped); a failure then
  * runs L3 to locate the cause. Resolves
  *   `{aborted: true}`
@@ -597,7 +606,8 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     return null;
   };
 
-  for (const level of want) {
+  const deferred = [];
+  for (const level of LEVEL_ORDER.filter((l) => want.includes(l))) {
     if (done[level]) continue;
     const pair = passed(1) && passed(2);
     const notRun = (why) => { done[level] = { v: "n", why }; };
@@ -636,9 +646,12 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
       const r = await ask(level === 6 ? "6" : "2e");
       if (r.aborted) return r;
-      if (r.v === "i") return stop(r);
+      if (r.v === "i") {
+        if (SETASIDE.has(r.s) && !r.capped) { deferred.push({ level, s: r.s, why: r.why }); continue; }       // about this request only: the bigger levels go on, a later run asks this one again
+        return stop(r);
+      }
       done[level] = row(r);
     }
   }
-  return { done, requests, tele, clamped, ...(state.escalated ? { escalated: true } : {}) };
+  return { done, requests, tele, clamped, ...(deferred.length ? { deferred } : {}), ...(state.escalated ? { escalated: true } : {}) };
 }
