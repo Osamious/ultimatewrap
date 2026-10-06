@@ -259,7 +259,12 @@ test("updatePending: a model in the queue that ends the run untested gets one mo
   const before = { "p/a": { r: "rate", n: 2, at: "2026-10-01T00:00:00.000Z" }, "p/done": { r: "cap", n: 1, at: "2026-10-01T00:00:00.000Z" }, "p/gone": { r: "cap", n: 1, at: "2026-10-01T00:00:00.000Z" } };
   const out = updatePending(before, { queue: U("p/a", "p/b", "p/done", "p/strike", "p/c"), recorded: new Set(["p/done"]), store, now: NOW, keepKeys: new Set(["p/a", "p/b", "p/done", "p/strike", "p/c"]),
     reasonOf: (k) => ({ "p/a": "pay", "p/c": "Spend Cap!" })[k] });
-  assert.deepEqual(out, { "p/a": { r: "pay", n: 3, at: NOW.toISOString() }, "p/b": { r: "not-run", n: 1, at: NOW.toISOString() }, "p/c": { r: "spend-cap-", n: 1, at: NOW.toISOString() } });
+  const T = NOW.toISOString();
+  assert.deepEqual(out, { "p/a": { r: "pay", n: 3, at: T, since: T }, "p/b": { r: "not-run", n: 1, at: T, since: T }, "p/c": { r: "spend-cap-", n: 1, at: T, since: T } }, "since: the first time THIS reason was recorded (p/a was rate before, so pay starts now)");
+  const again = updatePending(out, { queue: U("p/a", "p/b"), recorded: new Set(), store, now: new Date(NOW.getTime() + 86400000), keepKeys: null, reasonOf: (k) => ({ "p/a": "pay" })[k] });
+  assert.deepEqual([again["p/a"].n, again["p/a"].since, again["p/a"].at], [4, T, new Date(NOW.getTime() + 86400000).toISOString()], "the same reason again: since stays");
+  const legacy = updatePending({ "p/a": { r: "error", n: 2, at: "2026-10-01T00:00:00.000Z" } }, { queue: U("p/a"), recorded: new Set(), store, now: NOW, keepKeys: null, reasonOf: () => "error" });
+  assert.equal(legacy["p/a"].since, "2026-10-01T00:00:00.000Z", "an entry written before `since` existed reads as since its last time");
   assert.deepEqual(before["p/a"], { r: "rate", n: 2, at: "2026-10-01T00:00:00.000Z" }, "pure: the input is not changed");
   assert.deepEqual(cleanPending({ "p/ok": { r: "cap", n: 1, at: NOW.toISOString() }, "p/badr": { r: "BAD R", n: 1, at: NOW.toISOString() }, "p/badn": { r: "cap", n: 0, at: NOW.toISOString() },
     "p/bada": { r: "cap", n: 1, at: "x" }, "no slash": { r: "cap", n: 1, at: NOW.toISOString() } }), { "p/ok": { r: "cap", n: 1, at: NOW.toISOString() } });

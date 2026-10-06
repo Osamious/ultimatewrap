@@ -3,12 +3,13 @@
 // `SATURATION ...` line a loop script can stop on. Offline: fixtures only, a fake gateway, temp directories.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
 import { freshDir, fakeFetch, goodModel, http, record } from "./fixtures/tool-fidelity-helpers.mjs";
-import { main, parseArgs, plan, verdictLines, saturationLines } from "../refresh/tool-fidelity-cli.mjs";
-import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
+import { main, parseArgs, plan, verdictLines, saturationLines, hardLines } from "../refresh/tool-fidelity-cli.mjs";
+import { activeHolds, hardState, recheckCovers, releaseHolds, sweepVerdict, saturation, coverage, confirmedProviders, saveFidelity, loadFidelity, cleanMeta, capRecords, renderFile, HELD_PLAN, FILE_NAME, REAL_FILE } from "../refresh/tool-fidelity.mjs";
 
 const REAL_BEFORE = realFileState(REAL_FILE);
 guardRealState(after, assert);
@@ -146,7 +147,7 @@ test("the verdict counts match the ledger partition (tested + pending + held + e
   assert.equal(v.byRecoverable.rate, 1);
   assert.equal(v.byRecoverable.error, 1);
   const text = verdictLines(v);
-  assert.match(text[0], /^sweep verdict: RECOVERABLE \d+ of 14 \(.*\) \| HARD-BLOCKED 6 of 14 \(.*pay 4.*; lift only with --recheck-hard\/--release-holds\) \| TESTED 3 of 14 \| NEEDS-OWNER 1 of 14/);
+  assert.match(text[0], /^sweep verdict: RECOVERABLE \d+ of 14 \(.*\) \| HARD-BLOCKED 6 of 14 \(.*pay 4.*; lift only with --recheck-hard\/--release-holds\) \| TESTED 3 of 14 \(complete for every level it is eligible for 0 of 3; tested but optional levels not run 3 of 3: .*spawn 3.*\) \| NEEDS-OWNER 1 of 14 \(row-cost 1: raise --max-row-cost; a re-run alone changes nothing\)/);
   assert.match(text[1], /population: 14 model\(s\) of the ledger that are not excluded \(0 more are excluded/);
   assert.ok(!text.some((x) => x.startsWith("DONE")), "something is recoverable");
 });
@@ -332,4 +333,207 @@ test("saturationLines: a dry run is unknown unless nothing is recoverable; the m
   const sat = saturation({ requests: 10, rate: 1, failing: 1, newResults: 6, recoverable: 4 });
   assert.equal(saturationLines(v, sat).at(-1), "SATURATION saturated=no recoverable=4 hard=2 new_results=6");
   assert.equal(saturationLines(v, sat).length, 2);
+});
+
+// ================================================================ lifecycle review addendum (2026-10-06)
+
+// ---------------------------------------------------------------- 1. naming ONE model is a manual act
+
+test("--only provider/model (an exact id) lifts that model's own hard block and says so; --only <provider> alone does not", async () => {
+  const e = cliEnv([many("pa", 3), many("pb", 3)]);
+  const pending = { "pa/m0": { r: "pay", n: 4, at: hoursAgo(2), since: "2026-09-20T08:30:00.000Z" }, "pa/m1": pend("gone"), "pb/m0": pend("auth") };
+  const exact = planOf(e, ["--only", "pa/m0"], { pending });
+  assert.deepEqual(keys(exact), ["pa/m0"], "the named model is asked");
+  assert.deepEqual(exact.namedLifts.map((x) => [x.key, x.state, x.since, x.viaHold]), [["pa/m0", "pay", "2026-09-20T08:30:00.000Z", false]]);
+  assert.deepEqual(exact.hardBlocked.models, 0, "m1 and pb/m0 are outside --only, so nothing else is blocked in THIS queue");
+  const dry = await run(["--only", "pa/m0"], cliEnv([many("pa", 3), many("pb", 3)], { pending }).deps);
+  assert.match(dry.out, /pa\/m0: hard-blocked pay since 2026-09-20 08:30; asking it because you named it/);
+  assert.match(dry.out, /this run: 1 model\(s\) queued of 6 \(--only pa\/m0\)/);
+  // a provider name alone lifts nothing
+  const prov = planOf(e, ["--only", "pa"], { pending });
+  assert.deepEqual(keys(prov), ["pa/m2"], "m0 (pay) and m1 (gone) stay blocked");
+  assert.deepEqual([prov.namedLifts.length, prov.hardBlocked], [0, { models: 2, by: { pay: 1, gone: 1 } }]);
+  assert.doesNotMatch((await run(["--only", "pa"], cliEnv([many("pa", 3), many("pb", 3)], { pending }).deps)).out, /because you named it/);
+  // naming two models lifts both; a model that is not blocked prints nothing
+  const two = planOf(e, ["--only", "pa/m0,pa/m1,pa/m2"], { pending });
+  assert.deepEqual(keys(two), ["pa/m0", "pa/m1", "pa/m2"]);
+  assert.deepEqual(two.namedLifts.map((x) => x.key).sort(), ["pa/m0", "pa/m1"]);
+  // only the named one: its neighbours with a hard block stay out
+  assert.deepEqual(keys(planOf(e, ["--only", "pa/m1,pb"], { pending })), ["pa/m1", "pb/m1", "pb/m2"]);
+});
+
+test("naming a model of a HELD provider asks that one model (the hold stays for the rest, and the ledger does not call it held); naming only the provider does not", () => {
+  const e = cliEnv([many("pb", 3)]);
+  const held = { pb: { r: "pay", at: "2026-10-01T00:00:00.000Z" } };
+  const one = planOf(e, ["--only", "pb/m1"], { held });
+  assert.deepEqual(keys(one), ["pb/m1"]);
+  assert.deepEqual(one.namedLifts.map((x) => [x.key, x.state, x.since, x.viaHold]), [["pb/m1", "pay", "2026-10-01T00:00:00.000Z", true]]);
+  assert.equal(one.ledger.l12.counts.held, 2, "pb/m0 and pb/m2 stay held; pb/m1 is queued");
+  assert.deepEqual(keys(planOf(e, ["--only", "pb"], { held })), [], "the provider name alone does not lift a hold");
+  assert.match(hardLines(one).join("\n"), /pb\/m1: hard-blocked pay \(its provider is held\) since 2026-10-01 00:00; asking it because you named it/);
+});
+
+test("live: a named model with a stored pay block is asked, nobody else of its provider is, and an answer clears its pending entry", async () => {
+  let open = false;
+  const e = cliEnv([many("pa", 3)], { store: { "pa/known": record("ppnn") }, answer: (c) => (!open && c.body.model === "pa/m0" ? http(402, "this model needs credit") : goodModel(c)), pending: { "pa/m0": pend("pay", 2) } });
+  open = true;
+  const r = await run(["--live", "--only", "pa/m0", "--per-provider", "1"], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  assert.deepEqual([...new Set(calls(e.f).map((c) => c.body.model))], ["pa/m0"]);
+  assert.match(r.out, /pa\/m0: hard-blocked pay since .*; asking it because you named it/);
+  assert.ok(loadFidelity(e.out).models["pa/m0"]);
+  assert.ok(!loadFidelity(e.out).pending["pa/m0"]);
+});
+
+// ---------------------------------------------------------------- 2. since dates and run counts
+
+test("ledger rows carry `since` (the first time the stored reason was recorded) and the run count; a held row carries the hold's time; the verdict prints the oldest since per reason", () => {
+  const pending = { "pa/m0": { r: "rate", n: 4, at: hoursAgo(1), since: "2026-10-02T00:00:00.000Z" }, "pa/m1": { r: "rate", n: 1, at: hoursAgo(1), since: "2026-10-05T00:00:00.000Z" }, "pa/m2": { r: "error", n: 2, at: "2026-10-05T10:00:00.000Z" } };
+  const cov = coverage([{ key: "pa/m0" }, { key: "pa/m1" }, { key: "pa/m2" }, { key: "pa/m3" }, { key: "pb/m0" }], {}, { pending, plan: { "pb/m0": HELD_PLAN }, heldWhy: { pb: "pay" }, heldSince: { pb: "2026-09-28T00:00:00.000Z" } });
+  const row = Object.fromEntries(cov.pending.map((x) => [x.key, x]));
+  assert.deepEqual([row["pa/m0"].since, row["pa/m0"].runs], ["2026-10-02T00:00:00.000Z", 4]);
+  assert.equal(row["pa/m2"].since, "2026-10-05T10:00:00.000Z", "an entry from before `since` existed reads as since its last time");
+  assert.equal(row["pa/m3"].since, null, "never asked: no date");
+  assert.deepEqual([cov.held[0].reason, cov.held[0].since], ["pay", "2026-09-28T00:00:00.000Z"]);
+  const v = sweepVerdict({ l12: cov, pending });
+  assert.deepEqual(v.oldestSince, { rate: "2026-10-02T00:00:00.000Z", error: "2026-10-05T10:00:00.000Z", pay: "2026-09-28T00:00:00.000Z" });
+  const text = verdictLines(v).join("\n");
+  assert.match(text, /oldest since, per reason \(the first time that reason was recorded, among the 5 model\(s\) not tested\): pay 2026-09-28, rate 2026-10-02, error 2026-10-05/);
+  assert.ok(!verdictLines(sweepVerdict({ l12: coverage([{ key: "pa/a" }], { "pa/a": record("ppnn") }, {}) })).some((l) => l.includes("oldest since")), "nothing to say when everything is tested");
+});
+
+test("live: `since` stays at the first run of a reason across runs, restarts when the reason changes; the dry run shows the oldest since", async () => {
+  const e = cliEnv([many("pa", 2)], { answer: () => http(429, "slow down", { "retry-after": "0" }) });
+  await run(["--live", "--per-provider", "1"], e.deps);
+  const day2 = new Date(NOW.getTime() + DAY);
+  e.deps.now = () => day2;
+  await run(["--live", "--per-provider", "1"], e.deps);
+  const p = loadFidelity(e.out).pending["pa/m0"];
+  assert.deepEqual([p.r, p.n, p.since, p.at], ["rate", 2, NOW.toISOString(), day2.toISOString()]);
+  const dry = await run([], e.deps);
+  assert.match(dry.out, /oldest since, per reason .*: rate 2026-10-06/);
+  const e2 = cliEnv([many("pa", 1)], { answer: () => http(500, "boom") });
+  await run(["--live", "--per-provider", "1"], e2.deps);
+  e2.deps.now = () => day2;
+  e2.deps.fetch = fakeFetch(() => http(429, "slow down", { "retry-after": "0" }));
+  await run(["--live", "--per-provider", "1"], e2.deps);
+  const q = loadFidelity(e2.out).pending["pa/m0"];
+  assert.deepEqual([q.r, q.since], ["rate", day2.toISOString()], "error became rate: since starts again");
+});
+
+test("saveFidelity keeps `since` in the pending map; cleanPending drops only a malformed since, not the entry", () => {
+  const d = freshDir(), file = path.join(d, FILE_NAME);
+  saveFidelity(file, {}, { now: NOW, pending: { "pa/m0": { r: "rate", n: 2, at: hoursAgo(1), since: hoursAgo(30) }, "pa/m1": { r: "rate", n: 1, at: hoursAgo(1), since: "nope" } } });
+  const back = loadFidelity(file).pending;
+  assert.equal(back["pa/m0"].since, hoursAgo(30));
+  assert.deepEqual(back["pa/m1"], { r: "rate", n: 1, at: hoursAgo(1) });
+});
+
+// ---------------------------------------------------------------- 3. soft but stuck, and the meta block
+
+test("soft-but-stuck: error, timeout, empty or slow for 3 or more runs in a row stay recoverable but are counted apart; rate, cap and a lower count are not stuck", () => {
+  const rows = [many("pa", 9)];
+  const e = cliEnv(rows);
+  const pending = { "pa/m0": pend("error", 3), "pa/m1": pend("timeout", 7), "pa/m2": pend("empty", 3), "pa/m3": pend("slow", 5), "pa/m4": pend("error", 2), "pa/m5": pend("rate", 20), "pa/m6": pend("cap", 9), "pa/m7": pend("upstream-unavailable", 9) };
+  const p = planOf(e, ["--tf-max-tokens-per-provider", "1000000"], { pending });
+  const v = p.verdict;
+  assert.equal(v.recoverable, 9, "all nine are still recoverable (m8 was never asked)");
+  assert.equal(v.stuck, 4);
+  assert.deepEqual(v.byStuck, { error: 1, timeout: 1, empty: 1, slow: 1 });
+  assert.equal(p.queued.length, 9, "stuck-soft models are still queued: a manual re-run asks them");
+  assert.match(verdictLines(v)[0], /RECOVERABLE 9 of 9 \(.*; of which STUCK 4 \(.*; the same soft reason 3 or more runs in a row, still recoverable\)\) \| HARD-BLOCKED 0 of 9/);
+  assert.equal(sweepVerdict({ l12: p.ledger.l12, pending, stuckRuns: 5 }).stuck, 2, "the threshold is the --pending-runs option's");
+  assert.equal(planOf(e, ["--pending-runs", "5", "--tf-max-tokens-per-provider", "1000000"], { pending }).verdict.stuck, 2);
+  assert.ok(!verdictLines(planOf(e, [], { pending: { "pa/m0": pend("error", 1) } }).verdict)[0].includes("STUCK"));
+});
+
+test("saturation (pure): the recoverable set that did not shrink against the previous run is saturated; one that shrank, or an unknown previous count, is not", () => {
+  const base = { requests: 10, rate: 0, failing: 0, newResults: 4 };
+  const same = saturation({ ...base, recoverable: 5, prevRecoverable: 5 });
+  assert.deepEqual([same.saturated, same.why], [true, "the recoverable set did not shrink: 5 now, 5 at the end of the previous run"]);
+  assert.equal(saturation({ ...base, recoverable: 7, prevRecoverable: 5 }).saturated, true, "grew");
+  assert.equal(saturation({ ...base, recoverable: 4, prevRecoverable: 5 }).saturated, false, "shrank: progress");
+  assert.equal(saturation({ ...base, recoverable: 5, prevRecoverable: null }).saturated, false, "no previous run on record");
+  assert.equal(saturation({ ...base, recoverable: 5 }).saturated, false);
+  assert.equal(saturation({ ...base, recoverable: 0, prevRecoverable: 0 }).why, "nothing recoverable left", "that reason comes first");
+  assert.equal(saturation({ ...base, newResults: 0, recoverable: 5, prevRecoverable: 9 }).why, "no new result in this run");
+});
+
+test("the meta block (additive): cleanMeta keeps only a sane recoverable count with a date; it survives save and load; a writer that does not mention it keeps the one in the file; the size cap counts it", () => {
+  assert.deepEqual(cleanMeta({ recoverable: 3, at: NOW.toISOString(), junk: 1 }), { recoverable: 3, at: NOW.toISOString() });
+  for (const bad of [null, [], "x", { recoverable: -1, at: NOW.toISOString() }, { recoverable: 1.5, at: NOW.toISOString() }, { recoverable: 2 }, { recoverable: 2, at: "nope" }]) assert.equal(cleanMeta(bad), null);
+  const d = freshDir(), file = path.join(d, FILE_NAME);
+  saveFidelity(file, { "fa/a": record("ppnn") }, { now: NOW, meta: { recoverable: 7, at: NOW.toISOString() } });
+  assert.deepEqual(loadFidelity(file).meta, { recoverable: 7, at: NOW.toISOString() });
+  assert.match(fs.readFileSync(file, "utf8"), /"meta":\{"recoverable":7/);
+  saveFidelity(file, { "fa/a": record("ppnn"), "fa/b": record("ppnn") }, { now: NOW });
+  assert.equal(loadFidelity(file).meta.recoverable, 7, "a save that does not mention the meta keeps it");
+  saveFidelity(file, { "fa/a": record("ppnn") }, { now: NOW, meta: null });
+  assert.equal(loadFidelity(file).meta, null, "an explicit null clears it");
+  const models = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`fa/m${i}`, record("ppnn", { at: new Date(NOW.getTime() + i).toISOString() })]));
+  const fit = Buffer.byteLength(renderFile(Object.entries(models), NOW, null, null));
+  assert.ok(capRecords(models, { now: NOW, maxBytes: fit, meta: { recoverable: 7, at: NOW.toISOString() } }).dropped.length >= 1, "the meta text is part of the size");
+});
+
+test("live: the run leaves its recoverable count in the meta block; the next run that does not shrink it is saturated even though it recorded something; one that shrinks it is not; a manual lift ignores the rule", async () => {
+  const mk = (metaCount, argv = []) => {
+    const e = cliEnv([many("pa", 2)], { answer: (c) => (c.body.model === "pa/m0" ? http(500, "boom") : goodModel(c)), pending: { "pa/m0": pend("error", 5) } });
+    saveFidelity(e.out, {}, { now: NOW, pending: { "pa/m0": pend("error", 5) }, meta: metaCount === null ? null : { recoverable: metaCount, at: hoursAgo(5) } });
+    return { e, argv };
+  };
+  // previous run left 1 recoverable; this run records pa/m1 but pa/m0 (stuck error) is still there: 1 now, no shrink
+  const a = mk(1);
+  const ra = await run(["--live", "--per-provider", "1"], a.e.deps);
+  assert.match(ra.lines.at(-1), /^SATURATION saturated=yes recoverable=1 hard=0 new_results=1$/, ra.out);
+  assert.match(ra.out, /saturated: yes \(the recoverable set did not shrink: 1 now, 1 at the end of the previous run\)/);
+  assert.deepEqual(loadFidelity(a.e.out).meta, { recoverable: 1, at: NOW.toISOString() });
+  // previous run left 2: now 1, it shrank
+  const b = mk(2);
+  const rb = await run(["--live", "--per-provider", "1"], b.e.deps);
+  assert.match(rb.lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+  assert.deepEqual(loadFidelity(b.e.out).meta.recoverable, 1);
+  // no previous count on record
+  const c = mk(null);
+  assert.match((await run(["--live", "--per-provider", "1"], c.e.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+  // a manual lift is allowed to grow the set
+  const d = mk(1);
+  assert.match((await run(["--live", "--per-provider", "1", "--retry-accounts"], d.e.deps)).lines.at(-1), /^SATURATION saturated=no recoverable=1 hard=0 new_results=1$/);
+});
+
+// ---------------------------------------------------------------- 4. tier completeness
+
+test("the verdict says how many TESTED models are complete for every level they are eligible for and how many have optional levels not run, with the missing levels named; the tested partition is unchanged", () => {
+  const full = record("pppp", { big: "p", sp: "p", er: "p" });
+  const store = {
+    "pa/full": full,
+    "pa/core": record("ppnn"),                                   // L3 never asked: not eligible-missing for L4/big, but spawn and error-result have not run
+    "pa/noerr": record("pppp", { big: "p", sp: "p" }),
+    "pa/nobig": record("pppp", { sp: "p", er: "p" }),
+    "pa/nol4": record("pppn", { big: "p", sp: "p", er: "p" }),
+    "pa/failed": record("ffnn"),                                 // a failure: nothing more is asked
+  };
+  const universe = Object.keys(store).map((key) => ({ key }));
+  const l12 = coverage(universe, store, {});
+  const v = sweepVerdict({ l12, store });
+  assert.equal(v.tested, l12.counts.tested, "the partition itself is untouched");
+  assert.deepEqual([v.tested, v.complete, v.incomplete], [6, 2, 4]);
+  assert.deepEqual(v.byMissing, { spawn: 1, "error-result": 2, big: 1, L4: 1 });
+  assert.equal(v.complete + v.incomplete, v.tested);
+  const line = verdictLines(v)[0];
+  assert.match(line, /TESTED 6 of 6 \(complete for every level it is eligible for 2 of 6; tested but optional levels not run 4 of 6: /);
+  assert.match(line, /spawn 1/);
+  assert.match(line, /error-result 2/);
+});
+
+test("completeness goes with the tier: a tested model whose tier does not allow deep levels is complete for what it is eligible for; first strikes are not tested at all", () => {
+  const store = { "pa/x": record("ppnn"), "pb/x": record("ppnn"), "pa/s": record("fnnn", { strikes: 1, sl: 1 }) };
+  const l12 = coverage([{ key: "pa/x" }, { key: "pb/x" }, { key: "pa/s" }], store, { deepOk: (k) => k.startsWith("pa/") });
+  const v = sweepVerdict({ l12, store });
+  assert.deepEqual([v.tested, v.complete, v.incomplete, v.recoverable], [2, 1, 1, 1], "pb is not eligible for the deep levels; pa/s is a first strike (recoverable)");
+});
+
+test("dry run: the completeness figures reach the printed verdict with their denominator", async () => {
+  const e = cliEnv([many("pa", 3)], { store: { "pa/m0": record("ppnn"), "pa/m1": record("pppp", { big: "p", sp: "p", er: "p" }) } });
+  const r = await run([], e.deps);
+  assert.match(r.out, /TESTED 2 of 3 \(complete for every level it is eligible for 1 of 2; tested but optional levels not run 1 of 2: error-result 1, spawn 1\)/);
 });

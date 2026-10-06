@@ -156,7 +156,7 @@ export function loadFidelity(file = REAL_FILE) {
   try {
     if (fs.statSync(file).size > MAX_READ_BYTES) return { ok: false, reason: "too-large" };
     text = fs.readFileSync(file, "utf8").replace(/^﻿/, "");
-  } catch (e) { return e?.code === "ENOENT" ? { ok: true, absent: true, models: {}, rejected: {}, pending: {}, held: {}, generatedAt: null, dropped: 0 } : { ok: false, reason: "unreadable" }; }
+  } catch (e) { return e?.code === "ENOENT" ? { ok: true, absent: true, models: {}, rejected: {}, pending: {}, held: {}, meta: null, generatedAt: null, dropped: 0 } : { ok: false, reason: "unreadable" }; }
   let raw;
   try { raw = JSON.parse(text); } catch { return { ok: false, reason: "corrupt" }; }
   if (!raw || raw.kind !== KIND || raw.schema !== SCHEMA || !raw.models || typeof raw.models !== "object" || Array.isArray(raw.models)) return { ok: false, reason: "schema" };
@@ -167,7 +167,7 @@ export function loadFidelity(file = REAL_FILE) {
     if (rec) models[k] = rec;
     else { dropped += 1; if (keyOk(k)) rejected[k] = v; }
   }
-  return { ok: true, models, rejected, pending: cleanPending(raw.pending), held: cleanHeld(raw.held), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
+  return { ok: true, models, rejected, pending: cleanPending(raw.pending), held: cleanHeld(raw.held), meta: cleanMeta(raw.meta), generatedAt: typeof raw.generatedAt === "string" ? raw.generatedAt : null, dropped };
 }
 
 // ------------------------------------------------------------------ writing
@@ -175,7 +175,8 @@ export function loadFidelity(file = REAL_FILE) {
 /**
  * The PENDING map: for a model that was in a run's queue and ended it still untested, why, and in how many runs in a row. It is bookkeeping for the
  * coverage ledger (a model that waits for many runs is starving), not a result: it is dropped as soon as the model has one. `r` is a short reason code
- * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, route-shape, upstream-unavailable, cap, spend, row-cost, not-run), `n` the runs, `at` the last one.
+ * (rate, pay, auth, timeout, error, gone, empty, reasoning-budget, request-cap, priced-over-row-cap, slow, route-shape, upstream-unavailable, cap, spend, row-cost, not-run), `n` the runs, `at` the last one,
+ * `since` (additive, optional) the first time THIS reason was recorded in a row (an entry written before `since` existed reads as since its `at`).
  */
 export const PENDING_MAX = 5000;
 export function cleanPending(raw) {
@@ -185,7 +186,7 @@ export function cleanPending(raw) {
     if (!keyOk(k) || !v || typeof v !== "object") continue;
     if (typeof v.r !== "string" || !/^[a-z0-9-]{1,24}$/.test(v.r) || !Number.isInteger(v.n) || v.n < 1 || v.n > 9999) continue;
     if (typeof v.at !== "string" || !Number.isFinite(Date.parse(v.at))) continue;
-    out[k] = { r: v.r, n: v.n, at: v.at };
+    out[k] = { r: v.r, n: v.n, at: v.at, ...(typeof v.since === "string" && Number.isFinite(Date.parse(v.since)) ? { since: v.since } : {}) };
     if (Object.keys(out).length >= PENDING_MAX) break;
   }
   return out;
@@ -233,25 +234,35 @@ export function hardState(reason, provider, confirmed = {}) {
 }
 /** `--recheck-hard pay,auth,gone,<providers>`: does the manual lift `recheck` (`{reasons, providers}`, or null) cover this hard `state` of `provider`? An empty provider list means every provider. */
 export const recheckCovers = (recheck, state, provider) => !!recheck && recheck.reasons.includes(state) && (!recheck.providers.length || recheck.providers.includes(provider));
+/**
+ * The META block (additive): what the last live run left behind for the next one. `recoverable` is the verdict's recoverable count at the END of that run, so the next run can tell whether the recoverable
+ * set shrank (a loop must not spin forever on soft-but-stuck models); `at` is when.
+ */
+export function cleanMeta(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (!Number.isInteger(raw.recoverable) || raw.recoverable < 0 || raw.recoverable > 10000000 || typeof raw.at !== "string" || !Number.isFinite(Date.parse(raw.at))) return null;
+  return { recoverable: raw.recoverable, at: raw.at };
+}
+const metaText = (meta) => (meta ? `"meta":${JSON.stringify(meta)},` : "");
 const heldText = (held) => (held && Object.keys(held).length ? `"held":${JSON.stringify(held)},` : "");
 const pendingText = (pending) => (pending && Object.keys(pending).length ? `"pending":${JSON.stringify(pending)},` : "");
-const head = (now, pending, held = null) => `{"schema":${SCHEMA},"kind":${JSON.stringify(KIND)},"generatedAt":${JSON.stringify(now.toISOString())},${pendingText(pending)}${heldText(held)}"models":{`;
+const head = (now, pending, held = null, meta = null) => `{"schema":${SCHEMA},"kind":${JSON.stringify(KIND)},"generatedAt":${JSON.stringify(now.toISOString())},${pendingText(pending)}${heldText(held)}${metaText(meta)}"models":{`;
 const lineOf = (k, v) => `${JSON.stringify(k)}:${JSON.stringify(v)}`;
 /** The file text: one record per line. The size cap is measured on exactly this string. */
-export function renderFile(entries, now = new Date(), pending = null, held = null) {
+export function renderFile(entries, now = new Date(), pending = null, held = null, meta = null) {
   const lines = entries.map(([k, v]) => lineOf(k, v));
-  return `${head(now, pending, held)}${lines.length ? `\n${lines.join(",\n")}\n` : ""}}}\n`;
+  return `${head(now, pending, held, meta)}${lines.length ? `\n${lines.join(",\n")}\n` : ""}}}\n`;
 }
-const bytesOf = (sizes, now, pending, held = null) => Buffer.byteLength(head(now, pending, held)) + (sizes.length ? 2 + sizes.reduce((a, b) => a + b, 0) + 2 * (sizes.length - 1) : 0) + 3;
+const bytesOf = (sizes, now, pending, held = null, meta = null) => Buffer.byteLength(head(now, pending, held, meta)) + (sizes.length ? 2 + sizes.reduce((a, b) => a + b, 0) + 2 * (sizes.length - 1) : 0) + 3;
 
 /**
  * Capacity, not expiry: when the FILE AS WRITTEN would pass `maxBytes`, records of models that have left the catalogue go first, then the oldest;
  * records this reader did not understand (`preserve`) go last of all. Returns the kept `models` and `preserve` and the `dropped` keys.
  */
-export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, preserve = {}, now = new Date(), pending = null, held = null } = {}) {
+export function capRecords(models, { keep = null, maxBytes = MAX_FILE_BYTES, preserve = {}, now = new Date(), pending = null, held = null, meta = null } = {}) {
   const all = [...Object.entries(models).map(([k, v]) => ({ k, v, own: true })), ...Object.entries(preserve).filter(([k]) => !(k in models)).map(([k, v]) => ({ k, v, own: false }))];
   const size = new Map(all.map((e) => [e.k, Buffer.byteLength(lineOf(e.k, e.v))]));
-  let total = bytesOf([...size.values()], now, pending, held);
+  let total = bytesOf([...size.values()], now, pending, held, meta);
   const at = (e) => (e.own ? Date.parse(e.v.at) : Infinity);
   const order = [...all].sort((a, b) => {
     const ga = (a.own ? 0 : 2) + (keep && !keep.has(a.k) ? 0 : 1), gb = (b.own ? 0 : 2) + (keep && !keep.has(b.k) ? 0 : 1);
@@ -286,7 +297,7 @@ function canon(file) {
  *   - an existing file that is not this file (no `kind` marker, another schema, unreadable, too large) is never overwritten.
  * `preserve` holds raw records this reader did not understand: they are written back unchanged unless a valid record replaces them.
  */
-export function saveFidelity(file, models, { live = false, now = new Date(), keep = null, retries = 5, retryMs = 40, writeImpl = writeAtomic, realFile = REAL_FILE, preserve = {}, pending = {}, held } = {}) {
+export function saveFidelity(file, models, { live = false, now = new Date(), keep = null, retries = 5, retryMs = 40, writeImpl = writeAtomic, realFile = REAL_FILE, preserve = {}, pending = {}, held, meta } = {}) {
   const target = path.resolve(file);
   if (path.basename(target) !== FILE_NAME) throw new Error(`refused: the tool-fidelity writer only writes a file named ${FILE_NAME}, not ${path.basename(target)}`);
   if (canon(target) === canon(realFile) && !live) throw new Error("refused: the real state file is written only by a --live run");
@@ -296,9 +307,10 @@ export function saveFidelity(file, models, { live = false, now = new Date(), kee
   const keepRaw = Object.fromEntries(Object.entries(preserve).filter(([k]) => keyOk(k) && !(k in good)));
   const pend = cleanPending(pending);
   const hold = held === undefined ? cur.held : cleanHeld(held);                  // a writer that does not mention the holds keeps the ones in the file
-  const capped = capRecords(good, { keep, preserve: keepRaw, now, pending: pend, held: hold });
+  const metaV = meta === undefined ? cur.meta : cleanMeta(meta);                  // a writer that does not mention the meta keeps the one in the file
+  const capped = capRecords(good, { keep, preserve: keepRaw, now, pending: pend, held: hold, meta: metaV });
   const entries = [...Object.entries(capped.models), ...Object.entries(capped.preserve)].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  const text = renderFile(entries, now, pend, hold);
+  const text = renderFile(entries, now, pend, hold, metaV);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   for (let i = 0; ; i++) {
     try { writeImpl(target, text); break; }
@@ -520,9 +532,11 @@ export function queueFor(set, store, levels = DEFAULT_LEVELS, { force = false, r
 /** `--only provider` and `--only provider/id`, the same selection rule as the bench. */
 export function selectOnly(entries, only) {
   if (!only) return entries;
-  const prov = new Set(only.filter((o) => !o.includes("/"))), keys = new Set(only.filter((o) => o.includes("/")).map((o) => benchKey(...splitKey(o))));
+  const prov = new Set(only.filter((o) => !o.includes("/"))), keys = namedKeys(only);
   return entries.filter((e) => prov.has(e.provider) || keys.has(e.key));
 }
+/** The EXACT model keys `--only` names (`provider/model`); a provider name alone is not in it. Naming a model is a manual act: it lifts that model's own hard block (pay, auth, gone). */
+export function namedKeys(only) { return new Set((only ?? []).filter((o) => o.includes("/")).map((o) => benchKey(...splitKey(o)))); }
 const splitKey = (s) => { const i = s.indexOf("/"); return [s.slice(0, i), s.slice(i + 1)]; };
 
 /** `--limit N`: N models in total, taken round-robin across providers so a small sample touches every provider. */
@@ -965,8 +979,8 @@ export function assertPartition(universe, { tested, pending, excluded, held = []
  * `outdated` tested models whose record is against an older fixture (a `*`: re-sweep recommended, never automatic).
  */
 export const HELD_PLAN = "held";
-export function coverage(universe, store, { level = "l12", pending = {}, plan = {}, fixtureId = FIXTURE_ID, stuckRuns = 3, listCap = 10, deepOk = () => true, heldWhy = {} } = {}) {
-  const tested = [], waiting = [], excluded = [], provisional = [], stuck = [], outdated = [], held = [];
+export function coverage(universe, store, { level = "l12", pending = {}, plan = {}, fixtureId = FIXTURE_ID, stuckRuns = 3, listCap = 10, deepOk = () => true, heldWhy = {}, heldSince = {} } = {}) {
+  const tested = [], waiting = [], excluded = [], provisional = [], stuck = [], outdated = [], held = [], incomplete = [];
   const optional = { l4: 0, big: 0, sp: 0, er: 0 };
   for (const u of universe) {
     if (u.excluded) { excluded.push({ key: u.key, reason: u.excluded }); continue; }
@@ -979,17 +993,20 @@ export function coverage(universe, store, { level = "l12", pending = {}, plan = 
       tested.push({ key: u.key, tier: compiledClass(r), evidence: `${r.lvr}${r.big ? ` big ${r.big}` : ""}${r.capBelow ? ` cap<${r.capBelow}` : ""}${PF_FIELDS.filter((k) => r[k]).map((k) => ` ${k} ${r[k]}`).join("")}` });
       // OPTIONAL levels do not block `tested`: they are counted while they have not run (only where deep probes are allowed, and only behind an L3 pass or a passed pair)
       if (r.t !== "x" && r.lvr.startsWith("pp") && deepOk(u.key)) {
-        if (r.lvr[2] === "p" && r.lvr[3] === "n") optional.l4 += 1;
-        if (r.lvr[2] === "p" && r.big === undefined) optional.big += 1;
-        if (r.sp === undefined) optional.sp += 1;
-        if (r.er === undefined) optional.er += 1;
+        const miss = [];
+        if (r.lvr[2] === "p" && r.lvr[3] === "n") miss.push("l4");
+        if (r.lvr[2] === "p" && r.big === undefined) miss.push("big");
+        if (r.sp === undefined) miss.push("sp");
+        if (r.er === undefined) miss.push("er");
+        for (const k of miss) optional[k] += 1;
+        if (miss.length) incomplete.push({ key: u.key, missing: miss });             // tested, but an optional level it is eligible for has not run (uncapped: the verdict reads it)
       }
       if (r.fx !== fixtureId) outdated.push({ key: u.key, fx: r.fx });
       continue;
     }
     const p = pending[u.key];
-    if (plan[u.key] === HELD_PLAN) { held.push({ key: u.key, reason: heldWhy[u.key.slice(0, u.key.indexOf("/"))] ?? "held" }); continue; }          // its provider is held: not waiting, not 'pending too long'
-    waiting.push({ key: u.key, reason: strike ? "first-strike" : plan[u.key] ?? p?.r ?? "not-run", runs: p?.n ?? 0 });
+    if (plan[u.key] === HELD_PLAN) { const pv = u.key.slice(0, u.key.indexOf("/")); held.push({ key: u.key, reason: heldWhy[pv] ?? "held", since: heldSince[pv] ?? null }); continue; }          // its provider is held: not waiting, not 'pending too long'
+    waiting.push({ key: u.key, reason: strike ? "first-strike" : plan[u.key] ?? p?.r ?? "not-run", runs: p?.n ?? 0, since: p ? p.since ?? p.at : null });       // since: when the stored reason was first recorded (null: never asked)
     if (p && p.n >= stuckRuns) stuck.push({ key: u.key, reason: p.r, runs: p.n });
   }
   assertPartition(universe, { tested, pending: waiting, excluded, held });
@@ -999,7 +1016,7 @@ export function coverage(universe, store, { level = "l12", pending = {}, plan = 
     level, total: universe.length, tested, pending: waiting, excluded, held,
     counts: { total: universe.length, tested: tested.length, pending: waiting.length, excluded: excluded.length, held: held.length, byHeld: tally(held, (e) => e.reason),
               byTier: tally(tested, (e) => e.tier), byPending: tally(waiting, (e) => e.reason), byExcluded: tally(excluded, (e) => e.reason) },
-    provisional: cap(provisional), stuck: cap(stuck), outdated: cap(outdated), optional,
+    provisional: cap(provisional), stuck: cap(stuck), outdated: cap(outdated), optional, incomplete,
   };
 }
 
@@ -1039,7 +1056,8 @@ export function updatePending(pending, { queue, recorded, store, reasonOf, now =
     if (recorded.has(e.key) || r?.strikes === 1) { delete out[e.key]; continue; }
     const code = String(reasonOf(e.key) ?? "not-run").toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 24) || "not-run";
     if (code === "cap" && out[e.key] && TRIED_REASONS.has(out[e.key].r)) continue;           // it waited for the cap this time: what the last ask said stays, and so does its place in the line
-    out[e.key] = { r: code, n: Math.min(9999, (out[e.key]?.n ?? 0) + 1), at: now.toISOString() };
+    const prev = out[e.key];
+    out[e.key] = { r: code, n: Math.min(9999, (prev?.n ?? 0) + 1), at: now.toISOString(), since: prev && prev.r === code ? prev.since ?? prev.at : now.toISOString() };       // since: the first time THIS reason was recorded
   }
   return out;
 }
@@ -1129,50 +1147,74 @@ export function untestedTable(cov) {
 
 /** Pending reasons that a re-run alone cannot change: the owner has to change a flag or the route (a row-cost ceiling, a route shape). Not recoverable, not an account state. */
 export const OWNER_REASONS = new Set(["row-cost", "priced-over-row-cap", "route-shape"]);
+/** A soft reason that has been the answer this many runs in a row is STILL recoverable, but counted apart as stuck: only these reasons (a rate limit or a cap says nothing about the model). */
+export const STUCK_REASONS = new Set(["error", "timeout", "empty", "slow"]);
+export const STUCK_RUNS = 3;
+/** The optional levels of a tested model, by the short names the ledger uses, as the verdict names them. */
+const OPTIONAL_NAME = { l4: "L4", big: "big", sp: "spawn", er: "error-result" };
 /**
  * The one partition the loop reads, over the models of the ledger(s) that are not excluded (a model in both ledgers counts once; the worst state wins: hard, then recoverable, then needs-owner, then tested):
- *   tested       it has a result for the step: never asked again by a normal run
+ *   tested       it has a result for the step: never asked again by a normal run. Split by completeness: `complete` (every level it is eligible for has run) and `incomplete` (tested, but an optional level it is
+ *                eligible for has not run: L4, big, spawn, error-result); the `tested` partition itself is not changed by it
  *   recoverable  pending for a reason that a later run can change: rate, error, timeout, cap, spend, request-cap, empty, slow, reasoning-budget, upstream-unavailable, not-run (also `queued`), first-strike, ...
- *   hard         pay, auth, gone (a provider held for one of them, or a model pending it): non-recoverable by the engine, lifted only by a manual action (--recheck-hard, --retry-accounts, --release-holds)
+ *                `stuck` of them (error, timeout, empty or slow for `stuckRuns` or more runs in a row) stay recoverable but are counted apart
+ *   hard         pay, auth, gone (a provider held for one of them, or a model pending it): non-recoverable by the engine, lifted only by a manual action (--recheck-hard, --retry-accounts, --release-holds, naming the model with --only)
  *   owner        row-cost, priced-over-row-cap, route-shape: a re-run changes nothing until the owner changes a flag or a route
- * `confirmed` is `confirmedProviders(store)` (see `hardState`), `pending` the stored pending map, `store` the records (a first strike is recoverable). Pure: `{total, tested, recoverable, byRecoverable, hard, byHard, owner, byOwner, excluded}`; total = tested + recoverable + hard + owner.
+ * `confirmed` is `confirmedProviders(store)` (see `hardState`), `pending` the stored pending map, `store` the records (a first strike is recoverable). `oldestSince` is, per reason, the oldest date it was first
+ * recorded among the models that are not tested (the cool-down a re-run has had). Pure: `{total, tested, complete, incomplete, byMissing, recoverable, byRecoverable, stuck, byStuck, hard, byHard, owner, byOwner, excluded, oldestSince}`;
+ * total = tested + recoverable + hard + owner.
  */
-export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {} }) {
+export function sweepVerdict({ l12, l3 = null, confirmed = {}, pending = {}, store = {}, stuckRuns = STUCK_RUNS }) {
   const RANK = { excluded: 0, tested: 1, owner: 2, recoverable: 3, hard: 4 };
-  const by = new Map();
-  const put = (key, s, reason) => { const cur = by.get(key); if (!cur || RANK[s] > RANK[cur.s]) by.set(key, { s, reason }); };
+  const by = new Map(), missing = new Map();
+  const put = (key, s, reason, since = null, runs = 0) => { const cur = by.get(key); if (!cur || RANK[s] > RANK[cur.s]) by.set(key, { s, reason, since, runs }); };
   const prov = (k) => k.slice(0, k.indexOf("/"));
   for (const cov of [l12, l3]) {
     if (!cov) continue;
     for (const e of cov.excluded) put(e.key, "excluded", e.reason);
     // a FIRST STRIKE has a stored result but is provisional: the next run asks it again, so it is recoverable, not tested
-    for (const e of cov.tested) { if (store?.[e.key]?.strikes === 1) put(e.key, "recoverable", "first-strike"); else put(e.key, "tested", null); }
-    for (const e of cov.held) put(e.key, "hard", HELD_STATES.includes(e.reason) ? e.reason : "gone");
+    for (const e of cov.tested) { if (store?.[e.key]?.strikes === 1) put(e.key, "recoverable", "first-strike", store[e.key].at ?? null); else put(e.key, "tested", null); }
+    for (const e of cov.incomplete ?? []) missing.set(e.key, [...new Set([...(missing.get(e.key) ?? []), ...e.missing])]);
+    for (const e of cov.held) put(e.key, "hard", HELD_STATES.includes(e.reason) ? e.reason : "gone", e.since ?? null);
     for (const e of cov.pending) {
       // this run's plan (`queued`, `cap`) hides why the model was pending before: the stored reason is the one that says what a re-run is up against
-      const reason = (e.reason === "queued" || e.reason === "cap") && pending?.[e.key] ? pending[e.key].r : e.reason;
+      const st = pending?.[e.key];
+      const reason = (e.reason === "queued" || e.reason === "cap") && st ? st.r : e.reason;
+      const same = st ? st.r === reason : true;
+      const since = same ? (st ? st.since ?? st.at : e.since ?? null) : null, runs = same ? (st ? st.n : e.runs ?? 0) : 0;
       const h = hardState(reason, prov(e.key), confirmed);
-      if (h) put(e.key, "hard", h);
-      else if (OWNER_REASONS.has(reason)) put(e.key, "owner", reason);
-      else put(e.key, "recoverable", reason === "queued" ? "not-run" : reason);
+      if (h) put(e.key, "hard", h, since, runs);
+      else if (OWNER_REASONS.has(reason)) put(e.key, "owner", reason, since, runs);
+      else put(e.key, "recoverable", reason === "queued" ? "not-run" : reason, since, runs);
     }
   }
-  const tally = (s) => { const o = {}; for (const v of by.values()) if (v.s === s) o[v.reason] = (o[v.reason] ?? 0) + 1; return o; };
-  const count = (s) => [...by.values()].filter((v) => v.s === s).length;
-  const v = { tested: count("tested"), recoverable: count("recoverable"), byRecoverable: tally("recoverable"), hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded") };
+  const tally = (s, f = () => true) => { const o = {}; for (const v of by.values()) if (v.s === s && f(v)) o[v.reason] = (o[v.reason] ?? 0) + 1; return o; };
+  const count = (s, f = () => true) => [...by.values()].filter((v) => v.s === s && f(v)).length;
+  const isStuck = (v) => STUCK_REASONS.has(v.reason) && v.runs >= stuckRuns;
+  const oldestSince = {};
+  for (const v of by.values()) if (v.s !== "tested" && v.s !== "excluded" && v.since && (!oldestSince[v.reason] || Date.parse(v.since) < Date.parse(oldestSince[v.reason]))) oldestSince[v.reason] = v.since;
+  const testedKeys = [...by].filter(([, v]) => v.s === "tested").map(([k]) => k);
+  const incompleteKeys = testedKeys.filter((k) => missing.get(k)?.length);
+  const byMissing = {};
+  for (const k of incompleteKeys) for (const m of missing.get(k)) byMissing[OPTIONAL_NAME[m] ?? m] = (byMissing[OPTIONAL_NAME[m] ?? m] ?? 0) + 1;
+  const v = { tested: testedKeys.length, complete: testedKeys.length - incompleteKeys.length, incomplete: incompleteKeys.length, byMissing, recoverable: count("recoverable"), byRecoverable: tally("recoverable"),
+    stuck: count("recoverable", isStuck), byStuck: tally("recoverable", isStuck), hard: count("hard"), byHard: tally("hard"), owner: count("owner"), byOwner: tally("owner"), excluded: count("excluded"), oldestSince };
   return { total: v.tested + v.recoverable + v.hard + v.owner, ...v };
 }
 
 /**
- * The loop's stop signal for ONE run: `requests` it sent, how many ended `rate` and how many ended `rate`, `error` or `timeout` (`failing`), the `newResults` it recorded and the verdict's `recoverable`.
- * Saturated when the run recorded zero new results, or at least 80% of its requests ended rate / error / timeout, or nothing is recoverable any more (nothing left to ask). A run that sent nothing has
- * zero new results, so it is saturated. Pure.
+ * The loop's stop signal for ONE run: `requests` it sent, how many ended `rate` and how many ended `rate`, `error` or `timeout` (`failing`), the `newResults` it recorded, the verdict's `recoverable` and
+ * `prevRecoverable` (the recoverable count the PREVIOUS run left in the file's meta block, or null when unknown, or when this run was a manual lift that legitimately grew the set).
+ * Saturated when nothing is recoverable any more, or the run recorded zero new results, or at least 80% of its requests ended rate / error / timeout, or the recoverable set did NOT SHRINK
+ * against the previous run's (a loop must not spin forever on soft-but-stuck models). A run that sent nothing has zero new results, so it is saturated. Pure.
  */
 export const SATURATION_FAIL_SHARE = 0.8;
-export function saturation({ requests = 0, rate = 0, failing = 0, newResults = 0, recoverable = 0 }) {
+export function saturation({ requests = 0, rate = 0, failing = 0, newResults = 0, recoverable = 0, prevRecoverable = null }) {
   const failShare = requests ? failing / requests : 0, rateShare = requests ? rate / requests : 0;
-  const why = recoverable === 0 ? "nothing recoverable left" : newResults === 0 ? "no new result in this run" : requests && failShare >= SATURATION_FAIL_SHARE ? `${Math.round(failShare * 100)}% of the requests ended rate, error or timeout` : null;
-  return { saturated: why !== null, why, requests, rate, failing, failShare, rateShare, newResults };
+  const notShrunk = prevRecoverable !== null && prevRecoverable !== undefined && recoverable >= prevRecoverable;
+  const why = recoverable === 0 ? "nothing recoverable left" : newResults === 0 ? "no new result in this run" : requests && failShare >= SATURATION_FAIL_SHARE ? `${Math.round(failShare * 100)}% of the requests ended rate, error or timeout`
+    : notShrunk ? `the recoverable set did not shrink: ${recoverable} now, ${prevRecoverable} at the end of the previous run` : null;
+  return { saturated: why !== null, why, requests, rate, failing, failShare, rateShare, newResults, recoverable, prevRecoverable: prevRecoverable ?? null };
 }
 
 // ------------------------------------------------------------------ canary migration
