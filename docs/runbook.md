@@ -386,6 +386,20 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   and so part of the content hash: a rebuild that gains `bk` rows changes the hash, and so the
   injected marker once; it changes no tier, rank, band or count, and `explain` says "proven to accept
   400 KB" for such a row.
+  SHRINK GUARD and discovery freshness (incident 2026-10-06: a bench run's automatic snapshot rebuild applied the
+  7-day discovery routing ceiling to 56 of 63 stale caches, the snapshot fell from 6,432 to 2,009 routes and a policy
+  rebuild from 92 to 21 rows). `rebuild` and a real `set` REFUSE (exit 1, E_SHRINK, nothing written, the saved policy
+  untouched) when the snapshot's route count fell by more than 25% against the policy they would replace, or, with the
+  same toggles, the eligible rows did (a changed toggle is the owner's choice and is not a rebuild's shrink). The line
+  says "the snapshot shrank from N to M routes (K of P discovery caches are older than 7 days): refresh discovery first
+  (node refresh/cli.mjs, needs your OK), or pass --accept-shrink yes". Only `--accept-shrink yes` passes; the automatic
+  `rebuild --if-stale yes` never does and prints the refusal as one line. A compile records `builtFrom.snapshotRoutes`
+  and `builtFrom.discovery` ({providers, fresh, stale, unreadable, ceilingDays}); both are outside the content hash and
+  outside the stale test, so `--if-stale` still decides from the cheap stamps first and never reads the cache folder.
+  `status` and `show` read that folder READ ONLY (record times only) and print DISCOVERY_STALE ("discovery: N of P
+  providers fresh, M past the 7-day ceiling (not routed): a snapshot rebuild now would drop their models") when any cache
+  is past the ceiling, and SNAPSHOT_DRIFT when the policy was compiled from a snapshot whose route count differs from the
+  current one by more than 10%. `--discovery-dir` names another folder (a test).
   `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
   `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves
@@ -450,36 +464,70 @@ failure, exit 2 a usage error. `--since` is at most `30d`, because a PASS expire
   `classify.jsonl`), the decision log and the agent log, in bounded 1 MiB chunks. Requests with no
   session id (`hasSid` false, or the `nosession` spelling on an older line) are the UW tooling's own
   probe traffic and are left out of EVERY denominator; the report says how many it left out.
-- **Ground truth.** The log has no labels. A request's true class is `rc` (the class Claude Code
-  sends when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`) when logged, otherwise the two independent
-  detectors, the agent id and the billing flag: both set is a built-in subagent, both clear is main.
-  A request where only the agent id fires (a teammate) has no second opinion and is reported on its
-  own line, never counted in T1. Agreement of the detectors tests consistency, not labelled truth;
-  the labelled sets of 12.5 stay the stronger evidence.
-- **Metrics.** T1 (at least 99% of corroborated tool-carrying subagent requests classified sub,
-  Wilson lower bound at least 97%), T2 (no helper call classified other than aux or returned on
-  another model, in at least 200), T3 (tool-less real subagents, reported), T4 (no main request
-  classified other than main, in at least 200), T5 (at most 1% of built-in requests without an agent
-  id, in at least 40), T6 (the Claude Code and CCR versions are recorded). Every line names its
-  population: `INSUFFICIENT: 12 of 40 requests`. Zero-tolerance metrics FAIL on the first violation.
-- **Minimum samples.** 5 subagent types with 40 requests each, 30 distinct subagents, 200 helper-shaped
-  requests, 200 main requests in 2 sessions with at least one `/model` switch, 3 sessions on 2 UTC
-  days. The agent type is logged only with the hint headers, so today the only types are the kinds
-  built-in, teammate and billing-only; the report states that and what traffic is missing.
+- **Ground truth: `rc` or nothing.** The router's class is a pure function of the two detectors it
+  logs (the agent id and the billing flag) and the tool count, so a check against those detectors
+  only shows that the router agrees with itself ("0 of 1,756 main misclassified" is true by
+  construction). The only independent label is `rc`, the request class Claude Code sends when
+  `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` (header `x-claude-code-request-class`). T1, T2 and T4 are
+  judged on `rc`-labelled requests ONLY; without `rc` the verdict is INSUFFICIENT with the line
+  `ground truth missing: rc is logged on 0 of N rows; enable the gateway hint headers ...`. The
+  detector-consensus figures stay printed, marked REPORTED, and are never gated. A teammate (an agent
+  id without the billing flag) has no second opinion and is reported on its own line.
+  `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is now in the `env` block of `~/.claude/settings.json` (the
+  owner approved the one line). Claude Code reads it at start-up, so ONLY sessions started after the
+  change send `rc` and the subagent type (`at`); a running session keeps the old behaviour until it is
+  restarted. Expect `rc` to appear in classify lines of new sessions only, so the counts of
+  `rc`-labelled requests start from zero and grow with new-session traffic; old lines stay unlabelled
+  for good and are never counted as ground truth.
+- **What each PASS proves, in one sentence.**
+  T1: of at least 200 requests Claude Code itself labelled as built-in subagents, from at least 30
+  distinct agents, at least 99% were classified `sub`, and the lower of the per-request and the
+  per-agent (one sample per agent, its worst outcome) one-sided 95% Wilson bounds is at least 97%
+  (88 agents with no miss are the least that can reach it).
+  T2: of at least 200 requests Claude Code labelled as compaction or auxiliary helpers, none was
+  classified `sub`, `exempt` or `other` (or `main` while an agent id or the billing flag was set) and
+  no helper-shaped decision-log row left on another model; a helper the router called `main` with no
+  detector set is a counted sample, because main is never rewritten.
+  T4: of at least 200 requests Claude Code labelled `main`, none was classified anything else and no
+  `main-learn` event came from a non-main request.
+  T5: of at least 40 built-in subagent requests from at least 30 agents, at most 1% carried the
+  billing flag without an agent id, which is a real cross-check of two independent header signals
+  and needs no `rc`.
+  T6: the Claude Code and CCR versions are recorded, so an update can invalidate the verdict.
+  A PASS proves the classifier on the traffic that was logged, not on traffic that was not; the
+  labelled sandbox sets of 12.5 are stronger evidence still.
+- **Metrics and populations.** Every line names its population: `INSUFFICIENT: 12 of 200
+  rc-labelled helper requests`. T1 and T5 count DISTINCT built-in agents (a session and agent id pair;
+  teammates do not count) because requests cluster per agent. Zero-tolerance metrics (T2, T4) FAIL on
+  the first violation. T3 (tool-less real subagents) is reported only.
+- **Minimum samples.** 5 subagent types with 40 requests each, 30 distinct built-in agents, 200
+  `rc`-labelled helper requests (40 each for compaction and auxiliary), 200 `rc`-labelled main
+  requests in 2 sessions including one `/model` switch on tool-carrying requests, 3 sessions with at
+  least 20 requests each on 2 UTC days. The newest counted request must be under 7 days old (the 30
+  days is how long a written PASS lives, not how old the evidence may be); a request dated more than
+  5 minutes in the future is a clock fault and is not counted. The agent type is logged only with the
+  hint headers, so today the only types are the kinds built-in, teammate and billing-only.
 - **What the log cannot show.** A helper request is never in the decision log and carries no returned
-  model. T2 counts the helper-shaped requests the router did not classify aux and the helper-shaped
+  model. T2 counts the helper requests the router did not classify aux and the helper-shaped
   decision rows whose returned model differs; the router returns the asked model for aux and exempt
-  requests by construction.
+  requests by construction. A real helper (a haiku call, no tools, no flags) the router called `main`
+  without `rc` is reported as an unlabelled helper-shaped main row and is not a T2 sample.
 - **Shadow tally.** For every subagent request, what the compiled policy of each of `dynamic`,
   `inherit` and `free` WOULD use: the share that moves off the asked model, the share that keeps it,
   the share with no eligible substitute and the share with no learned main, by provider and model. It
   is MODELLED from the inputs on disk (providers from the snapshot flag, not the live gateway), as an
-  expected value over the lead pool; it ignores cooling, payload caps and the tool tier rule. The
-  router's own shadow decisions are printed beside it (observed, exact for the policy then active).
-  These are G3 preconditions 1 and 7; the provider tally is the one to review with the owner.
+  expected value over the lead pool, with the payload caps (a representative size per log bucket and
+  the rule that an unknown cap ranks last above 200 KB); it ignores cooling and demotion. Only the
+  mode of the live policy is OBSERVED (the router's own shadow decisions, exact for the policy then
+  active): dynamic and inherit are modelled only and unvalidated, because nearly every subagent asks
+  the main model, which both modes keep. The report prints modelled against observed shares per
+  provider and per model with the difference; a remaining gap is cooling, byte sizes and the few
+  agents behind the observed picks. These are G3 preconditions 1 and 7; the provider tally is the one
+  to review with the owner.
 - **`--write yes --live yes`** needs both flags, replaces `accuracy.json` atomically with whatever
-  verdict was computed (a FAIL or INSUFFICIENT replaces a PASS and says so) and records the evidence
-  hash. The verdict is evidence for the owner's G3 decision, never the decision.
+  verdict was computed and records the evidence hash. A FAIL or INSUFFICIENT replaces a PASS and a
+  warning says so when that PASS had not expired. With `--json yes` stdout is the JSON record only;
+  the notes go to stderr. The verdict is evidence for the owner's G3 decision, never the decision.
 
 ## 6. Phase B — catalogue refresh and health
 
