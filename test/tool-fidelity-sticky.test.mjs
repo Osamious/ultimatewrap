@@ -2025,3 +2025,42 @@ test("--reset-transient also drops the pay entries that rest on an availability 
   assert.deepEqual(Object.keys(st.pending), ["anymodel/m5"], "every pay entry of the provider is gone (and the soft rate entry stays)");
   assert.equal(planOf(e, [], { store: st.models, pending: st.pending }).queued.length, 7);
 });
+
+// ---------------------------------------------------------------- the estimate counts only the models the run will ASK
+
+test("row ceiling: the refusal estimate counts only the models that will be asked: it falls as --max-row-cost falls, an over-ceiling model adds $0, and the printed figure is the one liveRefusal compares", async () => {
+  const prices = [[1, 1], [10, 10], [100, 100], [500, 500]];
+  const rows = [{ provider: "pb", keyId: "k.pb.free", models: [...prices.map(([a, b], i) => m(`p${i}`, { badge: "PAID", pin: a, pout: b })), m("free1"), m("unlisted", { badge: null, pin: null, pout: null })] }];
+  const e = cliEnv(rows);
+  const argv = ["--live", "--levels", "12", "--max-spend", "5", "--tf-max-tokens-per-provider", "10000000"];
+  const at = (ceiling) => plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs([...argv, "--max-row-cost", String(ceiling)]), tiers: e.deps.tiers, nowMs: NOW.getTime() });
+  const all = at(1000), by = Object.fromEntries(all.run.entries.map((x) => [x.id, x.cost]));
+  assert.ok(by.p0 < by.p1 && by.p1 < by.p2 && by.p2 < by.p3 && by.p0 > 0, "four listed prices, four costs");
+  assert.equal(by.free1, 0); assert.equal(by.unlisted, 0);
+  assert.equal(all.heldBack.entries.length, 0, "a ceiling above every row holds nothing back");
+  // a ceiling between the 3rd and the 4th cost: the 4th is not asked and adds nothing
+  const mid = at((by.p2 + by.p3) / 2);
+  assert.deepEqual(mid.run.entries.map((x) => x.id).sort(), ["free1", "p0", "p1", "p2", "unlisted"]);
+  assert.ok(Math.abs(mid.run.usd - (by.p0 + by.p1 + by.p2)) < 1e-12, "the estimate is the sum of the models under the ceiling");
+  assert.ok(Math.abs(mid.heldBack.usd - by.p3) < 1e-12 && mid.heldBack.entries.length === 1, "what the held-back model would cost is kept apart, never charged");
+  assert.equal(mid.kept.length, 6 - 0, "the model over the ceiling is still in kept: it is recorded as pending, not dropped");
+  // the estimate moves with the ceiling, step by step
+  const usd = [1000, (by.p2 + by.p3) / 2, (by.p1 + by.p2) / 2, (by.p0 + by.p1) / 2, by.p0 / 2].map((c) => at(c).run.usd);
+  for (let i = 1; i < usd.length; i++) assert.ok(usd[i] < usd[i - 1], `a lower ceiling gives a lower estimate: ${usd.join(" > ")}`);
+  assert.equal(usd.at(-1), 0, "a ceiling below every priced row: nothing costs money");
+  assert.equal(at(by.p0 / 2).run.paidModels, 0);
+  // liveRefusal compares THAT figure: a cap under the whole estimate refuses when the ceiling lets every model in, and accepts when the ceiling holds the dear one back
+  const cap = String(1.5 * (by.p0 + by.p1 + by.p2));
+  const withCap = (ceiling) => { const a = [...argv.slice(0, -4), '--max-spend', cap, '--tf-max-tokens-per-provider', '10000000', '--max-row-cost', String(ceiling)]; return { a, p: plan({ snap: { rows }, bench: e.deps.bench, store: {}, o: parseArgs(a), tiers: e.deps.tiers, nowMs: NOW.getTime() }) }; };
+  const wide = withCap(1000), narrow = withCap((by.p2 + by.p3) / 2);
+  assert.match(liveRefusal(parseArgs(wide.a), wide.p) ?? '', /is above the cap/);
+  assert.equal(liveRefusal(parseArgs(narrow.a), narrow.p), null, 'the dear model is held back by the ceiling: the same cap passes');
+  // the figure the dry run prints is the figure the refusal quotes
+  const dryWide = await runRaw(wide.a.filter((x) => x !== "--live"), e.deps);
+  const printed = /estimate (\$[\d.,]+) \(input and output priced/.exec(dryWide.out)?.[1], quoted = /the estimate (\$[\d.,]+) is above the cap/.exec(liveRefusal(parseArgs(wide.a), wide.p))?.[1];
+  assert.ok(printed && printed === quoted, `printed ${printed} against refused ${quoted}`);
+  const dryNarrow = await runRaw(narrow.a.filter((x) => x !== "--live"), e.deps);
+  assert.match(dryNarrow.out, /over the \$[\d.]+ row ceiling, NOT asked and not in the estimate: 1 priced model\(s\)/);
+  assert.match(dryNarrow.out, /costliest models asked \(3 of 5 cost money\): pb\/p2 \$/);
+  assert.match(dryNarrow.out, /per tier this run: free 5 model\(s\)/);
+});

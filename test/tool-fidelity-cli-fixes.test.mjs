@@ -135,7 +135,7 @@ test("a run narrowed with --only costs a model the same as a full run: an unlist
   const e = env([["pb", "priced", { pin: 50, pout: 100 }], ["pb", "unpriced", { pin: 1, pout: 1 }], ["fa", "free1"]]);
   e.deps.snapshot.snap.rows[0].models.find((m) => m.id === "unpriced").pin = null;
   e.deps.snapshot.snap.rows[0].models.find((m) => m.id === "unpriced").pout = null;
-  const entry = (only, key) => plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, tiers: e.deps.tiers, o: { ...parseArgs([]), only } }).run.entries.find((x) => x.key === key);
+  const entry = (only, key) => plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, tiers: e.deps.tiers, o: { ...parseArgs([]), only, maxRowCost: 100 } }).run.entries.find((x) => x.key === key);
   const narrow = entry(["pb/unpriced"], "pb/unpriced"), whole = entry(null, "pb/unpriced");
   assert.deepEqual([narrow.cost, whole.cost, narrow.free, narrow.unlistedOnFree], [0, 0, true, true], "no listed price on a key of tier free: costed at $0, narrowed or not");
   const listedNarrow = entry(["pb/priced"], "pb/priced"), listedWhole = entry(null, "pb/priced");

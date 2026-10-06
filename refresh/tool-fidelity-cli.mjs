@@ -302,11 +302,17 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const capEff = heldEntries.length && provsRun ? Math.min(o.tfMaxTokens * 2, Math.round(o.tfMaxTokens * provsAll / provsRun)) : o.tfMaxTokens;
   const est = estimate(queued, { maxTokens: o.maxTokens, fallback });
   const { kept, waiting, tooBig, needed } = applyProviderCap(est.entries, capEff);
-  const run = estimate(kept, { maxTokens: o.maxTokens, fallback });
+  // The engine (`runSweep`) skips a priced row whose cost is over the row ceiling (`skip:row-cost`) before it sends anything: such a model is in `kept` (it is recorded as pending) but it costs $0 and sends
+  // no request. So the figures of the run (`run`: requests, tokens, dollars, tiers, wall time; and what liveRefusal compares to the cap) count only the models that WILL be asked.
+  const overCeiling = (e) => !e.free && e.cost > o.maxRowCost;
+  const overRowKept = kept.filter(overCeiling);
+  const askedKept = kept.filter((e) => !overCeiling(e));
+  const run = estimate(askedKept, { maxTokens: o.maxTokens, fallback });
+  const heldBack = estimate(overRowKept, { maxTokens: o.maxTokens, fallback });            // what the models over the ceiling WOULD cost: printed, never charged
   // free-tier keys whose listing carries a price are costed at it: how many, what they cost at full depth, and which are over the row ceiling (they stay pending: priced-over-row-cap)
   const pricedOnFree = estimate(queued.filter((e) => e.pricedOnFree).map((e) => ({ ...e, todo: [1, 2, 3, 5, 6, 7] })), { maxTokens: o.maxTokens, fallback });
   const overRowAll = est.entries.filter((e) => e.pricedOnFree && e.cost > o.maxRowCost).length;                // over the ceiling at the levels this run asks, in the whole queue
-  const overRow = new Set(run.entries.filter((e) => e.pricedOnFree && e.cost > o.maxRowCost).map((e) => e.key));   // and the ones of them that would run this time
+  const overRow = new Set(overRowKept.map((e) => e.key));                                                     // and the ones that would be skipped this time
   // the cost of lifting, per tier, at the levels asked and as if --live were given: the numbers a person approves BEFORE the paid tier is touched
   let liftPreview = null;
   if (all && o.includeTiers?.length) {
@@ -317,7 +323,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
     const asked2 = queueFor({ ...wantSet, models: rows }, store, o.levels, { force: o.force, retryFailed: o.retryFailed }).map((e) => (!e.todo.includes(5) || !(e.ctx > 0 && e.ctx < BIG_MIN_CTX) ? e : { ...e, todo: e.todo.filter((l) => l !== 5) })).filter((e) => e.todo.length);
     liftPreview = Object.fromEntries(want.map((t) => { const x = estimate(asked2.filter((e) => e.tier === t), { maxTokens: o.maxTokens, fallback }); return [t, { models: x.entries.length, requests: x.requests, inTokens: x.inTokens, usd: x.usd }]; }));
   }
-  const planned = (levels) => Object.fromEntries([...kept.map((e) => [e.key, overRow.has(e.key) ? PRICED_OVER_ROW : "queued"]), ...waiting.map((e) => [e.key, "cap"]), ...tooBig.map((e) => [e.key, "cap-too-big"])]
+  const planned = (levels) => Object.fromEntries([...kept.map((e) => [e.key, overRow.has(e.key) ? (e.pricedOnFree ? PRICED_OVER_ROW : "row-cost") : "queued"]), ...waiting.map((e) => [e.key, "cap"]), ...tooBig.map((e) => [e.key, "cap-too-big"])]
     .filter(([k]) => [...kept, ...waiting, ...tooBig].find((e) => e.key === k).todo.some((l) => levels.includes(l))));
   const heldWhy = Object.fromEntries(Object.entries(heldNow).map(([p, h]) => [p, h.r]));
   const heldPlan = Object.fromEntries(set.models.filter((e) => heldNow[e.provider] && !named.has(e.key)).map((e) => [e.key, HELD_PLAN]));
@@ -336,7 +342,7 @@ export function plan({ snap, bench, store, o, policy = null, pending = {}, tiers
   const wall = wallEstimate(run.entries, { concurrency: o.concurrency ?? 8, perProvider, latencyMs });
   const untested = untestedTable(ledger.l12);
   const verdict = sweepVerdict({ l12: ledger.l12, l3: ledger.l3, confirmed, pending, store, stuckRuns: o.pendingRuns ?? STUCK_RUNS, levels: o.levels, optional: optionalOf({ set, cand, o, store, heldNow, queuedKeys: new Set(kept.map((e) => e.key)), waitingKeys: new Set([...waiting, ...tooBig].map((e) => e.key)) }) });
-  return { untested, verdict, namedLifts, hardBlocked: { models: hardEntries.length, by: hardBy }, ownerBlocked: { models: ownerSticky.length + ownerCost.length, by: ownerBy }, ignoredHolds, heldInfo, capEff, queuedAllCount: selected.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRow.size, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
+  return { untested, verdict, namedLifts, hardBlocked: { models: hardEntries.length, by: hardBy }, ownerBlocked: { models: ownerSticky.length + ownerCost.length, by: ownerBy }, ignoredHolds, heldInfo, capEff, queuedAllCount: selected.length, gateway: gatewayInsights(store), timeoutStats, overRowAll, heldBack, liftPreview, missingAfterPrint, tierInfo: tiers ? describeTiers({ info: tierMeta?.info ?? null, source: tierMeta?.source ?? "tiers given by the caller", tiers, providers: fullSet.models.map((m) => m.provider), nowMs }) : null, pricedOnFree, overRow: overRowKept.filter((e) => e.pricedOnFree).length, set, counts, queued, est, run, kept, waiting, tooBig, needed, cand, ledger, sample, bigSkipped, presetNote, envelope: envelope(est.entries, o.tfMaxTokens), lift, clamped: cl.clamped, fullSet, wall, latencyMs, heavy, perProvider, tiers };
 }
 
 /** Where the provider tiers came from, how old they are and which providers they do not cover (printed in the plan and in the report). */
@@ -668,6 +674,9 @@ export function printPlan(p, o) {
   L.push(`  requests ${num(p.run.requests)}   input tokens ~${tok(p.run.inTokens)}   output tokens up to ~${tok(p.run.outTokens)}   (whole queue, before the cap: ${num(p.est.requests)} requests, ~${tok(p.est.inTokens)} input tokens)`);
   const free = p.run.entries.filter((e) => e.free).length, paid = p.run.paidModels;
   L.push(`  free tier ${num(free)} model(s): no money; paid tier ${num(paid)} model(s): estimate ${usd(p.run.usd)} (input and output priced, cap ${usd(o.maxSpend)}, row ceiling ${usd(o.maxRowCost)}; an unlisted price on a free-labelled key: $0${p.run.entries.some((e) => e.unlistedOnFree) ? ` (${num(p.run.entries.filter((e) => e.unlistedOnFree).length)} model(s) of this run)` : ""}; an unlisted price on a lifted paid tier is charged at the highest listed paid price of the whole probe set)`);
+  if (p.heldBack?.entries.length) L.push(`  over the ${usd(o.maxRowCost)} row ceiling, NOT asked and not in the estimate: ${num(p.heldBack.entries.length)} priced model(s) that fit the cap (the engine skips them: row-cost; they would cost ${usd(p.heldBack.usd)} at these levels); raise --max-row-cost to ask them`);
+  const drivers = p.run.entries.filter((e) => e.cost > 0).sort((a, b) => b.cost - a.cost || (a.key < b.key ? -1 : 1)).slice(0, 5);
+  if (drivers.length) L.push(`  costliest models asked (${num(p.run.entries.filter((e) => e.cost > 0).length)} of ${num(p.run.entries.length)} cost money): ${drivers.map((e) => `${show(e.key, 40)} ${usd(e.cost)}`).join(", ")}`);
   L.push(...tierLines(p));
   L.push(...gatewayLines(p.gateway ?? []));
   L.push(...heldLines(p, o));
@@ -711,7 +720,7 @@ export function liveRefusal(o, p) {
   if (big && !o.l3) return "levels 3, 4 and 5 send the 157 KB and 400 KB fixtures (about 40,000 to 100,000 input tokens per request): add --l3 yes";
   if (big && !o.only && !o.explicit.has("maxSpend") && !o.explicit.has("tfMaxTokens")) return "levels 3, 4 and 5 need a named provider subset (--only) or an explicit cap (--max-spend or --tf-max-tokens-per-provider)";
   if (o.includeTiers?.length && o.levelsExplicit && o.levels.some((l) => l > 2) && !p.lift.ok) return `deep probes on the paid or deposit tier need ALL of: ${p.lift.missing.join("; ")}`;
-  const priced = p.kept.filter((e) => !e.free);
+  const priced = p.run.entries.filter((e) => !e.free);              // the models that will be ASKED: one over the row ceiling is skipped by the engine and costs nothing
   if (priced.length && !o.explicit.has("maxSpend")) return `${num(priced.length)} priced model(s) are queued (a listed price counts, also on a free-labelled provider): a live run with money at stake needs an explicit --max-spend (the default is not accepted); the estimate for them is ${usd(p.run.usd)}`;
   if (!p.kept.length && p.tooBig.length) return `--tf-max-tokens-per-provider ${num(o.tfMaxTokens)} is below the cost of one model for these levels: nothing would run. Use at least ${num(p.needed)}`;
   if (p.run.usd > o.maxSpend) return `the estimate ${usd(p.run.usd)} is above the cap ${usd(o.maxSpend)}: narrow the run (--only, --limit, --levels) or raise --max-spend`;
