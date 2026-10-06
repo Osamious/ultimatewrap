@@ -31,7 +31,7 @@
 //   coolLimited            failures of a FIFTH or later DISTINCT model of one session within an hour: marked at rung 0 (2 minutes) only, never escalated (O1)
 //   stickyJournalTorn      journal lines that were unparsable, skipped for length, or a torn last line (counted once per offset)
 // R-v3 (owner batch 2026-10-06; ROUTER_VERSION stays 2: it is the compiled-policy format the compiler writes for, and this changes none of it): the main-first shortcut of
-// pickSubstitute applies only when main's row is in the lead band (banding on); an unknown payload cap ranks last for a request above 200 KB; classify.jsonl rotates at 8 MiB and
+// pickSubstitute applies only when main's row is in the lead band (banding on); an unknown payload cap ranks last for a request above 200 KB (204,800 bytes; a pb-0 row whose bk covers the request is a known fit); classify.jsonl rotates at 8 MiB and
 // keeps 2 generations, and each classify line carries hasSid and ua. The identity of a redeploy is the loader's stat of this file, so no constant needs a bump.
 const __uwImpl = function (IMPL_ID) {                            // IMPL_ID: this file's identity (the loader's stat), "" when unknown
 const module = { exports: {} };                                    // the body assigns module.exports; here it fills the factory's own object, the loader re-exports it
@@ -65,8 +65,8 @@ const POLICY_MAX = 1024 * 1024;
 const STICKY_TTL = 6 * 3600 * 1000, STICKY_ABS = 24 * 3600 * 1000, TOUCH_MS = 600000;
 const MAIN_TTL_DEFAULT = 6 * 3600 * 1000, MAIN_RECHECK_MS = 5000, FUTURE_SLACK_MS = 5 * 60 * 1000;
 const CAPS = { sticky: 512, stickySession: 128, main: 64, mainStatus: 8, auxModels: 16, byModel: 64, seen: 2048, journals: 512, learned: 512 };
-const LOG_MAX = 1024 * 1024, CLASS_MAX = 8 * 1024 * 1024;         // R-v3: classify.jsonl rotates at 8 MiB and keeps 2 generations: at most 3 files, 24 MiB (+ the 50-append size-check overshoot, at most 200 KiB a file), 24.6 MiB in the worst case
-const BIG_REQ = 200 * 1024;                                       // R-v3: above this many request bytes (content-length) a row with an UNKNOWN payload cap ranks lowest in a substitute pick
+const LOG_MAX = 1024 * 1024, CLASS_MAX = 8 * 1024 * 1024;         // R-v3: classify.jsonl rotates at 8 MiB and keeps 2 generations: 3 files, 24 MiB for one writer, plus at most 50 lines (200 KiB) a file for every worker that appends (each checks the size on its own 50th append; a worker whose file another worker rotated reopens the path at that check)
+const BIG_REQ = 200 * 1024, BK_MAX = 64 * 1024 * 1024;           // R-v3: ABOVE 200 KB (204,800 bytes, content-length > 204800) a row with an UNKNOWN payload cap ranks lowest in a substitute pick; a row field bk (bytes the tool sweep proved the model accepts) above BK_MAX is garbage and ignored
 const LINE_MAX = 4096, ASKED_MAX = 160;                           // a client-controlled string is never stored, keyed or logged unbounded
 const JOURNAL_COMPACT = 64 * 1024, JOURNAL_MAX = 1024 * 1024;
 const JOURNAL_READ_CAP = 256 * 1024, JOURNAL_LINES_MAX = 8192, SYNC_EVERY_MS = 1500, COMPACT_PER_PASS = 2;   // per request: at most 256 KiB read from a journal (the next miss resumes); per session and process: at most 8,192 lines loaded
@@ -340,10 +340,13 @@ function pump(st, file, rec) {
 // short write is terminated with a newline so the next line starts clean.
 function dropped() { count("logDropped"); warn("LOG_DROPPED", "log lines were dropped (rate limit, a full disk or a failed write); counter logDropped"); }
 function closeFd(st, kind) { const f = st.fds[kind]; st.fds[kind] = null; if (f) { try { seam.fs.closeSync(f.fd); } catch { /* already closed */ } } }
+// R-v3 (F5): the file is CLAIMED first by a rename to a name of this worker (atomic: only one of several workers that saw the size gets it; a loser's rename fails with ENOENT and it
+// rotates nothing, so no generation is shifted for nothing), then the generations shift and the claimed file becomes generation 1.
 function rotate(file, gens) {
-  const base = file.replace(/\.jsonl$/, "");
+  const base = file.replace(/\.jsonl$/, ""), claim = `${base}.rot-${process.pid.toString(36)}.jsonl`;
+  try { seam.fs.renameSync(file, claim); } catch (e) { if (e && e.code === "ENOENT") return; throw e; }   // another worker rotated it already
   for (let i = gens; i >= 2; i--) { try { seam.fs.renameSync(`${base}.${i - 1}.jsonl`, `${base}.${i}.jsonl`); } catch { /* generation missing */ } }
-  seam.fs.renameSync(file, `${base}.1.jsonl`);
+  seam.fs.renameSync(claim, `${base}.1.jsonl`);
 }
 function appendLog(kind, line) {
   const st = S(), L = LOGS[kind], now = nowMs();
@@ -366,9 +369,14 @@ function appendLog(kind, line) {
     if (typeof n === "number" && n < Buffer.byteLength(line)) { try { seam.fs.writeSync(f.fd, "\n"); } catch { /* the next line starts after the torn one anyway */ } dropped(); }
     st.appends[kind] += 1;
     if (st.appends[kind] % 50 === 0) {
-      let size = -1;
-      try { size = seam.fs.statSync(file).size; } catch { /* vanished: reopen on the next line */ }
-      if (size < 0) closeFd(st, kind);
+      let size = -1, moved = false;
+      try {
+        const ps = seam.fs.statSync(file);
+        size = ps.size;
+        const fsx = seam.fs.fstatSync(f.fd);                          // R-v3 (F5): another worker rotated the file, so this descriptor still points at the RENAMED one: reopen the path
+        moved = ps.ino > 0 && fsx.ino > 0 && ps.ino !== fsx.ino;
+      } catch { /* vanished: reopen on the next line */ }
+      if (size < 0 || moved) closeFd(st, kind);
       else if (size >= L.max) { closeFd(st, kind); rotate(file, L.gens); }
     }
   } catch { closeFd(st, kind); st.dirOk = false; st.logDownUntil = now + 30000; dropped(); /* logging never breaks routing */ }
@@ -921,8 +929,10 @@ function ctxFlags(row, beta1m) {
  * old whole-list pool; banded, only rows of the lead row's band count. `o.exclude` (a Set) is never picked; `o.cool(sel)` demotes a model: cooling rows are
  * used only when no other usable row exists. Returns {cand, fragile}.
  * R-v3: (1) with banding ON main's own model is taken first only when its row is in the LEAD band (the band of the first usable, non-cooling row of the pool the pick scans);
- * otherwise the fan-out spreads over the lead band. (2) for a request above BIG_REQ bytes a row with an unknown payload cap (pb 0) is never excluded but ranks LAST: it is
- * picked only when no known-cap row fits and nothing is cooling-only either; for a smaller request nothing is reordered.
+ * otherwise the fan-out spreads over the lead band. (2) for a request above 200 KB (204,800 bytes) a row with an unknown payload cap (pb 0) is never excluded but ranks LAST: it
+ * is picked only when no known-cap row fits and nothing is cooling-only either (order: got, main cooling, chill, unknown, unknown cooling); it follows the same tier, cooling and
+ * handoff rules as every row. A pb-0 row with a bk (bytes the sweep proved it accepts) of at least the request is a KNOWN fit and ranks by band and tier like any known row. For a smaller
+ * request nothing is reordered.
  */
 const tierRankOf = (row) => (!row ? -1 : row.t === "v" ? 0 : row.t === "t" ? 1 : 2);
 function pickSubstitute(P, S0, main, X, config, floor, o) {
@@ -940,7 +950,8 @@ function pickSubstitute(P, S0, main, X, config, floor, o) {
     if (!fitsBytes(row, X, silent)) { if (!silent) count("payloadSkip"); return false; }
     return true;
   };
-  const unkBig = (row) => X.bytes > BIG_REQ && !(row.pb > 0);      // R-v3: an unknown payload cap on a big request ranks last
+  // R-v3: an unknown payload cap on a big request ranks last. A row with pb 0 whose advisory field bk (bytes the sweep proved it accepts; never a refusal) covers the request is a KNOWN FIT.
+  const unkBig = (row) => { if (!(X.bytes > BIG_REQ) || row.pb > 0) return false; const bk = row.bk; return !(typeof bk === "number" && bk > 0 && bk <= BK_MAX && bk >= X.bytes); };
   let coolMain = null, mainKind = 0, mainRow = null;
   if (main) {
     const mi = P.idx.get(main.model);
@@ -949,19 +960,31 @@ function pickSubstitute(P, S0, main, X, config, floor, o) {
       if (usable(row) && !(noUntested && tierRankOf(row) === 2) && !unkBig(row)) { mainKind = cool ? cool(main.model) : 0; if (mainKind === 1 && noCool) { /* a cooling main is no handoff target */ } else if (mainKind) coolMain = row; else if (!banded) return { cand: main.model, fragile: false }; else mainRow = row; }
     }
   }
-  // scan one list: first K usable non-cooling rows (banded: of the lead's band) in `got`, the first K usable cooling rows in `chill`, the first K usable unknown-cap rows of a big request in `unk`
+  // scan one list: first K usable non-cooling rows (banded: of the lead's band) in `got`, the first K usable cooling rows in `chill`; for a big request the first K usable non-cooling
+  // unknown-cap rows in `unk` and the first K usable cooling ones in `unkChill` (R-v3: they follow the SAME tier, cooling and handoff rules as every row, then rank after got, chill)
   const scan = (arr, filterProv, lim) => {
-    const got = [], chill = [], unk = [], n = arr === null ? lLen(P, S0) : arr.length;
-    let lead = null, t0 = o && Number.isInteger(o.t0) ? o.t0 : -1, mask = mainKind;
+    const got = [], chill = [], unk = [], unkChill = [], n = arr === null ? lLen(P, S0) : arr.length;
+    let lead = null, t0 = o && Number.isInteger(o.t0) ? o.t0 : -1, mask = mainKind, ut0 = t0, uLead = null;   // ut0, uLead: the tier rule's state for the unknown-cap rows, kept apart so they never set the lead or the tier of the known ones
     for (let i = 0; i < n && got.length < lim; i++) {
       const row = models[arr === null ? lAt(S0, i) : arr[i]];
       if (!row) continue;
       if (filterProv !== null && providerOf(row.s) !== filterProv) continue;
       if (exclude && exclude.has(row.s)) continue;
       if (banded && lead !== null && row.b !== lead.b) break;      // a band is a contiguous run of the ranked rows: the next band is never mixed in
+      const big = unkBig(row);
+      if (big && unk.length >= K && (!cool || unkChill.length >= K || !cool(row.s))) continue;   // neither unknown-cap bucket can change: skip the heavy checks (a list of mostly unknown rows is walked cheaply)
       if (!usable(row)) continue;
-      if (unkBig(row)) { if (unk.length < K) unk.push(row); continue; }   // never lead, never sets the tier: kept only as the last resort
       const tr = tierRankOf(row);
+      if (big) {                                                   // the same D2, O3 and cooling rules as below, on the unknown-cap rows' own state
+        if (ut0 < 0) ut0 = tr;
+        if (banded && uLead === null && tr === 2 && ut0 < 2) continue;
+        if (noUntested && tr === 2) continue;
+        const uk = cool ? cool(row.s) : 0;
+        if (uk) { if (uk === 1 && noCool) continue; if (unkChill.length < K) unkChill.push(row); continue; }
+        if (uLead === null) uLead = row;
+        if (unk.length < K) unk.push(row);
+        continue;
+      }
       if (t0 < 0) t0 = tr;                                         // the tier of the first usable row, or of the model being handed off (o.t0)
       // D2: when the lead band is all demoted the scan may fall to a LOWER tool tier only if that tier is tested (v then t); never to an untested u from a tested tier.
       // Banding off keeps the old pool unchanged.
@@ -972,7 +995,7 @@ function pickSubstitute(P, S0, main, X, config, floor, o) {
       if (lead === null) lead = row;
       got.push(row);
     }
-    return { got, chill, unk, mask };
+    return { got, chill, unk, unkChill, mask };
   };
   const pool = (lim) => {
     let res = null;
@@ -980,12 +1003,12 @@ function pickSubstitute(P, S0, main, X, config, floor, o) {
       const mp = providerOf(main.model), pl = own(pol.lists.prov, mp);
       res = Array.isArray(pl) ? scan(pl, null, lim) : S0 !== null && S0.length > 0 && (pol.owner.source !== "all-providers") ? scan(S0, null, lim) : scan(S0, mp, lim);
     }
-    let chill = res ? res.chill : [], unk = res ? res.unk : [];
+    let chill = res ? res.chill : [], unk = res ? res.unk : [], unkChill = res ? res.unkChill : [];
     if (!res || res.got.length === 0) {
       const r2 = scan(S0, null, lim);
-      res = r2; if (chill.length === 0) chill = r2.chill; if (unk.length === 0) unk = r2.unk;
+      res = r2; if (chill.length === 0) chill = r2.chill; if (unk.length === 0) unk = r2.unk; if (unkChill.length === 0) unkChill = r2.unkChill;
     }
-    return { res, chill, unk };
+    return { res, chill, unk, unkChill };
   };
   if (mainRow) {                                                   // R-v3 (banded): main's own model is taken first only when it is in the lead band; a silent probe finds that band
     silent = true;
@@ -993,16 +1016,17 @@ function pickSubstitute(P, S0, main, X, config, floor, o) {
     silent = false;
     if (!lead || !(mainRow.b > lead.b)) return { cand: main.model, fragile: false };
   }
-  const { res, chill, unk } = pool(K);
+  const { res, chill, unk, unkChill } = pool(K);
   let top = res.got;
   if (top.length && !(o && o.quiet)) { if (res.mask & 1) count("coolDemote"); if (res.mask & 2) count("overlayDemote"); }   // a demoted row was skipped for a non-demoted one
   if (top.length === 0) {                                          // nothing but cooling rows is usable: demoted, never blocked
     if (coolMain) return { cand: main.model, fragile: false, demoted: true };
     top = chill.length && banded ? chill.filter((r) => r.b === chill[0].b) : chill;
-    if (top.length === 0) {                                        // R-v3: only unknown-cap rows of a big request are left: they rank last, never excluded
-      top = unk.length && banded ? unk.filter((r) => r.b === unk[0].b) : unk;
+    if (top.length === 0) {                                        // R-v3: only unknown-cap rows of a big request are left: they rank last, never excluded: non-cooling ones, then cooling ones
+      const uTop = unk.length ? unk : unkChill;
+      top = uTop.length && banded ? uTop.filter((r) => r.b === uTop[0].b) : uTop;
       if (top.length === 0) return { cand: null, fragile: false };
-      return { cand: top[fnv1a32(X.agentKey + ((o && o.seed) || "")) % top.length].s, fragile: top.length < K };
+      return { cand: top[fnv1a32(X.agentKey + ((o && o.seed) || "")) % top.length].s, fragile: top.length < K, ...(uTop === unkChill ? { demoted: true } : {}) };
     }
     return { cand: top[fnv1a32(X.agentKey + ((o && o.seed) || "")) % top.length].s, fragile: top.length < K, demoted: true };
   }

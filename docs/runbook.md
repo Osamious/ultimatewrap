@@ -281,8 +281,9 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   `state/subagent/status-<worker>.json`, `agents.jsonl` (one line per new subagent, plus three
   rotated files of 1 MiB), `classify.jsonl` (one line per classified request; since router v3 it
   carries `hasSid`, a session id was present, and `ua`, the client class `claude-cli`, `sdk`, `other`
-  or `none`, never the raw header; it rotates at 8 MiB and keeps two older files, so at most 24 MiB,
-  about 24.6 MiB in the worst case) and `cooling.json`; `shadow.flag` is the pause (the router stats it on
+  or `none`, never the raw header; it rotates at 8 MiB and keeps two older files: 3 files and 24 MiB for one writer, plus at most
+  about 200 KiB a file for every router worker that appends, since each checks the size every 50
+  lines; a worker whose file another worker rotated reopens the path at its next check) and `cooling.json`; `shadow.flag` is the pause (the router stats it on
   every request) and `paused-from.json` remembers what `resume` should restore.
 - **Main's own model first (router v3).** With banding on (the default), a subagent that needs a
   substitute takes main's own model first only when that model is in the LEAD rank band of the
@@ -358,7 +359,7 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   subagent, its largest later request divided by its first request, as a median, 90th percentile and
   maximum over the n subagents with two or more counted requests; it measures the headroom a model
   needs and changes nothing. `report` and `status` also say how many eligible models have no known
-  request-size limit, so the size check does nothing for them until a tool test records one (router v3: for a request above 200 KB such a model ranks LAST, after every known-limit model that fits and after cooling ones, and is never left out: it serves only when nothing else can).
+  request-size limit, so the size check does nothing for them until a tool test records one (router v3: for a request above 200 KB (204,800 bytes) such a model ranks LAST, after every known-limit model that fits and after cooling ones, and is never left out: it serves only when nothing else can, and it follows the same tier, cooling and handoff rules as every model. A model with no known limit that carries `bk`, the 400,000 bytes its tool sweep's big step proved it accepts, counts as a KNOWN fit for a request of up to `bk` bytes and ranks by band and tier like any known-limit model; `bk` is advisory, the router never refuses a request because of it, and a garbled value is ignored).
   Traffic shares come from the same classifier log and count CLIENT requests only: the requests that
   carry no session id (logged as `nosessio`) are the UW tooling's own probe traffic (the keysync and
   refresh probe profiles, machine-paced), not a client session and not a subagent bypass, so `report`,

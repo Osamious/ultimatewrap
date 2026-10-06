@@ -3702,6 +3702,152 @@ test("R-v3 (3): classify.jsonl rotates at 8 MiB (not at the old 2 MiB) and keeps
   assert.ok(/CLASS_MAX = 8 \* 1024 \* 1024/.test(SRC) && SRC.includes('name: "classify.jsonl", max: CLASS_MAX, rate: 50, gens: 2'), "the source pins 8 MiB and 2 generations");
 });
 
+// ---- R-v3 review round (cr-router-v3 F1, F2, F4, F5, and the bk field). The unknown-cap rows of a big request follow the SAME tier, cooling and handoff rules as every row.
+const bigReq = (agent, bytes, o = {}) => sub("nowhere/x", { agent, bytes, ...o });
+const BIGB = 300 * 1024;
+const seedCool = (e, m) => { seedCooling(e, m); e.tick(6000); };   // the router re-reads cooling.json at most every few seconds of its clock
+async function bigFan(e, n, bytes, config = CFGP) { const got = []; for (let i = 0; i < n; i++) { e.tick(100); got.push(await e.route(bigReq(`bf-${i}`, bytes), config, {})); } return got; }
+const P3 = (specs, o = {}) => mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce", ...o }, rows: specs.map(([n, extra]) => pr(n, { b: 0, ...extra })), withProv: true });
+
+test("R-v3 F1: a COOLING unknown-cap row is not picked for a big request while a non-cooling one exists; with only cooling unknown rows left one still serves, demoted, never blocked", async () => {
+  const mk = () => P3([[1, { pb: 100000 }], [2, { pb: 0 }], [3, { pb: 0 }]]);
+  const e = env(mk(), { slot: null });
+  await learn(e, OPUS);
+  seedCool(e, { "p2/m": cool1(T0 + 3600000) });
+  assert.deepEqual([...new Set(await bigFan(e, 30, BIGB))], ["p3/m"], "p1's known cap (100 KB) is below the request, p2 is cooling: p3 serves every agent");
+  const e2 = env(mk(), { slot: null });
+  await learn(e2, OPUS);
+  assert.deepEqual([...new Set(await bigFan(e2, 30, BIGB))].sort(), ["p2/m", "p3/m"], "nothing cooling: both unknown rows spread (the case it must not break)");
+  const e3 = env(mk(), { slot: null });
+  await learn(e3, OPUS);
+  seedCool(e3, { "p2/m": cool1(T0 + 3600000), "p3/m": cool1(T0 + 3600000) });
+  const got = new Set(await bigFan(e3, 20, BIGB));
+  assert.ok([...got].every((m) => m === "p2/m" || m === "p3/m"), `only cooling unknown rows exist: one of them serves, demoted (${[...got]})`);
+});
+
+test("R-v3 F1: the D2 rule holds for the unknown-cap rows: from a cooling TESTED lead a big request never falls to an UNTESTED row, and a known row still beats every unknown one", async () => {
+  const mk = () => mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows: [pr(1, { b: 0, t: "v" }), pr(2, { b: 1, t: "u" })], withProv: true });
+  const e = env(mk(), { slot: null });
+  await learn(e, OPUS);
+  seedCool(e, { "p1/m": cool1(T0 + 3600000) });
+  assert.deepEqual([...new Set(await bigFan(e, 20, BIGB))], ["p1/m"], "p1 (tested, unknown cap, cooling) is used demoted; the untested p2 is never reached from it");
+  const e2 = env(mk(), { slot: null });
+  await learn(e2, OPUS);
+  assert.deepEqual([...new Set(await bigFan(e2, 20, 100 * 1024))], ["p1/m"], "a small request: the old pool, p1 leads");
+});
+
+test("R-v3 F2: a handoff of a big request never lands on an UNTESTED row or on a COOLING unknown-cap row; a known-cap row and a non-cooling tested unknown one are still valid targets", async () => {
+  const retry = async (e, agent) => { const first = await e.route(retried(agent, 5, { bytes: BIGB }), CFGP, {}); e.tick(1000); return [first, await e.route(retried(agent, 5, { bytes: BIGB }), CFGP, {})]; };
+  const rows1 = [pr(1, { t: "v", pb: 900000 }), pr(2, { t: "u", pb: 0 })];                      // from the tested p1 the only other row is untested and unknown-cap
+  const e = env(mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows: rows1.map((r) => ({ ...r, b: 0 })), withProv: true }), { slot: null });
+  await learn(e, OPUS);
+  const [first, second] = await retry(e, "h-u");
+  assert.equal(first, "p1/m");
+  assert.equal(second, "p1/m", "no handoff to the untested p2");
+  assert.deepEqual([e.counters().handoff, e.counters().handoffNone], [0, 1]);
+  const eb = env(mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce", banded: false }, rows: rows1.map((r) => ({ ...r, b: 0 })), withProv: true }), { slot: null });
+  await learn(eb, OPUS);
+  const [fb, sb] = await retry(eb, "h-ub");
+  assert.deepEqual([fb, sb, eb.counters().handoff], ["p1/m", "p1/m", 0], "banding off: the untested unknown-cap p2 is still no handoff target (O3 holds whatever the banding says)");
+  const ec = env(P3([[1, { t: "v", pb: 900000 }], [2, { t: "v", pb: 0 }]]), { slot: null });   // the only other row is unknown-cap and COOLING: no handoff, never a cooling target
+  await learn(ec, OPUS);
+  seedCool(ec, { "p2/m": cool1(T0 + 3600000) });
+  const [fc, sc] = await retry(ec, "h-uc");
+  assert.deepEqual([fc, sc, ec.counters().handoff, ec.counters().handoffNone], ["p1/m", "p1/m", 0, 1], "a cooling unknown-cap row is not a handoff target");
+  let handoffs = 0;                                                                            // p2 is a tested unknown-cap row but COOLING, p3 is not: only p3 is a target
+  for (let i = 0; i < 10; i++) {
+    const e2 = env(P3([[1, { t: "v", pb: 900000 }], [2, { t: "v", pb: 0 }], [3, { t: "v", pb: 0 }]]), { slot: null });
+    await learn(e2, OPUS);
+    seedCool(e2, { "p2/m": cool1(T0 + 3600000) });
+    const [f, s] = await retry(e2, `h-c${i}`);
+    assert.equal(f, "p1/m");
+    assert.equal(s, "p3/m", "never the cooling p2");
+    handoffs += e2.counters().handoff;
+  }
+  assert.equal(handoffs, 10);
+  const e3 = env(P3([[1, { t: "v", pb: 900000 }], [2, { t: "v", pb: 900000 }]]), { slot: null });   // the case it must not break: a known-cap tested row is a target
+  await learn(e3, OPUS);
+  const [f3, s3] = await retry(e3, "h-k");
+  assert.deepEqual([f3, s3].sort(), ["p1/m", "p2/m"], "the agent moved to the other known-cap row");
+});
+
+test("R-v3 bk: a pb-0 row whose bk (bytes the sweep proved) covers the request is a KNOWN fit; unknown otherwise; pb > 0 keeps its own rule; a request of 200 KB or less is unchanged", async () => {
+  const rows = () => [[1, { pb: 900000 }], [2, { pb: 0, bk: 400000 }], [3, { pb: 0 }], [4, { pb: 0, bk: 400000 }]];
+  const run = async (bytes, specs = rows()) => { const e = env(P3(specs), { slot: null }); await learn(e, OPUS); return [...new Set(await bigFan(e, 60, bytes))].sort(); };
+  assert.deepEqual(await run(BIGB), ["p1/m", "p2/m", "p4/m"], "300 KB: the known row and the two proven rows spread; the unknown p3 is last");
+  assert.deepEqual(await run(500 * 1000), ["p1/m"], "500,000 bytes: bk 400,000 no longer covers the request, so p2 and p4 are unknown too: only the known-cap p1 serves");
+  assert.deepEqual(await run(400000), ["p1/m", "p2/m", "p4/m"], "exactly bk bytes is covered");
+  assert.deepEqual(await run(100 * 1024), ["p1/m", "p2/m", "p3/m"], "100 KB: bk changes nothing, the old pool (the first three rows)");
+  assert.deepEqual(await run(200 * 1024), ["p1/m", "p2/m", "p3/m"], "exactly 204,800 bytes is not above 200 KB");
+  assert.deepEqual(await run(BIGB, [[1, { pb: 100000, bk: 900000 }], [2, { pb: 0 }]]), ["p2/m"], "a row with pb > 0 keeps the pb rule: bk never lifts a measured refusal limit");
+  assert.deepEqual(await run(BIGB, [[1, { pb: 0 }], [2, { pb: 0, bk: 400000 }]]), ["p2/m"], "the proven row beats the unknown row that leads the rank");
+  assert.deepEqual(await run(BIGB, [[1, { pb: 0, bk: 400000 }], [2, { pb: 0 }]]), ["p1/m"], "and the rank order decides between proven rows and the rest of a band as for any known row");
+});
+
+test("R-v3 bk: a garbage bk (string, negative, zero, null, NaN, boolean, object, array, huge) is treated as absent; bk is advisory and never refuses anything", async () => {
+  for (const bad of ["400000", -5, 0, null, NaN, true, {}, [400000], 1e30, 64 * 1024 * 1024 + 1]) {
+    const e = env(P3([[1, { pb: 900000 }], [2, { pb: 0, bk: bad }]]), { slot: null });
+    await learn(e, OPUS);
+    assert.deepEqual([...new Set(await bigFan(e, 20, BIGB))], ["p1/m"], `bk ${JSON.stringify(bad)} is absent: p2 stays unknown and ranks after p1`);
+  }
+  const onlyBk = env(P3([[1, { pb: 0, bk: 1000 }], [2, { pb: 0 }]]), { slot: null });          // a bk below the request is not a refusal: with no known row the unknown rows still serve
+  await learn(onlyBk, OPUS);
+  assert.deepEqual([...new Set(await bigFan(onlyBk, 30, BIGB))].sort(), ["p1/m", "p2/m"], "never excluded");
+});
+
+test("R-v3 bk: the cooling, tier and handoff rules apply to a proven row like any known row", async () => {
+  const e = env(P3([[1, { pb: 0, bk: 400000 }], [2, { pb: 0 }]]), { slot: null });
+  await learn(e, OPUS);
+  seedCool(e, { "p1/m": cool1(T0 + 3600000) });
+  assert.deepEqual([...new Set(await bigFan(e, 20, BIGB))], ["p1/m"], "the proven row is cooling (demoted) but still outranks the unknown row: chill comes before unknown");
+  const e2 = env(P3([[1, { pb: 0, bk: 400000 }], [2, { pb: 0, bk: 400000 }], [3, { pb: 0 }]]), { slot: null });
+  await learn(e2, OPUS);
+  seedCool(e2, { "p1/m": cool1(T0 + 3600000) });
+  assert.deepEqual([...new Set(await bigFan(e2, 20, BIGB))], ["p2/m"], "a non-cooling proven row beats a cooling proven row and an unknown row");
+  const e3 = env(P3([[1, { t: "v", pb: 900000 }], [2, { t: "u", b: 1, pb: 0, bk: 400000 }]]), { slot: null });   // a handoff from a tested tier never lands on an untested proven row
+  await learn(e3, OPUS);
+  const first = await e3.route(retried("bk-h", 5, { bytes: BIGB }), CFGP, {}); e3.tick(1000);
+  assert.equal(first, "p1/m");
+  assert.equal(await e3.route(retried("bk-h", 5, { bytes: BIGB }), CFGP, {}), "p1/m", "O3: no handoff to the untested row");
+});
+
+test("R-v3 F4: a list that is mostly unknown-cap rows is walked cheaply for a big request and the one known row at its end is still found", async () => {
+  const rows = []; for (let i = 0; i < 600; i++) rows.push(row(`prov${i % 30}/u${i}`, { c: 200000, b: 0, g: 0, pb: 0 }));
+  rows.push(row("prov1/known", { c: 200000, b: 0, g: 0, pb: 900000 }));
+  const providers = []; for (let p = 0; p < 30; p++) providers.push({ name: `prov${p}`, models: [...rows.filter((r) => r.s.startsWith(`prov${p}/`)).map((r) => r.s.split("/")[1])] });
+  const e = env(mkPolicy({ owner: { mode: "dynamic", source: "all-providers", enforcement: "enforce" }, rows, withProv: true }), { slot: null });
+  await learn(e, OPUS);
+  const got = new Set();
+  for (let i = 0; i < 20; i++) { e.tick(100); got.add(await e.route(bigReq(`mw-${i}`, BIGB), { Providers: providers }, {})); }
+  assert.deepEqual([...got], ["prov1/known"], "600 unknown rows precede the only known row: it still wins");
+});
+
+test("R-v3 F5: a worker whose descriptor points at a file ANOTHER worker rotated reopens the path at its next size check", async () => {
+  const e = env(POL(), { slot: null });
+  const f = (n) => path.join(e.state, n);
+  const fire = async (tag, n = 50) => { for (let i = 0; i < n; i++) { e.tick(100); await e.route(aux(HAIKU, { agent: `${tag}${i}` }), CFG, {}); } };
+  await fire("a");                                                                             // 50 lines in classify.jsonl, descriptor open
+  fs.renameSync(f("classify.jsonl"), f("classify.1.jsonl")); fs.writeFileSync(f("classify.jsonl"), "");   // another worker rotated: a new file stands at the path
+  await fire("b");                                                                             // lines 51 to 100 still reach the renamed file; the check at the 100th append notices
+  await fire("c", 10);
+  const lines = (n) => fs.readFileSync(f(n), "utf8").split("\n").filter(Boolean).length;
+  assert.equal(lines("classify.jsonl"), 10, "the next lines land in the file at the path");
+  assert.equal(lines("classify.1.jsonl"), 100);
+});
+
+test("R-v3 F5: a rotation another worker already did shifts NO generation: the claim rename fails with ENOENT and the older files are untouched", async () => {
+  const e = env(POL(), { slot: null });
+  const f = (n) => path.join(e.state, n), MiB = 1024 * 1024;
+  fs.writeFileSync(f("classify.1.jsonl"), "G1\n"); fs.writeFileSync(f("classify.2.jsonl"), "G2\n");
+  const real = e.route.__test.fs;
+  e.route.__test.fs = { ...real, statSync: (p, ...a) => { const s = real.statSync(p, ...a); return String(p).endsWith("classify.jsonl") ? { size: 9 * MiB, ino: 0 } : s; },
+    renameSync: (a, b) => { if (/\.rot-/.test(String(b))) throw Object.assign(new Error("ENOENT: taken by another worker"), { code: "ENOENT" }); return real.renameSync(a, b); } };
+  for (let i = 0; i < 50; i++) { e.tick(100); await e.route(aux(HAIKU, { agent: `r${i}` }), CFG, {}); }   // the 50th append sees "9 MiB" and tries to rotate
+  assert.equal(fs.readFileSync(f("classify.1.jsonl"), "utf8"), "G1\n", "generation 1 was not shifted");
+  assert.equal(fs.readFileSync(f("classify.2.jsonl"), "utf8"), "G2\n", "generation 2 was not overwritten");
+  assert.equal(e.counters().logDropped ?? 0, 0, "and the log stayed up");
+});
+
 // =====================================================================================================================
 // Latency harness (O4a). The measurements live HERE, once, and are used twice: by the loose-ceiling tests of this suite (a machine under load must not fail a build) and by the strict
 // standalone script test/perf/subagent-router-perf.mjs (the plan's numbers, best of 3 batches, run on a quiet machine). Importing this file with UW_HELPERS_ONLY=1 registers no test.
