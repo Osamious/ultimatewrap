@@ -352,6 +352,8 @@ async function resetTransient(o, outFile, deps) {
   for (const c of m1.cleared) { const p = c.key.slice(0, c.key.indexOf("/")); prov[p] = (prov[p] ?? 0) + 1; }
   const top = Object.entries(prov).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, n]) => `${show(k, 18)} ${num(n)}`).join(", ");
   if (top) console.log(`  by provider: ${top}`);
+  const reopened = m1.cleared.filter((c) => c.reopen);
+  if (reopened.length) console.log(`  of those, ${num(reopened.length)} are L3 failures that rest on an empty answer or unfinished call arguments, written before the stop reason and the budget were looked at (${tally(reopened, (c) => c.shape)}); L3 is asked again and the stop reason is kept (l3w)`);
   console.log(`  failures caused by the gateway's request translation: ${num(m1.tagged.length)} would be tagged xw gateway (they stay x)`);
   console.log(`  argument-fidelity failures that came from the old test content (a path with an escape look-alike, an optional parameter left out): ${num(m1.afReset.length)} would be cleared (ask again with --force --levels 1 --only provider/model)`);
   if (!o.live) { console.log("nothing was written. Re-run with --reset-transient --live to apply it."); return 0; }

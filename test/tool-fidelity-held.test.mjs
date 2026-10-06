@@ -95,10 +95,10 @@ test("held providers leave the queue BEFORE the per-provider cap: zero requests 
   assert.equal(by.pb, undefined, "zero requests to a provider that is held");
   assert.equal(by.pc, undefined);
   assert.ok(by.pa > 0 && by.pd > 0);
-  const p = plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, o: parseArgs(CAP), tiers: e.deps.tiers, held });
+  const p = plan({ snap: e.deps.snapshot.snap, bench: e.deps.bench, store: {}, o: parseArgs(CAP), tiers: e.deps.tiers, held, nowMs: NOW.getTime() });
   assert.deepEqual(p.heldInfo.map((x) => [x.provider, x.models]), [["pb", 12], ["pc", 12]]);
   assert.equal(p.capEff, 34200);
-  const three = plan({ snap: { rows: [many("pa", 12), many("pb", 12), many("pc", 12)] }, bench: e.deps.bench, store: {}, o: parseArgs(CAP), tiers: { pa: "free", pb: "free", pc: "free" }, held: { pc: held.pc } });
+  const three = plan({ snap: { rows: [many("pa", 12), many("pb", 12), many("pc", 12)] }, bench: e.deps.bench, store: {}, o: parseArgs(CAP), tiers: { pa: "free", pb: "free", pc: "free" }, held: { pc: held.pc }, nowMs: NOW.getTime() });
   assert.equal(three.capEff, 25650, "3 providers, 2 can run: 1.5 x the cap");
 });
 

@@ -206,9 +206,9 @@ test("L1: a mangled argument fails `af` (never L1), carries `afw` in the verdict
 
 test("L4: a failed parallel-call check carries `l4w` (how many calls of 2 came back, or what else was wrong), stored on the record, cleared by a later pass", async () => {
   const single = await one("3b", () => ok(stream(ev.tool(0, ECHO_TOOL, '{"message":"a"}', "toolu_a"), ev.stop("tool_use"))));
-  assert.deepEqual([single.r.l4, single.r.l4w], ["f", "1 call of 2"]);
+  assert.deepEqual([single.r.l4, single.r.l4w], ["f", "1 call of 2 stop=tool_use"]);
   const none = await one("3b", () => ok(stream(ev.text(0, "ok"), ev.stop("end_turn"))));
-  assert.deepEqual([none.r.l4, none.r.l4w], ["f", "0 call of 2"]);
+  assert.deepEqual([none.r.l4, none.r.l4w], ["f", "0 call of 2 stop=end_turn"]);
   const two = await one("3b", () => ok(stream(ev.tool(0, ECHO_TOOL, '{"message":"a"}', "toolu_a"), ev.tool(1, ECHO_TOOL, '{"message":"b"}', "toolu_b"), ev.stop("tool_use"))));
   assert.equal(two.r.l4, "p");
   assert.equal(two.r.l4w, undefined);

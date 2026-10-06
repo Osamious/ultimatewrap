@@ -32,7 +32,8 @@
 //   nm        an MCP-style ~60-character tool name came back exactly (p / f), from the L3 constructs request (3a)
 //   cc        the cache_control markers Claude Code sends were accepted (p) or rejected by name (f); a model that rejected them is not sent them again
 //   sp        the Agent (spawn) tool: a valid call with a prompt and a recognised subagent_type (p / f), L6. Two strikes like L1-L3 (sl 6); never lowers the class
-//   afw, l4w  what differed when argument fidelity (af) or the parallel-call check (L4) failed: a few printable words, at most 60 characters ("old_string: newline lost", "1 call of 2"). Never a verdict; cleared by a later pass
+//   afw, l4w, l3w, spw  what differed when argument fidelity (af), the parallel-call check (L4), L3 or the spawn call (L6) failed: a few printable words, at most 60 characters ("old_string: newline lost",
+//             "1 call of 2 stop=tool_use", "stop=end_turn blocks=none in=40210 out=0"). Never a verdict; cleared by a later pass
 //   d3        what decided L3: a (failed at the 3a constructs request), b (failed at the 157 KB request), i (passed by implication: the big step passed first)
 // L4 (parallel calls) is answered by the same 157 KB request as L3. None of these fields is part of lvr, and none changes the class except fc (class t at best).
 // Compiler reads `t`, `alias`, `capBelow`, `big` and `lvr[3]` (L4): inside class v a model ranks big p, then big not run, then big f, and
@@ -48,7 +49,7 @@ import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
 import { RELAY_KEY_ID, isTier } from "../menu/tiers.mjs";
 import { SUBSTITUTE_FLOOR, funnel } from "../menu/subagent-funnel.mjs";
 import { isFree, UNPRICED_PER_M } from "./bench.mjs";
-import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText } from "./tool-fidelity-probe.mjs";
+import { kindSize, kindsOf, BUDGETS, PROBE_MAX_TOKENS, LIFTS, deepAllowed, NOT_FREE_REASON, accountOrRoute, GATEWAY_WORDS, isAvailabilityText, namesRequest } from "./tool-fidelity-probe.mjs";
 export { NOT_FREE_REASON };
 import { FIXTURE_ID } from "./tool-fidelity-fixture.mjs";
 
@@ -64,8 +65,8 @@ export const BIG_LEVEL = 5;                          // the ~400 KB step, a leve
 
 const LVR_RE = /^[pfn]{4}$/;
 const FX_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "xw"]);
-const NOTE_FIELDS = ["afw", "l4w"];                                      // short reasons of non-blocking marker failures (printable ASCII, at most 60 characters): what differed, never a verdict
+const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "l3w", "spw", "xw"]);
+const NOTE_FIELDS = ["afw", "l4w", "l3w", "spw"];                                      // short reasons of non-blocking marker failures (printable ASCII, at most 60 characters): what differed, never a verdict
 export const GATEWAY_WHY = GATEWAY_WORDS;                                  // the reason text of a failure caused by the gateway's own request translation
 const noteOk = (x) => typeof x === "string" && /^[ -~]{1,60}$/.test(x);
 const PF_FIELDS = ["fc", "af", "nm", "cc", "br", "er", "sp"];            // the one-letter p / f markers, in the order they are written
@@ -320,8 +321,9 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
   } else if (prior?.strikes === 1 && !ran(prior.sl)) { strikes = 1; sl = prior.sl; }       // this probe did not look at the struck level: the strike waits
 
   // the markers: a provisional probe changes none of them
-  const keep = { ...Object.fromEntries(PF_FIELDS.map((k) => [k, prior?.[k]])), d3: prior?.d3, afw: prior?.afw, l4w: prior?.l4w };
+  const keep = { ...Object.fromEntries(PF_FIELDS.map((k) => [k, prior?.[k]])), d3: prior?.d3, afw: prior?.afw, l4w: prior?.l4w, l3w: prior?.l3w, spw: prior?.spw };
   const m = { ...keep };
+  if (ran(3)) m.l3w = done[3].v === "f" && noteOk(done[3].w) ? done[3].w : undefined;       // the evidence of a first strike is kept too
   if (!provisional) {
     if (ran(1)) { m.af = done[1].af; m.fc = done[1].fc; m.afw = m.af === "f" && noteOk(done[1].afw) ? done[1].afw : undefined; }
     if (ran(4)) m.l4w = done[4].v === "f" && noteOk(done[4].w) ? done[4].w : undefined;
@@ -330,6 +332,7 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc; }
     if (ran(3)) m.d3 = done[3].v === "f" ? (String(done[3].why ?? "").startsWith("[3a]") ? "a" : "b") : done[3].implied ? "i" : undefined;
     if (ran(6)) {
+      m.spw = done[6].v === "f" && noteOk(done[6].w) ? done[6].w : undefined;
       if (done[6].v === "p") m.sp = "p";
       else if (prior?.strikes === 1 && prior.sl === 6) { m.sp = "f"; strikes = 2; sl = 6; }
       else if (!strikes) { strikes = 1; sl = 6; }                               // the strike slot is free: the first spawn failure is only provisional
@@ -1157,15 +1160,22 @@ export function transientShape(msg) {
   return null;
 }
 const REFUSAL_WHY = /^L([123467]): (?:\[3[ab]\] )?HTTP (4\d\d): ([\s\S]*)$/;
-const NAMED_FOR_MIGRATION = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
 /** Why a stored reason is an availability (or an unnamed 400) and not a verdict about the model, or null: `{level, shape}`. */
 export function transientReason(why) {
   const m = typeof why === "string" ? REFUSAL_WHY.exec(why) : null;
   if (!m) return null;
   const msg = extractMsg(m[3]);
   if (isAvailabilityText(m[3])) return { level: Number(m[1]), shape: transientShape(msg) ?? "availability" };
-  if (m[2] === "400" && m[1] !== "5" && !NAMED_FOR_MIGRATION.test(msg)) return { level: Number(m[1]), shape: transientShape(msg) ?? "unnamed 400" };
+  if (m[2] === "400" && m[1] !== "5" && !namesRequest(msg)) return { level: Number(m[1]), shape: transientShape(msg) ?? "unnamed 400" };
   return null;
+}
+/**
+ * A stored L3 failure whose reason is an EMPTY answer or unfinished tool-call arguments, written before the stop reason and the budget were looked at: the output budget, a cut stream or a moderation stop can
+ * all produce it, so it is no verdict. Returns `{level: 3, shape, reopen: true}` or null.
+ */
+export function reopenReason(why) {
+  const m = typeof why === "string" ? /^L3: \[3[ab]\] (empty answer to the (?:constructs|large) request|tool call arguments are not valid JSON)$/.exec(why) : null;
+  return m ? { level: 3, shape: m[1].startsWith("empty") ? "empty L3 answer" : "L3 arguments not valid JSON", reopen: true } : null;
 }
 const extractMsg = (body) => { let t = String(body ?? ""); try { const j = JSON.parse(t); const c = j?.error?.message ?? j?.message ?? (typeof j?.error === "string" ? j.error : null); if (typeof c === "string") t = c; } catch { /* as is */ } return t.replace(/\s+/g, " ").trim(); };
 /**
@@ -1177,7 +1187,7 @@ export function migrateTransient(store) {
   const out = {}, cleared = [], tagged = [], afReset = [];
   for (const [key, rec] of Object.entries(store ?? {})) {
     if (!rec) { out[key] = rec; continue; }
-    const tr = rec.lvr?.includes("f") || rec.strikes !== undefined ? transientReason(rec.why) : null;
+    const tr = rec.lvr?.includes("f") || rec.strikes !== undefined ? transientReason(rec.why) ?? reopenReason(rec.why) : null;
     if (tr) {
       const kind = rec.strikes === 1 ? "strike" : "failed";
       const chars = rec.lvr.split("");
@@ -1188,11 +1198,11 @@ export function migrateTransient(store) {
       const { strikes, sl, why, ...rest } = rec;
       const base = { ...rest, lvr, lv: lvOf(lvr) };
       delete base.xw;
-      if (tr.level === 6) delete base.sp;
-      if (tr.level <= 3) { delete base.big; delete base.d3; delete base.capBelow; delete base.l4w; }
+      if (tr.level === 6) { delete base.sp; delete base.spw; }
+      if (tr.level <= 3) { delete base.big; delete base.d3; delete base.capBelow; delete base.l4w; delete base.l3w; }
       if (tr.level <= 2) for (const k of ["af", "afw", "fc", "br", "er", "nm", "cc", "sp"]) delete base[k];
       const keepsNothing = lvr === "nnnn" && base.sp === undefined && ["af", "nm", "cc", "br", "er", "fc"].every((k) => base[k] === undefined);
-      cleared.push({ key, kind, shape: tr.shape, level: tr.level, removed: keepsNothing });
+      cleared.push({ key, kind, shape: tr.shape, level: tr.level, removed: keepsNothing, ...(tr.reopen ? { reopen: true } : {}) });
       if (keepsNothing) continue;
       const t = classOf({ lvr, capBelow: base.capBelow, fc: base.fc });
       out[key] = { ...base, t, ok: t === "v" || t === "t" };
@@ -1219,6 +1229,8 @@ export function summaryOf(rec) {
   const out = { class: rec.t, lvr: rec.lvr, l4: m(rec.lvr[3] === "n" ? undefined : rec.lvr[3]), big: m(rec.big), sp: m(rec.sp), af: m(rec.af), nm: m(rec.nm), cc: m(rec.cc), br: m(rec.br), er: m(rec.er), fc: m(rec.fc), d3: rec.d3 ?? null, capBelow: rec.capBelow ?? 0, notes: [] };
   if (rec.af === "f" && rec.afw) out.notes.push(`argument fidelity failed: ${rec.afw}`);
   if (rec.l4w) out.notes.push(`parallel calls failed: ${rec.l4w}`);
+  if (rec.l3w) out.notes.push(`L3 answer: ${rec.l3w}`);
+  if (rec.spw) out.notes.push(`spawn failed: ${rec.spw}`);
   if (rec.fc === "p") out.notes.push("passed only when the tool call was forced: class t at best");
   if (rec.d3 === "i") out.notes.push("L3 passed by implication (the big step passed first)");
   if (rec.d3 === "a") out.notes.push("L3 failed at the constructs request (3a), before the 157 KB request");

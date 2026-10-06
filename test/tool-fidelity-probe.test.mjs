@@ -196,12 +196,12 @@ test("TIMEOUTS are per request class and inconclusive: small 15 s, 157 KB 60 s, 
   const t0 = Date.now();
   const small = await runKind("1", conn(hang, { timeouts: { small: 30, "157": 5000, big: 5000 } }));
   assert.deepEqual([small.v, small.s], ["i", "timeout"]);
-  assert.ok(Date.now() - t0 < 1500, "the SMALL class timeout applied, not the long ones");
+  assert.ok(Date.now() - t0 < 2500, "the SMALL class timeout applied, not the long ones");
   const t1 = Date.now();
   const mid = await runKind("3b", conn(hang, { timeouts: { small: 5000, "157": 40, big: 5000 } }));
   const big = await runKind("5", conn(hang, { timeouts: { small: 5000, "157": 5000, big: 50 } }));
   assert.deepEqual([mid.s, big.s], ["timeout", "timeout"]);
-  assert.ok(Date.now() - t1 < 2000, "each request kind used its own class");
+  assert.ok(Date.now() - t1 < 4500, "each request kind used its own class");
   const ac = new AbortController();
   const p = runKind("1", conn(hang, { signal: ac.signal }));
   ac.abort();

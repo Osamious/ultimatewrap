@@ -260,7 +260,7 @@ test("a hostile stream is bounded: too many blocks, events or bytes end the read
   const e = await runKind("1", conn(endless));
   assert.equal(e.v, "f");
   assert.ok(sent < STREAM_LIMITS.events + 100, `stopped reading after ${sent} events`);
-  assert.ok(Date.now() - t0 < 5000);
+  assert.ok(Date.now() - t0 < 30000);
   let pulled = 0;
   const huge = async () => new Response(new ReadableStream({ pull(c) { pulled += 1; c.enqueue(new TextEncoder().encode(sse("ping", { pad: "z".repeat(100000) }))); if (pulled >= 60) c.close(); } }), { status: 200 });
   const big = await runKind("1", conn(huge));

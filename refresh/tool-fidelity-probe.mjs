@@ -131,6 +131,11 @@ const WALLET_WORDS = /(wallet|account|credit|balance)[^.]{0,40}(insufficient|too
 const ROUTE_WORDS = /must be called (via|through|at|using)|should be called (via|through|at)|wrong endpoint|use (the )?\/[\w./{}-]*v\d[\w./{}-]*|unsupported protocol|not supported (on|at) this (endpoint|route|api)|(only|exclusively) (available|supported) (via|on|at|through) [^.]{0,40}(\/v\d|messages|chat\/completions)/i;
 // A 400 whose sentence names none of these says nothing about the request's shape ("Upstream provider rejected the request"): an upstream hiccup until it repeats word for word.
 const SCHEMA_WORDS = /thought_signature|empty content|assistant messages?|schema|tools?\b|function|parameter|argument|format|propert|field|required|json|enum|anyof|oneof|\$ref|tool_choice|input|type\b|unsupported|not supported|invalid|malformed|validation|too (large|big|long)|context|token/i;
+// The phrases a gateway or a provider puts in EVERY rejection, whatever it is about ("provider rejected the request", "invalid request error", "check the model, input, and parameters", a trace or request id):
+// they name nothing, so they must not count as naming the request even though they contain words such as `invalid`, `input` and `parameters`.
+const GENERIC_PHRASES = /(the )?(upstream )?provider rejected the request( as invalid)?|invalid request( error)?|check the model,? (the )?input,? (and|or) (the )?parameters|\(?(request|trace)[ _]?id:? ?[^\s)]*\)?/gi;
+/** Does a 400's own sentence name something about the request (a tool, a schema, a parameter, a size), once the phrases every rejection carries are taken out? */
+export const namesRequest = (msg) => SCHEMA_WORDS.test(String(msg ?? "").replace(GENERIC_PHRASES, " "));
 /** The tight reading of a refusal text, plus the two shapes above: `{s, reason?, hint?}` or null. */
 function tightRead(text) {
   const t = classifyTight(text);
@@ -152,9 +157,9 @@ const NAMES_REQUEST = /schema|tool[ _-]?choice|tools?\.\d|input_schema|parameter
 export const isAvailabilityText = (text) => { const m = extractMessage(text); return AVAIL_WORDS.test(m) && !NAMES_REQUEST.test(m); };
 /**
  * The gateway's own translation of an Anthropic request to the provider's shape fails ("Function call is missing a thought_signature in functionCall parts", "Empty content is not allowed for
- * assistant messages" for an assistant turn that has only a tool_use): a real failure for practical use through this gateway, but not a limit of the model. The record stays x and is tagged `xw: gateway`.
+ * assistant messages" for an assistant turn that has only a tool_use, "Tool call id was toolu_... but must be a-z, A-Z, 0-9, with a length of 9" for an id the provider cannot take): a real failure for practical use through this gateway, but not a limit of the model. The record stays x and is tagged `xw: gateway`.
  */
-export const GATEWAY_WORDS = /thought_signature|empty content is not allowed for assistant messages/i;
+export const GATEWAY_WORDS = /thought_signature|empty content is not allowed for assistant messages|tool call id was \S+ but must be/i;
 
 const TRANSIENT_WORDS = /overload|rate.?limit|too many|try again|timed? ?out|unavailable|capacity|temporar|busy|quota/i;
 // A refusal that is about the account's allowance or the moment, never about the model, whatever the status (a 413 can say this too).
@@ -275,7 +280,20 @@ export function afCheck(v) {
   return { af: "p" };
 }
 
-/** Judges the stream of one request KIND. Pure over `readStream`'s result. */
+const printable = (x, n) => String(x ?? "").replace(/[^ -~]/g, "").slice(0, n);
+/** How an answer looked, in at most 60 printable characters: "stop=end_turn blocks=thinking in=40210 out=3" (what a verdict about an unusable answer rests on). */
+const shapeOf = (r) => {
+  const kinds = [...new Set(r.blocks.map((b) => (b.type === "text" && !b.text ? "text(empty)" : printable(b.type ?? "?", 14))))].join("+") || "none";
+  return printable(`stop=${printable(r.stopReason ?? "none", 14)} blocks=${kinds.slice(0, 22)} in=${r.inTok ?? "?"} out=${r.outTok ?? "?"}`, 60);
+};
+/** A short note for a failed verdict: what was wrong, then the stop reason; at most 60 printable characters. */
+const noteOf = (what, r) => printable(`${what} stop=${printable(r.stopReason ?? "none", 14)}`, 60);
+/** The output budget ran out: the stop reason says so, or the output tokens used it up whatever stop reason the gateway reports (some translate "length" to "end_turn"). */
+const budgetOut = (r) => r.stopReason === "max_tokens" || (Number.isFinite(r.outTok) && Number.isFinite(r.max) && r.max > 0 && r.outTok >= 0.9 * r.max);
+// A stop reason that is the provider's moderation or refusal, not an answer: says nothing about tools.
+const FILTER_STOP = /refus|filter|safety|policy|blocked|moderat|sensitive/i;
+
+/** Judges the stream of one request KIND. Pure over `readStream`'s result (`max`: the output budget the request was sent with). */
 export function judge(kind, r) {
   if (r.noBody) return inconclusive("error", "HTTP 200 with no response body");
   if (r.overflow) return fail("the answer stream passed the size limits (too many bytes, events or blocks)");
@@ -290,10 +308,17 @@ export function judge(kind, r) {
     return fail(`stream error before any content: ${r.streamError}`);
   }
   if (!r.events) return inconclusive("error", "HTTP 200 with no stream events");
-  if (!usable && r.stopReason === "max_tokens") return inconclusive("empty", "output budget spent before any text or tool call (stop_reason max_tokens)");
+  // An answer with NO content says something about the model only when the budget cannot be the reason: it did not end on max_tokens and its output tokens (when reported) did not use the budget up
+  // (the caller asks once more, larger). A thinking-only answer that stopped normally with room left is a real miss. A moderation stop is the provider's, not the model's.
+  if (!usable && budgetOut(r)) return inconclusive("empty", `output budget spent before any text or tool call (${shapeOf(r)})`);
+  if (!usable && FILTER_STOP.test(r.stopReason ?? "")) return inconclusive("error", `the provider stopped the answer (${shapeOf(r)})`, { reason: "upstream-unavailable", hint: clip(`stop_reason ${printable(r.stopReason, 30)}`) });
+  // a stream that ended with neither a stop reason nor message_stop was cut (a closed connection, a proxy limit): what is missing from it says nothing about the model
+  const cut = !r.stopped && r.stopReason === null && !r.early;
   const bad = tools.find((b) => !argsOf(b).ok);
+  if (!usable && cut) return inconclusive("error", `the stream ended without a stop event and with no text or tool call (${shapeOf(r)})`);
+  if (bad && cut) return inconclusive("error", "the stream ended without a stop event in the middle of a tool call");
   // a tool call cut off by the output budget (stop_reason max_tokens, arguments unfinished) says nothing about the model: the budget is asked once more, larger
-  if (bad && r.stopReason === "max_tokens") return inconclusive("empty", "output budget spent in the middle of a tool call (stop_reason max_tokens)");
+  if (bad && budgetOut(r)) return inconclusive("empty", `output budget spent in the middle of a tool call (${shapeOf(r)})`);
   if (kind === "1a" || kind === "1af") {
     if (!tools.length) return fail(textOf(r) ? "answered in text instead of calling the tool" : "no tool call in the answer", { nocall: true });
     if (bad) return pass({ af: "f", afw: "arguments not valid JSON" });
@@ -320,14 +345,14 @@ export function judge(kind, r) {
     return textOf(r) || tools.length ? pass() : fail("empty answer after an error result");
   }
   if (kind === "6") {
-    if (!tools.length) return fail(textOf(r) ? "answered in text instead of delegating" : "no tool call in the answer");
-    if (bad) return fail("tool call arguments are not valid JSON");
+    if (!tools.length) return fail(textOf(r) ? "answered in text instead of delegating" : "no tool call in the answer", { w: noteOf(textOf(r) ? "text, not delegating" : "no tool call", r) });
+    if (bad) return fail("tool call arguments are not valid JSON", { w: noteOf("arguments not valid JSON", r) });
     const call = tools.find((b) => b.name === AGENT_TOOL);
-    if (!call) return fail("tool call names a tool that was not offered");
+    if (!call) return fail("tool call names a tool that was not offered", { w: noteOf("another tool", r) });
     const v = argsOf(call).value;
-    if (typeof v.prompt !== "string" || v.prompt.trim().length < 10) return fail("the Agent call has no usable prompt");
-    if (!AGENT_TYPES.includes(v.subagent_type)) return fail("the Agent call names a subagent_type that was not offered");
-    if (typeof v.description !== "string") return fail("the Agent call lacks a description");
+    if (typeof v.prompt !== "string" || v.prompt.trim().length < 10) return fail("the Agent call has no usable prompt", { w: noteOf("no usable prompt", r) });
+    if (!AGENT_TYPES.includes(v.subagent_type)) return fail("the Agent call names a subagent_type that was not offered", { w: noteOf("unknown subagent_type", r) });
+    if (typeof v.description !== "string") return fail("the Agent call lacks a description", { w: noteOf("no description", r) });
     return pass();
   }
   if (kind === "3a") {
@@ -336,17 +361,19 @@ export function judge(kind, r) {
     const named = tools.map((b) => b.name);
     // the name round trip: the long MCP-style name comes back exactly (`nm`), or a call came back under a different name; no call at all says nothing about names
     const nm = named.includes(LONG_TOOL) ? "p" : named.length ? "f" : undefined;
-    return usable ? pass({ nm }) : fail("empty answer to the constructs request");
+    return usable ? pass({ nm }) : fail("empty answer to the constructs request", { empty: true, w: shapeOf(r) });
   }
   // 3b and 5: the large request was accepted and answered with something well formed; 3b also carries the parallel-call level (L4)
-  if (bad) return fail("tool call arguments are not valid JSON");
-  if (!usable) return fail("empty answer to the large request");
+  if (bad) return fail("tool call arguments are not valid JSON", { w: noteOf("arguments not valid JSON", r) });
+  if (!usable) return fail("empty answer to the large request", { empty: true, w: shapeOf(r) });
   if (r.streamError) return fail(`stream error: ${r.streamError}`);
   if (kind === "5") return pass();
   const echoes = tools.filter((b) => b.name === ECHO_TOOL);
+  // fewer than two calls because the budget ran out (256 tokens, a model that thinks first) is not a model that cannot call in parallel: the budget is asked once more, larger
+  if (echoes.length < 2 && budgetOut(r)) return inconclusive("empty", `output budget spent before the second parallel call (${shapeOf(r)})`);
   const par = echoes.length >= 2 && new Set(echoes.map((b) => b.id ?? b)).size >= 2 && echoes.every((b) => b.json !== "" && typeof argsOf(b).value.message === "string");
   return pass({ l4: par ? "p" : "f", ...(par ? {} : { l4why: echoes.length < 2 ? `${echoes.length} tool call instead of 2 parallel calls` : echoes.length >= 2 && echoes.some((b) => b.json === "") ? "the tool call arguments were not streamed (no argument deltas)" : "parallel tool calls share one id or lack the argument",
-    l4w: echoes.length < 2 ? `${echoes.length} call of 2` : echoes.some((b) => b.json === "") ? "args not streamed" : "shared id or no arg" }) });
+    l4w: noteOf(echoes.length < 2 ? `${echoes.length} call of 2` : echoes.some((b) => b.json === "") ? "args not streamed" : "shared id or no arg", r) }) });
 }
 
 /** A server that cannot take the AUTO tool choice ("auto" tool choice requires --enable-auto-tool-choice): only a FORCED choice can pass, so this routes to the forced fallback and is never a strike by itself. */
@@ -365,13 +392,15 @@ async function readBounded(res, limit) {
       if (done) break;
       bytes += value.byteLength; text += dec.decode(value, { stream: true });
     }
-    try { await Promise.race([Promise.resolve(reader.cancel()), new Promise((r) => setTimeout(r, 200).unref?.())]); } catch { /* closed */ }
+    let t;                                                                                       // a real (referenced) timer: a stalled cancel() must not leave the loop with nothing to wait for
+    try { await Promise.race([Promise.resolve(reader.cancel()), new Promise((r) => { t = setTimeout(r, 200); })]); } catch { /* closed */ }
+    clearTimeout(t);
     return text.slice(0, limit);
   } catch { return ""; }                                                                         // an unreadable body
 }
 
 /** One request and its judgement; `body` is the request text. Resolves `{v, ..., bytes, ms, inTok, outTok}` or `{aborted: true}`; never rejects. */
-async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, now = () => performance.now() }) {
+async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, maxTokens, now = () => performance.now() }) {
   const bytes = Buffer.byteLength(body);
   const t0 = now();
   const ac = new AbortController();
@@ -392,7 +421,7 @@ async function send(kind, body, { fetchImpl, url, key, timeoutMs, signal, now = 
       return { ...httpVerdict(kind, res.status, text, ra), http: res.status, body: text, ...tele() };
     }
     const rs = await readStream(res, { signal: ac.signal, expect: EXPECT_TOOLS[kind] });
-    return { ...judge(kind, rs), ...tele({ inTok: rs.inTok, outTok: rs.outTok, early: rs.early }) };
+    return { ...judge(kind, { ...rs, max: maxTokens }), ...tele({ inTok: rs.inTok, outTok: rs.outTok, early: rs.early }) };
   } catch (e) {
     if (timedOut) return { ...inconclusive("timeout", `no complete answer within ${timeoutMs} ms`), ...tele() };
     if (signal?.aborted) return { aborted: true };
@@ -420,7 +449,7 @@ function httpVerdict(kind, status, text, ra) {
     if (LIMIT_WORDS.test(text)) return inconclusive("rate", why, extra);
     // availability, or a 400 that names nothing about the request: never a verdict (pending upstream-unavailable, asked again by a later run). At the big step an unnamed 400 stays a size refusal.
     const msg400 = extractMessage(text);
-    if (isAvailabilityText(text) || (status === 400 && kind !== "5" && !SCHEMA_WORDS.test(msg400))) return inconclusive("error", why, { ...extra, reason: "upstream-unavailable", hint: clip(msg400).slice(0, 120) });
+    if (isAvailabilityText(text) || (status === 400 && kind !== "5" && !namesRequest(msg400))) return inconclusive("error", why, { ...extra, reason: "upstream-unavailable", hint: clip(msg400).slice(0, 120) });
     if (CC_WORDS.test(text) && (kind === "3a" || kind === "3b" || kind === "5")) return fail(why, { kind: "schema", ccFail: true });
     const size = status === 413 || SIZE_WORDS.test(text) || kind === "5";       // a refusal only at the big step, after the 157 KB step was accepted, is about size
     return fail(why, { kind: size && kind !== "3a" ? "size" : "schema", ...(NAME_WORDS.test(text) && kind === "3a" ? { nmFail: true } : {}), ...(GATEWAY_WORDS.test(text) ? { gw: true } : {}) });
@@ -437,7 +466,7 @@ export async function runKind(kind, { fetchImpl = fetch, url, key, model, maxTok
   const conn = { fetchImpl, url, key, signal };
   const budget = maxTokens ?? BUDGETS[kind];
   const limit = timeoutMs ?? timeouts[CLASS_OF[kind]];
-  const go = (k) => send(k, JSON.stringify(buildBody(k, model, budget, { noCc })), { ...conn, timeoutMs: limit });
+  const go = (k) => send(k, JSON.stringify(buildBody(k, model, budget, { noCc })), { ...conn, timeoutMs: limit, maxTokens: budget });
   const first = await go(kind);
   if (first.aborted) return first;
   if ((kind === "1" || kind === "1a") && first.v === "f" && (first.nocall || autoRefused(first))) {
@@ -513,6 +542,15 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     }
     // a 400 that names cache_control: note it, stop sending the markers to this model and ask the same request again so the level is still learned
     if (r.ccFail && !opts.noCc) { state.noCc = true; state.ccFail = true; const again = await ask(kind); return again.aborted || again.v === "i" ? again : { ...again, cc: "f" }; }
+    // an EMPTY answer to the constructs request (3a) is asked once more without the cache_control markers, to tell a provider that goes silent on them (the markers are what fails: `cc` f, the level
+    // is still learned) from one that is silent on the constructs themselves (the failure stands). The markers stay off only when the second answer proves them the cause.
+    if (r.v === "f" && r.empty && kind === "3a" && !opts.noCc) {
+      state.noCc = true;
+      const again = await ask(kind);
+      if (again.v === "p") { state.ccFail = true; return { ...again, cc: "f" }; }
+      state.noCc = false;
+      return again.aborted || again.v === "i" ? again : r;
+    }
     return r;
   };
   const stop = (r) => (r.slow
@@ -524,21 +562,21 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     : { inconclusive: { s: r.s, why: r.why, ...(r.ra !== undefined ? { ra: r.ra } : {}), ...(r.http ? { http: r.http } : {}), ...(r.reason ? { reason: r.reason } : {}), ...(r.hint ? { hint: r.hint } : {}) }, requests, tele });
 
   const bigFirst = order === "big-first" && ctx >= 200000 && want.includes(5) && deep;
-  const row = (r, extra = {}) => ({ v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...(r.gw ? { gw: true } : {}), ...extra });
+  const row = (r, extra = {}) => ({ v: r.v, ...(r.why ? { why: r.why } : {}), ...(r.kind ? { kind: r.kind } : {}), ...(r.gw ? { gw: true } : {}), ...(r.w ? { w: r.w } : {}), ...extra });
   // L3: 3a (constructs), then 3b (157 KB, which also answers L4). 3a's verdict is kept in `state` so a retry after an inconclusive 3b does not ask it again.
   const doL3 = async () => {
     if (!state.l3a) {
       const a = await ask("3a");
       if (a.aborted) return a;
       if (a.v === "i") return stop(a);
-      state.l3a = { v: a.v, why: a.why, kind: a.kind, nm: a.nmFail ? "f" : a.nm, cc: state.ccFail ? "f" : a.cc ?? (state.noCc ? undefined : "p") };
+      state.l3a = { v: a.v, why: a.why, kind: a.kind, w: a.w, nm: a.nmFail ? "f" : a.nm, cc: state.ccFail ? "f" : a.cc ?? (state.noCc ? undefined : "p") };
     }
     const { nm, cc } = state.l3a, marks = { ...(nm ? { nm } : {}), ...(cc ? { cc } : {}) };
-    if (state.l3a.v === "f") { done[3] = { v: "f", why: `[3a] ${state.l3a.why}`, kind: state.l3a.kind, ...marks }; return null; }
+    if (state.l3a.v === "f") { done[3] = { v: "f", why: `[3a] ${state.l3a.why}`, kind: state.l3a.kind, ...(state.l3a.w ? { w: state.l3a.w } : {}), ...marks }; return null; }
     const b = await ask("3b");
     if (b.aborted) return b;
     if (b.v === "i") return stop(b);
-    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), bytes: b.bytes, ...marks };
+    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), ...(b.w ? { w: b.w } : {}), bytes: b.bytes, ...marks };
     if (b.v === "p" && b.l4) done[4] = { v: b.l4, ...(b.l4why ? { why: b.l4why } : {}), ...(b.l4w ? { w: b.l4w } : {}), bytes: b.bytes };
     return null;
   };

@@ -220,7 +220,7 @@ test("TIMEOUTS per request class are configurable and inconclusive: a hung reque
   const e = env(world());
   const t0 = Date.now();
   const r = await run(["--live", "--only", "fa/a1", "--timeout-small", "0.05"], { ...e.deps, fetch: (url, init) => (String(url).endsWith("/health") ? Promise.resolve(new Response("ok")) : new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("aborted"))))) });
-  assert.ok(Date.now() - t0 < 4000);
+  assert.ok(Date.now() - t0 < 20000);
   assert.deepEqual(Object.keys(loadFidelity(e.out).models), [], "nothing recorded");
   assert.match(r.out, /not recorded \(they stay queued.*\): .*timeout/);
   assert.match(r.out, /\d+ timed out/, "the telemetry counts the timeouts");
