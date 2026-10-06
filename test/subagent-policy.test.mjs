@@ -225,7 +225,7 @@ test("Q6 rank key 2b: class 0 (price 0, free-tier row) above class 0t (ft row) a
   // D1: AGE is no longer a band key and no longer outranks the price class: a stale probe on alpha leaves it in price class 0, above the fresh 0t rows (recency only orders INSIDE a band)
   const stale = await fx((d) => { q6Mutate(d); const b = rd(path.join(d, "bench.json")); b.models[alpha].a = NOW / 1000 - 20 * 86400; wr(path.join(d, "bench.json"), b); });
   const rs = run(stale.g, { mode: "free", freeScope: "providers+deposit", source: "all-providers" });
-  assert.equal(rs.groups.get(alpha).rk[15], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
+  assert.equal(rs.groups.get(alpha).rk[14], 2, "alpha is recency class 2 (older than 14 days): an ordering key");
   assert.equal(rs.groups.get(alpha).rk[1], 0, "and health (the latest status is ok) is yes: age is ignored");
   assert.ok(sels(rs).indexOf(alpha) < sels(rs).indexOf(fxd), "the price class (band key) beats recency (ordering key): an older class 0 row still ranks above a fresh 0t row");
 });
@@ -628,7 +628,7 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; the LAST ordering
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 2 * day + 3600, l: 1 } } });   // newer than the probe: the overlay wins (a tie is the probe's)
   });
   const r = run(g, { mode: "dynamic" });
-  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[15];
+  const k2 = (x) => r.groups.get(`fx-free-a/${x}`).rk[14];
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map(k2), [0, 1, 2], "recency class: live and fresh, fresh, older");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).rk[1]), [0, 0, 0], "health (latest status ok) is yes for all three: age is ignored");
   assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => r.groups.get(`fx-free-a/${x}`).b), [r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b, r.groups.get("fx-free-a/fxa-alpha").b], "and the three rows share ONE band");
@@ -642,7 +642,7 @@ test("F8 + D1: the recency class (live<=7d, fresh<=14d, older; the LAST ordering
     wr(path.join(d, "observed.json"), { schema: 1, writtenAt: "2026-10-02T00:00:00.000Z", feed: "ok", models: { "fx-free-a/fxa-alpha": { s: "ok", t: 500, a: NOW / 1000 - 8 * day + 3600, l: 1 } } });
   });
   const e = run(edge.g, { mode: "dynamic" });
-  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[15]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
+  assert.deepEqual(["fxa-alpha", "fxa-gamma", "fxa-beta"].map((x) => e.groups.get(`fx-free-a/${x}`).rk[14]), [1, 1, 2], "live at 8 d is class 1; 14 d exactly is class 1; 14 d + 1 s is class 2");
 });
 
 test("D-bh: the TTFT bucket is a QUANTILE of the eligible set (fast, ok, slow, very slow), ahead of the ctx class; a missing TTFT is bucket 4, last", async () => {
@@ -665,11 +665,11 @@ test("D-bh: the TTFT bucket is a QUANTILE of the eligible set (fast, ok, slow, v
   assert.ok(r.models.every((m) => m.h >= 0 && m.h <= 3), "every row of this fixture has a TTFT, so buckets 0 to 3");
   // the rank key: TTFT bucket (index 9) is ahead of the ctx class (index 10)
   const keys = r.groups.get("fx-free-a/fxa-alpha").rk;
-  assert.equal(keys[12], h("fx-free-a/fxa-alpha")); assert.equal(keys[13], 3, "alpha has 200k: ctx class 3 (>= 200k)");
+  assert.equal(keys[11], h("fx-free-a/fxa-alpha")); assert.equal(keys[12], 3, "alpha has 200k: ctx class 3 (>= 200k)");
   const none = await fx((d) => { const b = rd(path.join(d, "bench.json")); delete b.models["fx-free-a/fxa-alpha"].t; wr(path.join(d, "bench.json"), b); });
   const rn = run(none.g, { mode: "dynamic" });
   assert.equal(cell(rn, "fx-free-a/fxa-alpha").h, 4, "a missing TTFT is bucket 4: no TTFT recorded");
-  assert.deepEqual(rn.groups.get("fx-free-a/fxa-alpha").rk.slice(12, 15).length, 3);
+  assert.deepEqual(rn.groups.get("fx-free-a/fxa-alpha").rk.slice(11, 14).length, 3);
 });
 
 test("F9: a saved owner file always loads again: the allow list is bounded in count and length and saveOwner checks the serialized size", () => {
@@ -1058,10 +1058,10 @@ test("D-bg: the asked model's own context never raises the floor: every ctxHint 
 });
 
 test("D-bh: ctx CLASSES (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below) replace raw ctx: two rows in one class tie on the class key whatever their raw ctx", () => {
-  const cls = (c) => funnel(syn({ pa: [{ id: "x", ctx: c }] }), T()).groups.get("pa/x").rk[13];
+  const cls = (c) => funnel(syn({ pa: [{ id: "x", ctx: c }] }), T()).groups.get("pa/x").rk[12];
   assert.deepEqual([2000000, 1000000, 999999, 524288, 512000, 511999, 262144, 256000, 255999, 200000, 199999, 131072, 128000, 127999, 64000].map(cls), [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5]);
   const r = funnel(syn({ pa: [{ id: "a", ctx: 1000000, t: 500 }, { id: "b", ctx: 1500000, t: 500 }] }), T());
-  assert.equal(r.groups.get("pa/a").rk[13], r.groups.get("pa/b").rk[13], "1M and 1.5M are the same class");
+  assert.equal(r.groups.get("pa/a").rk[12], r.groups.get("pa/b").rk[12], "1M and 1.5M are the same class");
   assert.equal(r.groups.get("pa/a").g, r.groups.get("pa/b").g, "so they are one tie group (raw ctx is no longer a rank key)");
 });
 
@@ -1089,7 +1089,7 @@ test("D-bi: an unknown ctx with a same-name sibling of known ctx >= 128k gets an
   assert.equal(row("pb/lonely").ci, undefined, "no sibling, no inference");
   assert.equal(row("pb/model-w:free").ci, undefined, "siblings of 1M and 64k: the SMALLEST decides, so nothing is inferred");
   assert.equal(row("pa/model-x").ci, undefined, "a measured row is never flagged");
-  assert.equal(r.groups.get("pb/model-x:free").rk[13], 4, "never a ranking class above >= 128k");
+  assert.equal(r.groups.get("pb/model-x:free").rk[12], 4, "never a ranking class above >= 128k");
   assert.equal(r.counts.ctxInferred, 2); assert.equal(r.ctxStats.inferred, 2);
   assert.equal(r.substitutable["*"], 6, "known or inferred 128k+: pa x, y and w, pc y, and the two inferred pb rows (model-z 64k, pc w 64k, z@eu, lonely and w:free are not)");
   assert.deepEqual(sels(funnel(inp, T({ ctx: "128k" }))).filter((s) => s.startsWith("pb/")), [], "a hard 128k floor tests the MEASURED ctx: the inferred rows are left out (the inferred prior serves only the default substitute floor)");
@@ -1206,9 +1206,9 @@ test("rank order: an OLDER-probe ok model with better TTFT outranks a FRESHER-pr
   const bench = { "pa/old-fast": { a: NOW / 1000 - 20 * day }, "pa/new-slow": { a: NOW / 1000 - 3600 }, "pa/mid1": { a: NOW / 1000 - 3600 }, "pa/mid2": { a: NOW / 1000 - 3600 } };
   const r = funnel(syn(spec, { bench }), T());
   const g = (id) => r.groups.get(`pa/${id}`);
-  assert.equal(g("old-fast").rk.length, 18, "eighteen keys");
-  assert.deepEqual([g("old-fast").rk[15], g("new-slow").rk[15]], [2, 1], "old-fast is recency class 2 (older than 14 days), new-slow class 1");
-  assert.ok(g("old-fast").rk[12] < g("new-slow").rk[12], "and its TTFT bucket (key 8) is better");
+  assert.equal(g("old-fast").rk.length, 17, "seventeen keys");
+  assert.deepEqual([g("old-fast").rk[14], g("new-slow").rk[14]], [2, 1], "old-fast is recency class 2 (older than 14 days), new-slow class 1");
+  assert.ok(g("old-fast").rk[11] < g("new-slow").rk[11], "and its TTFT bucket (key 8) is better");
   assert.equal(r.models[0].s, "pa/old-fast", "the older probe wins on latency");
   assert.equal(r.models[r.models.length - 1].s, "pa/new-slow");
   assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "all one band: health is calendar-independent and recency is no band key");
@@ -1218,7 +1218,7 @@ test("rank order: an OLDER-probe ok model with better TTFT outranks a FRESHER-pr
   // recency is still an ordering key: with every earlier key equal, the fresher probe leads
   const e = funnel(syn({ pa: [{ id: "a", ctx: 200000, t: 500 }, { id: "b", ctx: 200000, t: 500 }] }, { bench: { "pa/a": { a: NOW / 1000 - 20 * day }, "pa/b": { a: NOW / 1000 - 60 } } }), T());
   assert.equal(e.models[0].s, "pa/b", "recency decides only when TTFT, ctx class and price tie");
-  assert.deepEqual(r.groups.get("pa/mid1").rk.slice(12, 14), [r.groups.get("pa/mid1").rk[12], 3], "key layout: [.. 12 TTFT bucket, 13 ctx class, 14 price value, 15 recency, 16 alias, 17 spawn marker]");
+  assert.deepEqual(r.groups.get("pa/mid1").rk.slice(11, 13), [r.groups.get("pa/mid1").rk[11], 3], "key layout: [.. 11 TTFT bucket, 12 ctx class, 13 price value, 14 recency, 15 alias, 16 spawn marker]");
 });
 
 test("final tie-break: rows equal on every key are ordered by a hash of the id (deterministic, independent of input order), not alphabetically", () => {
@@ -1522,7 +1522,7 @@ test("rank (decision 5): the demotion key sits BETWEEN the strike key and the bi
   assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "all one band");
   assert.deepEqual(r.models.map((m) => [m.s.slice(3, 4), r.groups.get(m.s).rk[4], r.groups.get(m.s).rk[5], r.groups.get(m.s).rk[6]]), [["a", 0, 0, 0], ["b", 0, 0, 2], ["c", 0, 1, 0], ["d", 1, 0, 0]]);
   assert.deepEqual(RANK_LABELS.slice(4, 8), ["first strike", "sweep demotion (blocked by the sweep, never excluded)", "big step (v only)", "L4 (v only)"]);
-  assert.match(RANK_LABELS.at(-1), /^spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)$/); assert.equal(RANK_LABELS.length, 18);
+  assert.match(RANK_LABELS.at(-1), /^spawn failed \(sp: a last tie-breaker; matters only for a row that acts as a MAIN agent\)$/); assert.equal(RANK_LABELS.length, 17);
   // the spawn marker: a row that failed the spawn call but has the better TTFT outranks a clean row with the worse TTFT; at equal everything else the clean row is first
   const spec2 = { pa: [{ id: "clean-slow", ctx: 200000, t: 900 }, { id: "sp-fast", ctx: 200000, t: 100 }, { id: "clean-fast2", ctx: 200000, t: 100 }] };
   const base = { t: "t", lvr: "ppnn", at: AT(3) };
@@ -1532,32 +1532,33 @@ test("rank (decision 5): the demotion key sits BETWEEN the strike key and the bi
   assert.ok(r2.models.findIndex((m) => m.s === "pa/clean-fast2") < r2.models.findIndex((m) => m.s === "pa/sp-fast"), "equal TTFT: the clean row first");
 });
 
-test("H2 markers are rank keys after L4 and before TTFT, each `clean above flagged`: fc p heaviest, then af f, then pt f, then er or br f; sp f is the weakest flag and the LAST key; none is a band key and none excludes", () => {
-  const spec = { pa: ["clean", "fc", "af", "pt", "erbr", "br", "sp", "afsp", "ptp", "ptx"].map((id) => ({ id, ctx: 200000, t: 100 })) };
+test("H2 markers are rank keys after L4 and before TTFT, each `clean above flagged`: fc p heaviest, then af f, then er or br f; sp f is the weakest flag and the LAST key; none is a band key and none excludes; a stored legacy `pt` marker is tolerated and IGNORED (it never ranks)", () => {
+  const spec = { pa: ["clean", "fc", "af", "erbr", "br", "sp", "afsp", "ptf", "ptp", "ptx"].map((id) => ({ id, ctx: 200000, t: 100 })) };
   const base = { t: "t", lvr: "ppnn", at: AT(3) };
-  const tf = { models: { "pa/clean": base, "pa/fc": { ...base, fc: "p" }, "pa/af": { ...base, af: "f" }, "pa/pt": { ...base, pt: "f" }, "pa/erbr": { ...base, er: "f" }, "pa/br": { ...base, br: "f" }, "pa/sp": { ...base, sp: "f" }, "pa/afsp": { ...base, af: "f", sp: "f" },
-    "pa/ptp": { ...base, pt: "p" }, "pa/ptx": { ...base, pt: "weird" } } };
+  const tf = { models: { "pa/clean": base, "pa/fc": { ...base, fc: "p" }, "pa/af": { ...base, af: "f" }, "pa/erbr": { ...base, er: "f" }, "pa/br": { ...base, br: "f" }, "pa/sp": { ...base, sp: "f" }, "pa/afsp": { ...base, af: "f", sp: "f" },
+    "pa/ptf": { ...base, pt: "f" }, "pa/ptp": { ...base, pt: "p" }, "pa/ptx": { ...base, pt: "weird" } } };
   const r = funnel(syn(spec, { tf }), T());
   assert.equal(r.models.length, 10, "nothing is excluded"); assert.equal(new Set(r.models.map((m) => m.b)).size, 1, "no marker is a band key");
   const k = (id) => r.groups.get(`pa/${id}`).rk;
-  const marks = (id) => k(id).slice(8, 12).concat(k(id).at(-1));                           // fc, af, pt, er-or-br, ..., and the LAST key sp
-  assert.deepEqual(marks("clean"), [0, 0, 0, 0, 0]);
-  assert.deepEqual(["fc", "af", "pt", "erbr", "br", "sp", "afsp", "ptp", "ptx"].map(marks), [[1, 0, 0, 0, 0], [0, 1, 0, 0, 0], [0, 0, 1, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 1, 0], [0, 0, 0, 0, 1], [0, 1, 0, 0, 1], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]],
-    "pt f is a flag; pt p (the full request passed) and an unknown pt value are clean");
+  const marks = (id) => k(id).slice(8, 11).concat(k(id).at(-1));                           // fc, af, er-or-br, ..., and the LAST key sp
+  assert.deepEqual(marks("clean"), [0, 0, 0, 0]);
+  assert.deepEqual(["fc", "af", "erbr", "br", "sp", "afsp", "ptf", "ptp", "ptx"].map(marks), [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 1, 0], [0, 0, 0, 1], [0, 1, 0, 1], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], "a stored pt marker (f, p or anything) is not a rank key");
+  assert.equal(k("clean").length, 17, "seventeen keys");
   const order = r.models.map((m) => m.s.slice(3));
   assert.equal(order.at(-1), "fc", "forced-choice-only is the heaviest flag"); assert.equal(order.indexOf("sp") < order.indexOf("erbr"), true, "sp is the weakest flag");
-  assert.ok(Math.max(order.indexOf("erbr"), order.indexOf("br")) < order.indexOf("pt") && order.indexOf("pt") < order.indexOf("af") && order.indexOf("af") < order.indexOf("afsp") && order.indexOf("afsp") < order.indexOf("fc"), order.join(" "));
-  assert.ok(["clean", "ptp", "ptx"].every((c) => order.indexOf(c) < order.indexOf("sp")), "clean, pt p and an unknown pt rank above even the weakest flag");
+  assert.ok(Math.max(order.indexOf("erbr"), order.indexOf("br")) < order.indexOf("af") && order.indexOf("af") < order.indexOf("afsp") && order.indexOf("afsp") < order.indexOf("fc"), order.join(" "));
+  assert.ok(["clean", "ptf", "ptp", "ptx"].every((c) => order.indexOf(c) < order.indexOf("sp")), "a legacy pt row ranks with the clean rows, above even the weakest flag");
   const spec2 = { aihubmix: [{ id: "coding-minimax-m3-free", ctx: 200000, t: 200 }, { id: "z-clean", ctx: 200000, t: 800 }], tokenharbor: [{ id: "mimo-v2.6-flash:free", ctx: 200000, t: 200 }], routewayai: [{ id: "gemma-4-26b-a4b-it-musica:free", ctx: 200000, t: 200 }] };
   const tf2 = { models: { "aihubmix/coding-minimax-m3-free": { ...base, af: "f" }, "aihubmix/z-clean": base, "tokenharbor/mimo-v2.6-flash:free": { ...base, sp: "f" }, "routewayai/gemma-4-26b-a4b-it-musica:free": { ...base, fc: "p" } } };
   assert.deepEqual(funnel(syn(spec2, { tf: tf2 }), T()).models.map((m) => m.s), ["tokenharbor/mimo-v2.6-flash:free", "aihubmix/z-clean", "aihubmix/coding-minimax-m3-free", "routewayai/gemma-4-26b-a4b-it-musica:free"],
     "the spawn marker is a tie-breaker only: the fast spawn-failed row leads the slow clean one; af f, then fc p, rank below both");
-  // pt keeps the class (a v row stays v) and does not touch a row without the marker: the compiled rows of a fixture without pt are the same as before the key existed
+  // a legacy `pt: "f"` changes nothing at all: same class, same position, identical compiled rows (so an identical routing content hash) as the same fixture without the field
   const v = funnel(syn({ pa: [{ id: "vrow", ctx: 200000, t: 100 }, { id: "vclean", ctx: 200000, t: 200 }] }, { tf: { models: { "pa/vrow": { t: "v", lvr: "pppp", at: AT(3), pt: "f" }, "pa/vclean": { t: "v", lvr: "pppp", at: AT(3) } } } }), T());
-  assert.deepEqual(v.models.map((m) => [m.s, m.t]), [["pa/vclean", "v"], ["pa/vrow", "v"]], "pt f never changes the class: both are v, the flagged one ranks below");
-  const without = funnel(syn(spec, { tf: { models: Object.fromEntries(Object.keys(tf.models).map((s) => [s, base])) } }), T());
-  const stripped = funnel(syn(spec, { tf: { models: Object.fromEntries(Object.keys(tf.models).map((s) => [s, { ...base, pt: "p" }])) } }), T());
-  assert.deepEqual(without.models, stripped.models, "pt p equals no pt: the compiled rows (and so the routing content hash) are identical");
+  assert.deepEqual(v.models.map((m) => [m.s, m.t]), [["pa/vrow", "v"], ["pa/vclean", "v"]], "pt f ranks like a row without it: the better TTFT leads, both stay v");
+  const strip = (models) => Object.fromEntries(Object.entries(models).map(([s, x]) => [s, Object.fromEntries(Object.entries(x).filter(([f2]) => f2 !== "pt"))]));
+  const withPt = funnel(syn(spec, { tf: { models: tf.models } }), T()), noPt = funnel(syn(spec, { tf: { models: strip(tf.models) } }), T());
+  assert.deepEqual(withPt.models, noPt.models, "the compiled rows are identical with and without the legacy pt field");
+  assert.deepEqual(withPt.models.map((m) => m.s), noPt.models.map((m) => m.s));
 });
 
 test("M2 a record tagged xw:gateway is left out as gateway-compat (a visible reason, counted, warned), whatever its tier; a row without the tag fails as before; a newer record without the tag is not gateway-compat; an --allow pin does NOT override it (nor an unreachable row)", () => {
@@ -1646,9 +1647,9 @@ test("explain lines (sweepExplainLines and STAGE_PLAIN): the demotion (soft, har
   assert.match(lines(grp({ reprobeSkipped: { source: "pending" } }))[0], /^re-probe skipped: its bench status is ok on a sample older than 2 days, but the tool sweep found it gone \(a hard answer\)/);
   assert.ok(lines(grp()).some((x) => /^provider pattern: pa: 6 of 6 bench-ok rows pending error: the provider, not this model, is probably the cause$/.test(x)));
   assert.ok(lines(grp(), owner, { providerPatterns: [] }).length === 0, "nothing to say, nothing printed");
-  const mk = lines(grp({ mk: { fc: 1, af: 1, pt: 1, erbr: 0, sp: 1 } })).find((x) => /^tool-test markers/.test(x));
-  assert.match(lines(grp({ mk: { fc: 0, af: 0, pt: 1, erbr: 0, sp: 0 } })).find((x) => /^tool-test markers/.test(x)) ?? "", /^tool-test markers \(rank keys, clean above flagged\): pt: pattern schemas make the answer empty through the gateway/, "pt alone is a marker line");
-  assert.match(mk, /fc: the first call passed only when forced; af: argument fidelity failed; pt: pattern schemas make the answer empty through the gateway \(it passed once the patterns were stripped\); sp: launching a subagent failed \(the LAST rank key, a tie-breaker; matters only when this model acts as a MAIN agent\)$/);
+  const mk = lines(grp({ mk: { fc: 1, af: 1, erbr: 0, sp: 1 } })).find((x) => /^tool-test markers/.test(x));
+  assert.ok(!lines(grp({ mk: { fc: 0, af: 0, pt: 1, erbr: 0, sp: 0 } })).some((x) => /^tool-test markers/.test(x)), "a legacy pt mark prints no marker line: it never ranks");
+  assert.match(mk, /fc: the first call passed only when forced; af: argument fidelity failed; sp: launching a subagent failed \(the LAST rank key, a tie-breaker; matters only when this model acts as a MAIN agent\)$/);
   for (const stage of ["unreachable", "gateway-compat"]) assert.match(lines(grp({ stage }), { allow: ["pa/m"] }).join("\n"), new RegExp(`^allow pin: your --allow pin for pa/m does NOT override ${stage}`, "m"));
   assert.ok(!lines(grp({ stage: "unreachable" }), { allow: [] }).some((x) => /allow pin/.test(x)), "no pin, no line");
   assert.match(lib.STAGE_PLAIN(grp({ stage: "unreachable", unreachable: { r: "gone", source: "pending", at: "A" } }), owner), /^the tool sweep found it gone \(a hard answer the sweep does not ask again\), last at A, and no confirmed pass exists.*An --allow pin does not override this$/);

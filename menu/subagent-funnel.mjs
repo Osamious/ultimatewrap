@@ -136,7 +136,7 @@ export const SWEEP_DEMOTE = SWEEP_SOFT;                                         
 export const SWEEP_HARD = Object.freeze(["gone", "pay", "auth"]);
 /** The rank keys, in order (the one list `explain` prints). The first four are the BAND keys; the rest order rows INSIDE a band. Every marker key is `clean above flagged`; the spawn marker is the LAST key, a tie-breaker only. */
 export const RANK_LABELS = Object.freeze(["tool tier (band)", "health: latest status ok (band)", "ctx preference (band)", "price class 2b (band)", "first strike", "sweep demotion (blocked by the sweep, never excluded)",
-  "big step (v only)", "L4 (v only)", "forced-choice only (fc)", "argument fidelity failed (af)", "pattern schemas make the answer empty through the gateway (pt)", "tool_result use failed (er, br)",
+  "big step (v only)", "L4 (v only)", "forced-choice only (fc)", "argument fidelity failed (af)", "tool_result use failed (er, br)",
   "ttft quantile bucket", "ctx class", "price 2b", "recency (order only, calendar-dependent)", "alias", "spawn failed (sp: a last tie-breaker; matters only for a row that acts as a MAIN agent)"]);
 /** Mirror of the sweep module's confirmedProviders and holdIsWrong: a test pins the two to each other. */
 export const confirmedByProvider = (models) => {
@@ -352,8 +352,8 @@ export function funnel(inputs, toggles) {
     if (seed?.kind === "cap" && basis !== "provenance" && (g.limit === 0 || seed.capBelow < g.limit)) { g.limit = seed.capBelow; g.limitSource = "known-issue"; }
     // sa-T3: a provisional first strike (refresh/tool-fidelity.mjs: strikes 1) is read from ANY record, class or not; it ranks below a clean row of the same class and never excludes
     g.tfStrike = tf && tf.strikes === 1 ? 1 : 0;
-    // H2 markers (never a band key, never an exclusion): clean above flagged. fc p = L1 passed only when the call was forced; af f = argument fidelity failed; pt f = the answer to the constructs/big request was EMPTY until the `pattern` keywords were stripped from the tool schemas (pt p, or absent, is clean; any other value is ignored); er f or br f = the is_error case or the use of a long tool_result failed; sp f = the spawn call failed
-    g.mk = basis === "tool-fidelity" ? { fc: tf.fc === "p" ? 1 : 0, af: tf.af === "f" ? 1 : 0, pt: tf.pt === "f" ? 1 : 0, erbr: tf.er === "f" || tf.br === "f" ? 1 : 0, sp: tf.sp === "f" ? 1 : 0 } : { fc: 0, af: 0, pt: 0, erbr: 0, sp: 0 };
+    // H2 markers (never a band key, never an exclusion): clean above flagged. fc p = L1 passed only when the call was forced; af f = argument fidelity failed; (a stored `pt` marker of an older sweep is tolerated and IGNORED: it never ranks); er f or br f = the is_error case or the use of a long tool_result failed; sp f = the spawn call failed
+    g.mk = basis === "tool-fidelity" ? { fc: tf.fc === "p" ? 1 : 0, af: tf.af === "f" ? 1 : 0, erbr: tf.er === "f" || tf.br === "f" ? 1 : 0, sp: tf.sp === "f" ? 1 : 0 } : { fc: 0, af: 0, erbr: 0, sp: 0 };
     if (!toolEligible(tier, T.unverified, allow.has(g.selector))) { counts.unverifiedExcluded += 1; g.stage = tier === "x" ? (basis === "known-issue" ? "known-bad" : "tools-failed") : "tools-unverified"; continue; }
     counts.toolsPass += 1;
     g.stage = "tools-pass";
@@ -432,8 +432,8 @@ export function funnel(inputs, toggles) {
   // band never depends on the calendar), 3 context preference class (only under a soft ctx preference prefer-256k, prefer-512k or prefer-1m: rows at or above it first), 4 price class (free
   // providers under mode free). Then, INSIDE a band only, the ordering keys: 5 strike (a provisional first tool-fidelity strike after a clean row, sa-T3), 6 sweep demotion (the tool sweep failed at its last 3+ attempts for a reason that is not "gone" or "error" and no newer pass
   // exists: ranked below clean rows, never excluded), 7 big step and 8 L4 (class v only), then the H2 MARKERS, each "clean above flagged" and none a band key: 9 fc (forced-choice only), 10 af (argument fidelity failed),
-  // 11 pt (pattern schemas make the answer empty through the gateway), 12 er or br (the is_error case or the long tool_result failed), then 13 TTFT QUANTILE bucket (D-bh), 14 ctx CLASS (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below or unknown; an inferred ctx is at most the 128k class),
-  // 15 price value, 16 RECENCY class (live within 7 days, probe within 14 days, older: CALENDAR-DEPENDENT, so it is an ordering key only: it never outranks latency or context), 17 non-alias first, and LAST 18 sp (the spawn
+  // 11 er or br (the is_error case or the long tool_result failed), then 12 TTFT QUANTILE bucket (D-bh), 13 ctx CLASS (>= 1M, >= 512k, >= 256k, >= 200k, >= 128k, below or unknown; an inferred ctx is at most the 128k class),
+  // 14 price value, 15 RECENCY class (live within 7 days, probe within 14 days, older: CALENDAR-DEPENDENT, so it is an ordering key only: it never outranks latency or context), 16 non-alias first, and LAST 17 sp (the spawn
   // call failed: a tie-breaker that matters only for a row that acts as a MAIN agent); then a hash of the id (FNV-1a), then the id. RANK_LABELS names them.
   const price2b = T.mode === "free" && T.freeScope !== "models";
   // TTFT QUANTILE buckets over the eligible set (D-bh): fast / ok / slow / very slow are the quartiles of the TTFTs of the rows in THIS set (nearest rank), so the buckets are equal-sized whatever the data
@@ -462,7 +462,7 @@ export function funnel(inputs, toggles) {
     // inside class v (never elsewhere): big step passed, then not run, then failed; then L4 the same way. Constant 0 outside v, so no other row moves.
     const inV = g.toolTier === "v" && g.toolBasis === "tool-fidelity";
     const pnf = { p: 0, n: 1, f: 2 };
-    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxPref, pc, g.tfStrike ? 1 : 0, g.demoted ? 1 : 0, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, g.mk.fc, g.mk.af, g.mk.pt, g.mk.erbr, h, ctxClassOf(g.c), pv, recency, g.alias ? 1 : 0, g.mk.sp];
+    return [TOOL_RANK[g.toolTier] ?? 2, healthOk, ctxPref, pc, g.tfStrike ? 1 : 0, g.demoted ? 1 : 0, inV ? pnf[g.tfBig] : 0, inV ? pnf[g.tfL4] : 0, g.mk.fc, g.mk.af, g.mk.erbr, h, ctxClassOf(g.c), pv, recency, g.alias ? 1 : 0, g.mk.sp];
   };
   for (const g of set) g.rk = keyOf(g);
   const cmpKeys = (a, b) => { for (let i = 0; i < a.rk.length; i++) if (a.rk[i] !== b.rk[i]) return a.rk[i] - b.rk[i]; return 0; };
