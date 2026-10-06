@@ -386,7 +386,8 @@ test("the REAL stub (loopback, ephemeral port): script.decide answers 429 with R
  * the set, cooling, counters. `bug` injects one defect each.
  */
 function fakeWorld(bug = {}) {
-  const w = { policy: null, files: new Map(), flag: false, counters: {}, warnings: [], agents: [], classify: [], sticky: new Map(), main: new Map(), script: {}, cooling: new Set(), overlay: new Set(), gw: { pid: 100, serviceSha: "s" }, corePid: 200, blocked: new Set(), workers: bug.workers ?? 1, seq: 0, records: [], torn: false, tornCounted: false };
+  const w = { policy: null, files: new Map(), flag: false, counters: {}, warnings: [], agents: [], classify: [], sticky: new Map(), main: new Map(), script: {}, cooling: new Set(), overlay: new Set(), gw: { pid: 100, serviceSha: "s" }, corePid: 200, blocked: new Set(), workers: bug.workers ?? 1, seq: 0, records: [], torn: false, tornCounted: false,
+    decisions: [], published: { counters: {}, warnings: [], cooling: [] }, logFd: false, overlayPending: new Set() };
   const count = (k, n = 1) => { w.counters[k] = (w.counters[k] ?? 0) + n; };
   const stub = { records: w.records, setScript: (s) => { w.script = s ?? {}; }, clear: () => { w.records.length = 0; }, last: () => w.records[w.records.length - 1] };
   const rows = () => (w.policy && typeof w.policy === "object" ? w.policy.models : []);
@@ -398,6 +399,10 @@ function fakeWorld(bug = {}) {
     w.records.push(r);
     return st;
   };
+  const cooled = (m) => w.cooling.has(m) || w.cooling.has("prov:uwstub");                 // router coolFail: two DISTINCT models of one provider failing within five minutes cool the provider key too
+  const coolFail = (m) => { const others = [...w.cooling].filter((k) => k !== m && !k.startsWith("prov:")); w.cooling.add(m); if (others.length) w.cooling.add("prov:uwstub"); };
+  const snapshot = () => ({ counters: { ...w.counters }, warnings: structuredClone(w.warnings.concat(w.blocked.size ? [{ code: "LOG_DROPPED" }] : [])), cooling: [...w.cooling].map((k) => ({ key: k, rung: 0, leftSec: 120, fails: 1 })) });
+  const publish = () => { w.published = snapshot(); };
   const hash = (s) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
   const K = 3;
   const scan = (exclude = new Set()) => {                                               // pickSubstitute: first K usable non-cooling rows of the lead band; a band is never mixed into the lead's
@@ -405,14 +410,15 @@ function fakeWorld(bug = {}) {
     for (const r of rows()) {
       if (exclude.has(r.s)) continue;
       if (!bug.noBands && lead && r.b !== lead.b) break;
-      if (!bug.coolingIgnored && (w.cooling.has(r.s) || w.overlay.has(r.s))) { if (chill.length < K) chill.push(r); continue; }
+      if (!bug.coolingIgnored && (cooled(r.s) || w.overlay.has(r.s))) { if (chill.length < K) chill.push(r); continue; }
       if (!lead) lead = r;
       got.push(r); if (got.length >= K) break;
     }
     return { got, chill };
   };
-  const pickSub = (aid) => { const { got, chill } = scan(); const pool = got.length ? got : chill.filter((r) => r.b === chill[0]?.b); return pool.length ? (bug.noSpread ? pool[0] : pool[hash(aid) % pool.length]).s : null; };
-  const handoffTo = (cur) => (bug.paidHandoff ? ["uwstub/m-free", "uwstub/m-big", "uwstub/m-main"].find((m) => m !== cur && !w.cooling.has(m)) ?? null : scan(new Set([cur])).got[0]?.s ?? null);
+  const mainFirst = (session, exclude = new Set()) => { const m = w.main.get(session); return !bug.noMainFirst && m && rows().some((r) => r.s === m) && !exclude.has(m) && !cooled(m) ? m : null; };     // plan 6.2: main's own model first, when it is a usable non-cooling row
+  const pickSub = (aid, session) => { const first = mainFirst(session); if (first) return first; const { got, chill } = scan(); const pool = got.length ? got : chill.filter((r) => r.b === chill[0]?.b); return pool.length ? (bug.noSpread ? pool[0] : pool[hash(aid) % pool.length]).s : null; };
+  const handoffTo = (cur, session) => (bug.paidHandoff ? ["uwstub/m-free", "uwstub/m-big", "uwstub/m-main"].find((m) => m !== cur && !cooled(m)) ?? null : mainFirst(session, new Set([cur])) ?? scan(new Set([cur])).got[0]?.s ?? null);
   async function send(shape, o = {}) {
     count("req");
     const model = o.model, session = o.session ?? "s", aid = o.agentId;
@@ -421,7 +427,7 @@ function fakeWorld(bug = {}) {
     count("sub");
     w.classify.push({ aid: String(aid).slice(0, 12), cls: bug.mainClass ? "main" : "sub" });
     const pol = w.policy, ms = bug.slow ? 90000 : 5;
-    const warn = (c) => { if (!w.warnings.some((x) => x.code === c)) w.warnings.push({ code: c }); };
+    const warn = (c) => { if (!w.warnings.some((x) => x.code === c)) { w.warnings.push({ code: c }); publish(); } };      // a new warning code forces a status flush
     const plain = () => { const st = forward(model, aid, true); return { status: st.status, ms, headers: {} }; };
     if (pol === "corrupt") { warn("POLICY_CORRUPT"); return plain(); }
     if (pol && pol.minRouter > 2) { if (!bug.noNewerWarn) warn("POLICY_NEWER"); return plain(); }
@@ -434,20 +440,21 @@ function fakeWorld(bug = {}) {
     if (pol.exempt.includes(model)) return plain();                                      // never reached by a correct world: exempt is read under inherit only (here: a dynamic policy with an exempt list is served like any other)
     const key = `${session}:${aid}`;
     let e = w.sticky.get(key), chosen, retry = false;
-    if (w.blocked.size) { count("logDropped"); if (bug.failOnBlocked) return { status: 500, ms: 5, headers: {} }; }
+    if (w.blocked.size && !w.logFd) { count("logDropped"); count("journalFail"); if (bug.failOnBlocked) return { status: 500, ms: 5, headers: {} }; }      // a worker that already holds its log descriptor open does not notice the swap
+    if (!w.blocked.size) w.logFd = true;
     if (e && o.messages === e.len && !bug.noRetrySignal) retry = true;
     if (retry) {
       count("retry");
       if (!bug.noHandoff) {
-        w.cooling.add(e.model); count("coolMark");
-        const other = handoffTo(e.model);
+        coolFail(e.model); count("coolMark");
+        const other = handoffTo(e.model, session);
         if (!other) { count("handoffNone"); chosen = e.model; }
         else { const from = e.model; e.model = other; chosen = other; count("handoff"); w.agents.push({ v: 2, path: "handoff", act: "handoff", aid: String(aid).slice(0, 12), aid_full: aid, from, to: other, hop: 1, rsrc: "len", reason: "retry:len:1", ret: other }); }
       } else chosen = e.model;
-    } else if (e) { chosen = e.model; count("stickyHit"); if (bug.stickyBroken) chosen = rows().find((r) => r.s !== e.model)?.s ?? e.model; }
+    } else if (e) { chosen = e.model; count("stickyHit"); e.hits = (e.hits ?? 0) + 1; if (e.hits === 1) w.decisions.push({ act: "sticky", aid: String(aid).slice(0, 12) }); if (bug.stickyBroken) chosen = rows().find((r) => r.s !== e.model)?.s ?? e.model; }
     else {
       const want = o.tag ?? model;
-      chosen = rows().some((r) => r.s === want) ? want : pickSub(aid) ?? model;
+      chosen = rows().some((r) => r.s === want) ? want : pickSub(aid, session) ?? model;
       e = { model: chosen, len: o.messages }; w.sticky.set(key, e);
       w.agents.push({ v: 2, path: "new", act: chosen === want ? "honour-tag" : "substitute", aid: String(aid).slice(0, 12), asked: model, ret: chosen, main: w.main.get(session) ?? null });
     }
@@ -458,22 +465,24 @@ function fakeWorld(bug = {}) {
     return { status: st.status, ms, headers: st.retryAfter !== null ? { "retry-after": String(st.retryAfter) } : {} };
   }
   const prims = {
-    send, stub, now: () => 1_800_000_000_000, sleep: async () => {}, settle: async () => {}, markDirty: () => {},
+    send, stub, now: () => 1_800_000_000_000, sleep: async (ms) => { if (ms >= 1000 && !bug.overlayIgnored) for (const m of w.overlayPending) w.overlay.add(m); if (ms >= 1000) w.overlayPending.clear(); }, settle: async () => {}, markDirty: () => {},
     policy: async (p) => { w.policy = p; w.flag = false; },
     writeState: async (f, text) => { w.files.set(f, text); if (f === "policy.json") { try { w.policy = JSON.parse(text); } catch { w.policy = "corrupt"; } } },
     appendState: async (f, text) => { w.files.set(f, (w.files.get(f) ?? "") + text); w.torn = !bug.tornIgnored; },
     removeState: async (f) => { w.files.delete(f); if (f === "policy.json") w.policy = null; },
     blockState: async (f) => { w.blocked.add(f); }, unblockState: async (f) => { w.blocked.delete(f); },
-    readLog: async (f) => (f === "agents.jsonl" ? structuredClone(w.agents) : f === "classify.jsonl" ? structuredClone(w.classify) : []),
-    status: async () => ({ counters: { ...w.counters }, warnings: structuredClone(w.warnings.concat(w.blocked.size ? [{ code: "LOG_DROPPED" }] : [])) }),
+    readLog: async (f) => (f === "agents.jsonl" ? structuredClone(w.agents) : f === "classify.jsonl" ? structuredClone(w.classify) : f === "decisions.jsonl" ? structuredClone(w.decisions) : []),
+    status: async () => structuredClone(w.published),                                 // STALE until a flush: what the router counted since is not in it
+    freshStatus: async () => { forward("uwstub/m-big", "uwsc-flush", false); publish(); return structuredClone(w.published); },      // an aux request after the window: it reaches the stub too (a record count would see it)
     workerFiles: async () => w.workers,
     gatewayFingerprint: async () => ({ ...w.gw }),
     rollback: async () => { w.flag = true; if (bug.gwRestart) w.gw = { pid: 101, serviceSha: "s" }; return true; }, resume: async () => { w.flag = false; },
-    feedOverlay: async (m) => { if (!bug.overlayIgnored) w.overlay.add(m); return true; },
+    feedOverlay: async (m) => { w.overlayPending.add(m); return true; },                // the router re-reads observed.json at most once a second: effective after a wait of one second or more
     lastOut: async () => [...w.agents.filter((a) => a.act === "handoff").map((a) => `HANDOFF ${a.from} -> ${a.to} (retry 1, hop 1)`), ...w.agents.filter((a) => a.act !== "handoff").map((a) => `asked ${a.asked} ran ${a.ret}`)],
-    restartWorker: async () => { const pidBefore = w.corePid; if (!bug.noRestart) w.corePid += 1; if (bug.noReplay) w.sticky.clear(); return { pidBefore, pidAfter: w.corePid }; },
+    restartWorker: async () => { const pidBefore = w.corePid; if (!bug.noRestart) { w.corePid += 1; w.logFd = false; w.cooling.clear(); w.files.delete("cooling.json"); } if (bug.noReplay) w.sticky.clear(); return { pidBefore, pidAfter: w.corePid, changed: w.corePid !== pidBefore, ready: true }; },
+    freshWorker: async () => { const r = await prims.restartWorker(); if (!r.changed) throw new Error("the router worker was not replaced"); return r; },
     claude: null, realCheck: null,
-    reset: async () => { w.files.delete("cooling.json"); w.cooling.clear(); w.overlay.clear(); w.sticky.clear(); w.flag = false; w.torn = false; w.tornCounted = false; w.warnings.length = 0; },
+    reset: async () => { w.files.delete("cooling.json"); if (!bug.resetIneffective) w.cooling.clear(); w.overlay.clear(); w.overlayPending.clear(); w.sticky.clear(); w.flag = false; w.torn = false; w.tornCounted = false; w.warnings.length = 0; w.published = { counters: w.published.counters, warnings: [], cooling: bug.resetIneffective ? w.published.cooling : [] }; },
   };
   return { w, prims };
 }
@@ -494,7 +503,7 @@ test("the whole suite against a CORRECT fake sandbox: every scenario passes (11 
 test("MUTATION (the fake router gets one defect each): every defect turns EXACTLY the matching scenarios to FAIL or FINDING and leaves every other scenario as it was", async () => {
   const cases = [
     [{ rewriteAux: true }, { 8: "FAIL" }], [{ noHandoff: true }, { 2: "FAIL", 3: "FAIL", 7: "FAIL", 10: "FAIL" }], [{ noRetrySignal: true }, { 2: "FINDING", 3: "FAIL", 7: "FAIL", 10: "FAIL" }],
-    [{ mainClass: true }, { 4: "FAIL" }], [{ stickyBroken: true }, { 5: "FAIL", 7: "FAIL" }], [{ noNewerWarn: true }, { 6: "FAIL" }], [{ noRestart: true }, { 7: "FINDING" }], [{ noReplay: true }, { 7: "FAIL" }],
+    [{ mainClass: true }, { 4: "FAIL" }], [{ stickyBroken: true }, { 5: "FAIL", 7: "FAIL" }], [{ noNewerWarn: true }, { 6: "FAIL" }], [{ noRestart: true }, { 7: "FINDING", C1: "FAIL", C3: "FAIL" }], [{ noReplay: true }, { 7: "FAIL" }],
     [{ rollbackIgnored: true }, { 9: "FAIL" }], [{ gwRestart: true }, { 9: "FAIL" }], [{ noSpread: true }, { 10: "FAIL" }], [{ overlayIgnored: true }, { 11: "FINDING" }],
     [{ tornIgnored: true }, { C2: "FAIL" }], [{ failOnBlocked: true }, { C3: "FAIL" }], [{ errorOnState: true }, { C1: "FAIL" }], [{ slow: true }, { 3: "FAIL" }],
     // F4: the broken variants a vacuous judge would have passed
@@ -752,4 +761,224 @@ test("runSandbox and runSelftest pass the second token that matches the orchestr
     assert.ok(errs.some((l) => /installed CCR was NOT FOUND/.test(l)), "the run got past the second-token check");
     assert.ok(!errs.some((l) => /--i-understand-no-guard/.test(l)), "no token complaint");
   }
+});
+
+// ====================================================================================== fix round 2 (the first replay run: no scenario was a router defect; the HARNESS read stale status, hid cooling state and fed the router wrong shapes)
+/** A virtual sandbox: a clock the sleeps advance, an in-memory scratch tree, a router that flushes status.json at most every 5 s (any request after the window flushes it), a core pid, and a gateway that answers 200. */
+async function virtualSandbox({ editBumpsPid = true, readyAfter = 2, dyingRewritesCooling = true } = {}) {
+  const { SCRATCH_STATE_DIR } = await import("../harness/subagent-sandbox-spec.mjs");
+  const mem = new Map(), r = (p) => path.resolve(p), V = { now: 1_800_000_000_000, statusAt: -1e15, reqs: [], corePid: 500, edits: 0, answered: 0 };
+  const statusFile = r(path.join(SCRATCH_STATE_DIR, "status.json")), coolFile = r(path.join(SCRATCH_STATE_DIR, "cooling.json"));
+  const flush = () => { V.statusAt = V.now; mem.set(statusFile, JSON.stringify({ updatedAt: new Date(V.now).toISOString(), counters: { req: V.reqs.length }, cooling: [] })); };
+  const d = {
+    fs: { mkdirSync() {}, writeFileSync: (p, t) => mem.set(r(p), String(t)), renameSync: (a, b) => { mem.set(r(b), mem.get(r(a))); mem.delete(r(a)); }, rmSync: (p) => { mem.delete(r(p)); }, readdirSync: () => [], existsSync: () => true },
+    sys: { readText: (p) => mem.get(r(p)) ?? null, listenerPid: () => V.corePid }, now: () => V.now, sleep: async (ms) => { V.now += ms; },
+    fetch: async (url, init) => {
+      const h = init.headers, aux = !JSON.parse(init.body).tools;
+      V.reqs.push({ aux, agent: h["x-claude-code-agent-id"] ?? null });
+      if (V.now - V.statusAt >= 5000) flush();                                          // the router flushes at most every 5 s
+      V.answered += 1;
+      if (dyingRewritesCooling && V.answered === 1) mem.set(coolFile, "{\"v\":1,\"models\":{}}");      // the dying worker rewrites cooling.json on its way out
+      const status = V.answered > readyAfter || V.edits === 0 ? 200 : 503;
+      return { status, text: async () => "", headers: { forEach() {} } };
+    },
+  };
+  const editConfig = async () => { V.edits += 1; if (editBumpsPid && V.edits === 1) { V.corePid += 1; V.answered = 0; } };
+  return { V, d, mem, coolFile, editConfig, statusFile };
+}
+
+test("H1 freshStatus: it waits until 5.1 s have passed since the last request, sends exactly ONE aux request, and returns the status THAT flush wrote; a plain read straight after a request is old", async () => {
+  const v = await virtualSandbox();
+  const p = S.sandboxPrims({ d: v.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: v.editConfig });
+  await p.send("main", { model: ANCHOR, session: "s" });                                  // a request: flushes (the window had passed)
+  const stale = await p.status();
+  await v.d.sleep(1000);
+  await p.send("sub", { model: ASKED_MODEL, agentId: "a1", session: "s", messages: 3, agentTool: false });   // 1 s later: inside the window, NO flush
+  const old = await p.status();
+  assert.equal(old.updatedAt, stale.updatedAt, "a read straight after a request is the old flush: this is the replay's stale-status defect");
+  assert.equal(old.counters.req, 1, "and it does not hold the second request");
+  const before = v.V.reqs.length, t0 = v.V.now;
+  const s = await p.freshStatus();
+  assert.equal(v.V.reqs.length, before + 1, "exactly ONE request");
+  assert.deepEqual(v.V.reqs.at(-1), { aux: true, agent: "uwsc-flush" }, "an aux-shaped request (an agent id, no tools)");
+  assert.ok(v.V.now - t0 >= 4100 + 400, `it waited out the window (${v.V.now - t0} ms virtual)`);
+  assert.equal(s.counters.req, 3, "the status holds all three requests");
+  assert.ok(!s.staleRead, "and is not marked stale");
+  const t1 = v.V.now; const s2 = await p.freshStatus();                                  // straight after: the flush it caused is the new window start, so it waits again
+  assert.ok(v.V.now - t1 >= 5100 && s2.counters.req === 4 && !s2.staleRead);
+});
+
+test("H1 freshStatus: when updatedAt never moves the read says so (staleRead) instead of passing old numbers off as fresh", async () => {
+  const v = await virtualSandbox();
+  const p = S.sandboxPrims({ d: { ...v.d, fetch: async () => ({ status: 200, text: async () => "", headers: { forEach() {} } }) }, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: v.editConfig });
+  v.d.fs.writeFileSync(v.statusFile, JSON.stringify({ updatedAt: "2026-01-01T00:00:00.000Z", counters: {} }));
+  const s = await p.freshStatus();
+  assert.equal(s.staleRead, true);
+});
+
+test("H1 MUTATION at the runner level: the same suite with a harness that reads the STALE status turns the counter-based scenarios to FAIL or FINDING; the fresh one passes them", async () => {
+  const good = await runAll({});
+  const { prims } = fakeWorld({});
+  const lines = [], res = await S.runScenarios({ ...prims, freshStatus: prims.status }, {}, (l) => lines.push(l));       // the stale reader
+  const by = Object.fromEntries(res.map((r) => [r.scn.id, r.result.verdict]));
+  assert.deepEqual([by["2"], by["3"], by.C2, by.C3], ["FINDING", "FAIL", "FAIL", "FAIL"], JSON.stringify(by));
+  assert.deepEqual([good.by["2"].verdict, good.by["3"].verdict, good.by.C2.verdict, good.by.C3.verdict], ["PASS", "PASS", "PASS", "PASS"]);
+});
+
+test("H1 scenario 3 reads no record COUNT (the status flush sends an aux request of its own that reaches the stub): 'the next agent was routed' is read from THAT agent's records", async () => {
+  const f = fakeWorld({});
+  const res = await S.runScenarios(f.prims, { only: ["3"] });
+  assert.equal(res[0].result.verdict, "PASS", res[0].result.text);
+  assert.ok(f.w.records.some((r) => r.headers["x-claude-code-agent-id"] === "uwsc-flush"), "the flush's aux request IS in the stub's records");
+  assert.ok(f.w.records.some((r) => /uwsc-s3n-1$/.test(r.headers["x-claude-code-agent-id"] ?? "")), "and so is the next agent's request");
+});
+
+test("H2 restart: the new worker must ANSWER before anything is measured, cooling.json is deleted AGAIN after the swap (the dying worker rewrote it), and the core pid must have changed", async () => {
+  const v = await virtualSandbox();
+  const p = S.sandboxPrims({ d: v.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: v.editConfig });
+  const r = await p.restartWorker();
+  assert.deepEqual([r.pidBefore, r.pidAfter, r.changed, r.ready], [500, 501, true, true]);
+  assert.equal(v.mem.has(v.coolFile), false, "cooling.json (rewritten by the dying worker during the poll) is gone again");
+  assert.ok(v.V.reqs.length >= 3, "readiness was POLLED (503, 503, then 200)");
+  v.V.edits = 0;
+  const f = await p.freshWorker(); assert.equal(f.ready, true);
+});
+
+test("H2 freshWorker and reset REFUSE (an error of the run, not a router verdict) when the pid did not change or the worker never answers; reset restarts only when an earlier scenario left state", async () => {
+  const same = await virtualSandbox({ editBumpsPid: false });
+  const p = S.sandboxPrims({ d: same.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: same.editConfig });
+  assert.equal((await p.restartWorker()).changed, false);
+  await assert.rejects(() => p.freshWorker(), /was not replaced \(core pid 500 -> 500\).*nothing after this is a router verdict/);
+  await p.reset();                                                                         // not dirty: nothing to restart, nothing to refuse
+  p.markDirty();
+  await assert.rejects(() => p.reset(), /was not replaced/);
+  const dead = await virtualSandbox({ readyAfter: 1e9 });
+  const q = S.sandboxPrims({ d: dead.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: dead.editConfig });
+  await assert.rejects(() => q.freshWorker(), /did not answer a request within 20 s/);
+  const fine = await virtualSandbox();
+  const w = S.sandboxPrims({ d: fine.d, key: "k", stub: { records: [] }, launchEnv: {} }, { editConfig: fine.editConfig });
+  w.markDirty(); await w.reset(); assert.equal(fine.V.corePid, 501, "a dirty reset replaced the worker");
+});
+
+test("H2 'cooling is empty' precondition: a scenario that needs a clean cooling list refuses to run on a leak, naming it as state of an earlier scenario, not a router verdict", async () => {
+  const f = fakeWorld({ resetIneffective: true });
+  const res = await S.runScenarios(f.prims, {});
+  const by = Object.fromEntries(res.map((r) => [r.scn.id, r.result]));
+  for (const id of ["2", "3", "7", "10", "11"]) { assert.equal(by[id].verdict, "FAIL", `${id}: ${by[id].text}`); assert.match(by[id].text, /precondition of scenario .*: cooling is not empty \(.*m-free.*\).*not a router verdict/, id); }
+  for (const id of ["1", "4", "5", "6", "8", "9", "C1", "C2", "C3"]) assert.equal(by[id].verdict, "PASS", `${id}: ${by[id].text}`);
+});
+
+test("H3 MAIN FIRST: scenarios 3 and 10 keep main OUTSIDE the policy's rows (main's own model comes first when it is a row and would hide the steering and the spread); 2 and 7 keep it in on purpose; the plan says so", async () => {
+  const seen = {};
+  for (const id of ["2", "3", "7", "10"]) {
+    const f = fakeWorld({}), pol = [], mains = [];
+    const prims = { ...f.prims, policy: async (p) => { pol.push(p); return f.prims.policy(p); }, send: async (shape, o) => { if (shape === "main") mains.push(o.model); return f.prims.send(shape, o); } };
+    await S.runScenarios(prims, { only: [id] });
+    seen[id] = { main: [...new Set(mains)], rows: new Set(pol.flatMap((p) => p.models.map((m) => m.s))) };
+  }
+  for (const id of ["3", "10"]) assert.ok(seen[id].main.every((m) => !seen[id].rows.has(m)), `scenario ${id}: main ${seen[id].main} is not a row (${[...seen[id].rows]})`);
+  assert.deepEqual(seen["10"].main, ["uwstub/m-lead"]);
+  for (const id of ["2", "7"]) assert.ok(seen[id].main.some((m) => seen[id].rows.has(m)), `scenario ${id} keeps main in the set on purpose`);
+  const plan = S.planLines().join("\n");
+  assert.match(plan, /MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes \(and hands off to\) main's model before it spreads/);
+  assert.match(plan, /Scenarios 3 and 10 therefore keep main OUTSIDE the set/); assert.match(plan, /owner decision still open/);
+  assert.match(S.SCENARIOS.find((s) => s.id === "10").proves, /with main outside the set/);
+});
+
+test("H3 the fan-out judge refuses a world where main IS in the set: every agent lands on main's model, outside the lead band (the replay's failure, now a named FAIL)", async () => {
+  const f = fakeWorld({});
+  await f.prims.policy(S.scenarioPolicy({ rows: [{ name: "m-free", b: 0 }, { name: "m-big", b: 0 }, { name: "m-main", b: 1 }] }));
+  f.prims.stub.setScript({});
+  await f.prims.send("main", { model: "uwstub/m-main", session: "x" });
+  const a = [];
+  for (let i = 0; i < 20; i++) { const aid = `f${i}`; const r = await f.prims.send("sub", { model: "uwstub/m-main", tag: "uwstub/m-gone", agentId: aid, session: "x", messages: 3, agentTool: false }); a.push({ aid, status: r.status, ret: f.w.records.filter((q) => q.headers["x-claude-code-agent-id"] === aid)[0]?.model }); }
+  const ev = { a, b: a, band: ["uwstub/m-free", "uwstub/m-big"], otherBand: ["uwstub/m-main"], cooled: ["uwstub/m-free"] };
+  assert.equal(ok("10", ev).verdict, "FAIL"); assert.match(ok("10", ev).text, /20 of 20 agents were served outside the lead band/);
+});
+
+test("H4 scenario 3 cools exactly ONE model before the all-limited step (two distinct failing models of the one sandbox provider would also cool the provider key), then ONE agent meets 429 on every model", async () => {
+  const f = fakeWorld({});
+  const sent = [];
+  const prims = { ...f.prims, send: async (shape, o) => { sent.push({ shape, aid: o.agentId, model: o.model, retry: o.retryCount }); return f.prims.send(shape, o); } };
+  const res = await S.runScenarios(prims, { only: ["3"] });
+  assert.deepEqual(f.w.policy.models.map((m) => m.s), ["uwstub/m-free", "uwstub/m-big"], "two rows, main is not one of them");
+  assert.equal(sent.filter((x) => /s3w/.test(x.aid ?? "")).length, 2, "step 1: ONE agent, one 429 and its retry");
+  assert.equal(sent.filter((x) => x.aid === "uwsc-s3-1").length, 5, "step 2: ONE agent, five requests (at most 8 are allowed)");
+  assert.equal(res[0].result.verdict, "PASS", res[0].result.text);
+});
+
+test("H5 scenario 11: after the overlay record is fed the suite waits more than the router's one-second re-read BEFORE the first measured agent; without the wait the agents are not steered (FINDING)", async () => {
+  const f = fakeWorld({});
+  const r = await S.runScenarios(f.prims, { only: ["11"] });
+  assert.equal(r[0].result.verdict, "DEGRADED", r[0].result.text);
+  const waits = [];
+  const g = fakeWorld({});
+  const lazy = await S.runScenarios({ ...g.prims, sleep: async (ms) => { waits.push(ms); } }, { only: ["11"] });          // a harness whose wait does nothing: the overlay never became effective
+  assert.equal(lazy[0].result.verdict, "FINDING", lazy[0].result.text);
+  assert.ok(waits.some((ms) => ms >= 1100), `the runner asked for a wait of at least 1.1 s (${waits})`);
+});
+
+test("H7 C3 runs on a FRESH worker: a worker that already holds its log descriptor open does not notice the swap, so a harness that skips the replacement sees nothing and FAILs; the judge accepts journalFail OR logDropped", async () => {
+  const good = await S.runScenarios(fakeWorld({}).prims, { only: ["C3"] });
+  assert.equal(good[0].result.verdict, "PASS", good[0].result.text);
+  const g = fakeWorld({});
+  const fdOpen = { ...g.prims, freshWorker: async () => { g.w.logFd = true; } };                                  // no replacement: the worker keeps its open descriptor
+  const lazy = await S.runScenarios(fdOpen, { only: ["C3"] });
+  assert.equal(lazy[0].result.verdict, "FAIL", lazy[0].result.text); assert.match(lazy[0].result.text, /logDropped 0 -> 0, journalFail 0 -> 0/);
+  const base = { requests: [{ status: 200 }], status0: { counters: {}, warnings: [] } };
+  assert.equal(ok("C3", { ...base, status1: { counters: { journalFail: 2 }, warnings: [] } }).verdict, "PASS", "journalFail alone is a report");
+  assert.equal(ok("C3", { ...base, status1: { counters: { logDropped: 1 }, warnings: [] } }).verdict, "PASS");
+  assert.equal(ok("C3", { ...base, status1: { counters: {}, warnings: [{ code: "LOG_DROPPED" }] } }).verdict, "PASS");
+  assert.equal(ok("C3", { ...base, status1: { counters: {}, warnings: [] } }).verdict, "FAIL");
+});
+
+test("H6 C1 stamps the shapes the router writes, BEFORE the first request of each session, on a fresh worker; the judge names the request that failed with its status and error", async () => {
+  const f = fakeWorld({});
+  const writes = [], order = [];
+  const prims = { ...f.prims, freshWorker: async () => { order.push("fresh"); return f.prims.freshWorker(); }, writeState: async (n, text) => { order.push(`write ${n}`); writes.push([n, text]); return f.prims.writeState(n, text); },
+    send: async (shape, o) => { order.push(`send ${shape}`); return f.prims.send(shape, o); } };
+  const r = await S.runScenarios(prims, { only: ["C1"] });
+  assert.equal(r[0].result.verdict, "PASS", r[0].result.text);
+  const firstSend = order.findIndex((x) => x.startsWith("send")), lastWrite = Math.max(...order.map((x, i) => (x.startsWith("write") ? i : -1)));
+  assert.ok(order.indexOf("fresh") >= 0 && order.indexOf("fresh") < firstSend, "a fresh worker comes first");
+  assert.ok(lastWrite < order.indexOf("send sub"), "every stamp is written before the first subagent request");
+  const main = writes.filter(([n]) => /^main-/.test(n)).map(([, t]) => JSON.parse(t)), cool = JSON.parse(writes.find(([n]) => n === "cooling.json")[1]);
+  assert.ok(main.length === 2 && main.every((m) => typeof m.t === "string" && !Number.isNaN(Date.parse(m.t)) && m.model && m.beta1m === false), "main files: {model, beta1m, t: ISO string}");
+  assert.ok(Date.parse(main[0].t) > 1_800_000_000_000 + 80000000 && Date.parse(main[1].t) < 1_800_000_000_000 - 170000000, "a day ahead and two days behind");
+  const e = cool.models["uwstub/m-free"];
+  assert.equal(cool.v, 1); assert.ok(["u", "l", "t", "n", "t0"].every((k) => Number.isFinite(e[k])) && e.u > e.t, "cooling.json: {v:1, models:{sel:{u,l,t,n,t0}}}");
+  const bad = ok("C1", { requests: [{ label: "sub, future-stamped main", status: 200 }, { label: "main", status: null, error: "fetch failed" }], status0: { counters: {} }, status1: { counters: {} } });
+  assert.equal(bad.verdict, "FAIL"); assert.match(bad.text, /1 of 2 request\(s\) failed .*main HTTP none \(fetch failed\)/);
+});
+
+test("scenario 7: the judge prints handoffNone, retry, the cooling list, the agent's answers and the pids so the next run isolates the cause", () => {
+  const ev = { handoffSeen: false, pidBefore: 5, pidAfter: 6, setup: { handoffNone: 2, retry: 1, cooling: ["uwstub/m-free", "prov:uwstub"], answers: ["m-free:429", "m-free:429"] } };
+  const r = ok("7", ev);
+  assert.equal(r.verdict, "FAIL");
+  for (const piece of ["handoffNone 2", "retry 1", "cooling [uwstub/m-free, prov:uwstub]", "m-free:429, m-free:429", "core pid 5 -> 6"]) assert.ok(r.text.includes(piece), `${piece} in: ${r.text}`);
+  assert.match(ok("7", { handoffSeen: true, handedTo: "uwstub/m-main", afterModel: "uwstub/m-big", pidBefore: 5, pidAfter: 6, setup: ev.setup }).text, /served uwstub\/m-big, not the handed-off uwstub\/m-main \(setup: handoffNone 2/);
+  assert.equal(ok("7", { handoffSeen: true, handedTo: "uwstub/m-main", afterModel: "uwstub/m-main", pidBefore: 5, pidAfter: 6 }).verdict, "PASS");
+});
+
+test("scenario 5: the router's own decision log is the second witness of a sticky hit (the first hit writes an act:sticky line); no counter and no line is still a FAIL", () => {
+  const ev = { aid: "uwsc-s5a-1", aidNew: "uwsc-s5b-1", firstModel: "uwstub/m-free", laterModel: "uwstub/m-free", switchedTo: "uwstub/m-big", agents: [{ aid: "uwsc-s5b-1", main: "uwstub/m-big" }], status0: { counters: { stickyHit: 0 } }, status1: { counters: { stickyHit: 0 } } };
+  assert.equal(ok("5", ev).verdict, "FAIL"); assert.match(ok("5", ev).text, /stickyHit 0 -> 0[)] and its decision log has no sticky line/);
+  assert.equal(ok("5", { ...ev, decisions: [{ act: "sticky", aid: "uwsc-s5a-1" }] }).verdict, "PASS");
+  assert.equal(ok("5", { ...ev, decisions: [{ act: "sticky", aid: "someone-else" }] }).verdict, "FAIL", "another agent's line is no evidence");
+  assert.equal(ok("5", { ...ev, status1: { counters: { stickyHit: 1 } } }).verdict, "PASS");
+});
+
+test("H4 the sandbox has ONE provider: two DISTINCT failing models cool the provider key too and demote every row, so six new agents are no longer steered to one model (the replay's scenario 3 failure); the shipped scenario cools exactly one", async () => {
+  const f = fakeWorld({});
+  await f.prims.policy(S.scenarioPolicy({ rows: ["m-free", "m-big"] }));
+  f.prims.stub.setScript({ decide: (rec) => (rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined) });                // EVERY model limited from the first agent on: the old step 1
+  await f.prims.send("main", { model: ANCHOR, session: "x" });
+  for (const n of [0, 1, 2]) await f.prims.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentTool: false, session: "x", agentId: "w", messages: 3, ...(n ? { retryCount: n } : {}) });
+  assert.ok(["uwstub/m-free", "uwstub/m-big", "prov:uwstub"].every((k) => f.w.cooling.has(k)), [...f.w.cooling].join());
+  const served = [];
+  for (let i = 0; i < 6; i++) { const aid = `s${i}`; await f.prims.send("sub", { model: ANCHOR, tag: "uwstub/m-gone", agentTool: false, session: "x", agentId: aid, messages: 3 }); served.push(f.w.records.find((r) => r.headers["x-claude-code-agent-id"] === aid)?.model); }
+  assert.ok(new Set(served).size > 1, `with every row demoted the agents spread over ${[...new Set(served)]}: the steering check could not hold`);
+  const g = fakeWorld({});
+  await S.runScenarios(g.prims, { only: ["3"] });
+  assert.ok(g.w.cooling.has("uwstub/m-free") && g.w.cooling.has("uwstub/m-big"), "the shipped scenario ends with both cooled (step 2)");
 });

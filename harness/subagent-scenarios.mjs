@@ -76,7 +76,7 @@ export const SCENARIOS = Object.freeze([
   { id: "2", key: "free-429-handoff", client: "real", runs: 1, title: "FREE MODEL RETURNS 429",
     proves: "the stub returns 429 for the chosen free model, the retry reaches the router, the router HANDS OFF to a different eligible model, the task COMPLETES, and the handoff is in the agent log and in `last`; FINDING (not PASS) when no retry signal reaches the router" },
   { id: "3", key: "all-limited", client: "real", runs: 1, title: "ALL FREE MODELS LIMITED",
-    proves: "every eligible model returns 429: the agent FAILS GRACEFULLY (no hang, a bounded number of requests), `handoffNone` is counted, cooling is marked, and routing is never blocked (the next agent is still routed)" },
+    proves: "with exactly ONE model limited (it cools) six new agents are all steered to the one healthy model; then every eligible model returns 429 to ONE agent: it FAILS GRACEFULLY (no hang, at most 8 requests), `handoffNone` is counted, cooling is marked, and routing is never blocked (the next agent is still routed and reaches the stub). Main is NOT a row of the policy (main's own model comes first when it is in the set: plan 6.2, router decide)" },
   { id: "4", key: "team-agents", client: "replay", runs: 1, title: "TEAM AGENTS",
     proves: "agent ids that carry `@` (for example ccr-logs@session-f49cde2f) with a parent agent id are classified as SUBAGENTS, decided by the policy, not treated as main" },
   { id: "5", key: "model-switch", client: "replay", runs: 1, title: "/model SWITCH MID-SESSION",
@@ -84,20 +84,20 @@ export const SCENARIOS = Object.freeze([
   { id: "6", key: "bad-policy", client: "replay", runs: 1, title: "CORRUPT, MISSING AND NEWER POLICY",
     proves: "a corrupt policy file (POLICY_CORRUPT), a newer one (POLICY_NEWER) and a missing one (silent) each serve the model ASKED for, with the matching warning, and no request fails" },
   { id: "7", key: "worker-restart", client: "replay", runs: 1, title: "WORKER RESTART",
-    proves: "after the router worker is replaced (the core pid changes), an agent that had been HANDED OFF is still served the handed-off model: the sticky journal replays it; FINDING when no restart could be made" },
+    proves: "after the router worker is replaced (the core pid changes) and the cooling file is cleared, an agent that had been HANDED OFF (to main's model, which comes first when it is in the set) is still served the handed-off model: the sticky journal replays it; FINDING when no restart could be made" },
   { id: "8", key: "helper-calls", client: "replay", runs: 1, title: "HELPER CALLS",
     proves: "title, summary and background calls (an agent id and no tools; no agent id and no tools; an exempt alias) are NEVER rewritten: the stub's model equals the asked model on every one" },
   { id: "9", key: "rollback", client: "replay", runs: 1, title: "ROLLBACK MID-RUN",
     proves: "a rollback takes effect on the VERY NEXT request (a new agent is served the model it asked for) and the sandbox gateway pid and service.json are identical before and after" },
   { id: "10", key: "fan-out", client: "replay", runs: 1, title: "20-SUBAGENT FAN-OUT",
-    proves: "twenty concurrent subagents are spread across the models of the lead row's band: every one inside the band, more than one model used, none on a cooling model, none failed" },
+    proves: "with main outside the set, twenty concurrent subagents are spread across the models of the lead row's band: every one inside the band, more than one model used, none on a cooling model, none failed" },
   { id: "11", key: "daily-cap", client: "real", runs: 1, title: "DAILY-CAP 429 (Retry-After 3600)",
     proves: "ONE failure, then AVOIDANCE: the agent fails at once with no further request, and the next agent (a new agent id) is steered to a different eligible model; reported as DEGRADED (as designed), never as a seamless handoff" },
 ]);
 export const CHAOS = Object.freeze([
-  { id: "C1", key: "clock-jump", client: "replay", runs: 1, title: "WALL-CLOCK JUMP (state left by a jump)", proves: "state stamped a day in the future and a day in the past is tolerated: requests are served, no router error is counted (the host clock itself is NOT changed)" },
+  { id: "C1", key: "clock-jump", client: "replay", runs: 1, title: "WALL-CLOCK JUMP (state left by a jump)", proves: "state stamped a day in the future and a day in the past, in the shapes the router writes (cooling.json {v,models:{sel:{u,l,t,n,t0}}}, main-<sid>.json with an ISO time), is tolerated by a FRESH worker: requests are served, no router error is counted (the host clock itself is NOT changed)" },
   { id: "C2", key: "torn-journal", client: "replay", runs: 1, title: "TORN JOURNAL", proves: "a journal with garbage and a partial last line is ignored: the request is served, no error is counted, the torn lines are counted" },
-  { id: "C3", key: "log-write-failure", client: "replay", runs: 1, title: "LOG AND JOURNAL WRITE FAILURE (ENOSPC emulated)", proves: "when the agent log and the session journal cannot be written the request is still served and `logDropped` or LOG_DROPPED reports it (the disk is NOT filled: the targets are made unwritable)" },
+  { id: "C3", key: "log-write-failure", client: "replay", runs: 1, title: "LOG AND JOURNAL WRITE FAILURE (ENOSPC emulated)", proves: "on a FRESH worker (its log file descriptors are cached, so a worker that had written the log would not notice), when the agent log and the session journal cannot be written the request is still served and `logDropped` (the log), `journalFail` (the journal) or LOG_DROPPED reports it (the disk is NOT filled: the targets are made unwritable)" },
   { id: "C4", key: "two-workers", client: "replay", runs: 1, title: "TWO WORKERS, ONE STATE DIRECTORY", proves: "with two worker status files both agree on the same sticky model; FINDING when only one worker exists (G1 X2 measured one)" },
 ]);
 export const ALL = Object.freeze([...SCENARIOS, ...CHAOS]);
@@ -203,11 +203,14 @@ J["4"] = (ev) => {
 J["5"] = (ev) => {
   if (!ev.firstModel || !ev.laterModel) return R("FAIL", "the running agent's two requests did not both reach the stub");
   if (!modelIs(ev.laterModel, ev.firstModel)) return R("FAIL", `the running agent moved from ${clip(ev.firstModel)} to ${clip(ev.laterModel)} after the switch: it must stay on its sticky model`);
-  if (counter(ev.status1, "stickyHit") - counter(ev.status0, "stickyHit") < 1) return R("FAIL", "the router counted no sticky hit for the running agent");
+  // the counter is read from a FRESH status (the router flushes status.json at most every 5 s); the router's own log is the second witness: the first sticky hit of an agent writes an `act: "sticky"` line
+  const hits = counter(ev.status1, "stickyHit") - counter(ev.status0, "stickyHit");
+  const logged = asArr(ev.decisions).some((x) => x && x.act === "sticky" && x.aid && String(ev.aid).toLowerCase().startsWith(String(x.aid).toLowerCase()));
+  if (hits < 1 && !logged) return R("FAIL", `the router counted no sticky hit for the running agent (stickyHit ${counter(ev.status0, "stickyHit")} -> ${counter(ev.status1, "stickyHit")}) and its decision log has no sticky line for it`);
   const l = asArr(ev.agents).filter((x) => x && x.aid && String(ev.aidNew).toLowerCase().startsWith(String(x.aid).toLowerCase())).pop();
   if (!l) return R("FAIL", "the router logged no decision for the new agent");
   if (!modelIs(l.main, ev.switchedTo)) return R("FAIL", `the new agent was decided with main ${clip(l.main)}, not the switched-to ${clip(ev.switchedTo)}`);
-  return R("PASS", `the running agent stayed on ${clip(ev.firstModel)} (sticky hits +${counter(ev.status1, "stickyHit") - counter(ev.status0, "stickyHit")}); the new agent saw main ${clip(l.main)}. Cross-provider variant: NOT measurable (one sandbox provider)`);
+  return R("PASS", `the running agent stayed on ${clip(ev.firstModel)} (sticky hits +${hits}${logged ? ", a sticky line in the decision log" : ""}); the new agent saw main ${clip(l.main)}. Cross-provider variant: NOT measurable (one sandbox provider)`);
 };
 /** 6: bad policy. ev: {variants:[{variant, status, stubModel, asked, warnings}]} */
 J["6"] = (ev) => {
@@ -225,9 +228,11 @@ J["6"] = (ev) => {
 };
 /** 7: worker restart. ev: {handedTo, afterModel, pidBefore, pidAfter, handoffSeen} */
 J["7"] = (ev) => {
-  if (!ev.handoffSeen) return R("FAIL", "the setup handoff did not happen, so there is no handed-off model to replay");
+  const su = ev.setup ?? {};
+  const detail = `setup: handoffNone ${clip(su.handoffNone ?? "?", 6)}, retry ${clip(su.retry ?? "?", 6)}, cooling [${asArr(su.cooling).map((x) => clip(x, 40)).join(", ") || "empty"}], the agent's answers [${asArr(su.answers).map((x) => clip(x, 30)).join(", ") || "none"}]; core pid ${clip(ev.pidBefore ?? "?", 12)} -> ${clip(ev.pidAfter ?? "?", 12)}`;
+  if (!ev.handoffSeen) return R("FAIL", `the setup handoff did not happen, so there is no handed-off model to replay (${detail})`);
   if (!(ev.pidBefore && ev.pidAfter) || ev.pidBefore === ev.pidAfter) return R("FINDING", `no worker restart could be made (core pid ${clip(ev.pidBefore ?? "?", 12)} -> ${clip(ev.pidAfter ?? "?", 12)}): the journal replay is not shown here (router unit tests cover it)`);
-  if (!ev.afterModel || !modelIs(ev.afterModel, ev.handedTo)) return R("FAIL", `after the restart (core pid ${ev.pidBefore} -> ${ev.pidAfter}) the agent was served ${clip(ev.afterModel)}, not the handed-off ${clip(ev.handedTo)}`);
+  if (!ev.afterModel || !modelIs(ev.afterModel, ev.handedTo)) return R("FAIL", `after the restart (core pid ${ev.pidBefore} -> ${ev.pidAfter}) the agent was served ${clip(ev.afterModel)}, not the handed-off ${clip(ev.handedTo)} (${detail})`);
   return R("PASS", `core pid ${ev.pidBefore} -> ${ev.pidAfter}; the agent was still served the handed-off model ${clip(ev.handedTo)}`);
 };
 /**
@@ -285,7 +290,7 @@ J["11"] = (ev) => {
 /** C1..C4 */
 J.C1 = (ev) => {
   const bad = asArr(ev.requests).filter((r) => r.status !== 200);
-  if (bad.length) return R("FAIL", `${bad.length} request(s) failed after the stamped state was written`);
+  if (bad.length) return R("FAIL", `${bad.length} of ${asArr(ev.requests).length} request(s) failed after the stamped state was written: ${bad.map((r) => `${clip(r.label ?? "?", 24)} HTTP ${clip(r.status ?? "none", 8)}${r.error ? ` (${clip(r.error, 60)})` : ""}`).join("; ")}`);
   if (counter(ev.status1, "error") > counter(ev.status0, "error")) return R("FAIL", `the router counted ${counter(ev.status1, "error") - counter(ev.status0, "error")} error(s) on future- and past-dated state`);
   return R("PASS", `${plural(asArr(ev.requests).length, "request")} served over future- and past-dated state, 0 router errors (the host clock itself was not changed)`);
 };
@@ -298,8 +303,9 @@ J.C2 = (ev) => {
 J.C3 = (ev) => {
   if (asArr(ev.requests).some((r) => r.status !== 200)) return R("FAIL", "a request failed while the logs could not be written");
   const dropped = counter(ev.status1, "logDropped") - counter(ev.status0, "logDropped");
-  if (dropped < 1 && !warnCodes(ev.status1).includes("LOG_DROPPED")) return R("FAIL", "nothing reported the dropped log lines (logDropped did not move and LOG_DROPPED is not raised)");
-  return R("PASS", `${plural(asArr(ev.requests).length, "request")} served with unwritable logs; logDropped +${dropped}${warnCodes(ev.status1).includes("LOG_DROPPED") ? ", LOG_DROPPED raised" : ""}`);
+  const jfail = counter(ev.status1, "journalFail") - counter(ev.status0, "journalFail");       // a failed JOURNAL write counts journalFail, a failed LOG write counts logDropped
+  if (dropped < 1 && jfail < 1 && !warnCodes(ev.status1).includes("LOG_DROPPED")) return R("FAIL", `nothing reported the unwritable log and journal (logDropped ${counter(ev.status0, "logDropped")} -> ${counter(ev.status1, "logDropped")}, journalFail ${counter(ev.status0, "journalFail")} -> ${counter(ev.status1, "journalFail")}, LOG_DROPPED not raised)`);
+  return R("PASS", `${plural(asArr(ev.requests).length, "request")} served with unwritable logs; logDropped +${dropped}, journalFail +${jfail}${warnCodes(ev.status1).includes("LOG_DROPPED") ? ", LOG_DROPPED raised" : ""}`);
 };
 J.C4 = (ev) => {
   if ((ev.workerFiles ?? 0) < 2) return R("FINDING", `only ${clip(ev.workerFiles ?? 0, 6)} worker status file(s): two workers on one state directory cannot be exercised here (G1 X2: one worker); the cross-worker paths are covered by the router journal tests`);
@@ -342,7 +348,15 @@ export function suiteVerdict(lines, ids) {
 
 // ---------------------------------------------------------------- the runners (each returns EVIDENCE; they drive a primitives object, so a fake sandbox can stand in)
 const SUB = (p, over) => p.send("sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentTool: false, ...over });     // a real subagent has no Agent tool
-const evidenceBase = async (p) => ({ agents: await p.readLog("agents.jsonl"), classify: await p.readLog("classify.jsonl"), status: await p.status() });
+// The router flushes status.json at most every 5 s (a new warning code forces a flush), so a status read straight after a request can be 5 s old: EVERY status0/status1 read goes through freshStatus (wait, one aux
+// request, wait, read), which also hands back the cooling list. Scenario 6 reads `status` only for WARNING codes, which force their own flush.
+const evidenceBase = async (p, withStatus = true) => ({ agents: await p.readLog("agents.jsonl"), classify: await p.readLog("classify.jsonl"), status: withStatus ? await p.freshStatus() : undefined });
+/** The precondition of every scenario that reads cooling or counts a handoff: no model is cooling (a leak from an earlier scenario would be blamed on the router). Returns the fresh status it read. */
+const needCoolingEmpty = async (p, label) => {
+  const s = await p.freshStatus(), c = asArr(s?.cooling);
+  if (c.length) throw new Error(`precondition of ${label}: cooling is not empty (${c.map((x) => clip(x?.key, 30)).join(", ")}): state of an earlier scenario leaked, this is not a router verdict`);
+  return s;
+};
 const aidFor = (run, tag) => `uwsc-${tag}-${run}`;
 const stubSub = (p, aid) => messagesOf(p.stub.records).filter((r) => aidOf(r) === aid);
 const rollupLast = (p) => p.lastOut();
@@ -362,7 +376,7 @@ RUN["1"] = async (p, o) => {
     await SUB(p, { session: sess, agentId: aid, messages: 3 });
   }
   await p.settle();
-  const base = await evidenceBase(p);
+  const base = await evidenceBase(p, false);
   const realAid = o.real && p.claude ? aidOf(messagesOf(p.stub.records).find(isSub)) : aid;
   return { client: clientLabel(o, p), policy: "uwstub/m-free", asked: o.real && p.claude ? ANCHOR : ASKED_MODEL, aid: realAid, records: [...p.stub.records], agents: base.agents, lastOut: await rollupLast(p) };
 };
@@ -372,6 +386,8 @@ const clientLabel = (o, p) => (o.real && p.claude ? "real claude -p" : o.real ? 
 const spawnOnce = (label = "scn") => { let done = false; return () => { if (done) return undefined; done = true; return { subagent_type: "general-purpose", label }; }; };
 const firstSubAid = (p) => aidOf(messagesOf(p.stub.records).find(isSub));
 const limitFree = (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined);
+const OVERLAY_WAIT_MS = 1200;                            // above the router's one-second overlay re-read
+const MAIN_OUTSIDE = "uwstub/m-lead";                    // a main model that is not a row of the scenario's policy
 const NOT_IN_SET = "uwstub/m-gone";                       // a TAG naming a model the policy does not hold: the router substitutes (the asked model stays a real stub model, so CCR resolves the request)
 RUN["2"] = async (p, o) => {
   p.markDirty?.();
@@ -379,7 +395,7 @@ RUN["2"] = async (p, o) => {
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big", "m-main"] }));
   p.stub.setScript({ decide: limitFree, ...(real ? { onMain: spawnOnce("s2") } : {}) }); p.stub.clear();
   if (!real) await p.send("main", { model: ANCHOR, session: sess });
-  const status0 = await p.status();
+  const status0 = await needCoolingEmpty(p, "scenario 2");
   let finalOk;
   if (real) finalOk = (await p.claude({ prompt: REAL_PROMPT, maxTurns: 6 }))?.code === 0;
   else {
@@ -394,7 +410,7 @@ RUN["2"] = async (p, o) => {
   await p.policy(scenarioPolicy({ mode: "free", rows: [{ name: "m-free", fp: 1 }, { name: "m-main", fp: 1 }] }));
   p.stub.setScript({ decide: limitFree }); p.stub.clear();
   await p.send("main", { model: ANCHOR, session: fsess });
-  const fstatus0 = await p.status();
+  const fstatus0 = await needCoolingEmpty(p, "scenario 2 (free-mode variant)");
   await SUB(p, { session: fsess, agentId: faid, messages: 3 });
   await SUB(p, { session: fsess, agentId: faid, messages: 3, retryCount: 1 });
   await p.settle();
@@ -405,30 +421,33 @@ RUN["2"] = async (p, o) => {
 RUN["3"] = async (p, o) => {
   p.markDirty?.();
   const sess = `uwsc-s3-${o.run}`, real = !!(o.real && p.claude);
-  await p.policy(scenarioPolicy({ rows: ["m-free", "m-big", "m-main"] }));
-  // steps 1 and 2 (replay: this is the router's cooldown, not the client): m-free and m-big return 429, m-main is healthy. One agent is limited twice and handed on to m-main, which cools both limited models;
-  // then six NEW agents (a tag the policy does not hold, so each is substituted) must all be served the one healthy model
-  p.stub.setScript({ decide: (rec) => (rec.headers?.["x-claude-code-agent-id"] && !modelIs(rec.model, "uwstub/m-main") ? 429 : undefined) }); p.stub.clear();
+  // main (ANCHOR, m-main) is NOT a row: main's own model comes first when it is in the set (plan 6.2, router decide), which would hide both the steering and the failure. Two rows only, and ONE model cools in step 1:
+  // two DISTINCT failing models of the sandbox's single provider within 5 minutes would also cool the provider key (router coolFail) and demote every row, so step 1 must cool exactly one.
+  await p.policy(scenarioPolicy({ rows: ["m-free", "m-big"] }));
+  p.stub.setScript({ decide: limitFree }); p.stub.clear();
   await p.send("main", { model: ANCHOR, session: sess });
+  await needCoolingEmpty(p, "scenario 3");
+  // step 1 (replay: this is the router's cooldown, not the client): ONLY m-free returns 429. One agent is limited, its retry is handed on to m-big (m-free cools); then six NEW agents (a tag the policy does not hold, so each
+  // is substituted) must all be served the one healthy model
   const warm = aidFor(o.run, "s3w");
   await SUB(p, { session: sess, agentId: warm, messages: 3 });
   await SUB(p, { session: sess, agentId: warm, messages: 3, retryCount: 1 });
-  await SUB(p, { session: sess, agentId: warm, messages: 3, retryCount: 2 });
   const steerIds = Array.from({ length: 6 }, (_, i) => aidFor(o.run, `s3s${i}`));
-  for (const id of steerIds) await SUB(p, { session: sess, agentId: id, messages: 3, model: "uwstub/m-main", tag: NOT_IN_SET });
+  for (const id of steerIds) await SUB(p, { session: sess, agentId: id, messages: 3, model: ANCHOR, tag: NOT_IN_SET });
   await p.settle();
-  const steer = { models: steerIds.map((id) => stubSub(p, id)[0]?.model).filter(Boolean), healthy: "uwstub/m-main", cooled: ["uwstub/m-free", "uwstub/m-big"] };
-  // step 3: now EVERY model returns 429 for a subagent
+  const steer = { models: steerIds.map((id) => stubSub(p, id)[0]?.model).filter(Boolean), healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] };
+  // step 2: now EVERY model returns 429 for a subagent, and ONE agent meets it on m-big (m-free is cooling), is retried, and no eligible model is left
   p.stub.setScript({ decide: (rec) => (rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined), ...(real ? { onMain: spawnOnce("s3") } : {}) }); p.stub.clear();
-  const status0 = await p.status(), responses = [], aid = aidFor(o.run, "s3");
+  const status0 = await p.freshStatus(), responses = [], aid = aidFor(o.run, "s3");
   if (real) { const t0 = p.now(); await p.claude({ prompt: REAL_PROMPT, maxTurns: 6 }); responses.push({ status: 429, ms: p.now() - t0 }); }
-  else for (let i = 0; i < 5; i++) { const r = await SUB(p, { session: sess, agentId: aid, messages: 3, model: "uwstub/m-main", tag: NOT_IN_SET, ...(i ? { retryCount: i } : {}) }); responses.push({ status: r.status, ms: r.ms }); }
+  else for (let i = 0; i < 5; i++) { const r = await SUB(p, { session: sess, agentId: aid, messages: 3, model: ANCHOR, tag: NOT_IN_SET, ...(i ? { retryCount: i } : {}) }); responses.push({ status: r.status, ms: r.ms }); }
   await p.settle();
-  const before = p.stub.records.length;
-  await SUB(p, { session: sess, agentId: aidFor(o.run, "s3n"), messages: 3, model: "uwstub/m-main", tag: NOT_IN_SET });
+  // routing is never blocked: the NEXT agent is still routed (every row is cooling, so a demoted row is used); read from the stub's records of THAT agent, never from a record count (the status flush sends an aux request of its own)
+  const nextAid = aidFor(o.run, "s3n");
+  await SUB(p, { session: sess, agentId: nextAid, messages: 3, model: ANCHOR, tag: NOT_IN_SET });
   await p.settle();
   const base = await evidenceBase(p);
-  return { client: clientLabel(o, p), aid: real ? firstSubAid(p) : aid, steer, responses, records: [...p.stub.records], agents: base.agents, status0, status1: base.status, nextReached: p.stub.records.length > before };
+  return { client: clientLabel(o, p), aid: real ? firstSubAid(p) : aid, steer, responses, records: [...p.stub.records], agents: base.agents, status0, status1: base.status, nextReached: stubSub(p, nextAid).length > 0 };
 };
 RUN["4"] = async (p, o) => {
   const sess = `uwsc-s4-${o.run}`;
@@ -437,7 +456,7 @@ RUN["4"] = async (p, o) => {
   await p.send("main", { model: ANCHOR, session: sess });
   await SUB(p, { session: sess, agentId: X4_AGENT, parent: X4_PARENT, messages: 3 });
   await p.settle();
-  const base = await evidenceBase(p);
+  const base = await evidenceBase(p, false);
   return { aid: X4_AGENT, parent: X4_PARENT, policy: "uwstub/m-free", records: [...p.stub.records], agents: base.agents, classify: base.classify, status1: base.status };
 };
 RUN["5"] = async (p, o) => {
@@ -448,14 +467,14 @@ RUN["5"] = async (p, o) => {
   await SUB(p, { session: sess, agentId: a, messages: 3 });
   await p.settle();
   const firstModel = stubSub(p, a)[0]?.model;
-  const status0 = await p.status();
+  const status0 = await p.freshStatus();
   await p.send("main", { model: "uwstub/m-big", session: sess });                       // the /model switch: main's requests now carry another model
   await SUB(p, { session: sess, agentId: a, messages: 5 });                              // the running agent's next turn (grown messages: no retry signal)
   await SUB(p, { session: sess, agentId: b, messages: 3, model: "uwstub/m-main", tag: undefined });
   await p.settle();
   const base = await evidenceBase(p);
   const later = stubSub(p, a);
-  return { aid: a, aidNew: b, firstModel, laterModel: later[later.length - 1]?.model, switchedTo: "uwstub/m-big", agents: base.agents, status0, status1: base.status };
+  return { aid: a, aidNew: b, firstModel, laterModel: later[later.length - 1]?.model, switchedTo: "uwstub/m-big", agents: base.agents, decisions: await p.readLog("decisions.jsonl"), status0, status1: base.status };
 };
 RUN["6"] = async (p, o) => {
   const variants = [], sess = `uwsc-s6-${o.run}`;
@@ -477,20 +496,24 @@ RUN["6"] = async (p, o) => {
 RUN["7"] = async (p, o) => {
   p.markDirty?.();
   const aid = aidFor(o.run, "s7"), sess = `uwsc-s7-${o.run}`;
+  // main (ANCHOR, m-main) IS a row here on purpose: a handoff goes to main's own model first (plan 6.2, router decide), so the handed-off model is m-main and the journal must replay exactly that
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big", "m-main"] }));
-  p.stub.setScript({ decide: (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined) }); p.stub.clear();
+  p.stub.setScript({ decide: limitFree }); p.stub.clear();
   await p.send("main", { model: ANCHOR, session: sess });
+  await needCoolingEmpty(p, "scenario 7");
   await SUB(p, { session: sess, agentId: aid, messages: 3 });
   await SUB(p, { session: sess, agentId: aid, messages: 3, retryCount: 1 });
   await p.settle();
   const hs = handoffs(await p.readLog("agents.jsonl"), aid);
   const handedTo = hs[0]?.to;
-  const restart = await p.restartWorker();
+  const st = await p.freshStatus();                                                      // what the judge prints if the setup handoff is missing: handoffNone, retry, the cooling list, the agent's answers
+  const setup = { handoffNone: counter(st, "handoffNone"), retry: counter(st, "retry"), cooling: asArr(st?.cooling).map((x) => x?.key), answers: stubSub(p, aid).map((r) => `${bareOf(r.model)}:${r.sent?.status}`) };
+  const restart = await p.restartWorker();                                               // a fresh worker; the dying one may rewrite cooling.json, so it is deleted again once the new one answers
   await p.send("main", { model: ANCHOR, session: sess });                                // the new worker learns main again
   p.stub.clear();
   await SUB(p, { session: sess, agentId: aid, messages: 5 });
   await p.settle();
-  return { handoffSeen: hs.length > 0, handedTo, afterModel: stubSub(p, aid)[0]?.model, pidBefore: restart?.pidBefore, pidAfter: restart?.pidAfter };
+  return { handoffSeen: hs.length > 0, handedTo, afterModel: stubSub(p, aid)[0]?.model, pidBefore: restart?.pidBefore, pidAfter: restart?.pidAfter, setup };
 };
 RUN["8"] = async (p, o) => {
   const sess = `uwsc-s8-${o.run}`, calls = [];
@@ -537,8 +560,11 @@ RUN["10"] = async (p, o) => {
   const sess = `uwsc-s10-${o.run}`;
   // TWO bands: m-free and m-big are the lead band (0), m-main is a worse band (1). Every agent asks a real stub model but names a tag the policy does not hold, so each is substituted
   await p.policy(scenarioPolicy({ rows: [{ name: "m-free", b: 0 }, { name: "m-big", b: 0 }, { name: "m-main", b: 1 }] }));
+  // main is OUTSIDE the set (a model no row names): a main model that is a row comes first (plan 6.2, router decide) and every agent would land on it, hiding the spread. The main request itself may be refused by the
+  // gateway (the stub has no such model); only the router's lesson from it matters, and its status is not read.
   p.stub.setScript({}); p.stub.clear();
-  await p.send("main", { model: "uwstub/m-main", session: sess });
+  await p.send("main", { model: MAIN_OUTSIDE, session: sess });
+  await needCoolingEmpty(p, "scenario 10");
   const wave = async (tag) => {
     const ids = Array.from({ length: 20 }, (_, i) => aidFor(o.run, `s10${tag}-${i}`));
     const res = await Promise.all(ids.map((aid) => p.send("sub", { model: "uwstub/m-main", tag: NOT_IN_SET, agentId: aid, session: sess, messages: 3, agentTool: false })));
@@ -560,6 +586,7 @@ RUN["11"] = async (p, o) => {
   const a = aidFor(o.run, "s11a"), b = aidFor(o.run, "s11b"), sess = `uwsc-s11-${o.run}`, real = !!(o.real && p.claude);
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big"] }));
   p.stub.setScript({ decide: (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? { status: 429, retryAfter: 3600 } : undefined), ...(real ? { onMain: spawnOnce("s11") } : {}) }); p.stub.clear();
+  await needCoolingEmpty(p, "scenario 11");
   if (real) await p.claude({ prompt: REAL_PROMPT, maxTurns: 4 });
   else { await p.send("main", { model: ANCHOR, session: sess }); await SUB(p, { session: sess, agentId: a, messages: 3 }); }   // the client fails the agent AT ONCE: no second request is sent
   await p.settle();
@@ -567,49 +594,56 @@ RUN["11"] = async (p, o) => {
   const firstRecs = firstAid ? stubSub(p, firstAid) : [];                              // never the main request: only requests that carry the agent's own id
   const failed = firstRecs.some((r) => r.sent?.status === 429 && r.sent.retryAfter === 3600);      // read from the STUB's evidence, not from a client exit code
   const overlay = await p.feedOverlay("uwstub/m-free", "rate");                         // what the observer would write after seeing the 429 in the gateway log
+  await p.sleep(OVERLAY_WAIT_MS);                                                       // the router re-reads observed.json at most once a second (overlayView): the first measured agent must come AFTER that
   const nexts = Array.from({ length: 6 }, (_, i) => `${b}-${i}`);                      // six agents: with two rows one agent would avoid the limited model by chance half the time, six all-but-never
   for (const aid of nexts) await SUB(p, { session: sess, agentId: aid, messages: 3, model: "uwstub/m-main", tag: NOT_IN_SET });   // not in the policy: a substitute is picked, and a demoted model is passed over
   await p.settle();
   return { client: clientLabel(o, p), aid: firstAid, failed, recordsForFirst: firstRecs.length, chosen: "uwstub/m-free", nextModels: nexts.map((aid) => stubSub(p, aid)[0]?.model).filter(Boolean), overlay: !!overlay };
 };
+const DAY_MS = 86400000;
 RUN.C1 = async (p, o) => {
   p.markDirty?.();
-  const sess = `uwsc-c1-${o.run}`, now = p.now(), requests = [];
+  const sess = `uwsc-c1-${o.run}`, past = `${sess}p`, now = p.now(), requests = [];
+  const iso = (ms) => new Date(ms).toISOString();
   await p.policy(scenarioPolicy({ rows: ["m-free", "m-big"] }));
+  await p.freshWorker();                                                                 // the router reads a session's main file only on a MEMORY MISS: a worker that already knows the session would never see the stamp
   p.stub.setScript({}); p.stub.clear();
-  const status0 = await p.status();
-  await p.writeState(`main-${sess}.json`, JSON.stringify({ model: "uwstub/m-main", t: now + 86400000, v: 1 }));            // stamped a day AHEAD, as after a forward clock jump
-  await p.writeState("cooling.json", JSON.stringify({ v: 1, models: { "uwstub/m-free": { until: now + 86400000 * 3, rung: 3 } } }));
-  requests.push(await p.send("main", { model: "uwstub/m-main", session: sess }));
-  requests.push(await SUB(p, { session: sess, agentId: aidFor(o.run, "c1a"), messages: 3 }));
-  await p.writeState(`main-${sess}.json`, JSON.stringify({ model: "uwstub/m-main", t: now - 86400000 * 2, v: 1 }));          // and two days BEHIND, as after a backward jump
-  requests.push(await SUB(p, { session: sess, agentId: aidFor(o.run, "c1b"), messages: 3 }));
+  const status0 = await p.freshStatus();
+  // the shapes the router itself writes, stamped BEFORE the first request of each session: main-<sid>.json is {model, beta1m, t: ISO string}; cooling.json is {v:1, models:{sel:{u, l, t, n, t0}}} (u: ms until, t: ms of the failure)
+  await p.writeState(`main-${sess}.json`, JSON.stringify({ model: "uwstub/m-main", beta1m: false, t: iso(now + DAY_MS) }));          // a day AHEAD, as after a forward clock jump
+  await p.writeState(`main-${past}.json`, JSON.stringify({ model: "uwstub/m-main", beta1m: false, t: iso(now - 2 * DAY_MS) }));      // and two days BEHIND, as after a backward jump
+  await p.writeState("cooling.json", JSON.stringify({ v: 1, models: { "uwstub/m-free": { u: now + 3 * DAY_MS, l: 3, t: now + DAY_MS, n: 1, t0: now + DAY_MS } } }));
+  const go = async (label, shape, over) => { const r = await p.send(shape, over); requests.push({ label, status: r.status, error: r.error }); };
+  await go("sub, future-stamped main", "sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentTool: false, session: sess, agentId: aidFor(o.run, "c1a"), messages: 3 });
+  await go("main", "main", { model: ANCHOR, session: sess });
+  await go("sub, past-stamped main", "sub", { model: ASKED_MODEL, tag: TAG_MODEL, agentTool: false, session: past, agentId: aidFor(o.run, "c1b"), messages: 3 });
   await p.settle();
-  return { requests: requests.map((r) => ({ status: r.status })), status0, status1: await p.status() };
+  return { requests, status0, status1: await p.freshStatus() };
 };
 RUN.C2 = async (p, o) => {
   const sess = `uwsc-c2-${o.run}`;
   await p.policy(scenarioPolicy({ rows: ["m-free"] }));
   p.stub.setScript({}); p.stub.clear();
   await p.send("main", { model: ANCHOR, session: sess });                               // creates the session files
-  const status0 = await p.status();
+  const status0 = await p.freshStatus();
   await p.appendState(`agents-${sess}.jsonl`, "this is not json\n{\"k\":\"torn\",\"m\":\"uwstub/m-free\",\"t\":1");   // garbage, then a partial last line with no newline
   const r = await SUB(p, { session: sess, agentId: aidFor(o.run, "c2"), messages: 3 });
   await p.settle();
-  return { status: r.status, status0, status1: await p.status() };
+  return { status: r.status, status0, status1: await p.freshStatus() };
 };
 RUN.C3 = async (p, o) => {
   const sess = `uwsc-c3-${o.run}`, requests = [];
   await p.policy(scenarioPolicy({ rows: ["m-free"] }));
+  await p.freshWorker();                                                                 // appendLog caches its file descriptor: a worker that had already written agents.jsonl would not notice the file being replaced by a directory
   p.stub.setScript({}); p.stub.clear();
   await p.send("main", { model: ANCHOR, session: sess });
-  const status0 = await p.status();
+  const status0 = await p.freshStatus();
   await p.blockState("agents.jsonl"); await p.blockState(`agents-${sess}.jsonl`);      // a DIRECTORY where the log and the journal are expected: every append fails, as on a full disk
   try {
     for (let i = 0; i < 3; i++) requests.push(await SUB(p, { session: sess, agentId: aidFor(o.run, `c3${i}`), messages: 3 }));
     await p.settle();
-  } finally { await p.unblockState("agents.jsonl"); await p.unblockState(`agents-${sess}.jsonl`); }
-  return { requests: requests.map((r) => ({ status: r.status })), status0, status1: await p.status() };
+  } finally { await p.unblockState("agents.jsonl"); await p.unblockState(`agents-${sess}.jsonl`); p.markDirty?.(); }      // this worker's log stays down for 30 s after a failure: the next scenario gets a fresh one
+  return { requests: requests.map((r) => ({ status: r.status })), status0, status1: await p.freshStatus() };
 };
 RUN.C4 = async (p, o) => {
   const sess = `uwsc-c4-${o.run}`;
@@ -726,22 +760,22 @@ async function defaultLiveRequestsFor(sessionIds, sinceMs) {
 }
 
 /** The primitives over a live sandbox (the e2e context `c`). Not unit-tested against a gateway: its effects are unit-checked through the injected `d` (a fake filesystem and fake spawn). */
-export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [], rollbackFn = null, real = false, identity = null, liveRequestsFor = defaultLiveRequestsFor } = {}) {
+export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [], rollbackFn = null, real = false, identity = null, liveRequestsFor = defaultLiveRequestsFor, editConfig = editSandboxConfig } = {}) {
   const { d, key, stub } = c;
   const state = (f) => path.join(SCRATCH_STATE_DIR, f);
   const readJson = (f) => { try { return JSON.parse(d.sys.readText(state(f)) ?? "null"); } catch { return null; } };
-  let dirty = false, startedAt = d.now();
+  let dirty = false, startedAt = d.now(), lastSendEnd = d.now();        // lastSendEnd: when the last request (ours or the client's) ended: the router flushes status.json at most 5 s after its previous flush, which is no later than that
   const gw = () => ({ pid: d.sys.listenerPid(SANDBOX_PORTS.gateway), serviceSha: sha256(String(d.sys.readText(path.join(CCR_CONFIG_DIR, "service.json")) ?? "(absent)")) });
   const launchEnv = c.launchEnv ?? buildLaunchEnv(process.env, { preloadGuard: false });
   const prims = {
-    send: (shape, over) => e2eSend(d, key, shape, over), stub, now: () => d.now(), sleep: (ms) => d.sleep(ms),
+    send: async (shape, over) => { try { return await e2eSend(d, key, shape, over); } finally { lastSendEnd = d.now(); } }, stub, now: () => d.now(), sleep: (ms) => d.sleep(ms),
     settle: async () => { await d.sleep(400); },
     markDirty: () => { dirty = true; },
     // cooling lives in the router worker's memory (and cooling.json, which the worker re-reads only when the file changes), so after a scenario that cooled a model the only reliable reset is a fresh worker
     reset: async () => {
       for (const f of ["cooling.json", "shadow.flag"]) rmSafe(d, state(f));
       rmSafe(d, path.join(SCRATCH_STATE_DIR, "..", "observed.json"));
-      if (dirty) { dirty = false; await prims.restartWorker(); }
+      if (dirty) { dirty = false; await prims.freshWorker(); }                             // a restart that did not change the pid would leave the cooling of the last scenario in memory: that is an error, not a result
     },
     policy: async (p) => writeSafe(d, state("policy.json"), JSON.stringify(p)),
     writeState: async (f, text) => writeSafe(d, state(f), text),
@@ -751,6 +785,17 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
     unblockState: async (f) => rmSafe(d, state(f)),
     readLog: async (f) => logObj(d.sys.readText(state(f))),
     status: async () => readJson("status.json"),
+    // FRESH status: status.json is flushed at most every 5 s (flushStatus), but ANY request after that window flushes it, and an aux request is the cheapest one. So: wait until 5.1 s have passed since the last request, send ONE aux
+    // request, wait for the async write, read. If updatedAt still has not moved the read is marked `staleRead` (the judges would then be reading old counters).
+    freshStatus: async () => {
+      const wait = 5100 - (d.now() - lastSendEnd);
+      if (wait > 0) await d.sleep(wait);
+      const before = readJson("status.json")?.updatedAt;
+      await prims.send("aux", { model: ASKED_MODEL, agentId: "uwsc-flush", session: "uwsc-flush", messages: 1 });
+      let s = null;
+      for (const ms of [400, 800, 1600]) { await d.sleep(ms); s = readJson("status.json"); if (s && s.updatedAt !== before) return s; }
+      return s ? { ...s, staleRead: true } : s;
+    },
     workerFiles: async () => { try { return d.fs.readdirSync(SCRATCH_STATE_DIR).map((e) => (typeof e === "string" ? e : e.name)).filter((n) => /^status-[0-9a-z]{1,13}\.json$/.test(n)).length; } catch { return 0; } },
     gatewayFingerprint: async () => gw(),
     rollback: async () => { writeSafe(d, state("shadow.flag"), new Date(d.now()).toISOString() + "\n"); return true; },
@@ -759,14 +804,25 @@ export function sandboxPrims(c, { spawnClaude = null, lastText = async () => [],
     lastOut: lastText,
     restartWorker: async () => {                                                      // G1 observed that a Router.fallback swap makes CCR respawn its core worker: the core pid changes
       const pidBefore = d.sys.listenerPid(SANDBOX_PORTS.core);
-      await editSandboxConfig(c, "scn-restart", (cfg) => { cfg.Router = { ...cfg.Router, fallback: fallbackFor("model-chain") }; });
-      await editSandboxConfig(c, "scn-restart-restore", (cfg) => { cfg.Router = { ...cfg.Router, fallback: structuredClone(c.fallback ?? fallbackFor("off")) }; });
+      await editConfig(c, "scn-restart", (cfg) => { cfg.Router = { ...cfg.Router, fallback: fallbackFor("model-chain") }; });
+      await editConfig(c, "scn-restart-restore", (cfg) => { cfg.Router = { ...cfg.Router, fallback: structuredClone(c.fallback ?? fallbackFor("off")) }; });
       await d.sleep(1500);
-      return { pidBefore, pidAfter: d.sys.listenerPid(SANDBOX_PORTS.core) };
+      // the new worker must ANSWER before anything is measured (the first request after a respawn can fail), and the dying one may have rewritten cooling.json on its way out: delete it again once the new one is up
+      let ready = false;
+      for (let i = 0; i < 40 && !ready; i++) { const r = await prims.send("aux", { model: ASKED_MODEL, agentId: "uwsc-ready", session: "uwsc-ready", messages: 1 }); ready = r.status === 200; if (!ready) await d.sleep(500); }
+      rmSafe(d, state("cooling.json"));
+      const pidAfter = d.sys.listenerPid(SANDBOX_PORTS.core);
+      return { pidBefore, pidAfter, changed: !!pidAfter && pidAfter !== pidBefore, ready };
+    },
+    freshWorker: async () => {
+      const r = await prims.restartWorker();
+      if (!r.changed) throw new Error(`the router worker was not replaced (core pid ${r.pidBefore ?? "?"} -> ${r.pidAfter ?? "?"}): state of the last scenario (cooling, open files) is still in it, so nothing after this is a router verdict`);
+      if (!r.ready) throw new Error("the router worker did not answer a request within 20 s after its replacement");
+      return r;
     },
     claude: real && spawnClaude && identity ? async ({ prompt, maxTurns }) => {
       writeSafe(d, path.join(SCRATCH_CLAUDE_CONFIG, "settings.json"), canarySettings(key));          // canary: the sandbox claude-config's own settings point at the sandbox gateway with the sandbox-only key
-      return spawnClaude(claudeInvocation({ prompt, maxTurns, key, launchEnv, supports: identity.supports }), { exe: identity.path });
+      try { return await spawnClaude(claudeInvocation({ prompt, maxTurns, key, launchEnv, supports: identity.supports }), { exe: identity.path }); } finally { lastSendEnd = d.now(); }
     } : null,
     realCheck: real && spawnClaude && identity ? async () => {
       const ids = [...new Set(stub.records.map((r) => r.headers?.["x-claude-code-session-id"]).filter(Boolean))];
@@ -808,6 +864,7 @@ export function planLines() {
     "`--real yes` is a SEPARATE, RISKIER mode with its own consent (--approve-plan --real yes): a real headless Claude Code (`claude -p`) is started for scenarios 1, 2, 3 and 11 only (the others, and the free-mode variant of 2 and the cooldown steering of 3, stay replays). It is pointed at the sandbox by environment only (the sandbox's whitelist launch environment with HOME, USERPROFILE, APPDATA, LOCALAPPDATA, TEMP and CLAUDE_CONFIG_DIR under the scratch root, ANTHROPIC_BASE_URL and a sandbox-only key, a scratch working directory, a canary settings.json in the sandbox claude-config, --setting-sources user and --strict-mcp-config when the launcher has them). The approval pins the launcher's path, sha256 and --version. After the run the suite checks that the real ~/.claude.json and ~/.claude/projects hold nothing for the scratch directory, that the child wrote under the sandbox claude-config, and that no request carrying its session id reached the live gateway (result RC). That the real ~/.claude is never touched cannot be verified offline.",
     "scenarios (what each must prove; client: REAL = the client's own behaviour is measured with --real yes, REPLAY = the shapes are enough):",
     ...SCENARIOS.map((s) => `  ${s.id.padStart(2)} ${s.title} [${s.client === "real" ? "REAL with --real yes, else replay" : "REPLAY"}, ${s.runs} run${s.runs === 1 ? "" : "s"}]: ${s.proves}`),
+    "how the scenarios read the router (stated so a result can be trusted): (a) every counter and the cooling list come from a FRESH status: the router flushes status.json at most every 5 s, so the suite waits 5.1 s after its last request, sends one helper-shaped (aux) request, waits for the write and then reads; the router's own agent and decision logs are read as a second witness where one exists (a handoff line with its rsrc and reason, the first sticky-hit line). (b) MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes (and hands off to) main's model before it spreads (plan 6.2, router decide). Scenarios 3 and 10 therefore keep main OUTSIDE the set (10 names a main model no row has, so its main request may be refused by the gateway: only the router's lesson from it counts), while scenarios 2 and 7 keep it in the set on purpose (their handoff target is main's model). Whether that shortcut is wanted is an owner decision still open; the suite documents it, it does not judge it. (c) A router worker that served earlier scenarios is REPLACED before the next one when an earlier scenario left state in it (cooling, open log files): the core pid must change, the new worker must answer a request, cooling.json is deleted again after the swap (the dying worker can rewrite it), and a scenario that needs a clean cooling list checks that it is empty first; a worker that cannot be replaced is an error of the run, not a router verdict. (d) The sandbox has ONE provider: two distinct failing models within five minutes also cool the provider key and demote every row, so scenario 3 cools exactly one model before the all-limited step.",
     "chaos checks (same sandbox):",
     ...CHAOS.map((s) => `  ${s.id} ${s.title} [REPLAY, ${s.runs} run]: ${s.proves}`),
     "verdicts: PASS; FAIL (anything wrong: the suite is NOT OK); FINDING (allowed ONLY for scenarios 2, 7 and C4: a named thing could not be shown here: no retry signal reached the router, no worker restart could be made, one worker); DEGRADED (scenario 11 ONLY: one failure then avoidance, the behaviour the quality bar promises, never a seamless handoff). Every line that is not a PASS says it is not G3 evidence, and the exit code is non-zero for a FINDING anywhere else.",

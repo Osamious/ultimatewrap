@@ -383,6 +383,13 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   client reached the live gateway. A FINDING names
   something the sandbox could not show (for example that no retry signal reached the router); a
   DEGRADED line is the daily-cap case: one failure and then avoidance, never a seamless handoff.
+  How the suite reads the router: every counter and the cooling list come from a fresh status (the
+  router flushes `status.json` at most every 5 s, so the suite waits 5.1 s, sends one helper-shaped
+  request and reads), a worker that served earlier scenarios is replaced when it holds their state
+  (core pid must change; `cooling.json` is deleted again after the swap), and a scenario that needs a
+  clean cooling list checks it first. Main's own model comes first when it is a row of the policy (plan
+  6.2): scenarios 3 and 10 keep main outside the set, scenarios 2 and 7 keep it in on purpose; whether
+  that shortcut is wanted is an open owner decision, the suite documents it and does not judge it.
 - **Counts carry their denominator.** Every figure printed says what it is a count of ("7 of 7
   eligible models are not tool-tested"). "Eligible" means allowed by the toggles; "usable" means it
   can stand in for a subagent (a known context of at least 128,000) and fits the request.
