@@ -31,6 +31,8 @@
 //   br        the answer after the ~20 KB tool_result used the fact at the END of it (p / f), from L2.   er  the is_error tool_result case answered, not empty (p / f), L7
 //   nm        an MCP-style ~60-character tool name came back exactly (p / f), from the L3 constructs request (3a)
 //   cc        the cache_control markers Claude Code sends were accepted (p) or rejected by name (f); a model that rejected them is not sent them again
+//   pt        the JSON-schema `pattern` construct of the L3 / big requests: p = the full request passed; f = the answer to the full request was EMPTY (stop end_turn, 0 output tokens) and the same request with the
+//             patterns stripped passed (a gateway or upstream defect on one construct, not a limit of the model: the level passes, the class does not change, the policy ranks it below a clean pass); absent = never asked
 //   sp        the Agent (spawn) tool: a valid call with a prompt and a recognised subagent_type (p / f), L6. Two strikes like L1-L3 (sl 6); never lowers the class
 //   afw, l4w, l3w, spw  what differed when argument fidelity (af), the parallel-call check (L4), L3 or the spawn call (L6) failed: a few printable words, at most 60 characters ("old_string: newline lost",
 //             "1 call of 2 stop=tool_use", "stop=end_turn blocks=none in=40210 out=0"). Never a verdict; cleared by a later pass
@@ -65,11 +67,11 @@ export const BIG_LEVEL = 5;                          // the ~400 KB step, a leve
 
 const LVR_RE = /^[pfn]{4}$/;
 const FX_RE = /^[A-Za-z0-9._-]{1,40}$/;
-const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "l3w", "spw", "xw"]);
+const FIELDS = new Set(["lv", "lvr", "t", "ok", "why", "at", "fx", "maxBytes", "alias", "big", "capBelow", "strikes", "sl", "fc", "af", "nm", "cc", "br", "er", "sp", "d3", "afw", "l4w", "l3w", "spw", "xw", "pt"]);
 const NOTE_FIELDS = ["afw", "l4w", "l3w", "spw"];                                      // short reasons of non-blocking marker failures (printable ASCII, at most 60 characters): what differed, never a verdict
 export const GATEWAY_WHY = GATEWAY_WORDS;                                  // the reason text of a failure caused by the gateway's own request translation
 const noteOk = (x) => typeof x === "string" && /^[ -~]{1,60}$/.test(x);
-const PF_FIELDS = ["fc", "af", "nm", "cc", "br", "er", "sp"];            // the one-letter p / f markers, in the order they are written
+const PF_FIELDS = ["fc", "af", "nm", "cc", "br", "er", "sp", "pt"];            // the one-letter p / f markers, in the order they are written
 const WHY_CHARS = 160;
 const BAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -400,7 +402,7 @@ export function buildRecord(prior, done, { now = new Date(), fixtureId = FIXTURE
     if (ran(4)) m.l4w = done[4].v === "f" && noteOk(done[4].w) ? done[4].w : undefined;
     if (ran(2)) m.br = done[2].br;
     if (ran(7)) m.er = done[7].v;
-    for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc; }
+    for (const l of [3, BIG_LEVEL]) { if (ran(l) && done[l].nm) m.nm = done[l].nm; if (ran(l) && done[l].cc) m.cc = done[l].cc; if (ran(l) && done[l].pt) m.pt = done[l].pt === "f" || m.pt === "f" ? "f" : done[l].pt; }       // pt: f wins
     if (ran(3)) m.d3 = done[3].v === "f" ? (String(done[3].why ?? "").startsWith("[3a]") ? "a" : "b") : done[3].implied ? "i" : undefined;
     if (ran(6)) {
       m.spw = done[6].v === "f" && noteOk(done[6].w) ? done[6].w : undefined;
@@ -1511,6 +1513,8 @@ export function summaryOf(rec) {
   if (rec.l3w) out.notes.push(`L3 answer: ${rec.l3w}`);
   if (rec.spw) out.notes.push(`spawn failed: ${rec.spw}`);
   if (rec.fc === "p") out.notes.push("passed only when the tool call was forced: class t at best");
+  if (rec.pt) out.pt = rec.pt;
+  if (rec.pt === "f") out.notes.push("the pattern construct made the answer empty; the request without patterns passed (a gateway defect on one construct, not a model limit)");
   if (rec.d3 === "i") out.notes.push("L3 passed by implication (the big step passed first)");
   if (rec.d3 === "a") out.notes.push("L3 failed at the constructs request (3a), before the 157 KB request");
   if (rec.d3 === "b") out.notes.push("L3 failed at the 157 KB request (3b)");

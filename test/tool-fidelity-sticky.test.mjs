@@ -2266,3 +2266,31 @@ test("tripwire: the models of the provider that WAIT for the per-provider cap ar
   assert.deepEqual(["pa/u1", "pa/u2", "pa/u3"].map((k) => st.pending[k]?.r), ["spend-tripwire", "spend-tripwire", "spend-tripwire"], "u3 waited for the cap: still spend-tripwire");
   assert.deepEqual(keys(planOf(e, [], { store: st.models, pending: st.pending })), []);
 });
+
+// ================================================================ round 7: the pattern re-ask through the CLI, and the retry path for the stored empties
+
+test("round 7: --retry-failed --l3 yes --only <provider> asks the stored empty-3a failures again (strikes 2, d3 a, l3w and why do not block it); they pass with pt f, the class is v, and the stale fields are gone; a first strike is asked by --levels 123, not by --retry-failed", async () => {
+  const BADP = JSON.stringify("[^\\0]").slice(1, -1);
+  const silent = (c) => (JSON.stringify(c.body.tools ?? []).includes(BADP) && ["3a", "3b", "5"].includes(kindOf(c)) ? ok(stream(ev.stop("end_turn", 0))) : goodModel(c));
+  const stale = { why: "L3: [3a] empty answer to the constructs request", d3: "a", l3w: "stop=end_turn blocks=none in=0 out=0" };
+  const store = { "cc/x0": record("ppfn", { strikes: 2, sl: 3, ...stale }), "cc/x1": record("ppfn", { strikes: 2, sl: 3, ...stale }), "cc/y0": record("ppnn", { strikes: 1, sl: 3, l3w: stale.l3w }) };
+  const e = cliEnv([{ provider: "cc", keyId: "k.cc.free", models: [m("x0"), m("x1"), m("y0")] }], { answer: silent, store });
+  const args = ["--retry-failed", "--l3", "yes", "--only", "cc", "--max-spend", "5", "--tf-max-tokens-per-provider", "5000000"];
+  const p = planOf(e, args, { store });
+  assert.deepEqual(keys(p), ["cc/x0", "cc/x1"], "class x: queued for L3; the first strike is not class x");
+  assert.deepEqual(p.queued.map((x) => x.todo.join()), ["3", "3"]);
+  const r = await runRaw(["--live", ...args], e.deps);
+  assert.equal(r.code, 0, r.err + r.out);
+  const st = loadFidelity(e.out);
+  for (const k of ["cc/x0", "cc/x1"]) {
+    const rec = st.models[k];
+    assert.deepEqual([rec.t, rec.lvr[2], rec.pt, rec.strikes, rec.d3, rec.l3w, rec.why], ["v", "p", "f", undefined, undefined, undefined, undefined], k + " " + JSON.stringify(rec));
+  }
+  assert.equal(st.models["cc/y0"].strikes, 1, "the first strike was not touched by --retry-failed");
+  assert.equal(calls(e.f).some((c) => c.body.model === "cc/y0"), false);
+  // the first strike is asked by a run that includes L3
+  const r2 = await runRaw(["--live", "--levels", "123", "--l3", "yes", "--only", "cc", "--max-spend", "5", "--tf-max-tokens-per-provider", "5000000"], e.deps);
+  assert.equal(r2.code, 0, r2.err + r2.out);
+  const y = loadFidelity(e.out).models["cc/y0"];
+  assert.deepEqual([y.t, y.lvr[2], y.pt, y.strikes, y.l3w], ["v", "p", "f", undefined, undefined]);
+});

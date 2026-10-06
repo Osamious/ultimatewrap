@@ -73,9 +73,26 @@ const systemBlocks = (text, cc) => (cc ? [{ type: "text", text, cache_control: {
 
 /**
  * The request body of one KIND (`1`, `1f` forced, `2`, `2e`, `3a`, `3b`, `5`, `6`) for `model`. Pure: the planner measures these bytes, the probe sends them.
- * `noCc` leaves the cache_control markers off (a provider that rejected them is not sent them again).
+ * `noCc` leaves the cache_control markers off (a provider that rejected them is not sent them again). `noPat` strips the JSON-schema `pattern` keyword from every tool schema (a provider whose gateway
+ * goes silent on one pattern construct is not sent them again).
  */
-export function buildBody(kind, model, maxTokens = BUDGETS[kind], { noCc = false } = {}) {
+export function buildBody(kind, model, maxTokens = BUDGETS[kind], { noCc = false, noPat = false } = {}) {
+  const body = buildBodyRaw(kind, model, maxTokens, { noCc });
+  return noPat && Array.isArray(body.tools) ? { ...body, tools: stripPatterns(body.tools) } : body;
+}
+const SCHEMA_MAPS = ["properties", "patternProperties", "$defs", "definitions"], SCHEMA_ONE = ["items", "additionalProperties", "not", "if", "then", "else", "contains", "propertyNames"], SCHEMA_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems"];
+/** Removes the `pattern` KEYWORD (a string in a schema object) from a schema, wherever it nests; a PROPERTY named pattern (a key of `properties`) is left alone. */
+function stripSchema(sc) {
+  if (Array.isArray(sc)) { for (const x of sc) stripSchema(x); return; }
+  if (!sc || typeof sc !== "object") return;
+  if (typeof sc.pattern === "string") delete sc.pattern;
+  for (const k of SCHEMA_MAPS) if (sc[k] && typeof sc[k] === "object") for (const v of Object.values(sc[k])) stripSchema(v);
+  for (const k of SCHEMA_ONE) stripSchema(sc[k]);
+  for (const k of SCHEMA_LISTS) if (Array.isArray(sc[k])) for (const v of sc[k]) stripSchema(v);
+}
+/** A copy of `tools` with every `pattern` keyword gone from their input schemas. */
+export function stripPatterns(tools) { const t = structuredClone(tools); for (const x of t) stripSchema(x.input_schema); return t; }
+function buildBodyRaw(kind, model, maxTokens, { noCc }) {
   const base = { model, max_tokens: maxTokens, stream: true };
   const cc = !noCc;
   if (kind === "1" || kind === "1f") return { ...base, tools: [echoTool()], ...(kind === "1f" ? { tool_choice: { type: "tool", name: ECHO_TOOL } } : { tool_choice: { type: "auto" } }), messages: [{ role: "user", content: ASK[1] }] };
@@ -490,11 +507,11 @@ function httpVerdict(kind, status, text, ra) {
  * L1 is asked with the choice left to the model; only when that yields NO call is it asked FORCED (`forced: true` on the result, with the forced answer), and a forced request the
  * backend rejects for tool_choice leaves the auto verdict standing.
  */
-export async function runKind(kind, { fetchImpl = fetch, url, key, model, maxTokens, timeoutMs, timeouts = TIMEOUTS_MS, signal = null, noCc = false } = {}) {
+export async function runKind(kind, { fetchImpl = fetch, url, key, model, maxTokens, timeoutMs, timeouts = TIMEOUTS_MS, signal = null, noCc = false, noPat = false } = {}) {
   const conn = { fetchImpl, url, key, signal };
   const budget = maxTokens ?? BUDGETS[kind];
   const limit = timeoutMs ?? timeouts[CLASS_OF[kind]];
-  const go = (k) => send(k, JSON.stringify(buildBody(k, model, budget, { noCc })), { ...conn, timeoutMs: limit, maxTokens: budget });
+  const go = (k) => send(k, JSON.stringify(buildBody(k, model, budget, { noCc, noPat })), { ...conn, timeoutMs: limit, maxTokens: budget });
   const first = await go(kind);
   if (first.aborted) return first;
   if ((kind === "1" || kind === "1a") && first.v === "f" && (first.nocall || autoRefused(first))) {
@@ -550,12 +567,13 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
   const passed = (n) => (done[n]?.v ?? (prior[n - 1] === "p" ? "p" : "n")) === "p";
   const kindBudget = (k) => Math.max(conn.maxTokens ?? BUDGETS[k], state.maxTokens ?? 0);
   if (flags?.cc === "f") state.noCc = true;
+  if (flags?.pt === "f") { state.noPat = true; state.patFail = true; }           // the pattern construct made an answer empty before: the model is not sent it again
   const CAPPED = { v: "i", s: "error", why: `the request ceiling of ${MAX_MODEL_REQUESTS} for one model was reached`, capped: true };
   const spent = (r) => { requests += r.reqs ?? 1; state.requests = (state.requests ?? 0) + (r.reqs ?? 1); };
-  const ask = async (kind) => {
+  const askBase = async (kind) => {
     if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
     const base = (conn.timeouts ?? TIMEOUTS_MS)[CLASS_OF[kind]];
-    const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc, timeoutMs: base * (state.tmult ?? 1) };
+    const opts = { ...conn, maxTokens: kindBudget(kind), noCc: !!state.noCc, noPat: !!state.noPat, timeoutMs: base * (state.tmult ?? 1) };
     let r = await runKind(kind, opts);
     if (r.aborted) return r;
     spent(r);
@@ -564,7 +582,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       if ((state.requests ?? 0) >= MAX_MODEL_REQUESTS) return CAPPED;
       state.escalated = true; state.maxTokens = ESCALATED_MAX_TOKENS;
       tele.push(teleOf(r, opts.maxTokens));                                       // the thinking-only request was sent and its output spent: it is accounted for too
-      r = await runKind(kind, { ...conn, maxTokens: ESCALATED_MAX_TOKENS, noCc: !!state.noCc });
+      r = await runKind(kind, { ...conn, maxTokens: ESCALATED_MAX_TOKENS, noCc: !!state.noCc, noPat: !!state.noPat });
       if (r.aborted) return r;
       spent(r);
     }
@@ -572,21 +590,38 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     // a timeout: asked once more at DOUBLE the time inside this run (it counts toward the request ceiling, and the model's later requests keep the doubled time); a second timeout at the
     // doubled value ends the model for this run: on L1 as "slow" (with the seconds it was given), elsewhere as a plain timeout. Never a verdict.
     if (r.v === "i" && r.s === "timeout") {
-      if ((state.tmult ?? 1) < 2) { state.tmult = 2; return ask(kind); }
+      if ((state.tmult ?? 1) < 2) { state.tmult = 2; return askBase(kind); }
       return kind === "1" ? { ...r, slow: true, secs: Math.round((opts.timeoutMs ?? 0) / 100) / 10 } : r;
     }
     // a 400 that names cache_control: note it, stop sending the markers to this model and ask the same request again so the level is still learned
-    if (r.ccFail && !opts.noCc) { state.noCc = true; state.ccFail = true; const again = await ask(kind); return again.aborted || again.v === "i" ? again : { ...again, cc: "f" }; }
+    if (r.ccFail && !opts.noCc) { state.noCc = true; state.ccFail = true; const again = await askBase(kind); return again.aborted || again.v === "i" ? again : { ...again, cc: "f" }; }
     // an EMPTY answer to the constructs request (3a) is asked once more without the cache_control markers, to tell a provider that goes silent on them (the markers are what fails: `cc` f, the level
     // is still learned) from one that is silent on the constructs themselves (the failure stands). The markers stay off only when the second answer proves them the cause.
-    if (r.v === "f" && r.empty && kind === "3a" && !opts.noCc) {
-      state.noCc = true;
-      const again = await ask(kind);
+    if (r.v === "f" && r.empty && kind === "3a" && !opts.noCc && !state.ccTried) {
+      state.noCc = true; state.ccTried = true;                                   // once per model: the pattern re-ask below does not repeat it
+      const again = await askBase(kind);
       if (again.v === "p") { state.ccFail = true; return { ...again, cc: "f" }; }
       state.noCc = false;
       return again.aborted || again.v === "i" ? again : r;
     }
     return r;
+  };
+  // An EMPTY answer (stop end_turn, 0 output tokens, no block) to a request that carries the pattern construct (3a, 3b, the big step) is asked ONCE more with the `pattern` keywords stripped from every tool
+  // schema: some gateways go silent on one such construct (a path pattern ending in [^\0]+), which says nothing about the model. If the stripped request passes the level PASSES, marked `pt` f (the
+  // pattern construct made the answer empty) and the model's later requests are sent without patterns (`noPat`); if it fails too the failure stands. Once per request kind and model; the extra ask counts
+  // toward the request ceiling.
+  const PATTERN_KINDS = new Set(["3a", "3b", "5"]);
+  const emptyStop = (r) => /^stop=end_turn\b/.test(r.w ?? "") && /\bout=0\b/.test(r.w ?? "");
+  const ask = async (kind) => {
+    const r = await askBase(kind);
+    if (r.aborted || r.v !== "f" || !r.empty || !PATTERN_KINDS.has(kind) || state.noPat || !emptyStop(r) || (state.patAsked ??= new Set()).has(kind)) return r;
+    state.patAsked.add(kind);
+    state.noPat = true;
+    const again = await askBase(kind);
+    if (again.aborted) return again;
+    if (again.v === "p") { state.patFail = true; return { ...again, pt: "f" }; }
+    state.noPat = false;
+    return again.v === "i" ? again : r;
   };
   const stop = (r) => (r.slow
     ? { inconclusive: { s: "timeout", reason: "slow", secs: r.secs, why: r.why }, requests, tele }
@@ -604,14 +639,15 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       const a = await ask("3a");
       if (a.aborted) return a;
       if (a.v === "i") return stop(a);
-      state.l3a = { v: a.v, why: a.why, kind: a.kind, w: a.w, nm: a.nmFail ? "f" : a.nm, cc: state.ccFail ? "f" : a.cc ?? (state.noCc ? undefined : "p") };
+      state.l3a = { v: a.v, why: a.why, kind: a.kind, w: a.w, nm: a.nmFail ? "f" : a.nm, cc: state.ccFail ? "f" : a.cc ?? (state.noCc ? undefined : "p"), pt: a.v === "p" ? (state.patFail ? "f" : "p") : undefined };
     }
-    const { nm, cc } = state.l3a, marks = { ...(nm ? { nm } : {}), ...(cc ? { cc } : {}) };
+    const { nm, cc, pt: pt3 } = state.l3a, marks = { ...(nm ? { nm } : {}), ...(cc ? { cc } : {}) };
+    const ptMark = () => { const p = state.patFail ? "f" : pt3; return p ? { pt: p } : {}; };          // f wins: a later request that needed the strip taints the whole level
     if (state.l3a.v === "f") { done[3] = { v: "f", why: `[3a] ${state.l3a.why}`, kind: state.l3a.kind, ...(state.l3a.w ? { w: state.l3a.w } : {}), ...marks }; return null; }
     const b = await ask("3b");
     if (b.aborted) return b;
     if (b.v === "i") return stop(b);
-    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), ...(b.w ? { w: b.w } : {}), bytes: b.bytes, ...marks };
+    done[3] = { v: b.v, ...(b.why ? { why: `[3b] ${b.why}` } : {}), ...(b.kind ? { kind: b.kind } : {}), ...(b.w ? { w: b.w } : {}), bytes: b.bytes, ...marks, ...(b.v === "p" ? ptMark() : {}) };
     if (b.v === "p" && b.l4) done[4] = { v: b.l4, ...(b.l4why ? { why: b.l4why } : {}), ...(b.l4w ? { w: b.l4w } : {}), bytes: b.bytes };
     return null;
   };
@@ -619,7 +655,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
     const r = await ask("5");
     if (r.aborted) return r;
     if (r.v === "i") return stop(r);
-    done[5] = row(r, { bytes: r.bytes, ...(r.cc ? { cc: r.cc } : {}) });
+    done[5] = row(r, { bytes: r.bytes, ...(r.cc ? { cc: r.cc } : {}), ...(r.v === "p" ? { pt: state.patFail ? "f" : "p" } : {}) });
     return null;
   };
 
@@ -645,7 +681,7 @@ export async function probeModel({ levels, prior = "nnnn", flags = null, done = 
       if (!pair) { notRun("not run: L1 and L2 did not both pass"); continue; }
       if (bigFirst && !done[5]) {
         const x = await doBig(); if (x) return x;
-        if (done[5]?.v === "p") { done[3] = { v: "p", implied: "big", bytes: done[5].bytes, ...(done[5].cc ? { cc: done[5].cc } : {}) }; continue; }     // a pass at 400 KB implies the 157 KB step
+        if (done[5]?.v === "p") { done[3] = { v: "p", implied: "big", bytes: done[5].bytes, ...(done[5].cc ? { cc: done[5].cc } : {}), ...(done[5].pt ? { pt: done[5].pt } : {}) }; continue; }     // a pass at 400 KB implies the 157 KB step
       }
       const x = await doL3(); if (x) return x;
     } else if (level === 4) {

@@ -110,8 +110,8 @@ test("when the second answer is empty too the markers were not the cause: the fa
   const f = fakeFetch((c) => (kindOf(c) === "3a" ? empty("end_turn", 0) : goodModel(c)));
   const state = {};
   const r = await probeModel({ levels: [3, 4], prior: "ppnn", state, ...FREE, ...conn(f) });
-  assert.deepEqual(kinds(f), ["3a", "3a"]);
-  assert.deepEqual([r.done[3].v, r.done[3].cc, state.noCc], ["f", "p", false]);
+  assert.deepEqual(kinds(f), ["3a", "3a", "3a"], "the full request, the one without the markers, then the one without the patterns (an empty stop end_turn answer is asked both ways, once each)");
+  assert.deepEqual([r.done[3].v, r.done[3].cc, state.noCc, r.done[3].pt, state.noPat], ["f", "p", false, undefined, false], "neither was the cause: the failure stands, no marker is blamed, the markers and the patterns come back");
   assert.equal(r.done[3].w, "stop=end_turn blocks=none in=40210 out=0");
   const s = await probeModel({ levels: [3], prior: "ppnn", state: {}, ...FREE, ...conn(fakeFetch((c) => (kindOf(c) === "3a" ? ok(stream(ev.text(0, "no tool"), ev.stop("end_turn", 3))) : goodModel(c)))) });
   assert.equal(s.done[3].v, "p", "an answer with text is not empty: no re-ask");
