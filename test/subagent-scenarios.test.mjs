@@ -796,6 +796,13 @@ async function virtualSandbox(o = {}) {
     if (cur && V.now <= cur.u + 3600000 && V.now - cur.t0 <= 24 * 3600000) { n = cur.n + 1; t0 = cur.t0; }
     const lvl = n >= 4 ? 3 : n - 1;
     V.cool.set(sel, { u: V.now + LADDER[lvl], l: lvl, t: V.now, n, t0 });
+    const prov = sel.slice(0, sel.indexOf("/")), pk = `prov:${prov}`;                      // the PROVIDER RULE: another model of the provider with a record whose t is within 5 minutes (cooling or not) cools the provider key
+    for (const [k, v] of V.cool) {
+      if (k === sel || k.startsWith("prov:") || k.slice(0, k.indexOf("/")) !== prov || V.now - v.t > 5 * 60000) continue;
+      const pc = V.cool.get(pk);
+      if (!(pc && pc.u > V.now)) V.cool.set(pk, { u: V.now + LADDER[Math.max(lvl, v.l)], l: Math.max(lvl, v.l), t: V.now, n: Math.max(n, v.n), t0: Math.min(t0, v.t0) });
+      break;
+    }
     const models = {}; for (const [k, v] of V.cool) models[k] = v;
     V.coolText = JSON.stringify({ v: 1, models }); mem.set(coolFile, V.coolText);
   };
@@ -1026,23 +1033,24 @@ test("H4 the sandbox has ONE provider: two DISTINCT failing models cool the prov
 // ====================================================================================== fix round 5 (the fifth replay run: the router lives in the sandbox DAEMON, so replacing the core worker never cleared its cooling; the reset writes newer, expired cooling records instead)
 const state = async (name) => path.join((await import("../harness/subagent-sandbox-spec.mjs")).SCRATCH_STATE_DIR, name);
 
-test("R5-1 reset clears the router's cooling: deleting cooling.json clears NOTHING (the defect of run 5), the reset's newer-and-expired records do; the next failure starts at rung 0 again (the streak is ended)", async () => {
+test("R5-1 reset clears the router's cooling of the failing model: deleting cooling.json clears NOTHING (the defect of run 5), the reset's newer-and-expired records do; the next failure starts at rung 0 again, and the provider key is NOT cooled by it", async () => {
   const v = await virtualSandbox(), w = prims(v);
-  v.V.coolFail("uwstub/m-free"); v.V.coolFail("uwstub/m-big"); v.V.coolFail("prov:uwstub");
+  v.V.coolFail("uwstub/m-free");
   let s = await w.freshStatus();
-  assert.deepEqual(s.cooling.map((x) => x.key).sort(), ["prov:uwstub", "uwstub/m-big", "uwstub/m-free"], "the scenario left three cooling entries in the router");
+  assert.deepEqual(s.cooling.map((x) => x.key), ["uwstub/m-free"], "the scenario left m-free cooling in the router");
   v.mem.delete(v.coolFile);                                                              // what the old reset did
   v.V.now += 6000; s = await w.freshStatus();
-  assert.equal(s.cooling.length, 3, "deleting the file cleared nothing: the router holds cooling in memory");
+  assert.equal(s.cooling.length, 1, "deleting the file cleared nothing: the router holds cooling in memory");
   await w.reset();
   s = await w.freshStatus();
   assert.deepEqual(s.cooling, [], "after the reset the fresh status lists no cooling");
   v.V.coolFail("uwstub/m-free");
   const e = v.V.cool.get("uwstub/m-free");
   assert.equal(e.l, 0, "rung 0 again"); assert.equal(e.n, 1, "no streak carried over"); assert.equal(e.u - v.V.now, 2 * 60000, "a 2-minute cooldown, not the 10 minutes an escalated rung would give");
+  assert.ok(!(v.V.cool.get("prov:uwstub")?.u > v.V.now), "the FIRST failure after a reset does not cool the provider key (no other model of the provider has a recent record)");
 });
 
-test("R5-2 what reset writes: v:1 records for every sandbox model and the provider key, each NEWER than now and EXPIRED more than an hour ago with n 1; shadow.flag and observed.json are removed; it waits 1.2 s for the router's one-second re-read; the seam has no RPC, guard or process function, so nothing is restarted or stopped", async () => {
+test("R5-2 what reset writes: v:1 records for uwstub/m-free and the provider key ONLY, each NEWER than now and EXPIRED more than an hour ago with n 1; shadow.flag and observed.json are removed; it waits 1.2 s for the router's one-second re-read; the seam has no RPC, guard or process function, so nothing is restarted or stopped", async () => {
   const v = await virtualSandbox(), w = prims(v);
   assert.deepEqual(Object.keys(v.d.sys).sort(), ["readText", "selfPid"]); assert.equal(v.d.rpc, undefined); assert.equal(v.d.guard, undefined);
   const flag = await state("shadow.flag"), obs = path.join(path.dirname(path.dirname(await state("x"))), "observed.json");
@@ -1052,9 +1060,32 @@ test("R5-2 what reset writes: v:1 records for every sandbox model and the provid
   assert.equal(v.V.now - t0, 1200, "exactly the 1.2 s wait");
   assert.equal(v.mem.has(path.resolve(flag)), false); assert.equal(v.mem.has(path.resolve(obs)), false);
   const f = JSON.parse(v.mem.get(v.coolFile));
-  assert.equal(f.v, 1); assert.deepEqual(Object.keys(f.models).sort(), ["prov:uwstub", "uwstub/m-big", "uwstub/m-free", "uwstub/m-main"]);
+  assert.equal(f.v, 1); assert.deepEqual(Object.keys(f.models).sort(), ["prov:uwstub", "uwstub/m-free"], "no record for m-big or m-main: a fresh t on another model of the provider would cool the whole provider on the first 429");
   for (const x of Object.values(f.models)) { assert.ok(x.t > t0, "newer than now"); assert.ok(t0 - x.u > 3600000, "expired by more than the one-hour streak window"); assert.equal(x.n, 1); assert.equal(x.l, 0); assert.ok(["u", "l", "t", "n", "t0"].every((k) => Number.isFinite(x[k]))); }
   await w.reset(); assert.equal(v.V.now - t0, 2400, "a reset costs 1.2 s whether or not the last scenario cooled anything; no process is ever restarted");
+});
+
+test("R5-2b the router's PROVIDER RULE (modelled): a reset that stamps a fresh t on the OTHER models too (run 6's defect) makes the first 429 cool the whole provider; the shipped reset does not; and a scenario that failed two models leaves a recent t that only TIME ages (5 minutes), no reset can", async () => {
+  const bad = await virtualSandbox(), bw = prims(bad);
+  const t = bad.V.now;
+  bad.mem.set(bad.coolFile, JSON.stringify({ v: 1, models: Object.fromEntries(["uwstub/m-main", "uwstub/m-free", "uwstub/m-big", "prov:uwstub"].map((k) => [k, { u: t - 7200000, l: 0, t: t + 1000, n: 1, t0: t - 7200000 }])) }));
+  await bw.freshStatus();
+  bad.V.coolFail("uwstub/m-free");
+  assert.ok(bad.V.cool.get("prov:uwstub").u > bad.V.now, "the broad reset: the provider key is cooled by the very first failure");
+  const good = await virtualSandbox(), gw = prims(good);
+  await gw.reset(); await gw.freshStatus(); good.V.coolFail("uwstub/m-free");
+  assert.ok(!(good.V.cool.get("prov:uwstub")?.u > good.V.now), "the shipped reset: it is not");
+  const many = await virtualSandbox(), mw = prims(many);
+  many.V.coolFail("uwstub/m-free"); many.V.now += 60000; many.V.coolFail("uwstub/m-big");          // scenario 3: m-free in step 1, m-big in step 3 (the provider key is cooled by the second)
+  await mw.reset(); await mw.freshStatus();
+  many.V.coolFail("uwstub/m-free");
+  assert.ok(many.V.cool.get("prov:uwstub").u > many.V.now, "right after: m-big's record is recent, the reset cannot age it, the next failure cools the provider");
+  const gap = await virtualSandbox(), pw = prims(gap);
+  gap.V.coolFail("uwstub/m-free"); gap.V.now += 60000; gap.V.coolFail("uwstub/m-big");
+  gap.V.now += S.PROVIDER_QUIET_MS; await pw.reset(); await pw.freshStatus();
+  gap.V.coolFail("uwstub/m-free");
+  assert.ok(!(gap.V.cool.get("prov:uwstub")?.u > gap.V.now), "after the quiet gap it does not");
+  assert.ok(S.PROVIDER_QUIET_MS > 5 * 60000, "more than the router's 5 minutes");
 });
 
 test("R5-3 a full suite run does 16 resets (15 scenarios plus the one between the two variants of scenario 2): about 20 s of waiting and NO core restart; a scenario that throws leaves nothing the next reset does not clear", async () => {
@@ -1093,4 +1124,43 @@ test("R5-5 a provider with autoFetchModels refuses in the isolation guard (CCR w
   const second = structuredClone(cfg); second.Providers.push({ name: "uwstub2", autoFetchModels: true });
   assert.throws(() => guard.assertPayloadIsolated(second, { allowProviders: true }), /provider "uwstub2" has autoFetchModels set/, "any provider, not only the first");
   assert.ok(/autoFetchModels: false/.test(fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness", "subagent-e2e.mjs"), "utf8")), "the e2e stub provider is written with autoFetchModels false");
+});
+
+test("R5-6 run order: scenario 3 (the only one that fails two models) runs after every other scenario that fails a model, the result lines follow that order, every scenario still runs once, and a full run never waits for the quiet gap", async () => {
+  assert.deepEqual([...S.RUN_ORDER].sort(), S.ALL.map((x) => x.id).sort(), "every scenario appears exactly once");
+  const at = (id) => S.RUN_ORDER.indexOf(id);
+  for (const id of S.FAILS_MODEL.filter((x) => x !== "3")) assert.ok(at(id) < at("3"), `${id} runs before 3`);
+  assert.deepEqual([...S.FAILS_MANY], ["3"]); assert.ok(S.FAILS_MODEL.every((id) => S.ALL.some((x) => x.id === id)));
+  assert.ok(S.RUN_ORDER.slice(at("3") + 1).every((id) => !S.FAILS_MODEL.includes(id)), "nothing that fails a model runs after 3");
+  const f = fakeWorld({}); let t = 1_800_000_000_000; const slept = [], notes = [];
+  const clock = { ...f.prims, now: () => t, sleep: async (ms) => { slept.push(ms); t += ms; return f.prims.sleep(ms); }, note: (m) => notes.push(m) };
+  const lines = []; const res = await S.runScenarios(clock, {}, (l) => lines.push(l));
+  assert.deepEqual(res.map((r) => r.scn.id), [...S.RUN_ORDER]);
+  assert.deepEqual(lines.map((l) => S.parseScenarioLine(l).id), [...S.RUN_ORDER]);
+  assert.equal(notes.filter((m) => /quiet gap/.test(m)).length, 0, "no quiet gap in a full run");
+  assert.ok(!slept.some((ms) => ms >= 30000), "and no long sleep");
+});
+
+test("R5-7 quiet gap: a scenario that fails a model and starts less than 5.5 minutes after the end of scenario 3 waits out the REST (from the clock, not a fixed sleep), with a progress line every 30 s; nothing waits when enough time has passed or when the next scenario fails no model", async () => {
+  const run = async (opts, between = 0) => {
+    const f = fakeWorld({}); let t = 1_800_000_000_000, calls = 0; const slept = [], notes = [];
+    const clock = { ...f.prims, now: () => t + (++calls >= 2 ? between : 0), sleep: async (ms) => { slept.push(ms); t += ms; }, note: (m) => notes.push(m) };      // the 2nd clock reading is the one at the start of the next run: `between` is the time that passed since the end of the last one
+    const res = await S.runScenarios(clock, opts);
+    return { res, slept, notes };
+  };
+  const two = await run({ only: ["3"], runs: 2 });
+  assert.equal(two.res[0].result.verdict, "PASS", two.res[0].result.text);
+  const gaps = two.slept.filter((ms) => ms >= 5000);
+  assert.ok(gaps.reduce((a, b) => a + b, 0) >= S.PROVIDER_QUIET_MS - 1000 && gaps.reduce((a, b) => a + b, 0) <= S.PROVIDER_QUIET_MS + 60000, `second run waited about ${S.PROVIDER_QUIET_MS / 1000} s (${gaps})`);
+  assert.ok(two.slept.filter((ms) => ms === 30000).length >= 9, "30 s steps");
+  assert.ok(two.notes.some((m) => /^quiet gap before scenario 3: .*330 s/.test(m)) && two.notes.filter((m) => /^quiet gap: \d+ s of \d+ s$/.test(m)).length >= 9, "progress lines");
+  const enough = await run({ only: ["3"], runs: 2 }, S.PROVIDER_QUIET_MS);                       // the clock already moved past the quiet time between the runs
+  assert.equal(enough.notes.filter((m) => /quiet gap/.test(m)).length, 0, "enough time passed: no wait");
+  const part = await run({ only: ["3"], runs: 2 }, 200000);                                       // 200 s already passed: only the rest is waited
+  const rest = part.slept.filter((ms) => ms >= 5000).reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(rest - (S.PROVIDER_QUIET_MS - 200000)) < 60000, `the rest only (${rest})`);
+  const noFail = await run({ only: ["3", "C2", "C4"] });                                          // C2 and C4 run AFTER 3 and fail no model: no wait
+  assert.equal(noFail.notes.filter((m) => /quiet gap/.test(m)).length, 0);
+  const after = await run({ only: ["7", "3"] });                                                   // 7 runs first by the order: no wait
+  assert.equal(after.notes.filter((m) => /quiet gap/.test(m)).length, 0);
 });
