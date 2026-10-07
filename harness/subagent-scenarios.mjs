@@ -21,6 +21,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import {
   runE2e, defaults as e2eDefaults, send as e2eSend, waitFor, writeSafe, rmSafe, installRouter, logObj, buildShadowPolicy, policyContentHash, bareOf, modelIs,
   ANCHOR, TAG_MODEL, ASKED_MODEL, NOTICE_MARK, X4_AGENT, X4_PARENT,
@@ -38,6 +39,7 @@ export const VERDICTS = Object.freeze(["PASS", "FAIL", "FINDING", "DEGRADED"]);
 const rel = (f) => path.relative(REPO_ROOT, f).replace(/\\/g, "/");
 /** the orchestrator set, this file, and keysync/subagent-policy.mjs (the orchestrator runs it for `last`, see defaultLastText) */
 export const EXECUTED_FILES = Object.freeze([...G1_FILES.map(rel), SCENARIOS_FILE, "keysync/subagent-policy.mjs"]);
+const { redactSecrets: redactBase } = createRequire(import.meta.url)("./trial31/redact31.cjs");     // read-only reuse of the 3.1.1 trial redactor (a pinned executed file), as subagent-e2e.mjs does
 const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
 /** An error that must stop the whole run (teardown, evidence), never become one scenario's FAIL: a refusal, a timed-out RPC (it may or may not have been applied), an isolation violation. */
 export const isFatalRun = (e) => !!e && (e.name === "RefusalError" || e.name === "RpcTimeoutError" || /ISOLATION VIOLATION/.test(String(e.message)));
@@ -413,12 +415,63 @@ export const realScript = (label = "scn", extra = {}) => ({ userMarkers: [REAL_M
 /** A stub `decide` for a REAL client: the FIRST request of every agent id gets `step` (429, or {status, retryAfter}); the router's choice of model is not ours to script, so whichever model that agent landed on is the one limited. */
 export const firstRequestOfEachAgent = (step) => { const seen = new Set(); return (rec) => { const a = rec.headers?.["x-claude-code-agent-id"]; if (!a || seen.has(a)) return undefined; seen.add(a); return step; }; };
 const firstSubModel = (records) => { const r = messagesOf(records).find(isSub); return r ? `uwstub/${bareOf(r.model)}` : null; };
-/** What the real client reported (`claude -p --output-format json`), reduced to a few words: exit code, subtype, error flag, turns, the NAMES of denied tools, the first words of its answer. Never the prompt, never a header. */
+/**
+ * Reduces the event stream of `claude -p --output-format stream-json --verbose` LINE BY LINE (a chunk may end inside a line) to the few things a verdict needs, so nothing of the conversation is kept: the permission mode the client
+ * reported in its init event, how many tools it listed, the NAMES of the tools it called, every tool_result that was an error (the first 200 characters, redacted: this is where "you haven't granted it yet" or an auto-mode
+ * classifier text says WHY a tool was denied), and its final result event (subtype, error flag, turns, the first words of its answer, the NAMES of the tools it reports as denied, never their input). A line that does not parse
+ * is counted, never kept; a partial line over 1 MB is dropped; every list is bounded. `secrets` (the sandbox key) are masked besides the shared redactor's patterns.
+ */
+/** Text that may reach a verdict or a log: the literal secrets (the sandbox key) masked BEFORE the shared redactor (it could cut a key in two) and AFTER it, then printable ASCII only and clipped. */
+export function cleanText(t, n, secrets = []) {
+  const mask = (x) => { for (const k of secrets) if (typeof k === "string" && k.length >= 8) x = x.split(k).join("<redacted>"); return x; };
+  return clip(mask(redactBase(mask(String(t ?? "")))), n);
+}
+export function createStreamReducer({ secrets = [] } = {}) {
+  let buf = "", malformed = 0, events = 0, init = null, result = null;
+  const calls = new Map(), errors = [];
+  const clean = (t, n) => cleanText(t, n, secrets);
+  const textOf = (c) => (typeof c === "string" ? c : asArr(c).map((b) => (b && typeof b.text === "string" ? b.text : "")).join(" "));
+  const one = (line) => {
+    let e; try { e = JSON.parse(line); } catch { malformed += 1; return; }
+    if (!e || typeof e !== "object" || typeof e.type !== "string") return;      // only a typed event counts: a bare JSON object is not a stream
+    events += 1;
+    if (e.type === "system" && e.subtype === "init") { init = { mode: clip(e.permissionMode ?? "", 24), tools: Array.isArray(e.tools) ? e.tools.length : null }; return; }
+    if (e.type === "assistant") { for (const b of asArr(e.message?.content)) if (b && b.type === "tool_use" && typeof b.id === "string" && calls.size < 64) calls.set(b.id.slice(0, 80), clip(b.name, 30)); return; }
+    if (e.type === "user") { for (const b of asArr(e.message?.content)) if (b && b.type === "tool_result" && b.is_error === true && errors.length < 64) errors.push({ id: String(b.tool_use_id ?? "").slice(0, 80), reason: clean(textOf(b.content), 200) }); return; }
+    if (e.type === "result") result = { subtype: clip(e.subtype ?? "", 40), isError: e.is_error ?? null, turns: Number.isFinite(e.num_turns) ? e.num_turns : null, text: clean(e.result ?? "", 100),
+      denied: asArr(e.permission_denials).slice(0, 8).map((d) => ({ tool: clip(d?.tool_name ?? "?", 30), id: String(d?.tool_use_id ?? "").slice(0, 80) })) };
+  };
+  return {
+    push(chunk) {
+      buf += String(chunk);
+      const lines = buf.split("\n"); buf = lines.pop();
+      if (buf.length > 1048576) buf = "";
+      for (const l of lines) if (l.trim()) one(l);
+    },
+    end() { if (buf.trim()) one(buf); buf = ""; },
+    summary() {
+      const reasonOf = (id) => errors.find((x) => x.id === id)?.reason ?? "";
+      return { events, malformed, mode: init?.mode ?? "", tools: init?.tools ?? null, called: [...new Set(calls.values())].slice(0, 8), result,
+        denied: asArr(result?.denied).map((d) => ({ tool: d.tool, reason: reasonOf(d.id) })),
+        errors: errors.slice(0, 5).map((x) => ({ tool: calls.get(x.id) ?? "?", reason: x.reason })) };
+    },
+  };
+}
+/**
+ * What the real client reported, reduced to a few words: exit code, subtype, error flag, turns, the permission mode it ran in, the NAMES of denied tools with the REASON the stream gave, the first words of its answer. Never the
+ * prompt, never a header, never a tool input. `r.stream` (the reduced event stream) is preferred; a plain `--output-format json` result is still understood.
+ */
 export function claudeInfo(r) {
   if (!r) return null;
-  let j = null; try { j = JSON.parse(String(r.text ?? "")); } catch { /* not JSON: the clipped text says so */ }
-  return { code: r.code ?? null, reason: clip(r.reason ?? "", 80), subtype: clip(j?.subtype ?? "", 40), isError: j?.is_error ?? null, turns: Number.isFinite(j?.num_turns) ? j.num_turns : null,
-    denials: asArr(j?.permission_denials).map((d) => clip(d?.tool_name ?? "?", 30)).slice(0, 5), result: clip(j?.result ?? r.text ?? "", 100), err: clip(r.err ?? "", 100) };
+  const st = r.stream ?? null;
+  let j = null; if (!st) { try { j = JSON.parse(String(r.text ?? "")); } catch { /* not JSON: the clipped text says so */ } }
+  const base = { code: r.code ?? null, reason: cleanText(r.reason ?? "", 80), err: cleanText(r.err ?? "", 100) };
+  if (st) {
+    const res = st.result ?? {}, why = [...asArr(st.denied).map((d) => `${d.tool}: ${d.reason || "no reason in the stream"}`), ...asArr(st.errors).filter((e) => !asArr(st.denied).some((d) => d.reason === e.reason)).map((e) => `${e.tool}: ${e.reason}`)].slice(0, 5);
+    return { ...base, subtype: res.subtype ?? "", isError: res.isError ?? null, turns: res.turns ?? null, denials: asArr(st.denied).map((d) => d.tool).slice(0, 5), mode: st.mode ?? "", reasons: why, called: asArr(st.called), result: clip(res.text ?? "", 100) };
+  }
+  return { ...base, subtype: clip(j?.subtype ?? "", 40), isError: j?.is_error ?? null, turns: Number.isFinite(j?.num_turns) ? j.num_turns : null, denials: asArr(j?.permission_denials).map((d) => clip(d?.tool_name ?? "?", 30)).slice(0, 5),
+    mode: "", reasons: [], called: [], result: cleanText(j?.result ?? r.text ?? "", 100) };
 }
 /** The requests the stub saw, grouped by shape: "11x main/18 tools+Agent/m-main/200 text". The answer to "what did the client do" when no subagent request came. */
 export function shapeDigest(records) {
@@ -430,8 +483,8 @@ export function shapeDigest(records) {
   return [...m].map(([k, n]) => `${n}x ${k}`).join("; ") || "no request";
 }
 /** A verdict that PASSED still names the tools the real client had denied (the default permission mode denies everything but the subagent tool): names only, never an input. Empty for a replay or a clean client. */
-const denialNote = (ev) => (asArr(ev?.claude?.denials).length ? ` [the real client had these tools denied: ${asArr(ev.claude.denials).join(", ")}]` : "");
-const diagOf = (ev) => `stub saw ${shapeDigest(ev.records)}; ${ev.claude ? `the client: exit ${clip(ev.claude.code, 6)}, ${clip(ev.claude.subtype || "no subtype", 30)}, turns ${clip(ev.claude.turns ?? "?", 4)}, denied tools [${asArr(ev.claude.denials).join(", ") || "none"}], answer "${ev.claude.result}"${ev.claude.err ? `, stderr "${ev.claude.err}"` : ""}` : "no client report (replay)"}`;
+const denialNote = (ev) => (asArr(ev?.claude?.denials).length ? ` [the real client had these tools denied: ${asArr(ev.claude.denials).join(", ")}${asArr(ev.claude.reasons).length ? `; why: ${clip(asArr(ev.claude.reasons)[0], 160)}` : ""}]` : "");
+const diagOf = (ev) => `stub saw ${shapeDigest(ev.records)}; ${ev.claude ? `the client: exit ${clip(ev.claude.code, 6)}, ${clip(ev.claude.subtype || "no subtype", 30)}, turns ${clip(ev.claude.turns ?? "?", 4)}, permission mode ${clip(ev.claude.mode || "unknown", 24)}, denied tools [${asArr(ev.claude.denials).join(", ") || "none"}]${asArr(ev.claude.reasons).length ? ` (why: ${asArr(ev.claude.reasons).map((x) => `"${clip(x, 200)}"`).join("; ")})` : ""}${asArr(ev.claude.called).length ? `, tools it called [${asArr(ev.claude.called).join(", ")}]` : ""}, answer "${ev.claude.result}"${ev.claude.err ? `, stderr "${ev.claude.err}"` : ""}` : "no client report (replay)"}`;
 const firstSubAid = (p) => aidOf(messagesOf(p.stub.records).find(isSub));
 const limitFree = (rec) => (modelIs(rec.model, "uwstub/m-free") && rec.headers?.["x-claude-code-agent-id"] ? 429 : undefined);
 const OVERLAY_WAIT_MS = 1200;                            // above the router's one-second overlay re-read
@@ -744,6 +797,14 @@ const samePath = (a, b) => path.resolve(String(a)).toLowerCase() === path.resolv
  * claudeInfo reports the names of the denied ones in the verdict. The stub answers a spawned subagent with text only, so the subagent has nothing else to try.
  */
 export const REAL_ALLOWED_TOOLS = Object.freeze(["Task", "Agent"]);
+/**
+ * The ONE permission mode the harness passes: `dontAsk`, which denies whatever is not allowed by a rule WITHOUT asking and without a classifier (not a bypass: it widens nothing). Without it the client may run in the auto
+ * mode, whose classifier is not meant to be reached from a sandbox and which sets broad allow rules aside (run 11's stderr was an auto-mode notice and the Task tool was still denied). It is passed only when the launcher's
+ * --help lists it. bypassPermissions, acceptEdits, auto and plan are never passed (a source-level test bans them).
+ */
+export const REAL_PERMISSION_MODE = "dontAsk";
+/** The ONE place the flag is spelled (a test counts its occurrences in all the harness code). */
+const PERMISSION_MODE_FLAG = "--permission-mode";
 export function claudeInvocation({ prompt, maxTurns = 4, key, launchEnv, scratchRoot = SCRATCH_ROOT, gatewayPort = SANDBOX_PORTS.gateway, supports = {} }) {
   if (!key || typeof key !== "string") throw new Error("claudeInvocation needs the sandbox profile key");
   if (!launchEnv || typeof launchEnv !== "object") throw new Error("claudeInvocation needs the whitelist launch environment (buildLaunchEnv): it never reads process.env itself");
@@ -752,7 +813,8 @@ export function claudeInvocation({ prompt, maxTurns = 4, key, launchEnv, scratch
     HOME: home, USERPROFILE: home, APPDATA: path.join(scratchRoot, "appdata"), LOCALAPPDATA: path.join(scratchRoot, "localappdata"), TEMP: path.join(scratchRoot, "tmp"), TMP: path.join(scratchRoot, "tmp"),
     CLAUDE_CONFIG_DIR: path.join(scratchRoot, "claude-config"), ANTHROPIC_BASE_URL: `http://127.0.0.1:${gatewayPort}`, ANTHROPIC_API_KEY: key,
     DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
-  const args = ["-p", String(prompt), "--output-format", "json", "--max-turns", String(maxTurns), "--allowedTools", REAL_ALLOWED_TOOLS.join(","),
+  const args = ["-p", String(prompt), ...(supports.streamJson ? ["--output-format", "stream-json", "--verbose"] : ["--output-format", "json"]), "--max-turns", String(maxTurns),
+    ...(supports.dontAsk ? [PERMISSION_MODE_FLAG, REAL_PERMISSION_MODE] : []), "--allowedTools", REAL_ALLOWED_TOOLS.join(","),
     ...(supports.settingSources ? ["--setting-sources", "user"] : []), ...(supports.strictMcp ? ["--strict-mcp-config"] : [])];
   return { args, env, cwd: path.join(scratchRoot, "tmp") };
 }
@@ -767,15 +829,20 @@ export function findClaude(env = process.env, fsx = fs) {
  * WHICH claude: its resolved path, the sha256 of that file, its `--version` text and whether it knows the two isolation flags. Pinned in the approval and compared at the start of a real run, so a replaced launcher
  * or an update between approval and run is refused. `run(file, args)` is injectable (a test never starts a process); the real one runs the two read-only commands with the sandbox's whitelist environment.
  */
+/** Does the --help entry of `flag` (from the flag to the next flag entry, a line that starts with at most four spaces and `--`) mention `word`? A word elsewhere in the help (another flag's text) does not count. */
+export function helpEntryMentions(help, flag, word) {
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`${esc(flag)}\\b(?:(?!\\n {0,4}--)[\\s\\S]){0,600}?\\b${esc(word)}\\b`).test(String(help ?? ""));
+}
 export function identifyClaude({ env = process.env, fsx = fs, run = realRunOnce } = {}) {
   const exe = findClaude(env, fsx);
   if (!exe) return null;
   let digest = "(unreadable)";
   try { digest = sha256(fsx.readFileSync(exe)); } catch { /* the identity says so */ }
   const v = run(exe, ["--version"]), h = run(exe, ["--help"]);
-  return { path: exe, sha256: digest, version: clip(String(v ?? "").trim().split(/\r?\n/)[0], 80), supports: { settingSources: /--setting-sources/.test(String(h ?? "")), strictMcp: /--strict-mcp-config/.test(String(h ?? "")) } };
+  return { path: exe, sha256: digest, version: clip(String(v ?? "").trim().split(/\r?\n/)[0], 80), supports: { settingSources: /--setting-sources/.test(String(h ?? "")), strictMcp: /--strict-mcp-config/.test(String(h ?? "")), dontAsk: helpEntryMentions(h, PERMISSION_MODE_FLAG, "dontAsk"), streamJson: helpEntryMentions(h, "--output-format", "stream-json") && /^\s{0,4}--verbose\b/m.test(String(h ?? "")) } };
 }
-const claudeIdentityLines = (c) => (c ? [`claude launcher: ${c.path}`, `claude sha256: ${c.sha256}`, `claude version: ${c.version}`, `claude flags: --setting-sources ${c.supports?.settingSources ? "yes" : "no"}, --strict-mcp-config ${c.supports?.strictMcp ? "yes" : "no"}`] : ["claude launcher: none"]);
+const claudeIdentityLines = (c) => (c ? [`claude launcher: ${c.path}`, `claude sha256: ${c.sha256}`, `claude version: ${c.version}`, `claude flags: --setting-sources ${c.supports?.settingSources ? "yes" : "no"}, --strict-mcp-config ${c.supports?.strictMcp ? "yes" : "no"}, permission mode dontAsk ${c.supports?.dontAsk ? "yes" : "no"}, stream-json with --verbose ${c.supports?.streamJson ? "yes" : "no"}`] : ["claude launcher: none"]);
 function realRunOnce(exe, args) {
   const cmd = /\.cmd$/i.test(exe) ? process.env.ComSpec ?? "cmd.exe" : exe, a = /\.cmd$/i.test(exe) ? ["/d", "/s", "/c", exe, ...args] : args;
   const r = spawnSync(cmd, a, { env: buildLaunchEnv(process.env, { preloadGuard: false }), shell: false, windowsHide: true, timeout: 20000, encoding: "utf8" });
@@ -934,7 +1001,7 @@ export function planLines() {
     "  3. run the scenarios below, each with a fresh synthetic policy written into the SANDBOX state folder only, against the stub model server; print PASS, FAIL, FINDING or DEGRADED per scenario with its run count and the client used",
     "  4. end with the same isolation proof, the live-state comparison (before and after), an identity-verified teardown and, for a refused or failed run, redacted evidence kept OUTSIDE the scratch root",
     "THE CLIENT. DEFAULT = REPLAY: every scenario is driven by a REPLAY of the request shapes a real Claude Code sends (main, sub, aux and bg shapes with the agent id, billing flag, session id, retry-count header and messages length G1's X3 and X5 recorded; not replayed: a streamed request, and a billing-only subagent without an agent id). A real client is never started.",
-    "`--real yes` is a SEPARATE, RISKIER mode with its own consent (--approve-plan --real yes): a real headless Claude Code (`claude -p`) is started for scenarios 1, 2, 3 and 11 only (the others, and the free-mode variant of 2 and the cooldown steering of 3, stay replays). It is pointed at the sandbox by environment only (the sandbox's whitelist launch environment with HOME, USERPROFILE, APPDATA, LOCALAPPDATA, TEMP and CLAUDE_CONFIG_DIR under the scratch root, ANTHROPIC_BASE_URL and a sandbox-only key, a scratch working directory, a canary settings.json in the sandbox claude-config, --setting-sources user and --strict-mcp-config when the launcher has them). Its permissions are the DEFAULT mode plus ONE narrow allowance, --allowedTools Task,Agent: the single subagent tool under the two names Claude Code 2.1.289 gives it (a request lists it as Agent, its permission rule and the denial it reports are named Task, which is why run 10 saw the client deny the spawn); every other tool stays denied, no permission mode and no bypass of any kind is ever passed, the stub answers a spawned subagent with text only, and every verdict names the tools the client had denied. The approval pins the launcher's path, sha256 and --version. After the run the suite checks that the real ~/.claude.json and ~/.claude/projects hold nothing for the scratch directory, that the child wrote under the sandbox claude-config, and that no request carrying its session id reached the live gateway (result RC). That the real ~/.claude is never touched cannot be verified offline.",
+    "`--real yes` is a SEPARATE, RISKIER mode with its own consent (--approve-plan --real yes): a real headless Claude Code (`claude -p`) is started for scenarios 1, 2, 3 and 11 only (the others, and the free-mode variant of 2 and the cooldown steering of 3, stay replays). It is pointed at the sandbox by environment only (the sandbox's whitelist launch environment with HOME, USERPROFILE, APPDATA, LOCALAPPDATA, TEMP and CLAUDE_CONFIG_DIR under the scratch root, ANTHROPIC_BASE_URL and a sandbox-only key, a scratch working directory, a canary settings.json in the sandbox claude-config, --setting-sources user and --strict-mcp-config when the launcher has them). Its permissions are the mode dontAsk (passed only when the launcher lists it: whatever no rule allows is denied WITHOUT asking and without the auto-mode classifier; it widens nothing) plus ONE narrow allowance, --allowedTools Task,Agent: the single subagent tool under the two names Claude Code 2.1.289 gives it (a request lists it as Agent, its permission rule and the denial it reports are named Task, which is why run 10 saw the client deny the spawn, and run 11's stderr was an auto-mode notice); every other tool stays denied, no other permission mode and no bypass of any kind is ever passed, the stub answers a spawned subagent with text only, and every verdict names the tools the client had denied and WHY: the client runs with its event stream on (stream-json with --verbose), read line by line, and only a few counters, the permission mode it reports, the tool names, the first 200 characters of each failed tool result (redacted) and its final result are kept, never a prompt, an input or a header. The approval pins the launcher's path, sha256 and --version. After the run the suite checks that the real ~/.claude.json and ~/.claude/projects hold nothing for the scratch directory, that the child wrote under the sandbox claude-config, and that no request carrying its session id reached the live gateway (result RC). That the real ~/.claude is never touched cannot be verified offline.",
     "scenarios (what each must prove; client: REAL = the client's own behaviour is measured with --real yes, REPLAY = the shapes are enough):",
     ...SCENARIOS.map((s) => `  ${s.id.padStart(2)} ${s.title} [${s.client === "real" ? "REAL with --real yes, else replay" : "REPLAY"}, ${s.runs} run${s.runs === 1 ? "" : "s"}]: ${s.proves}`),
     "how the scenarios read the router (stated so a result can be trusted): (a) every counter and the cooling list come from a FRESH status: the router flushes status.json at most every 5 s, so the suite waits 5.1 s after its last request, sends one helper-shaped (aux) request, waits for the write and then reads; the router's own agent and decision logs are read as a second witness where one exists (a handoff line with its rsrc and reason, the first sticky-hit line). (b) MAIN COMES FIRST: when main's own model is a row of the policy the router substitutes (and hands off to) main's model before it spreads (plan 6.2, router decide). Scenarios 3 and 10 therefore keep main OUTSIDE the set (10 names a main model no row has, so its main request may be refused by the gateway: only the router's lesson from it counts), while scenarios 2 and 7 keep it in the set on purpose (their handoff target is main's model). Whether that shortcut is wanted is an owner decision still open; the suite documents it, it does not judge it. (c) The suite restarts NOTHING and stops NO process. The router runs inside the sandbox DAEMON (the gateway process, whose pid is the one in the router's status-<pid36>.json), not in the core worker CCR can replace: replacing the core worker was tried (run 5) and the router kept its cooling, so nothing short of replacing the daemon, which the isolation proof pins, resets the router's memory. Every scenario instead starts from a clean slate by the router's own documented channel: shadow.flag and observed.json are deleted, and cooling.json is overwritten with records for uwstub/m-free and the provider key that are NEWER than any the router holds and already EXPIRED (u two hours back, which also ends a failure streak), because the router merges cooling.json when its stat changes (at most once a second) and a newer record replaces the one in memory, while deleting the file would clear nothing; the suite then waits 1.2 s, and a scenario that needs a clean cooling list checks FRESH status that it is empty and throws (not a router verdict) when it is not. Only m-free is written because the router's provider rule cools the WHOLE provider key when another model of the provider has a cooling record whose time is within the last 5 minutes (still cooling or not): a record stamped on m-big or m-main would cool every model on the first 429 (run 6). A time cannot be made older than the router's own (an older record is ignored), so scenario 3, the only scenario that fails more than one model (m-free, then m-big), runs AFTER every other scenario that fails a model (the run order is 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 3, C1, C2, C3, C4; the printed result lines follow it), and a scenario that fails a model and starts less than 5 minutes and 30 seconds after the end of scenario 3 waits out the rest, computed from the clock with a progress line every 30 s (a full run never waits; --runs 2 for scenario 3 would wait about 5.5 minutes before its second run). Session ids and agent ids are unique per scenario, so sticky entries and per-session files cannot leak. Consequences, stated: scenario 7 cannot show the journal replay after a restart (it shows the handed-off model is kept on the next request and is a FINDING, which the plan allows); scenario C3 cannot fail the router's cached log descriptor from outside, so it reports the journal path (journalFail), and the router keeps its logs down for 30 s after such a failure. A scenario that cannot start from a clean slate is an error of the run, not a router verdict. The isolation proof still records a core pid; the suite makes no RPC call at all. (d) The sandbox has ONE provider: two distinct failing models within five minutes also cool the provider key and demote every row, so scenario 3 cools exactly one model before the all-limited step.",
@@ -967,7 +1034,7 @@ export function checkApproval(text, planSha, files, nowMs, pin = {}) {
   if (changed.length) return `a file the run executes changed since you approved (${changed.join(", ")}): ${how}`;
   if (pin.ccr !== undefined && (!Array.isArray(a.ccr) || a.ccr.join("\n") !== pin.ccr.join("\n"))) return `the installed CCR changed since you approved (or the approval does not pin it): ${how}`;
   if (pin.real && a.real !== true) return `--real yes is a separate mode and was not approved: run --approve-plan --real yes first`;
-  if (pin.real && claudeIdentityLines(a.claude).join("\n") !== claudeIdentityLines(pin.claude).join("\n")) return `the claude launcher (path, sha256 or version) changed since you approved: ${how}`;
+  if (pin.real && claudeIdentityLines(a.claude).join("\n") !== claudeIdentityLines(pin.claude).join("\n")) return `the claude launcher (path, sha256, version or flag support) changed since you approved: ${how}`;
   return null;
 }
 const hashOne = (file) => {
@@ -1080,7 +1147,7 @@ export async function runSandbox({ only, runs, real, approval, identity }, io = 
   if (!sha) { (io.err ?? console.error)("could not read the orchestrator's plan hash: nothing was started"); return 1; }
   if (real) {                                                                         // the launcher that runs is the launcher that was approved
     const now = (deps.identifyClaude ?? identifyClaude)();
-    if (claudeIdentityLines(now).join("\n") !== claudeIdentityLines(identity).join("\n")) { (io.err ?? console.error)("refusing: the claude launcher (path, sha256 or version) is not the one pinned in the approval"); return 1; }
+    if (claudeIdentityLines(now).join("\n") !== claudeIdentityLines(identity).join("\n")) { (io.err ?? console.error)("refusing: the claude launcher (path, sha256, version or flag support) is not the one pinned in the approval"); return 1; }
   }
   const d = { ...d0, out: io.out ?? d0.out, err: io.err ?? d0.err, externalApproval: externalApprovalFor(approval), sessionPhases: sessionPhasesFor({ only: ids, runs, real }, { spawnClaude: real ? (deps.spawnClaude ?? realSpawnClaude) : null, lastText: deps.lastText ?? defaultLastText, identity: real ? identity : null }),
     sessionVerdict: (lines) => suiteVerdict(lines, ids) };
@@ -1108,12 +1175,15 @@ export function realSpawnClaude(inv, { exe = null, timeoutMs = 240000, spawnImpl
     try { child = spawnImpl(cmd, args, { env: inv.env, cwd: inv.cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (e) { return resolve({ code: null, text: "", err: "", reason: clip(e?.message, 100) }); }
     let text = "", errText = "", done = false;
+    const red = createStreamReducer({ secrets: [inv.env?.ANTHROPIC_API_KEY] });
+    const streamOf = () => { red.end(); const sm = red.summary(); return sm.events > 0 ? { stream: sm } : {}; };
+    const keys = [inv.env?.ANTHROPIC_API_KEY], mask = (x, n) => { let y = String(x ?? ""); for (const k of keys) if (typeof k === "string" && k.length >= 8) y = y.split(k).join("<redacted>"); return y.slice(0, n); };      // the sandbox key never leaves this function in text, err or reason
     const finish = (r) => { if (done) return; done = true; clearTimeout(cut); resolve(r); };
-    const cut = setTimeout(() => { kill(child.pid); finish({ code: null, text: text.slice(0, 4000), err: errText.slice(0, 2000), reason: "timed out; the process tree was killed" }); }, timeoutMs);
-    child.stdout?.on("data", (b) => { if (text.length < 8000) text += String(b); });
+    const cut = setTimeout(() => { kill(child.pid); finish({ code: null, text: mask(text, 4000), err: mask(errText, 2000), reason: "timed out; the process tree was killed", ...streamOf() }); }, timeoutMs);
+    child.stdout?.on("data", (b) => { red.push(b); if (text.length < 8000) text += String(b); });
     child.stderr?.on("data", (b) => { if (errText.length < 4000) errText += String(b); });
-    child.on("error", (e) => { kill(child.pid); finish({ code: null, text, err: errText.slice(0, 2000), reason: clip(e.message, 100) }); });
-    child.on("close", (code) => finish({ code, text: text.slice(0, 4000), err: errText.slice(0, 2000) }));
+    child.on("error", (e) => { kill(child.pid); finish({ code: null, text: mask(text, 8000), err: mask(errText, 2000), reason: cleanText(e.message, 100, keys), ...streamOf() }); });
+    child.on("close", (code) => finish({ code, text: mask(text, 4000), err: mask(errText, 2000), ...streamOf() }));
   });
 }
 
@@ -1130,7 +1200,7 @@ export async function runSelftest({ plan, expect, approval, real = false, identi
   if (!sha) throw new Error("could not read the orchestrator's plan hash: nothing was started");
   if (real) {
     const now = (deps.identifyClaude ?? identifyClaude)();
-    if (claudeIdentityLines(now).join("\n") !== claudeIdentityLines(identity).join("\n")) throw new Error("the claude launcher (path, sha256 or version) is not the one pinned in the approval");
+    if (claudeIdentityLines(now).join("\n") !== claudeIdentityLines(identity).join("\n")) throw new Error("the claude launcher (path, sha256, version or flag support) is not the one pinned in the approval");
   }
   const out = io.out ?? (() => {}), got = {};
   const phases = async (c) => {

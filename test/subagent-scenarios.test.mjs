@@ -588,10 +588,12 @@ test("identifyClaude: the launcher's path, sha256, --version and flag support ar
   const calls = [];
   const run = (exe, args) => { calls.push(args[0]); return args[0] === "--version" ? "2.1.0 (Claude Code)\nextra" : "Usage: claude [options]\n  --setting-sources <s>\n  --strict-mcp-config"; };
   const id = S.identifyClaude({ env: { PATH: ["bin1", "bin2"].join(path.delimiter) }, fsx: fakeFs, run });
-  assert.deepEqual([id.version, id.sha256, id.supports], ["2.1.0 (Claude Code)", sha(Buffer.from("fake-claude-bytes")), { settingSources: true, strictMcp: true }]); assert.match(id.path, /bin2[\\/]claude\.exe$/);
+  assert.deepEqual([id.version, id.sha256, id.supports], ["2.1.0 (Claude Code)", sha(Buffer.from("fake-claude-bytes")), { settingSources: true, strictMcp: true, dontAsk: false, streamJson: false }]); assert.match(id.path, /bin2[\\/]claude\.exe$/);
   assert.deepEqual(calls, ["--version", "--help"]);
   assert.equal(S.identifyClaude({ env: { PATH: "" }, fsx: fakeFs, run }), null);
-  assert.deepEqual(S.identifyClaude({ env: { PATH: "bin2" }, fsx: fakeFs, run: () => "no flags here" }).supports, { settingSources: false, strictMcp: false });
+  assert.deepEqual(S.identifyClaude({ env: { PATH: "bin2" }, fsx: fakeFs, run: () => "no flags here" }).supports, { settingSources: false, strictMcp: false, dontAsk: false, streamJson: false });
+  const full = S.identifyClaude({ env: { PATH: "bin2" }, fsx: fakeFs, run: (e, a) => (a[0] === "--version" ? "2.1.289" : '  --permission-mode <mode>  (choices: "acceptEdits", "dontAsk")\n  --output-format <f> "stream-json"\n  --verbose') });
+  assert.deepEqual([full.supports.dontAsk, full.supports.streamJson], [true, true]);
   assert.equal(S.findClaude({ PATH: "" }), null);
 });
 
@@ -1230,12 +1232,12 @@ test("R6-4 when no subagent request comes, the verdict says what the client DID:
   const records = [...Array.from({ length: 11 }, () => rec({ toolNames: Array.from({ length: 18 }, (_, i) => (i === 0 ? "Agent" : `T${i}`)) })), rec({ sent: { status: 200, kind: "tool_use" }, toolNames: ["Agent"] }), rec({ toolNames: ["Agent"], toolResults: 1 })];
   assert.equal(S.shapeDigest(records), "11x main/18 tools+Agent/m-main/200 text; 1x main/1 tools+Agent/m-main/200 tool_use; 1x main/1 tools+Agent/m-main/200 text (1 tool_result)");
   const claude = S.claudeInfo({ code: 0, text: JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 2, result: "done", permission_denials: [{ tool_name: "Agent", tool_input: { prompt: "SECRET" } }] }), err: "" });
-  assert.deepEqual(claude, { code: 0, reason: "", subtype: "success", isError: false, turns: 2, denials: ["Agent"], result: "done", err: "" });
+  assert.deepEqual(claude, { code: 0, reason: "", err: "", subtype: "success", isError: false, turns: 2, denials: ["Agent"], mode: "", reasons: [], called: [], result: "done" });
   assert.ok(!JSON.stringify(claude).includes("SECRET"), "denied tool NAMES only, never an input");
-  assert.deepEqual(S.claudeInfo({ code: 1, text: "not json \u0001", err: "boom", reason: "timed out" }), { code: 1, reason: "timed out", subtype: "", isError: null, turns: null, denials: [], result: "not json ?", err: "boom" });
+  assert.deepEqual(S.claudeInfo({ code: 1, text: "not json \u0001", err: "boom", reason: "timed out" }), { code: 1, reason: "timed out", err: "boom", subtype: "", isError: null, turns: null, denials: [], mode: "", reasons: [], called: [], result: "not json ?" });
   assert.equal(S.claudeInfo(null), null);
   const ev = { records, claude, policy: "uwstub/m-free", asked: "uwstub/m-main" };
-  const r1 = ok("1", ev); assert.equal(r1.verdict, "FAIL"); assert.match(r1.text, /the spawn never happened, nothing is proved \(stub saw 11x main\/18 tools\+Agent\/m-main\/200 text; .*the client: exit 0, success, turns 2, denied tools \[Agent\], answer "done"/);
+  const r1 = ok("1", ev); assert.equal(r1.verdict, "FAIL"); assert.match(r1.text, /the spawn never happened, nothing is proved \(stub saw 11x main\/18 tools\+Agent\/m-main\/200 text; .*the client: exit 0, success, turns 2, permission mode unknown, denied tools \[Agent\], answer "done"/);
   assert.match(ok("2", { ...ev, aid: "", chosen: "uwstub/m-free" }).text, /the client never spawned the agent, so no 429 was provoked \(stub saw 11x main/);
   assert.match(ok("3", { ...ev, aid: "", steer: { models: ["uwstub/m-big", "uwstub/m-big", "uwstub/m-big"], healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] } }).text, /the real client never spawned the agent that was to meet the limit, so nothing was limited \(stub saw/);
   assert.match(ok("11", { ...ev, failed: false }).text, /scenario is not set up \(stub saw/);
@@ -1268,31 +1270,48 @@ test("R6-5 the REAL scenarios against a fake client: scenario 3 names the agent 
 });
 
 // ====================================================================================== fix round 7 (run 10: the real client DENIED the subagent tool: its rule is named Task, the allowlist said Agent)
-const claudeArgs = (supports = { settingSources: true, strictMcp: true }) => S.claudeInvocation({ prompt: S.REAL_PROMPT, maxTurns: 4, key: "sandbox-key", launchEnv: { PATH: "C:\\bin", SystemRoot: "C:\\Windows", ComSpec: "C:\\Windows\\cmd.exe" }, scratchRoot: path.join(os.tmpdir(), "uw-scn-scratch"), supports }).args;
+const FULL = { settingSources: true, strictMcp: true, dontAsk: true, streamJson: true };
+const claudeArgs = (supports = FULL) => S.claudeInvocation({ prompt: S.REAL_PROMPT, maxTurns: 4, key: "sandbox-key", launchEnv: { PATH: "C:\\bin", SystemRoot: "C:\\Windows", ComSpec: "C:\\Windows\\cmd.exe" }, scratchRoot: path.join(os.tmpdir(), "uw-scn-scratch"), supports }).args;
 
 test("R7-1 the real client's argv carries EXACTLY one narrow allowance: --allowedTools Task,Agent (the subagent tool under both names), the default permission mode, and no bypass of any kind; the list is one token so the variadic flag cannot swallow a later flag or the prompt", () => {
   assert.deepEqual([...S.REAL_ALLOWED_TOOLS], ["Task", "Agent"]);
-  for (const supports of [{ settingSources: true, strictMcp: true }, {}]) {
+  for (const supports of [FULL, {}]) {
     const a = claudeArgs(supports);
     assert.equal(a.filter((x) => x === "--allowedTools").length, 1, "one allowlist");
     assert.equal(a[a.indexOf("--allowedTools") + 1], "Task,Agent");
     assert.deepEqual(a.slice(0, 2), ["-p", S.REAL_PROMPT], "the prompt is the -p positional, ahead of every variadic flag");
     const after = a.slice(a.indexOf("--allowedTools") + 2);
     assert.ok(after.every((x) => /^--(setting-sources|strict-mcp-config)$|^user$/.test(x)), `only the isolation flags follow: ${after}`);
-    for (const x of a) assert.ok(!/permission|bypass|acceptEdits|dontAsk|dangerously|disallowed|\*|Bash|Edit|Write|Read|\(/i.test(x.replace(S.REAL_PROMPT, "")), `no bypass, no wider tool in ${x}`);
+    for (const x of a) assert.ok(!/bypass|acceptEdits|dangerously|disallowed|\*|Bash|Edit|Write|Read|\(/i.test(x.replace(S.REAL_PROMPT, "")), `no bypass, no wider tool in ${x}`);
+    const modes = a.filter((x, i) => a[i - 1] === "--permission-mode");
+    assert.deepEqual(modes, supports.dontAsk ? ["dontAsk"] : [], "the ONE permission mode is dontAsk (deny what no rule allows), and only when the launcher lists it");
+    assert.deepEqual(a.filter((x) => x === "--permission-mode").length, supports.dontAsk ? 1 : 0);
+    assert.deepEqual(supports.streamJson ? ["stream-json", "--verbose"] : ["json"], supports.streamJson ? [a[a.indexOf("--output-format") + 1], a[a.indexOf("--output-format") + 2]] : [a[a.indexOf("--output-format") + 1]], "the event stream when the launcher has it");
   }
   assert.ok(S.REAL_ALLOWED_TOOLS.every((t) => /^[A-Za-z]+$/.test(t)), "plain tool names: no pattern, no argument rule");
 });
 
-test("R7-2 source level: the harness never passes a permission mode or a bypass, and names --allowedTools in exactly one place; the plan states the allowance and says the stub's subagent answer is text only", () => {
+/** The source-level ban on a permission bypass: comments stripped (block comments only when they open a line, so a string holding the opener cannot hide code), nothing else: a quoted line is scanned like any other. */
+const BAN = /--dangerously-skip-permissions|--allow-dangerously-skip-permissions|bypassPermissions|acceptEdits|--permission-mode=|defaultMode|['"`](auto|plan|manual)['"`]|permissionMode\s*[:=]/i;
+const codeOf = (src) => src.replace(/(^|\n)[ \t]*\/\*[\s\S]*?\*\//g, "$1").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
+const banned = (src) => BAN.test(codeOf(src).replace(/mode: clip\(e\.permissionMode[^\n]*/g, ""));
+
+test("R7-2 source level: the harness never passes a bypass or any permission mode but dontAsk, names --allowedTools and --permission-mode in exactly one place each; the plan states the allowance and says the stub's subagent answer is text only", () => {
   const dir = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "harness");
+  let modeFlags = 0;
   for (const f of ["subagent-scenarios.mjs", "subagent-e2e.mjs", "subagent-sandbox-spec.mjs", "stub-upstream.mjs"]) {
-    const code = fs.readFileSync(path.join(dir, f), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n").replace(/\n\s*"[^\n]*",?\s*(?=\n)/g, "");
-    assert.ok(!/--dangerously-skip-permissions|--allow-dangerously-skip-permissions|bypassPermissions|acceptEdits|dontAsk|--permission-mode|permissionMode/i.test(code), `${f}: no permission mode, no bypass`);
-    if (f === "subagent-scenarios.mjs") assert.equal((code.match(/"--allowedTools"/g) ?? []).length, 1, "one --allowedTools in the code");
+    const src = fs.readFileSync(path.join(dir, f), "utf8"), code = codeOf(src);
+    assert.ok(!banned(src), `${f}: no bypass and no other permission mode`);
+    modeFlags += (code.match(/--permission-mode/g) ?? []).length;
+    if (f === "subagent-scenarios.mjs") {
+      assert.equal((code.match(/"--allowedTools"/g) ?? []).length, 1, "one --allowedTools in the code");
+      assert.match(code, /export const REAL_PERMISSION_MODE = "dontAsk";/);
+    }
   }
+  assert.equal(modeFlags, 1, "the string --permission-mode occurs ONCE in all the harness code, and it is the one quoted token of claudeInvocation");
   const plan = S.planLines().join("\n");
-  assert.match(plan, /DEFAULT mode plus ONE narrow allowance, --allowedTools Task,Agent/); assert.match(plan, /every other tool stays denied, no permission mode and no bypass of any kind is ever passed, the stub answers a spawned subagent with text only/);
+  assert.match(plan, /the mode dontAsk .* plus ONE narrow allowance, --allowedTools Task,Agent/); assert.match(plan, /every other tool stays denied, no other permission mode and no bypass of any kind is ever passed, the stub answers a spawned subagent with text only/);
+  assert.match(plan, /stream-json with --verbose.*first 200 characters of each failed tool result \(redacted\)/);
   assert.match(plan, /run 10 saw the client deny the spawn/);
 });
 
@@ -1308,5 +1327,141 @@ test("R7-3 a verdict that PASSED still names the tools the real client had denie
   assert.ok(!/denied/.test(replay[0].result.text));
   const task = mk(["Task"]); task.prims.claude = async () => ({ code: 0, text: JSON.stringify({ subtype: "success", num_turns: 2, result: "stub-ok", permission_denials: [{ tool_name: "Task" }] }) });
   const fail = await S.runScenarios(task.prims, { only: ["1"], real: true });
-  assert.equal(fail[0].result.verdict, "FAIL"); assert.match(fail[0].result.text, /the client: exit 0, success, turns 2, denied tools \[Task\], answer "stub-ok"/, "run 10's line");
+  assert.equal(fail[0].result.verdict, "FAIL"); assert.match(fail[0].result.text, /the client: exit 0, success, turns 2, permission mode unknown, denied tools \[Task\], answer "stub-ok"/, "run 10's line");
+});
+
+// ====================================================================================== fix round 8 (run 11: still denied; the verdict must say WHY, and the permission mode the client ran in)
+const SANDBOX_KEY = "ccr-profile-0123456789abcdefABCDEF01";
+const streamLines = [
+  { type: "system", subtype: "init", permissionMode: "auto", tools: ["Task", "Bash", "Read", "Edit"], model: "m" },
+  { type: "assistant", message: { content: [{ type: "text", text: "I will delegate" }, { type: "tool_use", id: "toolu_1", name: "Task", input: { prompt: "SECRET PROMPT", description: "d" } }] } },
+  { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", is_error: true, content: "Claude requested permissions to use Task, but you haven't granted it yet." }] } },
+  { type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_2", name: "Bash", input: { command: "echo SECRET INPUT" } }] } },
+  { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_2", is_error: true, content: [{ type: "text", text: `denied by the auto mode classifier; key ${SANDBOX_KEY} x-api-key: abcdefghijklmnop` }] }] } },
+  { type: "result", subtype: "success", is_error: false, num_turns: 2, result: "stub-ok", permission_denials: [{ tool_name: "Task", tool_use_id: "toolu_1", tool_input: { prompt: "SECRET PROMPT" } }] },
+].map((o) => JSON.stringify(o)).join("\n") + "\n";
+
+test("R8-1 the stream reducer: line by line across arbitrary chunk boundaries, it keeps the permission mode, the tool count, the NAMES of the tools called, the first 200 characters of each failed tool_result (redacted, the sandbox key masked) and the result; never a prompt, an input or a header", () => {
+  for (const size of [1, 7, 64, streamLines.length]) {
+    const r = S.createStreamReducer({ secrets: [SANDBOX_KEY] });
+    for (let i = 0; i < streamLines.length; i += size) r.push(streamLines.slice(i, i + size));
+    r.end();
+    const sm = r.summary(), flat = JSON.stringify(sm);
+    assert.equal(sm.events, 6, `chunk ${size}`); assert.equal(sm.malformed, 0); assert.equal(sm.mode, "auto"); assert.equal(sm.tools, 4); assert.deepEqual(sm.called, ["Task", "Bash"]);
+    assert.deepEqual(sm.result, { subtype: "success", isError: false, turns: 2, text: "stub-ok", denied: [{ tool: "Task", id: "toolu_1" }] });
+    assert.deepEqual(sm.denied, [{ tool: "Task", reason: "Claude requested permissions to use Task, but you haven't granted it yet." }]);
+    assert.equal(sm.errors.length, 2); assert.equal(sm.errors[1].tool, "Bash"); assert.match(sm.errors[1].reason, /denied by the auto mode classifier/);
+    for (const bad of ["SECRET PROMPT", "SECRET INPUT", SANDBOX_KEY, "abcdefghijklmnop", "I will delegate"]) assert.ok(!flat.includes(bad), `${bad} is not kept`);
+  }
+  const r = S.createStreamReducer();
+  r.push("not json\n{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"is_error\":true,\"content\":\"" + "y".repeat(500) + "\"}]}}\n42\n"); r.end();
+  assert.equal(r.summary().malformed, 1, "an unparsable line is counted, not kept"); assert.equal(r.summary().errors[0].reason.length, 200, "200 characters");
+  const big = S.createStreamReducer(); big.push("x".repeat(1100000)); big.push("\n{\"type\":\"result\",\"subtype\":\"s\"}\n"); big.end();
+  assert.equal(big.summary().result.subtype, "s", "a huge partial line is dropped and the stream goes on");
+  const many = S.createStreamReducer(); for (let i = 0; i < 60; i++) many.push(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: `t${i}`, is_error: true, content: `e${i}` }] } }) + "\n"); many.end();
+  assert.ok(many.summary().errors.length <= 5, "bounded");
+});
+
+test("R8-2 a verdict says WHY: claudeInfo reads the stream (mode, denied tools with the reason, the tools it called) and the failing line carries them; a plain JSON result is still understood", () => {
+  const r = S.createStreamReducer({ secrets: [SANDBOX_KEY] }); r.push(streamLines); r.end();
+  const info = S.claudeInfo({ code: 0, text: "", err: "", stream: r.summary() });
+  assert.deepEqual([info.mode, info.denials, info.called, info.subtype, info.turns, info.result], ["auto", ["Task"], ["Task", "Bash"], "success", 2, "stub-ok"]);
+  assert.deepEqual(info.reasons, ["Task: Claude requested permissions to use Task, but you haven't granted it yet.", "Bash: denied by the auto mode classifier; key <redacted> x-api-key: <redacted>"]);
+  const rec = (o) => ({ method: "POST", path: "/v1/messages", headers: {}, toolNames: ["Agent"], model: "uwstub/m-main", sent: { status: 200, kind: "text" }, toolResults: 0, ...o });
+  const t = ok("1", { records: [rec({})], claude: info, policy: "uwstub/m-free", asked: "uwstub/m-main" }).text;
+  assert.match(t, /the client: exit 0, success, turns 2, permission mode auto, denied tools \[Task\] \(why: "Task: Claude requested permissions to use Task, but you haven't granted it yet\."; "Bash: denied by the auto mode classifier/);
+  assert.match(t, /tools it called \[Task, Bash\], answer "stub-ok"/);
+  assert.equal(S.claudeInfo({ code: 0, text: JSON.stringify({ subtype: "success", num_turns: 1, result: "x" }) }).mode, "");
+});
+
+test("R8-3 realSpawnClaude feeds the reducer from the live stdout (chunks cut mid-line) and returns it as `stream`; plain output without events returns no stream; the sandbox key is masked; the raw text is still clipped", async () => {
+  const inv = { args: ["-p", "x"], env: { ANTHROPIC_API_KEY: SANDBOX_KEY, PATH: "p" }, cwd: path.join(os.tmpdir(), "scn-cwd") };
+  let child = fakeChild();
+  const spawnImpl = () => child;
+  let p = S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl, kill: () => assert.fail("not killed") });
+  for (let i = 0; i < streamLines.length; i += 50) child.stdout.emit("data", Buffer.from(streamLines.slice(i, i + 50)));
+  child.emit("close", 0);
+  const r = await p;
+  assert.equal(r.code, 0); assert.ok(r.text.length <= 4000); assert.equal(r.stream.mode, "auto"); assert.deepEqual(r.stream.denied.map((d) => d.tool), ["Task"]);
+  assert.ok(!JSON.stringify(r.stream).includes(SANDBOX_KEY));
+  child = fakeChild(); p = S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl, kill: () => {} }); child.stdout.emit("data", Buffer.from("{\"result\":\"ok\"}")); child.emit("close", 0);
+  assert.equal("stream" in (await p), false, "no events: no stream");
+  child = fakeChild(9); const t = await S.realSpawnClaude(inv, { exe: "C:\\bin\\claude.exe", spawnImpl, timeoutMs: 20, kill: () => { child.stdout.emit("data", Buffer.from(streamLines)); } });
+  assert.equal(t.code, null);
+});
+
+test("R8-4 the reason belongs to the DENIED tool's own tool_use id, not to the first failed tool result", () => {
+  const r = S.createStreamReducer();
+  const ev = (o) => JSON.stringify(o) + "\n";
+  r.push(ev({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t0", is_error: true, content: "an unrelated failure" }] } }));
+  r.push(ev({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "the reason for Task" }] } }));
+  r.push(ev({ type: "result", subtype: "success", permission_denials: [{ tool_name: "Task", tool_use_id: "t1" }, { tool_name: "Read", tool_use_id: "t9" }] })); r.end();
+  assert.deepEqual(r.summary().denied, [{ tool: "Task", reason: "the reason for Task" }, { tool: "Read", reason: "" }]);
+  assert.equal(S.claudeInfo({ code: 0, stream: r.summary() }).reasons[1], "Read: no reason in the stream");
+});
+
+// ====================================================================================== fix round 9 (cr-harness-r2: the scan could be evaded, the key and the plain-JSON branch were not masked, a decoy in --help counted)
+test("R9-1 the source scan is not evadable: a multi-line args array holding a bypass is caught, so are --permission-mode=..., defaultMode, any quoted auto/plan/manual and a bypass hidden behind a string that holds a comment opener; comments and the shipped call are not flagged", () => {
+  const multi = `const args = [\n  "-p", prompt,\n  "--permission-mode",\n  "bypassPermissions",\n];`;
+  assert.equal(banned(multi), true, "a quoted line of its own is scanned like any other");
+  assert.equal(banned(`const args = [\n  "--dangerously-skip-permissions",\n];`), true);
+  assert.equal(banned(`const a = "--permission-mode=acceptEdits";`), true);
+  assert.equal(banned(`const s = { defaultMode: "x" };`), true);
+  for (const q of ["'auto'", '"plan"', "`manual`"]) assert.equal(banned(`const m = ${q};`), true, q);
+  assert.equal(banned(`const x = "/*";\nargs.push("bypassPermissions");\nconst y = "*/";`), true, "a string with a comment opener does not hide the code after it");
+  assert.equal(banned(`// bypassPermissions is never passed\n/**\n * acceptEdits neither\n */\nconst args = [PERMISSION_MODE_FLAG, REAL_PERMISSION_MODE];`), false, "comments are not code");
+  assert.equal(banned(`  ...(supports.dontAsk ? [PERMISSION_MODE_FLAG, REAL_PERMISSION_MODE] : []),`), false, "the shipped call");
+});
+
+test("R9-2 nothing unmasked reaches a verdict: cleanText masks the sandbox key before AND after the shared redactor, in the stream branch and in the plain-JSON branch of claudeInfo, and realSpawnClaude masks it in text, err and reason", async () => {
+  const K = "ccr-profile-ABCDEFGHIJKLMNOPQRSTUV12";
+  for (const text of [K, `"key":"${K}"`, `x-api-key: ${K}`, `Bearer ${K}`, `${K}tail`, `a${K}b ${K}`]) {
+    const c = S.cleanText(text, 200, [K]);
+    assert.ok(!c.includes(K) && !c.includes(K.slice(0, 20)), `masked in: ${text} -> ${c}`);
+  }
+  assert.ok(!S.cleanText("x-api-key: abcdefghijklmnop", 200).includes("abcdefghijklmnop"), "the shared redactor still applies");
+  const info = S.claudeInfo({ code: 0, text: JSON.stringify({ subtype: "success", num_turns: 1, result: "x-api-key: abcdefghijklmnop done" }), err: "api-key: abcdefghijklmnop boom", reason: "x-api-key: abcdefghijklmnop" });
+  assert.ok(!JSON.stringify(info).includes("abcdefghijklmnop"), "result, err and reason of the plain-JSON branch are redacted");
+  const inv = { args: ["-p", "x"], env: { ANTHROPIC_API_KEY: K, PATH: "p" }, cwd: path.join(os.tmpdir(), "scn-cwd") };
+  let child = fakeChild();
+  let p = S.realSpawnClaude(inv, { exe: "C:\bin\claude.exe", spawnImpl: () => child, kill: () => {} });
+  child.stdout.emit("data", Buffer.from(`plain output with ${K}`)); child.stderr.emit("data", Buffer.from(`stderr with ${K}`)); child.emit("close", 1);
+  const r = await p;
+  assert.ok(!JSON.stringify(r).includes(K), "text and err are masked");
+  child = fakeChild(); p = S.realSpawnClaude(inv, { exe: "C:\bin\claude.exe", spawnImpl: () => child, kill: () => {} }); child.emit("error", new Error(`spawn failed for ${K}`));
+  assert.ok(!JSON.stringify(await p).includes(K), "the error reason is masked");
+});
+
+test("R9-3 the launcher's flag support is read from the flag's OWN --help entry: a word in another flag's text is no support; the real 2.1.289 text is supported; stream-json also needs the --verbose entry", () => {
+  const real = [`  --output-format <format>              Output format (only works with --print):`, `                                        "text" (default), "json" (single`, `                                        result), or "stream-json" (realtime`, `                                        streaming) (choices: "text", "json",`, `                                        "stream-json")`,
+    `  --permission-mode <mode>              Permission mode to use for the session`, `                                        (choices: "acceptEdits", "auto",`, `                                        "bypassPermissions", "manual",`, `                                        "dontAsk", "plan")`,
+    `  --permission-prompts <target>         Who answers permission prompts with`, `  --verbose                             Override verbose mode setting from config`].join("\n");
+  const id = (help) => S.identifyClaude({ env: { PATH: "bin2" }, fsx: { statSync: () => ({ isFile: () => true }), readFileSync: () => Buffer.from("x") }, run: (e, a) => (a[0] === "--version" ? "2.1.289" : help) }).supports;
+  const full = id(real);
+  assert.deepEqual([full.dontAsk, full.streamJson], [true, true]);
+  const decoy = id([`  --foo <x>                             uses dontAsk and "stream-json" in its text`, `  --permission-mode <mode>              (choices: "plan", "manual")`, `  --output-format <format>              (choices: "text", "json")`, `  --verbose                             verbose`].join("\n"));
+  assert.deepEqual([decoy.dontAsk, decoy.streamJson], [false, false], "the words sit in another flag's entry");
+  const noVerbose = id(real.replace(/\n  --verbose[^\n]*/, ""));
+  assert.deepEqual([noVerbose.dontAsk, noVerbose.streamJson], [true, false], "stream-json without --verbose is not used");
+  assert.equal(S.helpEntryMentions(`--permission-mode <m>\n${"x".repeat(700)} dontAsk`, "--permission-mode", "dontAsk"), false, "bounded window");
+  assert.equal(S.helpEntryMentions("--permission-mode+ dontAsk", "--permission-mode", "dontAsk"), true);
+  assert.equal(S.helpEntryMentions(undefined, "--permission-mode", "dontAsk"), false);
+});
+
+test("R9-4 the reducer keeps up to 64 failed tool results by id, so a denial's reason is not lost behind a flood of other failures (the summary still shows five); beyond 64 the reason is honestly absent, never another tool's", () => {
+  const ev = (o) => JSON.stringify(o) + "\n";
+  const flood = (n, deniedId) => { const r = S.createStreamReducer(); for (let i = 0; i < n; i++) r.push(ev({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: `t${i}`, is_error: true, content: `failure ${i}` }] } })); r.push(ev({ type: "result", subtype: "success", permission_denials: [{ tool_name: "Task", tool_use_id: deniedId }] })); r.end(); return r.summary(); };
+  const a = flood(40, "t39"); assert.deepEqual(a.denied, [{ tool: "Task", reason: "failure 39" }]); assert.ok(a.errors.length <= 5);
+  const b = flood(64, "t63"); assert.equal(b.denied[0].reason, "failure 63");
+  const c = flood(70, "t69"); assert.equal(c.denied[0].reason, "", "past the cap: no reason, not a wrong one");
+  assert.equal(S.claudeInfo({ code: 0, stream: c }).reasons[0], "Task: no reason in the stream");
+});
+
+test("R9-5 the key is masked BEFORE the shared redactor (it rewrites a sk- run inside a key and the whole key can no longer be found afterwards); a word in the NEXT flag's entry is no support", () => {
+  const K = "ccr-profile-sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ12";
+  const c = S.cleanText(`token ${K} end`, 200, [K]);
+  assert.equal(c, "token <redacted> end", "the WHOLE key is masked: the redactor alone would leave the prefix `ccr-profile-` of it");
+  assert.equal(S.cleanText(K, 200), "ccr-profile-<redacted-key>", "what the redactor alone does to this key");
+  const after = [`  --permission-mode <mode>              (choices: "plan", "manual")`, `  --other <x>                           mentions dontAsk right here`].join("\n");
+  assert.equal(S.helpEntryMentions(after, "--permission-mode", "dontAsk"), false, "the entry ends at the next flag");
 });
