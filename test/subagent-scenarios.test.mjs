@@ -36,7 +36,7 @@ test("--plan prints every scenario with what it must prove, the client, and the 
 });
 
 test("the plan names the exact router bytes, and a test pins that constant to router/uw-router.next.cjs (a router change voids the plan and any approval)", () => {
-  assert.equal(S.ROUTER_SHA256, "e6a9afac8940ba25d9b87e8a1ad4a7b75feb66619131f3b52427841eba9bf35e");
+  assert.equal(S.ROUTER_SHA256, "32427d1230487692e2724ef91fcc1e614fa958cf96fe163a5bbaa44d9d9a93b8", "router v4");
   assert.equal(sha(fs.readFileSync(NEXT_ROUTER_SRC)), S.ROUTER_SHA256, "the router file in the working tree is the one the suite was written for");
   assert.ok(S.planLines().some((l) => l.includes(S.ROUTER_SHA256)));
   const changed = S.planLines().map((l) => l.replace(S.ROUTER_SHA256, "0".repeat(64)));
@@ -1464,4 +1464,86 @@ test("R9-5 the key is masked BEFORE the shared redactor (it rewrites a sk- run i
   assert.equal(S.cleanText(K, 200), "ccr-profile-<redacted-key>", "what the redactor alone does to this key");
   const after = [`  --permission-mode <mode>              (choices: "plan", "manual")`, `  --other <x>                           mentions dontAsk right here`].join("\n");
   assert.equal(S.helpEntryMentions(after, "--permission-mode", "dontAsk"), false, "the entry ends at the next flag");
+});
+
+// ====================================================================================== fix round 10 (run 12: router v4 pin; a real agent landing on m-big poisoned scenario 3; a real client retried once in scenario 11)
+import { mkTmp } from "./helpers/tmp.mjs";
+import { createRequire } from "node:module";
+
+test("R10-1 the suite accepts EXACTLY router v4 (32427d12): the pin is the file hash, any other bytes (the v3 hash, a one-character change, upper case, a prefix, nothing) are a FINDING line that fails the suite", () => {
+  const V4 = "32427d1230487692e2724ef91fcc1e614fa958cf96fe163a5bbaa44d9d9a93b8", V3 = "e6a9afac8940ba25d9b87e8a1ad4a7b75feb66619131f3b52427841eba9bf35e";
+  assert.equal(S.ROUTER_SHA256, V4); assert.equal(sha(fs.readFileSync(NEXT_ROUTER_SRC)), V4, "the router file in the tree is v4");
+  assert.equal(S.routerBytesFinding(V4), null, "exactly v4: no finding");
+  for (const bad of [V3, V4.slice(0, 63) + "0", V4.toUpperCase(), V4.slice(0, 12), "", undefined, "0".repeat(64)]) {
+    const f = S.routerBytesFinding(bad);
+    assert.match(f, new RegExp(`^FINDING router sha256 .* is not the ${V4} this suite was written for`), String(bad));
+    assert.equal(S.suiteVerdict(["SCENARIO PASS 1 X [replay] (1 of 1 run) :: ok", f], ["1"]).ok, false, `${bad}: the suite is not OK`);
+  }
+  assert.ok(S.planLines().join("\n").includes(V4) && !S.planLines().join("\n").includes(V3), "the plan names v4 only");
+});
+
+test("R10-2 the REAL scenarios 2 and 11 rank m-free alone in the lead band (a real agent id is random: equal rows would let it land on m-big and fail there, leaving a recent record on m-big that no reset clears); the replays keep their rows", async () => {
+  assert.deepEqual(S.REAL_BANDED_ROWS.map((r) => [r.name, r.b]), [["m-free", 0], ["m-big", 1]]);
+  for (const id of ["2", "11"]) {
+    const f = fakeWorld({}), seen = [];
+    const op = f.prims.policy; f.prims.policy = async (p) => { seen.push(p.models.map((m) => [m.s, m.b])); return op(p); };
+    f.prims.claude = async () => { await f.prims.send("main", { model: ANCHOR, session: "r10" }); await f.prims.send("sub", { model: ASKED_MODEL, tag: "uwstub/m-free", agentId: "real-agent", session: "r10", messages: 3, agentTool: false }); return { code: 0, text: "{}" }; };
+    await S.runScenarios(f.prims, { only: [id], real: true });
+    assert.deepEqual(seen[0], [["uwstub/m-free", 0], ["uwstub/m-big", 1]], `scenario ${id} real`);
+    const g = fakeWorld({}), seen2 = []; const op2 = g.prims.policy; g.prims.policy = async (p) => { seen2.push(p.models.map((m) => m.b)); return op2(p); };
+    await S.runScenarios(g.prims, { only: [id] });
+    assert.ok(seen2[0].every((b) => b === 0), `scenario ${id} replay keeps one band`);
+  }
+});
+
+test("R10-3 against the REAL router bytes: with the banded rows 40 new agents (no tag, an asked model outside the set) ALL land on m-free and a retry is handed to m-big; with two equal rows they land on both (the run 12 cause); m-big never fails in the banded run", async () => {
+  const dir = mkTmp("uw-scn-r10-"), spike = path.join(dir, "spike"), state = path.join(dir, "state", "subagent");
+  fs.mkdirSync(spike, { recursive: true }); fs.mkdirSync(state, { recursive: true });
+  fs.copyFileSync(NEXT_ROUTER_SRC, path.join(spike, "uw-router.cjs")); fs.writeFileSync(path.join(spike, "slot.json"), JSON.stringify({ model: "x/none" }));
+  const route = createRequire(import.meta.url)(path.join(spike, "uw-router.cjs"));
+  const CFG = { Providers: [{ name: "uwstub", models: ["m-main", "m-free", "m-big"] }] };
+  const tools = [{ name: "Agent", description: "spawn", input_schema: { properties: { prompt: { description: "p" } } } }, { name: "Bash" }];
+  const subReq = (sid, aid) => ({ body: { model: "claude-opus-5-5", tools: [{ name: "Bash" }], messages: [{ role: "user", content: "a" }, { role: "assistant", content: "b" }, { role: "user", content: "c" }] }, sessionId: sid, builtInClaudeCodeSubagent: true,
+    headers: { "x-claude-code-session-id": sid, "x-claude-code-agent-id": aid } });
+  const landing = async (rows, tag) => {
+    route.__test.reset(); fs.writeFileSync(path.join(state, "policy.json"), JSON.stringify(S.scenarioPolicy({ rows })));
+    const sid = `r10-${tag}`; await route({ body: { model: "uwstub/m-main", tools, messages: [{ role: "user", content: "x" }] }, headers: { "x-claude-code-session-id": sid }, sessionId: sid }, CFG, {});
+    const got = {}; for (let i = 0; i < 40; i++) { const m = await route(subReq(sid, `agent-${tag}-${i}`), CFG, {}); got[m] = (got[m] ?? 0) + 1; }
+    return { got, sid };
+  };
+  try {
+    const banded = await landing(S.REAL_BANDED_ROWS, "b");
+    assert.deepEqual(banded.got, { "uwstub/m-free": 40 }, "banded: every new agent lands on m-free");
+    const retry = await route(subReq(banded.sid, "agent-b-0"), CFG, {});                  // the same agent, the same messages again: the client's own retry
+    assert.equal(retry, "uwstub/m-big", "the retry is handed to the next band");
+    assert.ok(globalThis.__uwSub.counters.handoff >= 1 && !globalThis.__uwSub.cool.get("uwstub/m-big"), "m-big never failed: no record on it");
+    const equal = await landing(["m-free", "m-big"], "e");
+    assert.ok(equal.got["uwstub/m-free"] > 0 && equal.got["uwstub/m-big"] > 0, `two equal rows: both get agents (${JSON.stringify(equal.got)})`);
+  } finally { route.__test.reset(); }
+});
+
+test("R10-4 scenario 11 in REAL mode when the client retried once: served another model with the router handoff line = DEGRADED (the plan's verdict) with the evidence in the line; the retry on the SAME limited model, or another model with no handoff line, FAILs; no per-request evidence keeps the old FINDING", () => {
+  const base = { client: "real claude -p", failed: true, aid: "real-agent", chosen: "uwstub/m-free", nextModels: ["m-big", "m-big", "m-big"], overlay: true, recordsForFirst: 2 };
+  const first = (models) => models.map((m, i) => ({ model: m, status: i === 0 ? 429 : 200, retryAfter: i === 0 ? 3600 : null }));
+  const hand = (over = {}) => ({ v: 2, path: "handoff", act: "handoff", aid: "real-agent", aid_full: "real-agent", from: "uwstub/m-free", to: "uwstub/m-big", hop: 1, rsrc: "len", reason: "retry:len:1", ...over });
+  const steered = ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand()] });
+  assert.equal(steered.verdict, "DEGRADED", steered.text);
+  assert.match(steered.text, /ONE 429 on uwstub\/m-free: the real client retried 1 time\(s\) instead of failing at once \(client behaviour\), and the router steered the retry: handoff uwstub\/m-free -> uwstub\/m-big \(len\), served m-big; then avoidance: all 3 next agents/);
+  assert.match(steered.text, /the degraded verdict the plan allows, with the client's retry steered by the router/);
+  const same = ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-free"]), agents: [] });
+  assert.equal(same.verdict, "FAIL"); assert.match(same.text, /1 of 1 retries went to the SAME limited model uwstub\/m-free: nothing steered the retry away \(no handoff line from it\)/);
+  const unexplained = ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand({ from: "uwstub/m-main" })] });
+  assert.equal(unexplained.verdict, "FAIL"); assert.match(unexplained.text, /no handoff line from uwstub\/m-free: the steering is unexplained/);
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand({ to: "uwstub/m-free" })] }).verdict, "FAIL", "a handoff back to the same model is no steering");
+  assert.equal(ok("11", { ...base, recordsForFirst: 3, first: undefined }).verdict, "FINDING", "no per-request evidence: the old finding");
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand()], nextModels: ["m-big", "m-free", "m-big"] }).verdict, "FINDING", "the avoidance check still applies after a steered retry");
+  assert.equal(ok("11", { ...base, recordsForFirst: 1, first: first(["uwstub/m-free"]), agents: [] }).verdict, "DEGRADED", "the one-request case is unchanged");
+});
+
+test("R10-5 scenario 11 REAL end to end against the fake sandbox: a client that retries once is read from the stub records and the router handoff line (DEGRADED, the handoff in the line); the same client against a router that does not hand off FAILs", async () => {
+  const mk = (bug) => { const g = fakeWorld(bug); g.prims.claude = async () => { await g.prims.send("main", { model: ANCHOR, session: "r10" }); const sub = (o) => g.prims.send("sub", { model: ASKED_MODEL, tag: "uwstub/m-free", agentId: "real-agent", session: "r10", messages: 3, agentTool: false, ...o }); await sub({}); await sub({ retryCount: 1 }); return { code: 0, text: "{}" }; }; return g; };
+  const good = await S.runScenarios(mk({}).prims, { only: ["11"], real: true });
+  assert.equal(good[0].result.verdict, "DEGRADED", good[0].result.text); assert.match(good[0].result.text, /the real client retried 1 time\(s\) instead of failing at once \(client behaviour\), and the router steered the retry: handoff uwstub\/m-free -> /);
+  const bad = await S.runScenarios(mk({ noHandoff: true }).prims, { only: ["11"], real: true });
+  assert.equal(bad[0].result.verdict, "FAIL", bad[0].result.text); assert.match(bad[0].result.text, /SAME limited model uwstub\/m-free/);
 });
