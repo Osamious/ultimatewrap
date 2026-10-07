@@ -1188,7 +1188,7 @@ function uaClass(ua) {
 }
 function classLog(pol, c, cls) {
   if (pol.owner.classLog === "off") return;
-  const rc = hdr(c.h, H_CLASS), at = hdr(c.h, H_TYPE);
+  const rc = hdr(c.h, H_CLASS).trim().slice(0, 32).toLowerCase(), at = hdr(c.h, H_TYPE);   // R-v4: the same normalisation as the helper test in route()
   const o = { t: new Date(nowMs()).toISOString(), sid: c.sid.slice(0, 8), aid: c.aid, pid8: c.pid8, cls, ag: c.ag ? 1 : 0, bl: c.bl ? 1 : 0, nt: c.nt, ga: c.ga ? 1 : 0,
     sysb: c.sysb, m: logSel(c.asked0), rc: RC_SET.indexOf(rc) >= 0 ? rc : null, at: at && /^[A-Za-z0-9_.:@+-]{1,32}$/.test(at.slice(0, 32)) ? at.slice(0, 32) : null,
     bb: byteBucket(c.bytes), tc: typeof c.tokenCount === "number" && Number.isFinite(c.tokenCount) ? c.tokenCount : null,
@@ -1346,8 +1346,11 @@ module.exports = async function route(req, config, ctx) {
       return ret;
     };
 
-    if (ag || bl) {
-      if (!hasTools) {                                            // cr-M5: AUX class (helper call); I8a: any mode, never rewritten
+    // R-v4: Claude Code labels its own helper calls (rc auxiliary, compaction) and now sends them with the full tool list, with or without an agent id. The label is the class: such a request
+    // takes the AUX path below (passthrough, no sticky entry, no retry signal, no handoff, no notice, no learnMain, no injection). A forged label only makes a request pass through UNREWRITTEN.
+    const rcv = hdr(h, H_CLASS).trim().slice(0, 32).toLowerCase(), helperRc = rcv === "auxiliary" || rcv === "compaction";
+    if (ag || bl || helperRc) {
+      if (!hasTools || helperRc) {                                // cr-M5: AUX class (helper call); I8a: any mode, never rewritten
         pathTag = "aux";
         count("aux"); auxStats(P, asked0, bytes); c.role = "aux"; classLog(pol, c, "aux");
         flushStatus(false, P);
