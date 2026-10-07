@@ -1,0 +1,26 @@
+[
+  {
+    "provider": "anthropic",
+    "protocol": "anthropic"
+  },
+  {
+    "provider": "fx-free-a",
+    "protocol": "anthropic"
+  },
+  {
+    "provider": "fx-free-b",
+    "protocol": "anthropic"
+  },
+  {
+    "provider": "fx-dep",
+    "protocol": "anthropic"
+  },
+  {
+    "provider": "fx-paid",
+    "protocol": "anthropic"
+  },
+  {
+    "provider": "fx-mgmt",
+    "protocol": "anthropic"
+  }
+]

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import {
   createLogWriter, readLog, readBench, loadExisting, isFresh, compact, toStored,
 } from "../refresh/bench-store.mjs";
@@ -12,7 +13,7 @@ import {
   fmtMs, fmtTps, previewText, loadBench, BENCH_SCHEMA, PREVIEW_CHARS,
 } from "../menu/bench-data.mjs";
 
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-bench-"));
+const tmp = () => mkTmp("uw-bench-");
 const NOW = Date.parse("2026-09-29T12:00:00Z");
 const sec = (ms) => Math.floor(ms / 1000);
 

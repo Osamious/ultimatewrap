@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -20,7 +21,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TRIAL = path.join(HERE, "..", "harness", "trial31");
 const { TrialViolation, createPolicy, install, powershellEscapeHatch, tokenizeCmdline } = require(path.join(TRIAL, "guard-core.cjs"));
 const hex = (n = 24) => crypto.randomBytes(n).toString("hex");
-const mkTemp = (p = "uw-trial31-g2fix-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const mkTemp = (p = "uw-trial31-g2fix-") => mkTmp(p);
 
 // ================================================================ item 1: absolute system tools
 const GIT_BASH_ENV = {

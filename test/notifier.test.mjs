@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { BENCH_OUTDATED_DAYS, BENCH_OUTDATED_SHARE, outdatedNotice, outdatedShare, ageHistOf, cleanAgeHist, oldestAgeOf,
          oldestStampOf, loadBench, isUsable, countStatuses } from "../menu/bench-data.mjs";
 import { DEFAULTS } from "../refresh/bench-cli.mjs";
@@ -67,7 +68,7 @@ test("oldestStampOf: the OLDEST usable record among the listed routes, not the n
   assert.equal(oldestStampOf([row("p", [M("never")])], get, NOW), null, "no route has a record");
   assert.equal(oldestStampOf(rows, null, NOW), null);
   assert.equal(oldestStampOf([row("q", [M("future")])], get, NOW), null, "a future-dated record is not a stamp");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-oldest-"));
+  const dir = mkTmp("uw-oldest-");
   const file = path.join(dir, "bench.json");
   fs.writeFileSync(file, JSON.stringify({ schema: 1, generatedAt: iso(NOW), models: { "p/a": { s: "ok", a: sec(NOW - DAY) }, "p/b": { s: "gone", a: sec(NOW - 9 * DAY) } } }));
   const b = loadBench(file);
@@ -94,7 +95,7 @@ test("the snapshot bakes benchOldestAt (schema 9), carries it with the counts, a
   const carried = buildSnapshot(built, { previous: snap, bench: null, nowMs: NOW + 40 * DAY });
   assert.equal(carried.benchOldestAt, snap.benchOldestAt, "carried with the counts, whatever their age");
   assert.deepEqual(carried.rows[0].benchAgeHist, snap.rows[0].benchAgeHist, "and so is the age histogram");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-oldest2-"));
+  const dir = mkTmp("uw-oldest2-");
   const f = path.join(dir, "snapshot.json");
   writeSnapshotFile(snap, f);
   assert.equal(loadSnapshot(f).ok, true);

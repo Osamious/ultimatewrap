@@ -193,6 +193,399 @@ node keysync/key.mjs default-model clear                                    # an
 - With **no** default set, a live profile run prints a WARNING first if it is about
   to change a hand-set `env.ANTHROPIC_MODEL` to the profile anchor.
 
+### 5b. The subagent model policy (which model your subagents run on)
+
+A policy chooses the model each Claude Code subagent runs on, instead of the model it asked for.
+It is owner data, written only by the CLI, and it starts in **shadow**: it logs what it would
+do and changes nothing. `shadow` is the word on every screen; nothing is enforced until you
+say so, and a wizard or a preset never enforces.
+
+```powershell
+node keysync/key.mjs subagent-policy status                 # the verdict first (off, saved, waiting, idle, shadow, enforcing, paused or degraded) and the one command that helps, then about four lines: the policy, the compiled copy, what the router last reported
+node keysync/key.mjs subagent-policy preset                 # the five ready-made choices with live counts
+node keysync/key.mjs subagent-policy preset free            # preview one (the equivalent flags and what it would do); nothing is saved
+node keysync/key.mjs subagent-policy preset free --confirm yes --live yes
+node keysync/key.mjs subagent-policy wizard --live yes      # three questions on a terminal, a preview, then a save in shadow mode (it needs --live yes like every command that saves)
+node keysync/key.mjs subagent-policy last 20 --since 24h    # what the last subagents asked for, what ran, what the policy would use, in local time (--json yes for scripts)
+node keysync/key.mjs subagent-policy explain groq/llama-3.3-70b --mode free --free-scope providers   # would this model be allowed? saves nothing
+node keysync/key.mjs subagent-policy why EMPTY_SET          # what a warning means in plain words, and the command that fixes it
+node keysync/key.mjs subagent-policy pause                  # subagents run exactly as they asked from the next request; your toggles are kept
+node keysync/key.mjs subagent-policy resume --live yes      # continue (checked like set --enforce enforce)
+node keysync/key.mjs subagent-policy undo --live yes        # back one step (refused while paused: resume first, or add --lift-pause yes)
+node keysync/key.mjs subagent-policy help                   # the toggle map and every command
+```
+
+- **Running the examples in a fixture.** A test run names its own files instead of the real ones
+  (`T=$(mktemp -d); F=$(node test/fixtures/subagent-flags.mjs --dir "$T")`), and the flags it needs
+  depend on the command. `set`, `show`, `status`, `explain`, `rebuild`, `preset`, `wizard`, `resume`
+  and `undo` take the full set `$F`. `last` takes only `--state-dir "$T/state"`; `report` takes
+  `--state-dir "$T/state"` and optionally `--snapshot-file "$T/snapshot.json"` (the prices) and
+  `--logs-file <a fixture request log>` (for `--outcomes yes`; a fixture run that names none reads none),
+  and `selftest` takes no file flag at all (its approval file has one fixed place that no flag can
+  move). `pause`, `rollback`
+  and `clear` take only `--policy-file "$T/llmkeys/subagent-policy.json" --state-dir "$T/state"`.
+  `why` and `help` take no file flag. `$F` given to `last`, `pause`, `rollback`, `clear` or `why` is
+  refused as E_USAGE ("unknown or not applicable flag"), and a half set is refused as "incomplete
+  test-flag set". A fixture run never needs `--live yes`; a run on the real files always does.
+- **What `status` prints.** Not one line: the verdict and its next command first, then the policy,
+  the compiled copy (age, eligible models of the snapshot routes, how many are not tool-tested) and
+  what the router last reported (when, how many subagent requests of how many), plus one plain line
+  for each router warning. States: `OFF` (no policy saved), `SAVED-NOT-COMPILED`, `WAITING` (saved and
+  compiled; the router has not reported this exact copy yet and uses it from its next request: run
+  `status` again after you use Claude Code), `NOT-WIRED` (no router has ever reported and the compiled
+  copy is older than about ten minutes, or a router that ran for a long time still reports an older
+  copy), `IDLE` (the router reported this exact copy earlier and has been silent for over a day: it
+  reports only while Claude Code runs, so nothing is wrong unless you used Claude Code since),
+  `SHADOW`, `ENFORCING`, `PAUSED` and `DEGRADED(CODE)`. A saved policy file that cannot be read is
+  `DEGRADED(E_OWNER_CORRUPT)` with exit 4 and the command that clears it. After a `set` the first line
+  is `SAVED:` (the same state `status` calls `WAITING`).
+- **The free presets.** `preset free` (and answer 3 of the wizard) is the NARROW set: only models
+  tagged free (the count is printed in the preview: `N models tagged free; M models on free-labelled
+  providers`). `preset free-wide` is the wide set: every working model on a provider you labelled
+  free, which is a much larger set and can include models that have a price. Every free preview shows
+  both counts from the live funnel.
+
+- **The three toggles.** Toggle 1 *source* (`--source same-provider|all-providers`: only main's
+  own provider, or any provider). Toggle 2 *mode* (`--mode dynamic|inherit|free`: any model,
+  main's own model, or free models only; with `free`, `--free-scope models|providers|providers+deposit`
+  says which models count as free). Toggle 3 *context* (`--ctx any|128k|200k|256k|512k|1m|prefer-256k|prefer-512k|prefer-1m`: `any`
+  excludes nothing; `128k` to `1m` are hard floors that leave out every model with less known
+  context, unknown included; the `prefer-` values put models at or above that context first and
+  leave out nothing; the context the asked model has never raises the floor above the one you chose;
+  `set --dry yes`, `show`, `preset` and the wizard print how many rows pass each floor, each over
+  its own denominator, so you can pick one knowingly). A model whose context is unknown can pass
+  the 128k stand-in floor on the context of a same-name sibling (shown `c?`, never used for a higher
+  floor); safety, guard, embed, rerank, OCR, LoRA, moderation and under-4B models are never
+  candidates. A model that failed once in a tool test ranks below a clean one of its class. Inside
+  a rank band models are then ordered by the tool sweep's own blocked states (see below: they rank a model below clean ones, never out), the big request step, the tool-test markers (each clean above flagged, strongest flag first: forced-choice only, argument fidelity failed, tool_result use failed) and only then the L4 step (a model that makes N calls of 2 ranks above one whose tool results or arguments fail: tool errors are constant in Claude Code), speed
+  quartile (of the rows in your set), context class (1M, 512k, 256k, 200k, 128k), price, and only
+  then by how recently the model was probed (live within 7 days, probe within 14 days, older: this
+  depends on the calendar, so it only breaks ties and never outranks speed or context); a hash of
+  a failed spawn call (it matters only for a model acting as a main agent) breaks ties just before that, and the hash of
+  the model id breaks the last ties, so no provider is favoured by its name. Models with a known tool failure (a filed issue) stay
+  out until a real tool test says otherwise; free models dropped on a rate-limit, timeout, empty or
+  network status of an old test are listed as waiting for a re-probe, not treated as dead
+  (`show --detail yes` names them). The tool sweep's result is the model's LATEST state, whatever the age of its speed test. A hard answer (gone, pay or auth, which the sweep never asks again, so a count of attempts means nothing for it) acts at once: gone leaves a model out as `unreachable` unless it has an earlier confirmed pass (then it only ranks lower), pay and auth rank a model lower: when the pay or auth is NEWER than the model's last pass, the model is KNOWN to fail, so it is listed as tier u and ranks BELOW the untested models, in a band of its own (a known failure ranks under an unknown). A soft answer (rate limit, quota, upstream unavailable, slow, timeout or error) ranks a model lower after 3 runs in a row with the same reason, or after ONE run when a rate answer's stored message names the provider's own free-model quota or limit (quota, daily limit, reached the limit); an `error` leaves a model out (as unreachable, named and counted as stuck) only when the same error repeated on 10 or more runs in a row and the model has no confirmed pass, otherwise it only ranks lower; the scheduling and budget states (cap, spend, not-run, empty and the like) are not used at all. A confirmed pass NEWER than the sweep's answer wins; an unreadable date makes the answer unusable (nothing happens). A held provider counts the same way, except that a held gone or pay is ignored for a provider that has any confirmed result (the sweep's own rule: it answered, so it was never gone or out of credit as a whole); a held auth always applies. When most of one provider's models carry the same soft or hard sweep state the report prints ONE line for the provider (for example "cleanapis: 32 of 32 bench-ok rows pending error") because the provider, not the models, is probably the cause. Every count says what it is of ("1 of 5 bench-ok model left out"). Your `--allow` pin does NOT override `unreachable` or `gateway-compat` (the model cannot be reached, or fails through the gateway); it still overrides a tool-tier verdict. A free model dropped on an old transient bench status that the sweep found gone is named in a list (re-probe skipped), never silently dropped. A payload cap that came from a refusal at the big step is NOT the refused size: the cap is the largest request the model is proven to have answered (`maxBytes`; a record with no proof keeps its refusal size), and a context the provider itself stated in a refusal (`ctxStated`, tokens) lowers or replaces the context and caps the payload at 3 bytes a token. `show` and the preview say how the unverified models split: blocked by a state the sweep recorded, tested aliases (never above unverified), and really not tested. A model whose tool test failed in the gateway's own request translation (tagged `xw: gateway`) is left out as `gateway-compat` and is tested again only when CCR changes (a new CCR build re-queues it). Image-generation, translation and search models (`image`, `imagen`, `translate`, `search`, `deepsearch` as a word of the id) are never candidates. Rows whose 128k rests on a sibling's context are counted as `ctx unproven` in every preview (a context fact, on its own line, not a sweep fact): the only measured proof is the 400 KB big step (about 100k tokens), so the router's per-request fit check decides. Also
+  `--banded yes|no`, `--handoff-notice yes|no`, `--enforce shadow|enforce`, `--inject off|on`
+  and `--allow provider/model`. The presets: `follow-main` (mode inherit), `any` (dynamic, all
+  providers), `free` (free, all providers, free scope models: only models tagged free), `free-wide`
+  (the same with free scope providers: every model on a free-labelled provider), `free-1m` (free
+  scope providers with ctx 1m).
+  `set`, `show` and `preset` print the verdict first, then the change against the previous policy
+  (`mode dynamic -> free; eligible 14 -> 7 models, 5 -> 2 providers`); `--detail yes` adds the whole
+  funnel and every raw warning.
+- **Files.** Your choices: `~/.llmkeys/subagent-policy.json` (and `.prev`, the one generation `undo`
+  restores: written before every `set` or `clear` that changes something). The compiled copy the
+  router reads: `state/subagent/policy.json` (a saved choice is not live until it is compiled; `set`
+  does it, `rebuild --live yes` redoes it after a bench sweep or a key change). The router writes
+  `state/subagent/status-<worker>.json`, `agents.jsonl` (one line per new subagent, plus three
+  rotated files of 1 MiB), `classify.jsonl` (one line per classified request; since router v3 it
+  carries `hasSid`, a session id was present, and `ua`, the client class `claude-cli`, `sdk`, `other`
+  or `none`, never the raw header; it rotates at 8 MiB and keeps two older files: 3 files and 24 MiB for one writer, plus at most
+  about 200 KiB a file for every router worker that appends, since each checks the size every 50
+  lines; a worker whose file another worker rotated reopens the path at its next check; plus a stray claim file after a crash, removed on the next rotation after 10 minutes) and `cooling.json`; `shadow.flag` is the pause (the router stats it on
+  every request) and `paused-from.json` remembers what `resume` should restore.
+- **Main's own model first (router v3).** With banding on (the default), a subagent that needs a
+  substitute takes main's own model first only when that model is in the LEAD rank band of the
+  candidates (the band of the first usable, non-cooling row). When main's model is in the allowed
+  list but in a lower band, a fan-out of subagents spreads across the lead band instead of all
+  landing on main's model. `--mode inherit` and `--banded no` are unchanged.
+- **Pause, resume, undo.** `pause` (and its older name `rollback`) is compile-free and needs no
+  `--live yes`: one word must work in an emergency. A pause that the router set by itself (a safety
+  check tripped, shown as `DEGRADED(AUTO_ROLLBACK)`) is cleared by `resume` or by a `set`. `resume`
+  puts enforcement back to what it was when you paused, through the SAME checks as
+  `set --enforce enforce`, so it refuses (and the pause stays) while a precondition is unmet. `undo`
+  restores the previous generation and recompiles it; while the policy is paused it is REFUSED
+  (E_PRECONDITION, naming `resume`) because it would lift the pause as a side effect: add
+  `--lift-pause yes` to go back one step and lift the pause in one command, and it says so. If the
+  earlier policy cannot be compiled, `undo` prints the whole refusal and leaves you paused with the
+  earlier toggles saved. A real `set` during a pause lifts it and says so (including that enforcement
+  stays shadow when it was enforce before the pause). Every writing command on the REAL files (`set`
+  without `--dry yes`, `rebuild`, `clear`, `resume`, `undo`, `wizard`, a confirmed `preset`) needs
+  `--live yes`: a real save never happens without it on the command line (the wizard is refused before
+  its first question without it). A test run names its own files with the test flags instead and
+  never needs it.
+- **Restore command.** The router file is replaced and restored only through
+  `node harness/deploy-router.mjs --deploy yes --candidate <file>` and
+  `node harness/deploy-router.mjs --restore yes [--from <backup>]` (a backup is made first); the
+  CLI never touches it. `clear` removes the policy files and the router goes back to its exact
+  legacy behaviour on its next request.
+- **Tag-stripper note.** With `--inject on` main is asked to start a subagent prompt with
+  `<CCR-SUBAGENT-MODEL>Provider/model</CCR-SUBAGENT-MODEL>`; CCR removes that tag before the agent
+  runs. The router never relies on the tag being obeyed: an id outside the allowed list is replaced
+  by the policy and the replacement is logged.
+- **Native `/model` is not covered.** The policy chooses the model of SUBAGENTS only. What you pick
+  with Claude Code's own `/model` (main) is yours, and CCR's own model list (a provider with model
+  descriptions) is a second list the policy does not edit. Helper calls (titles, summaries,
+  compaction) are never rewritten in any mode.
+- **Reading `last`.** Claude Code's transcript shows the model that was REQUESTED, not the one that
+  served the request: the served model is in `last`, in the doctor and in CCR's `request_logs`.
+  A free subagent that runs out of limits is handed to the next free model on its next request; for a
+  daily cap the honest bound is ONE failure, then avoidance: Claude Code fails the subagent at once
+  when the retry delay is over a minute, so no retry reaches the router, and the router marks the
+  model as resting so the next subagent starts elsewhere.
+- **The 6 h rest.** A model that fails rests 2 min, then 10 min, then 60 min, then 6 h. The router has
+  no memory of a failure that happened "consecutively" in the strict sense: it approximates it with
+  the rest period plus one quiet hour, so a model that fails every 30 to 60 minutes reaches the 6 h
+  rung in about 3 hours.
+- **The report and the self-test.** Examples (a test runs each one in a fixture with the flags its
+  command takes):
+
+      node keysync/key.mjs subagent-policy report --since 24h     # asked -> ran per agent, the policy's choice, an input-token cost estimate against main's model
+      node keysync/key.mjs subagent-policy report --outcomes yes  # adds the gateway request log, read only (--json yes for scripts)
+      node keysync/key.mjs subagent-policy selftest --plan yes    # what a sandbox self-test would do, and its plan hash; it starts nothing
+
+  `report` answers "what did my subagents run on, and what would
+  that have cost on main's own model?" without the policy being enforced. It lists the newest 20
+  agents (asked -> ran, what the policy would use or chose, why), then totals, each over the
+  population it was counted on ("6 of 8 agent decisions would move to another model"), the router's
+  own counters (these are for the router's whole lifetime, not for `--since`), and one savings
+  line. The savings line is always labelled "estimate, input tokens only, snapshot prices": it
+  multiplies the token count of the FIRST request of each agent (the log holds one line per new
+  agent, so later requests are not in it, and real totals are higher) by the input price the model
+  snapshot lists, for main's own model, for what ran and for what the policy chose. An agent with no
+  token count, with no known main, or on a model whose price the snapshot does not list is left
+  out and counted ("2 without a token count ... 2 with an unlisted price"). `--session` takes the
+  logged session id (the log keeps the first 8 characters of a session id) or a longer id that starts
+  with exactly those 8; a shorter fragment matches nothing. The log file holds only new-agent lines and
+  hand-over lines; sampled repeat requests are in the other log and are not reported. `--outcomes yes` adds ground truth:
+  it reads the gateway's request log READ ONLY (never written, never by the router, never on a
+  timer), pairs each agent with the request of the same session and agent within 2 seconds, and says
+  how many of the matched requests the gateway served on the logged model, on another model, or
+  answered with an error status; the gateway keeps only recent request rows (how long is not
+  specified here; the observer notes in section 6 report roughly 1.5 hours on one machine, issue
+  #134, not a guarantee), so older agents show as "no matching request". An unreadable log or snapshot is said in the report, never left out.
+  The report also prints "context growth", an estimate from the router's classifier log: for each
+  subagent, its largest later request divided by its first request, as a median, 90th percentile and
+  maximum over the n subagents with two or more counted requests; it measures the headroom a model
+  needs and changes nothing. `report` and `status` also say how many eligible models have no known
+  request-size limit, so the size check does nothing for them until a tool test records one (router v3: for a request above 200 KB (204,800 bytes) such a model ranks LAST, after every known-limit model that fits and after cooling ones, and is never left out: it serves only when nothing else can, and it follows the same tier, cooling and handoff rules as every model. A model with no known limit that carries `bk`, the 400,000 bytes its tool sweep's big step proved it accepts, counts as a KNOWN fit for a request of up to `bk` bytes and ranks by band and tier like any known-limit model; `bk` is advisory, the router never refuses a request because of it, and a garbled value is ignored).
+  Traffic shares come from the same classifier log and count CLIENT requests only: the requests that
+  carry no session id (logged as `nosessio`) are the UW tooling's own probe traffic (the keysync and
+  refresh probe profiles, machine-paced), not a client session and not a subagent bypass, so `report`,
+  `status` and `show` print them as their own line ("non-client probe traffic (N of M classified
+  requests), excluded: they carry no session id") and leave them out of every main, sub and aux
+  share; each share names its denominator (client requests with a session id). A second line splits
+  the agent-shaped client requests into teammates (an agent id without the billing flag) and
+  built-in subagents (the billing flag), and says how often the two detectors disagree: that
+  disagreement is made of teammates. The router's own lifetime counters (`req`, `main`, `sub`) are
+  per router, not per session, so they still include the probe traffic; the lines above are the
+  client view. Any classifier-accuracy matrix must use these client-only denominators.
+  The classifier log is read from all of its files, oldest first (`classify.2.jsonl`,
+  `classify.1.jsonl`, `classify.jsonl`: router v3 keeps 8 MiB in each), each read in bounded chunks
+  up to 8.5 MiB (a normal file is read whole). One line says how much was read ("classifier log: read
+  24.0 MiB of 24.0 MiB kept (3 of 3 files)"); a file over the cap is read from its newest end and the
+  line says TRUNCATED with both sizes, an absent generation is named, and an unreadable file says
+  UNREADABLE. The read keeps only ten fields per row, about 27 MiB in memory for the full 24 MiB of
+  rows (measured). A router v3 line also carries `hasSid` (the router's own word that the request had
+  no session id; an older line is judged by its session spelling, the same set) and `ua` (the user
+  agent as claude-cli, sdk, other or none): `status`, `show` and `report` add one line, "user agent
+  of client requests (N of M carry it)", counting only the lines that have it. The "agent-shaped probe
+  rows" figure is the no-session-id and agent-shaped count; there is no separate one.
+  `bk` on a compiled row (400,000: the tool sweep's big step passed for that model) is routing data
+  and so part of the content hash: a rebuild that gains `bk` rows changes the hash, and so the
+  injected marker once; it changes no tier, rank, band or count, and `explain` says "proven to accept
+  400 KB" for such a row.
+  SHRINK GUARD and discovery freshness (incident 2026-10-06: a bench run's automatic snapshot rebuild applied the
+  7-day discovery routing ceiling to 56 of 63 stale caches, the snapshot fell from 6,432 to 2,009 routes and a policy
+  rebuild from 92 to 21 rows). `rebuild` and a real `set` REFUSE (exit 1, E_SHRINK, nothing written, the saved policy
+  untouched) when the snapshot's route count fell by more than 25% against the policy they would replace, or, with the
+  same toggles, the eligible rows did (a changed toggle is the owner's choice and is not a rebuild's shrink). The line
+  says "the snapshot shrank from N to M routes (K of P discovery caches are older than 7 days): refresh discovery first
+  (node refresh/cli.mjs, needs your OK), or pass --accept-shrink yes". Only `--accept-shrink yes` passes; the automatic
+  `rebuild --if-stale yes` never does and prints the refusal as one line. A compile records `builtFrom.snapshotRoutes`
+  and `builtFrom.discovery` ({providers, fresh, stale, unreadable, ceilingDays}); both are outside the content hash and
+  outside the stale test, so `--if-stale` still decides from the cheap stamps first and never reads the cache folder.
+  `status` and `show` read that folder READ ONLY (record times only) and print DISCOVERY_STALE ("discovery: N of P
+  providers fresh, M past the 7-day ceiling (not routed): a snapshot rebuild now would drop their models") when any cache
+  is past the ceiling, and SNAPSHOT_DRIFT when the policy was compiled from a snapshot whose route count differs from the
+  current one by more than 10%. `--discovery-dir` names another folder (a test).
+  ENFORCE READER (`set --enforce enforce`, and the `enforcement: enforce` a rebuild keeps): the accuracy verdict in
+  `state/subagent/accuracy.json` counts only when it is PASS, younger than 30 days and not dated more than 5 minutes in the
+  future, BOUND to the policy it was measured against (`evidence.policyContentHash` equals the content hash of the policy about
+  to be written, so a rebuild or a toggle change that moves the hash voids it and the compile carries shadow with the reason),
+  and measured on the installed CCR (`ccrVersion`, read from the installed package) and Claude Code (`ccVersion`, compared with
+  the launcher's own version file; when that cannot be read the field is required and printed, and the line says it was not
+  compared). Each refusal is one line with the evidence line (classified rows hashed, window). The reader never re-derives the
+  evidence hash (the evaluator owns it), reads fields by name and ignores extra fields.
+  Versions are compared WHOLE: a prerelease tag (3.0.22-evil), a v prefix or a fourth number is a different version (the text
+  `claude --version` prints, "2.1.289 (Claude Code)", is accepted for Claude Code). When the installed Claude Code version cannot
+  be read (no single launcher copy in its versions folder) the gate REFUSES; only `--accept-unverified-cc yes` (on `set` or
+  `rebuild`) lets the recorded version stand, and the printed line says it was not compared. A verdict file over 1 MiB is not read.
+  The shrink guard compares the route count with the PEAK baseline kept in `builtFrom.snapshotRoutesBaseline` (the highest count
+  since the last accepted shrink; `--accept-shrink yes` resets it to the accepted count), so two 20% steps cannot add up unseen;
+  the eligible-rows rule still compares with the previous policy only (a known limit: slow row loss under the same toggles shows
+  only through the route count). `resume`, `preset`, `wizard` and `undo` have no `--accept-shrink` of their own: their E_SHRINK line
+  names `set --accept-shrink yes`, and a refused `undo` keeps your earlier toggles saved and lands in the pause. `--discovery-dir`
+  gets the refusals of the file flags (blank, UNC, a protected folder).
+  KNOWN LIMITS of the enforce gate (documented, not closed here): (1) the router trusts `owner.enforcement` in the compiled policy
+  it reads and runs no gate of its own: every precondition above is checked by this command when it WRITES the policy, so a
+  hand-edited compiled file (or one written by another tool) that says enforce is obeyed: the content hash leaves `enforcement` out, so
+  changing that one field does not trip POLICY_HASH. (2) `accuracy.json` is self-attested:
+  the evaluator writes it and this command checks its date, policy hash and versions, but nothing signs it, so anyone who can write
+  `state/subagent/` can write a PASS; the evidence hash is printed, never re-derived. Both are inside the owner's own account and
+  were left as they are on purpose; the router is not changed for them.
+  `--accept-unverified-cc yes` is NOT persisted: it covers that one `set` or `rebuild` only, so a later `rebuild --if-stale yes` without it
+  drops to shadow with CLASSIFIER_UNMEASURED while the installed Claude Code version stays unreadable. `clear` followed by `set` starts a
+  new route baseline (the baseline lives in the compiled file, which `clear` removes). The eligible-ROWS rule has no peak (a ratchet
+  limit): under the same toggles each rebuild may lose up to 25% of the rows against the previous policy, so repeated small row losses
+  add up unseen unless the route count moves too.
+  `rebuild --auto yes` is the form for the automatic rebuild after a sweep or a keysync run (D-x): stale-only, silent when current,
+  ONE line when it rebuilt, no output and exit 0 when no policy was ever saved; it accepts no shrink and no unverified Claude Code
+  version whatever flags come with it, and it never turns enforcement on (an owner file that says enforce stays shadow in the compiled
+  file until the owner's own `rebuild`; it can only lower). `autoRebuild()` in the library runs it in process and never throws or sets
+  the exit code of its caller.
+  Where it runs (D-x): at the end of a live tool sweep (`refresh/tool-fidelity-cli.mjs`, after its store is saved), of a live bench
+  sweep that changed bench.json (`refresh/bench-cli.mjs`, after the closing snapshot rebuild), of a verified `--target live` keysync
+  write (`keysync/run.mjs`) and after a successful `key.mjs add`, `remove`, `retier` (not `--dry yes`) and `default-model set` or
+  `clear`. Each prints its one line on stderr, is strictly non-fatal and never changes the exit code of the command; `--no-rebuild yes`
+  on that command skips it. It is stale-only and accepts no shrink: a bench run whose snapshot was rebuilt from stale discovery caches
+  (the 2026-10-06 incident) gets one `E_SHRINK` line and the saved policy is left as it was. `key.mjs prefer` does not trigger it.
+  Not after Ctrl-C or after the gateway gave up (exit 4) in a tool sweep, nor after a bench run whose gateway gave up. The live
+  migrations of the tool sweep (`--reclass-l4`, `--stated-limits`, `--release-holds`, `--reset-gone-holds`, `--reset-awkward-json`, `--reset-transient`, `--reset-canary`, `--merge-unsaved`)
+  do NOT trigger it: after one of them the policy stays as it was until the next trigger or a manual `rebuild --live yes`.
+  `--release-holds`, `--reset-gone-holds` and `--reset-canary` change what the compile reads (holds and pending entries), so after one of them the
+  saved policy is out of date until the next trigger or a manual `rebuild --live yes`.
+  `--no-rebuild` takes yes or no in `key.mjs`, `keysync/run.mjs` and both sweeps; any other value is a usage error before any work.
+  Serialisation: the compiled file and the owner file are written atomically (a temp file named for the process, flushed, then renamed
+  over the target), so the router never reads a torn file, and every writer of the compiled policy (a real `set`, which also covers `resume`,
+  `preset` and `wizard`, `rebuild`, `rebuild --auto`, `undo` and `clear`) takes `state/subagent/rebuild.lock` first (an exclusive create
+  holding the process id and the time). While it is held another writer stops with `E_LOCKED: another policy rebuild is running; retry in a
+  minute` and writes nothing; the automatic rebuild after a sweep says instead that the policy stays as it is until the next trigger or a
+  manual rebuild. `pause` and `rollback` stay UNLOCKED on purpose: they are the emergency flip and never wait for a rebuild. A lock older
+  than 120 seconds, or whose process is gone, is taken over without a window in which two takers can both win (the takeover is serialised by
+  a second exclusive file, `rebuild.lock.takeover`, that is itself dropped after 10 seconds if a taker crashed); a busy file (EPERM, EACCES,
+  EBUSY) is retried a few times; a folder that cannot hold a lock (ENOENT, EROFS, ENOSPC) lets the writer run, with a one-line note that it
+  is not serialised. A `set --dry yes` and the read commands take no lock.
+  `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
+  `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
+  `selftest` is the one-run check that the policy really changes a subagent's model and leaves
+  helper calls alone, on a real headless Claude Code inside the isolated sandbox. `selftest --plan
+  yes` prints what a run would do and its plan hash; it reads no data file and starts no process.
+  `selftest --approve-plan yes --live yes` is yours to run in a terminal: the command refuses without
+  one and needs the first 12 hex characters of that hash typed. That blocks a pipe and an accidental
+  run and pins the plan and the files; it does not prove a person typed it (a program that opens a
+  pseudo-terminal passes the terminal check, the same documented limit as the sandbox approval).
+  The sandbox runner is `harness/subagent-scenarios.mjs` (built, never yet run; an approval is
+  refused if it is missing). `selftest --run
+  yes --live yes` needs that approval (one use, valid 24 hours, void if the plan or any file the run
+  executes changed), uses it up, and prints PASS or FAIL for the two checks (a subagent request
+  reached the stub on the policy's model and the sandbox router's own log shows it chose it; a helper
+  call stayed on the model it asked for). A check
+  that sees no matching request fails. A run is refused, with the approval left unused, if the
+  sandbox runner `harness/subagent-scenarios.mjs` is missing. The same file is the END-TO-END
+  SCENARIO SUITE: `node harness/subagent-scenarios.mjs --plan` prints eleven scenarios (spawn and
+  serve, a 429 handoff, all models limited, team agents, a `/model` switch, a corrupt, missing or
+  newer policy, a worker restart, helper calls, rollback, a 20-agent fan-out, a daily-cap 429) and
+  four chaos checks, what each must prove, and a plan hash, without reading or starting anything.
+  A run (`--approve-plan` in a terminal, then `--run`, optionally `--only 2,3` and `--runs N`)
+  uses the same sandbox and the same one-use typed approval as the other sandbox runs, replays the
+  request shapes a real client sends (no client is started), pins the installed CCR in the approval,
+  and prints PASS, FAIL, FINDING or DEGRADED per scenario with its run count and the client used; a
+  line that is not a PASS says it is not G3 evidence, and the exit code is non-zero for a FAIL or
+  for a FINDING outside scenarios 2, 7 and C4. `--real yes` (also on `selftest`) is a SEPARATE,
+  riskier mode with its own consent: it starts a real headless Claude Code for scenarios 1, 2, 3
+  and 11 only, pins the launcher's path, hash and version in the approval, and checks afterwards
+  that the real `~/.claude.json` and `~/.claude/projects` were not touched and no request of the
+  client reached the live gateway. A FINDING names
+  something the sandbox could not show (for example that no retry signal reached the router); a
+  DEGRADED line is the daily-cap case: one failure and then avoidance, never a seamless handoff.
+  How the suite reads the router: every counter and the cooling list come from a fresh status (the
+  router flushes `status.json` at most every 5 s, so the suite waits 5.1 s, sends one helper-shaped
+  request and reads), a worker that served earlier scenarios is replaced when it holds their state
+  (core pid must change; `cooling.json` is deleted again after the swap), and a scenario that needs a
+  clean cooling list checks it first. Main's own model comes first when it is a row of the policy (plan
+  6.2): scenarios 3 and 10 keep main outside the set, scenarios 2 and 7 keep it in on purpose; whether
+  that shortcut is wanted is an open owner decision, the suite documents it and does not judge it.
+- **Counts carry their denominator.** Every figure printed says what it is a count of ("7 of 7
+  eligible models are not tool-tested"). "Eligible" means allowed by the toggles; "usable" means it
+  can stand in for a subagent (a known context of at least 128,000) and fits the request.
+
+### 5c. Classifier accuracy and the shadow tally (the evidence for the enforce decision)
+
+`node keysync/subagent-accuracy.mjs` answers two questions from the router's own logs, without a
+process start or a request: is the subagent classifier accurate enough to enforce on (plan 12.5), and
+what would each mode have done to the subagent requests already seen. It is read-only except for one
+optional file, `state/subagent/accuracy.json`, the file `set --enforce enforce` reads.
+
+```
+node keysync/subagent-accuracy.mjs                       # text report, writes nothing
+node keysync/subagent-accuracy.mjs --since 7d --json yes # the whole record as JSON
+node keysync/subagent-accuracy.mjs --write yes --live yes --cc-version 2.1.0 --ccr-version 3.0.22
+```
+
+Exit 0 means "computed": INSUFFICIENT is a normal result, not an error. Exit 1 is a read or write
+failure, exit 2 a usage error. `--since` is at most `30d`, because a PASS expires after 30 days.
+
+- **What is counted.** The classifier log generations (`classify.2.jsonl`, `classify.1.jsonl`,
+  `classify.jsonl`), the decision log and the agent log, in bounded 1 MiB chunks. Requests with no
+  session id (`hasSid` false, or the `nosession` spelling on an older line) are the UW tooling's own
+  probe traffic and are left out of EVERY denominator; the report says how many it left out.
+- **Ground truth: `rc` or nothing.** The router's class is a pure function of the two detectors it
+  logs (the agent id and the billing flag) and the tool count, so a check against those detectors
+  only shows that the router agrees with itself ("0 of 1,756 main misclassified" is true by
+  construction). The only independent label is `rc`, the request class Claude Code sends when
+  `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` (header `x-claude-code-request-class`). T1, T2 and T4 are
+  judged on `rc`-labelled requests ONLY; without `rc` the verdict is INSUFFICIENT with the line
+  `ground truth missing: rc is logged on 0 of N rows; enable the gateway hint headers ...`. The
+  detector-consensus figures stay printed, marked REPORTED, and are never gated. A teammate (an agent
+  id without the billing flag) has no second opinion and is reported on its own line.
+  `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is now in the `env` block of `~/.claude/settings.json` (the
+  owner approved the one line). Claude Code reads it at start-up, so ONLY sessions started after the
+  change send `rc` and the subagent type (`at`); a running session keeps the old behaviour until it is
+  restarted. Expect `rc` to appear in classify lines of new sessions only, so the counts of
+  `rc`-labelled requests start from zero and grow with new-session traffic; old lines stay unlabelled
+  for good and are never counted as ground truth.
+- **What each PASS proves, in one sentence.**
+  T1: of at least 200 requests Claude Code itself labelled as built-in subagents, from at least 30
+  distinct agents, at least 99% were classified `sub`, and the lower of the per-request and the
+  per-agent (one sample per agent, its worst outcome) one-sided 95% Wilson bounds is at least 97%
+  (88 agents with no miss are the least that can reach it).
+  T2: of at least 200 requests Claude Code labelled as compaction or auxiliary helpers, none was
+  classified `sub`, `exempt` or `other` (or `main` while an agent id or the billing flag was set) and
+  no helper-shaped decision-log row left on another model; a helper the router called `main` with no
+  detector set is a counted sample, because main is never rewritten.
+  T4: of at least 200 requests Claude Code labelled `main`, none was classified anything else and no
+  `main-learn` event came from a non-main request.
+  T5: of at least 40 built-in subagent requests from at least 30 agents, at most 1% carried the
+  billing flag without an agent id, which is a real cross-check of two independent header signals
+  and needs no `rc`.
+  T6: the Claude Code and CCR versions are recorded, so an update can invalidate the verdict.
+  A PASS proves the classifier on the traffic that was logged, not on traffic that was not; the
+  labelled sandbox sets of 12.5 are stronger evidence still.
+- **Metrics and populations.** Every line names its population: `INSUFFICIENT: 12 of 200
+  rc-labelled helper requests`. T1 and T5 count DISTINCT built-in agents (a session and agent id pair;
+  teammates do not count) because requests cluster per agent. Zero-tolerance metrics (T2, T4) FAIL on
+  the first violation. T3 (tool-less real subagents) is reported only.
+- **Minimum samples.** 5 subagent types with 40 requests each, 30 distinct built-in agents, 200
+  `rc`-labelled helper requests (40 each for compaction and auxiliary), 200 `rc`-labelled main
+  requests in 2 sessions including one `/model` switch on tool-carrying requests, 3 sessions with at
+  least 20 requests each on 2 UTC days. The newest counted request must be under 7 days old (the 30
+  days is how long a written PASS lives, not how old the evidence may be); a request dated more than
+  5 minutes in the future is a clock fault and is not counted. The agent type is logged only with the
+  hint headers, so today the only types are the kinds built-in, teammate and billing-only.
+- **What the log cannot show.** A helper request is never in the decision log and carries no returned
+  model. T2 counts the helper requests the router did not classify aux and the helper-shaped
+  decision rows whose returned model differs; the router returns the asked model for aux and exempt
+  requests by construction. A real helper (a haiku call, no tools, no flags) the router called `main`
+  without `rc` is reported as an unlabelled helper-shaped main row and is not a T2 sample.
+- **Shadow tally.** For every subagent request, what the compiled policy of each of `dynamic`,
+  `inherit` and `free` WOULD use: the share that moves off the asked model, the share that keeps it,
+  the share with no eligible substitute and the share with no learned main, by provider and model. It
+  is MODELLED from the inputs on disk (providers from the snapshot flag, not the live gateway), as an
+  expected value over the lead pool, with the payload caps (a representative size per log bucket and
+  the rule that an unknown cap ranks last above 200 KB); it ignores cooling and demotion. Only the
+  mode of the live policy is OBSERVED (the router's own shadow decisions, exact for the policy then
+  active): dynamic and inherit are modelled only and unvalidated, because nearly every subagent asks
+  the main model, which both modes keep. The report prints modelled against observed shares per
+  provider and per model with the difference; a remaining gap is cooling, byte sizes and the few
+  agents behind the observed picks. These are G3 preconditions 1 and 7; the provider tally is the one
+  to review with the owner.
+- **`--write yes --live yes`** needs both flags, replaces `accuracy.json` atomically with whatever
+  verdict was computed and records the evidence hash. A FAIL or INSUFFICIENT replaces a PASS and a
+  warning says so when that PASS had not expired. With `--json yes` stdout is the JSON record only;
+  the notes go to stderr. The verdict is evidence for the owner's G3 decision, never the decision.
+
 ## 6. Phase B — catalogue refresh and health
 
 Refresh actions 6a to 6d are deliberate, manually-invoked commands by design; none
@@ -1252,6 +1645,249 @@ held) beside the bench file and log.
 
 Issues: #126 tagging, #127 overlay, #128 usage feed, #129 classifier and rules, #130 confirmation probe, #131 picker, #132 `--redact` / `--status` / `--reset`, #133 docs, #138 kill switch, all in
 `Osamious/ultimatewrap`; the follow-ups are the ones named above.
+
+### 6g. Tool fidelity — does the model really handle tools? (issue #121)
+
+The bench (6d) asks every model to say hello, with no tools. A model can answer that cleanly and still choke on the tool schemas a
+coding agent sends, and the catalogue's `tools` flag is a claim, not a measurement. The tool-fidelity probe measures it: a few
+requests per model through the gateway, the same way the bench does, with the result kept in its OWN file `state/tool-fidelity.json`
+(never in `bench.json` or the snapshot; the bench cannot overwrite it and it cannot change the bench).
+
+| Level | What the request asks | Passes when |
+|---|---|---|
+| L1 | a SIMPLE call: the `fx_echo` tool with a plain short message ("hello"), the choice left to the model (`tool_choice` auto) | a `tool_use` block with valid JSON and the required argument. If auto yields no call, or the server refuses the auto choice ("auto" tool choice requires --enable-auto-tool-choice), the same request is asked once with the call forced (`fc`): a model that only calls when forced is class `t` at best. A strike is recorded only after the forced request was tried too. A call cut off by the output budget is no verdict (the budget is asked once more, larger) |
+| L1 + argument fidelity (`1a`) | after L1 passed: an Edit-style call whose arguments are awkward (multi-line string, quotes, backslashes, unicode, an astral character, a nested JSON string, a boolean, an integer), the choice left to the model (forced as a fallback on no call) | every field comes back byte for byte (`af` p). A failure sets `af` f and `afw` ONLY: never a strike, never a lower class, never a failure of L1. A model that can call tools but cannot emit awkward content is class `t` with `af` f |
+| L2 | a `tool_result` round trip; the result is about 20 KB and the fact the answer needs is at its END (`br`) | a final text answer that uses the fact, and no 400 |
+| L3 | two requests: **3a** the constructs (a 58-character MCP-style tool name `nm`, a deep schema, `cache_control` on a tool `cc`; about 5 KB), then **3b** the large fixture (about 157 KB, about 40,000 input tokens, 44 tools) | 3a passes first; 3b is sent only after that. L3 passes when both are accepted and answered. A 3a pass alone is not an L3 pass |
+| L4 | two parallel tool calls, asked inside the 3b request | two `tool_use` blocks with their own ids and valid, streamed arguments |
+| big (5) | a fixture of about 400 KB (about 100,000 input tokens), `cache_control` on it | accepted and answered; a pass implies L3 (marked implied) |
+| L6 spawn | the `Agent` tool: `subagent_type` and a prompt | a well-formed call (`sp`); sent only after L1 and L2 passed; two strikes; a failure never lowers the class |
+| L7 error | a separate small request whose `tool_result` is `is_error` | the model reports the error and goes on (`er`) |
+
+L1 and L2 always run together. **Default levels and order.** A normal run asks the BASELINE: L1, L2, then L6 (spawn) and L7 (the error result), the two cheap levels that need only L1+L2 (about 270 and 180 input tokens); `--levels 12` is L1+L2 alone, as before, and `--candidates` still defaults to all seven. Whatever order the levels are listed in, they run in COST order: 1 (with 1a), 2, 6, 7, then 3, 4, 5, so a cheap level is never held behind a big request. What a model learned is kept when a later level stops it (a limit, a timeout, an error): once L1 and L2 both have a verdict, the record is saved with what finished (the report counts these as partial), and NO pending reason is written beside it: the queue simply asks the missing level again (it also counts as recoverable in the verdict, see below). A flaky L6 or L7 (an error, a timeout, an empty answer: something about that request alone) is set aside, never blocks L3 or the big step, and is asked again by a later run; the model carries a deferral marker meanwhile: the pending reason `optional-flaky` with `since` and `rn` (it counts toward stuck at `rn` 3 or more) and the provider's words, not a growing `not-run`; a limit or an account state on L6 stops the model as before. The per-model request ceiling stays 12; the worst case (every L1-type request needing its forced retry, plus the cache_control retries of 3a and 3b) reaches exactly 12 without a timeout or an escalation, so one more makes the model pending `request-cap`. L3 and L4 are sent only to a model that passed L1 and L2 and only when you ask for them (`--levels 34`);
+the big step only to a model that passed L3 (`--levels 5`; `--order big-first` below). A thinking block is not an answer: a reply that
+only thought and ran out of output budget says nothing about tools and is tried again later.
+
+A provider that refuses `cache_control` with a 400 that names it is recorded `cc: f` (the model is not failed) and the request is asked
+again without it. A 400 that names the tool name is recorded `nm: f`.
+
+**Free keys only (owner rule).** Only providers whose key tier is `free` are probed for tools AT ALL, at ANY level, L1 and L2 included. Providers
+whose tier is `paid`, `free-deposit`, `management` or unknown are skipped entirely for now: they are not in the probe set, they get no request,
+no record and no pending entry, and the ledger lists them as `excluded: not-free-tier (skipped for now)`, counted per tier (never an error).
+The relay and any subscription tier stay `relay-by-provenance`. The rule is default-deny: an unlabelled provider, or a run with no tier data at
+all (no compiled policy, no `--tiers-file`), probes nothing. It is enforced in three layers so no entry point can get round it (candidates,
+`--sample`, `--only`, `--limit`, incremental, resume, `--retry-failed`, onboarding): the probe set is restricted to free-labelled providers
+when the plan is made (`restrictToFree`), the queue is filtered again (`clampDeep`), and the engine (`probeModel`) itself sends zero
+requests for a model whose tier is not free. A named model of a non-free provider is therefore not a way round it (`--only pb/b1` matches no
+probe-ok model; `--allow` pins follow the same rule). The dry run reports the probe-ok models by key tier, how many were skipped, and the probe
+set size.
+
+**Lifting the rule (the same lift for every level).** It can be lifted only when ALL of these hold at once: `--include-tier paid` (or
+`free-deposit`) names the tier, `--levels` is given explicitly, `--live` is given, the run printed the per-tier cost estimate, and
+`--max-spend` is given explicitly (the dollar caps are in force). A lifted tier is probed at exactly the levels listed, L1 and L2 included:
+lifting L1+L2 for the paid tier is the same lift as lifting the deep levels. Drop any one condition and the tier stays out of the probe set;
+the dry run prints what is still missing. Management is never probed, lifted or not. No environment variable, config file, incremental run or
+onboarding entry point lifts it.
+
+**What a refusal means (classification).** A 400, 413 or 422 on a tool-bearing request is the model or its provider refusing the request itself: a verdict (a strike, see below) unless the provider's OWN sentence (read from `error.message`, never from a body that echoes a tool name or description) says one of these, each pending and never a strike:
+- `pay`: an account state, also in words such as "wallet balance is insufficient, recharge at ...", "out of credits", "top up your account", "credit limit reached", "payment required". The provider is named in the report's attention block. A tool or schema name that merely contains `balance`, `recharge` or `purchase` is NOT an account state.
+- `route-shape`: the route says the model must be called another way ("must be called via /provider/v1/messages", "wrong endpoint", "use /v1/...", "unsupported protocol"). The fix is in routing, not in the model. The report has a block `providers needing a routing fix` with the provider, how many models and the provider's words.
+- `upstream-unavailable`: an AVAILABILITY sentence ("The selected model is temporarily unavailable. Try another model.", "Upstream request failed.", service unavailable, please retry, an internal error, overload, capacity), or a 400 that names nothing about the request (no schema, tool, parameter, format or similar word, e.g. "Upstream provider rejected the request"). The phrases every rejection carries ("provider rejected the request", "invalid request error", "Check the model, input, and parameters", a trace or request id) do not count as naming it, even though they contain words such as invalid, input and parameters. It is NEVER a verdict and never a strike toward x, however often it repeats (one request, no confirmation): the model stays untested and a later run asks again. The report has a block listing the provider, how many models and the provider's words. A sentence that also names the schema or the tool choice is a verdict. At the big step an unnamed 400 stays a size refusal (a cap, never x).
+A first schema refusal is provisional (a strike) and the second at the same level confirms it, as before.
+
+**Failures caused by the gateway (`xw`).** Some refusals are the gateway's own translation of the Anthropic request failing ("Function call is missing a thought_signature in functionCall parts", "Empty content is not allowed for assistant messages" for an assistant turn that has only a tool_use, "Tool call id was toolu_... but must be a-z, A-Z, 0-9, with a length of 9" for an id format the provider cannot take): a subagent would fail on turn 2 through this gateway, so the record stays `x` for routing, but it is tagged `xw: gateway` (it is not a limit of the model). The report and the dry run list them by provider with the provider's words ("failing because of the gateway's request translation"). After a gateway fix, `node refresh/tool-fidelity-cli.mjs --retry-failed --only-gateway [--live]` asks again just those (dry by default); a pass clears the tag.
+
+**An empty or cut answer (what is a verdict).** An answer with no text and no tool call is judged on how it ended. It is NOT a verdict (inconclusive `empty`; the request is asked once more with 2,048 output tokens, then pending `reasoning-budget`) when the stop reason is max_tokens or the reported output tokens used 90 percent of the budget (some gateways translate "length" to "end_turn"). A stop reason that is a moderation or refusal ("refusal", "content_filter", "safety") is the provider's: pending `upstream-unavailable` with the stop reason as the hint. A stream that ends with neither a stop reason nor message_stop was cut: pending `error`, never a verdict. An empty answer that stopped normally with room left in the budget is a failure and the record keeps its shape in `l3w`. An empty answer to the 3a constructs request is asked once more WITHOUT the cache_control markers: when that answers, the markers were the cause (`cc f`, the level is learned, the later requests go without them); when it is empty too the markers are not blamed. At the 157 KB step, fewer than two parallel calls because the budget ran out is asked again with the larger budget, not recorded as an L4 failure.
+
+**Cleaning old records.** `node refresh/tool-fidelity-cli.mjs --reset-transient [--live]` (dry by default; `--live` applies it under the lock, atomically) clears the records an availability or unnamed refusal produced (the failed pass is asked again: L1 and L2 together, L3 with the big step), tags the gateway failures `xw: gateway`, and clears argument-fidelity results whose reason came from the old test content (a path with an escape look-alike, an optional parameter left out), and reopens the L3 failures that rest on an EMPTY answer or unfinished call arguments (written before the stop reason and the budget were looked at: they are counted apart and asked again). The dry run counts per shape, kind and provider.
+
+**Argument fidelity means "would corrupt a real Edit".** The test path is realistic (spaces, a non-ASCII letter, Windows separators, no newline, no escape look-alike); the awkward characters live in `old_string` and `new_string`. A path written with `/` for `\` passes; an optional parameter (`replace_all`, `start_line`) that was left out passes; a required field left out, or any change in a string, fails.
+
+**What is stored (one record per `provider/id`, every field).**
+
+| Field | Meaning |
+|---|---|
+| `lvr` | four letters, one per level L1..L4: `p` passed, `f` failed, `n` not run (only confirmed results) |
+| `lv`, `t`, `ok` | derived from the fields below, never set by hand (a stored class is re-derived on read): `lv` the levels passed in a row (0, 1 for L1+L2, 3, 4); `t` the class `v` (L3 passed: verified at that size), `t` (L1 and L2 passed; also a model whose L4 failed with ZERO calls, `l4w` "0 call of 2", and one that took the call only when forced, `fc` p), `x` (failed), `u` (nothing run); `ok` whether the model is usable with tools |
+| `why` | the first failed level's reason, redacted |
+| `at`, `fx` | when it was probed; the fixture id the L3/L4 result was measured against (an older id earns the record a `*` and a re-sweep recommendation, never a re-queue) |
+| `maxBytes` | the largest request the model ANSWERED (`provenBytes(rec)`). A lower bound, and the only PROVEN size: the compiler uses it as the payload cap when the big step refused (see What the compiler does with it) |
+| `alias` | a pool alias such as `auto`: it keeps its digit but compiles no higher than `u`, because the model behind that id can change |
+| `big` | `p` or `f` for the 400 KB step; absent means not run. Not part of `lvr` |
+| `capBelow` | bytes: the provider REFUSED a request of about this size or larger: an UPPER bound of what is refused (the refused size rounded down, or the provider-stated limit in bytes), never a proven size. Written only for a refusal about SIZE (413, a body naming size or context length, any refusal at the big step), never for a rate or tokens-per-minute limit |
+| `ctxStated` | tokens: the context limit the PROVIDER STATED in a size refusal ("maximum context length is 32768 tokens"), read before the sentence is clipped; `capBelow` is then at most capBelowFor(`ctxStated` * 3). Additive; see the sanity-pass paragraph |
+| `strikes`, `sl` | two strikes (below): the first failure at level `sl` (1, 2, 3 or 6) is provisional |
+| `fc`, `af`, `nm`, `cc`, `br`, `er`, `sp` | one-letter `p` (passed) or `f` (failed) markers for the extra checks: `fc` L1 needed a forced call, `af` argument fidelity, `nm` long MCP name, `cc` cache_control accepted, `br` the fact at the end of the 20 KB result, `er` the error result, `sp` spawn. Kept OUT of `lvr`. They never change `lv`, `t`, `ok` except `fc`, which caps class `v` to `t`. `summaryOf(record)` in `refresh/tool-fidelity.mjs` turns a record into one printable line |
+| `afw`, `l4w`, `l3w`, `spw` | what differed when a non-blocking marker failed, or what an unusable answer looked like, in at most 60 printable characters: `afw` for argument fidelity (`old_string: newline lost`, `file_path: backslash doubled`, `start_line: integer sent as string`, `old_string: unicode normalisation (NFC/NFD)`, `old_string: CRLF line endings`, `old_string: trailing whitespace changed`, `old_string: unicode escaped as \u`, ...), `l4w` for the parallel-call check (`1 call of 2 stop=tool_use`, `args not streamed stop=...`, `shared id or no arg stop=...`), `l3w` for a failed L3 (`stop=end_turn blocks=none in=40210 out=0`: the stop reason, the block kinds, the input and output tokens), `spw` for a failed spawn call (`text, not delegating stop=end_turn`). Never a verdict; cleared by a later pass; `summaryOf` prints them |
+| `d3` | which part of L3 decided it: `a` (failed at the constructs request), `b` (failed at the 157 KB request), `i` (passed by implication: the big step passed first) |
+
+**L1 and argument fidelity are two requests.** Before this change one L1 request carried the awkward content, so a model that CAN call tools but emitted invalid JSON for it (or whose server refused the auto tool choice) was recorded as an L1 failure and a strike, and a second strike would have made it `x`. The records that came from that request say so in their reason; `node refresh/tool-fidelity-cli.mjs --reset-awkward-json` counts them (dry by default; with `--live` it clears them under the lock, atomically: a record that is otherwise unknown is removed so the next run asks L1 again with the plain call). It also clears strikes that came from an empty wallet or a route-shape refusal recorded before those readings existed.
+
+**Argument fidelity is exact on purpose.** A real Edit finds its `old_string` only when it is byte for byte what the file holds, so a lost newline, CRLF, a doubled backslash, a different Unicode normalisation (NFC against NFD), trailing whitespace or a number sent as a string is a call that fails in use. Key order and fields the schema does not name do not matter. To learn WHAT a model mangled, ask L1 again for it: `node refresh/tool-fidelity-cli.mjs --force --levels 12 --only provider/model --live` (a handful of tiny requests); the record then carries `afw`.
+
+**Two strikes.** A first failure at L1, L2, or L3 for a reason that is not size does not make a model `x`. The record keeps what it was
+(a model never tested stays untested, a model that passed keeps its class), remembers the strike, and the next ordinary run asks that
+level once more. A second failure at the same level confirms it: `x`. An L3 failure that is not about size, confirmed, is `x` too (the
+model cannot take the real tool set). A refusal about size is never `x`: it sets `capBelow` and the model works for small payloads. A
+pass clears the strike. A rate limit, an empty balance, a dead key, a 5xx, a timeout or an exhausted output budget is never a failure: the
+model gets no record and stays queued. A route that says it has no tool support (even as a 404) is a failure.
+
+**What the compiler does with it** (`menu/subagent-funnel.mjs`). The stored class `t` is read as stored (the sweep already derives it, a zero-call L4 included). The compiled rank list, in order (`RANK_LABELS`, the list `explain` prints): 1 tool tier (band: v, t, u, then a model the sweep found out of credit or without a key), 2 health (band), 3 context preference (band), 4 price class (band), 5 first strike, 6 sweep demotion (blocked by the sweep, never excluded), 7 big step (v only: passed, not run, failed), 8 forced-choice only (`fc`), 9 argument fidelity failed (`af`), 10 tool_result use failed (`er`, `br`), 11 L4 (v only), 12 TTFT quartile, 13 context class, 14 price, 15 recency, 16 alias, 17 spawn failed (`sp`: a last tie-breaker). Every marker key is clean above flagged; `pt`, a legacy field, is ignored. The PAYLOAD CAP `pb`: a `capBelow` from a refusal AT THE BIG STEP (`big` f) is only an upper bound, so when the record has proven bytes the cap is those (`provenBytes`, source `proven`); otherwise `capBelow` (source `capBelow`), then the seeded known issues; and a provider-STATED context (`ctxStated`) caps it at 3 bytes a token (source `ctxStated`) and lowers, or fills in, the known context. Class `t` and `u` rows are not reordered by the marker keys.
+
+**Candidates: which models get the large requests.** L1 and L2 go to every probe-ok model of a free-labelled provider with no result (the ordinary run). L3, L4 and
+the 400 KB step (for the models that pass L3) go, with `--candidates policy`, to EVERY probe-ok model on a FREE-tier provider (and only there: see the hard rule), whether or
+not its context length is known. The tier is the provider's key tier: the compiled policy's `tiers` map (`state/subagent/policy.json`, or
+`--policy-file` for a fixture) or `--tiers-file` (a `{provider: tier}` file, a policy, or the vault registry). Not tested for now, each
+with its ledger reason: `not-free-tier (skipped for now)` (paid, free-deposit, management and unlabelled providers: see the owner rule above) and
+`relay-by-provenance` (the relay and any subscription tier). `--include-tier paid[,free-deposit]` lifts an exclusion later (all five conditions); a
+lifted paid model is charged as listed and the bench's row ceiling and spend cap apply. A model with a LISTED price on a FREE-labelled provider is
+probed too (the provider's label governs, not the model's price) and is costed at that price under the same caps. Pins (`--allow provider/model,...`)
+follow the tier rule like everything else: they bypass only the context-size exclusion.
+
+*Size rules, so results stay meaningful.* A model whose KNOWN context is too small for the 157 KB fixture (about 39,000 tokens times 1.5
+for tokeniser differences, plus the answer budget: about 59,000) is out with `ctx-too-small-for-fixture`. The 400 KB step is skipped, and
+never recorded as a failure, when the known context is below 200,000 tokens (the dry run counts those). An unknown context is tested: a
+context-length refusal at the big step is a size cap, not a failure.
+
+*Order is a priority queue, never a limit.* Level 1: the compiled policy's allowed set with a known context of at least 128,000, plus
+the pins (pins first). Level 2: the union of every preset's allowed set (dynamic and free in each scope, any context and 1M only, computed
+offline with the policy funnel; if that cannot be computed the dry run says so and level 2 is empty). Level 3: other models with a known
+context of at least 128,000. Level 4: unknown context. Level 5: known context below 128,000. Inside a level, the policy's own rank. The
+per-provider token cap and the spend cap stop a run; the rest stays `pending: cap` and the next run picks it up. A candidate with no
+L1+L2 result is asked those first, in the same run. The default levels of this mode are 1 to 7 (`--levels` overrides; on a key that is not free the engine clamps to 1 and 2, see the hard rule).
+
+*The envelope.* The dry run prints the cost of the WHOLE queue at full depth before any cap (requests and input tokens, over how many of
+the probe-ok models and providers), the per-provider cap that would finish it in one run (the largest provider's total), how many runs it
+takes at the cap in force, and the smallest cap at which every model can run at all (a model that alone costs more than the cap never
+runs under it: a full-depth model is about 147,000 input tokens, so the default cap of 150,000 just fits one; pass
+`--tf-max-tokens-per-provider` to run more per provider). It also prints the cost of each request kind, the per-tier totals, the wall-time
+estimate (a range, from provider latency and the in-flight rule below) and how many runs the whole queue takes at the default caps.
+
+*The pilot.* `--sample [N]` (default 60; `--seed S`, default 1) draws a deterministic stratified pilot from the free-tier candidates: a
+few per provider, in rounds so no provider is drawn twice before every provider once, mixing reasoning and plain models (judged from the
+id: the snapshot has no such flag) and the context classes unknown, small (under 128,000) and large. It runs every level (L1 to L7; L4 rides in the 157 KB request), and the big step
+for the models that pass; it never samples the big step. The dry run prints the strata counts and the estimate (about 40,000 tokens per model for L1+L2+L3,
+the big step on top for passers); the report prints the L3 failure rate among the models that passed L1+L2, overall and per provider, so
+the decision on promoting L3 and L4 to every model can be made on data.
+
+```bash
+node refresh/tool-fidelity-cli.mjs --candidates policy                                  # dry: the plan, the envelope and both ledgers
+node refresh/tool-fidelity-cli.mjs --sample                                              # dry: the 60-model pilot
+node refresh/tool-fidelity-cli.mjs --sample 60 --l3 yes --live --tf-max-tokens-per-provider 400000
+node refresh/tool-fidelity-cli.mjs --candidates policy --l3 yes --live --tf-max-tokens-per-provider 400000
+node refresh/tool-fidelity-cli.mjs --candidates policy --allow groq/some-model --l3 yes --live --tf-max-tokens-per-provider 400000
+node refresh/tool-fidelity-cli.mjs --candidates policy --include-tier paid                # dry: what the paid tier would add and cost
+```
+
+**Safety limits and accounting (security round).**
+
+- *Request ceiling.* No model is sent more than 12 requests in one run, counted together across every level, retry, the forced fallback, the thinking-only escalation and the `cache_control` re-ask. Reaching it ends the model as `pending: request-cap` (never a verdict, never an error). The `cache_control` re-ask happens once, and only when the failing request actually carried the marker; a model recorded `cc f` starts with the markers off.
+- *Free key, listed price.* A free-tier KEY does not make a LISTED price free. A model with a listed price (price above 0 and no free tag) is costed at it, so `--max-row-cost` (default $0.10) and `--max-spend` apply: one over the ceiling is `pending: priced-over-row-cap` (counted, never an error) and `--max-row-cost` raises it. The deep-probe rule still goes by the key tier. The dry run prints how many free-keyed models carry a listed price, the dollars at full depth, and how many are over the ceiling. A free-keyed model with no listed price, or a free listing, costs nothing. The provider's label governs whether a model is probed; the model's price only governs what it costs.
+- *Which tier a provider has.* The same effective tier the policy compiler uses for the chosen key. The compiled policy's `tiers` map is the compiler's own answer (the default source). A `--tiers-file` holding the vault registry (an array of rows with `id`) is resolved the way the compiler resolves it: a management key is ignored when the provider has another; one key gives its tier; several keys give the tier of the key the OWNER CHOSE (`--key-choices-file`, a `{provider: key id}` file, the compiler's key-choices). Only where no choice resolves it (none recorded, or one that names no usable key) keys of one tier give that tier and keys of DIFFERENT tiers give the MOST RESTRICTIVE tier (management, subscription, paid, free-deposit, free); the provider is then listed as a fallback. The result never depends on the row order. A tier outside the vocabulary leaves the provider unlabelled (default-deny). The dry run shows, per provider with several keys, which key and tier was chosen and why, and lists the providers that fell back.
+- *Tier source and age.* The dry run and the report print where the tiers came from (the policy file or the tiers file), when it was compiled (or last modified) and how old that is, how many providers of the probe set the map does not cover (they count as not free), and a WARNING when the map is older than 2 days or covers too little.
+- *The lift preview.* `--include-tier` prints, in every run (dry too), what lifting would cost per tier as if `--live` were given. The lift counts that line as shown only when it is in the printed plan; without it the paid tier stays clamped.
+- *Spend.* Charged per request that was billed, from the usage the answer reported (the estimate when it did not): a part-finished level, an all-thinking answer and the larger-budget request asked after it count; a rate limit, a dead key or a server error cost nothing.
+- *Error bodies.* A refusal body is read in chunks and cancelled after 2 KB.
+- *File size cap.* When the state file passes its size cap the provider's sentences (`why` of the pending entries: the non-stuck models' first, oldest first, the stuck models' last; the run summary says how many) are stripped first, then the oldest records (models that left the catalogue first) are dropped; the report says how many and why.
+- *The side file.* When the final save fails the records go to `state/tool-fidelity.unsaved.json`. `node refresh/tool-fidelity-cli.mjs --merge-unsaved` counts what it holds (dry); with `--live` it takes the records the state file lacks or has older, saves under the lock and only then deletes the side file.
+
+**Scheduler and cost rules (every one measured, none lowers what is learned).**
+
+- *Small output budgets.* Each request kind asks for few tokens: 256 for L1, L2, 3a, 3b and the error result, 512 for the big step and spawn. A reply cut by the budget is asked again once with 2048 (see below).
+- *Stream cut.* The stream is cancelled once every expected `tool_use` block is closed and the usage was seen; the dry run counts these as `cut early`.
+- *Timeouts are adaptive.* Each model's timeout is 3 x its own bench total time (`d` in `state/bench.json`, read only), clamped between a floor and a cap per request class: small requests (L1, L2, 3a, spawn, the error result) 45 s to 120 s, the 157 KB request 90 s to 180 s, the 400 KB request 120 s to 240 s; a model with no bench time gets the floors. The floors are `--timeout-small`, `--timeout-157`, `--timeout-big` and the caps `--timeout-max-small`, `--timeout-max-157`, `--timeout-max-big` (seconds). A timeout is asked ONCE more in the same run at DOUBLE the time (it counts toward the 12-request ceiling, is charged nothing, and the model's later requests keep the doubled time). A second timeout at the doubled value on L1 makes the model `pending: slow` (counted apart in the ledger and the report with the seconds it was given; the scheduler moves on); on any other level it is `pending: timeout`. A timeout is never a verdict. The dry run prints the factor, the floors and caps and this run's range.
+- *In flight.* One request at a time per provider for requests of 100 KB or more, otherwise two; eight in all. A 429 is retried after the `Retry-After` time (at most 60 s); three 429s in a row pause that provider for the rest of the run (pending `rate`).
+- *Canary, holds and providers needing attention.* A provider is paused (and HELD) only on EVIDENCE: `auth` is the key's state, so the first answer decides; `pay` needs two distinct models out of credit and none that answered; `gone` needs FOUR distinct models gone and none that answered (the first four asked are spread over the provider's queue: the first, the middle and the two quarter points). A provider that has CONFIRMED results from an earlier run (class t or v) is never paused or held for `pay` or `gone`: those are answers about models there, so the model is pending `pay` / `gone` and the provider goes on (an `auth` hold stays). A hold in the file for such a provider is ignored by the queue, and `--reset-gone-holds` removes it from the file. A paused provider gets nothing more in this run and is written to the file (`held`, `{provider: {r, at}}`, additive, at most 500); the next runs do not ask it at all, not even a canary. A hold is STICKY: it never expires by time (`--hold-hours N` is an opt-in expiry, off by default), see the next bullet. `--retry-accounts` forces held providers back in; a provider that answers is released; `--release-holds a,b` takes named holds off (dry by default, `--live` applies it under the lock, atomically; the `canary-*` pending entries of a released provider go too, and for a provider the owner NAMED, its models pending `pay` / `auth` / `gone` too). The report lists a block `providers needing attention`: the provider, its state, how many models were skipped and that it is held until lifted. It is an account state, not a verdict.
+- *The sweep is a loop: run, stop at saturation, resume for what is recoverable (owner rule 2026-10-06).* Run passes; stop when a pass is saturated; run again later only for what a re-run can change. **Recoverable** blockers: rate, error, timeout, cap, spend, request-cap, empty, slow, reasoning-budget, upstream-unavailable, not-run, first-strike. **Hard** blockers (`pay`, `auth`, `gone`) are non-recoverable by the engine: a hold never expires by time, and a model whose stored pending reason is `pay`, `auth` or `gone` (also `canary-*` of them) is NOT queued by a normal run, with or without a hold (a `canary-pay` / `canary-gone` of a provider that has confirmed results is not hard: that provider answered). A model with a result is never asked again by a normal run (a first strike is the one exception: it is asked again). Only a manual action lifts a hard blocker: `--recheck-hard pay,auth,gone[,provider,...]` (after you charged credit or rotated a key; reasons narrow it, providers narrow it; a provider alone means all three reasons; a model or provider that answers again is cleared as before, and a provider that answers also loses its stale `auth` and `canary-*` entries), `--retry-accounts`, or `--release-holds a,b --live` for a named provider. **Naming ONE model is a manual act too:** `--only provider/model` (an exact model id) lifts that model's own hard block (a stored `pay` / `auth` / `gone`, or its provider's hold) and asks it, printing `provider/model: hard-blocked pay since <date>; asking it because you named it`; `--only <provider>` alone lifts nothing. `--force` and `--retry-failed` do not lift them. Reasons that need the owner (`route-shape`, `row-cost`, `priced-over-row-cap`, `cap-too-big`) are counted apart as NEEDS-OWNER and are not queued by a normal run (zero requests): `route-shape` while it is the stored reason, `row-cost` / `priced-over-row-cap` while the model is still over the row ceiling (raise `--max-row-cost` and it runs), `cap-too-big` when the model's own estimate is above `--tf-max-tokens-per-provider` (raise it; it is worked out again each run); `--recheck-hard owner` or naming the model with `--only provider/model` asks them (`--retry-accounts` does not: it is about accounts), each reason with its count and what you must do (`row-cost` / `priced-over-row-cap`: raise `--max-row-cost`; `route-shape`: fix the route): a re-run alone changes nothing.
+- *The verdict and the stop signal.* The dry run and the end of every live run print `sweep verdict: RECOVERABLE n of N (reason counts) | HARD-BLOCKED m of N (pay x, auth y, gone z; lift only with --recheck-hard/--release-holds) | TESTED t of N`, where N is the models of the ledger(s) that are not excluded (a model in both ledgers counts once, the worst state wins), followed by a `population:` line with the excluded count and a line `of which tested at L1+L2 (a record with both verdicts): RECOVERABLE k of n, HARD-BLOCKED j of m` (the denominators are the two figures above it); with nothing recoverable it prints `DONE: nothing recoverable left`. A TESTED model that still lacks a level the run asks for (spawn and the error result by default; levels 3 to 5 only when `--levels` asks for them and the model is eligible) is not finished: it counts as RECOVERABLE (`optional-not-run`, or the reason of its pending entry such as `optional-flaky` or `rate`; HARD-BLOCKED when its provider is held), so a default dry run over models tested only at L1+L2 prints RECOVERABLE n and never DONE, and a non-empty queue never prints DONE. A live run adds `saturation of this run: R request(s) sent: X ended rate-limited (p% of R), Y ended rate, error or timeout (q% of R); K new record(s); saturated: yes|no`. Saturation is DIMINISHING RETURNS, not "everything is blocked": the tested total converges and each pass adds little. `saturated=yes` with one of these reasons: `done` (nothing recoverable is left), `zero-new` (the run recorded no new record), `failing` (at least 80% of its requests ended rate, error, timeout, quota or empty: a thinking-only answer), `diminishing` (the last `--saturate-runs` runs of THIS scope, this one included, each added newly tested models under `--saturate-gain` percent of their tested total AND (newly tested + deepened) under `--saturate-yield` percent of the models they asked; defaults 2 runs, 1%, 5%), `scope-exhausted` (the run sent nothing because nothing is queueable under its scope), and, only as a fallback while the scope has no run history yet, `no-shrink` (the recoverable set did not shrink against the previous run's). `newTested` counts models that went from not tested to tested in the run (any class, x included; a provisional first strike does not count, resolving one does; a partial record does: its L1+L2 verdicts are what make the model tested) and `deepened` tested models that gained a level the run asked for. For `diminishing` and `failing` the run prints the next action: a rate-limited or over-quota share of 50% or more of its requests says `resume later when rate limits clear (N recoverable)`; when most of the models the run asked produced no record at all (more than 50%) it prints `starved: N of M asked models produced no record (empty/rate/...)` and the resume-later action, never `converged`; otherwise `converged: the N remaining recoverable models are stuck (error/timeout/quota/optional-flaky); a re-run is unlikely to change them, review them`. A trend line shows the last runs: `last runs: +52, +14, +6 newly tested (of 950 tested now; 5.5% 1.5% 0.6% of each run's own tested total), asked 300/280/260 model(s), deepened ...`. The LAST line is machine-readable: `SATURATION saturated=<yes|no|unknown> recoverable=<n> hard=<m> new_results=<k> requests=<n> reason=<done|zero-new|failing|diminishing|no-shrink|scope-exhausted|queued|none|unknown> deepen_blocked=<n> account_state=<m>` (the last two counts come AFTER `reason`: split the line on spaces and read the fields by name; a run that was interrupted or hit a ledger error prints `saturated=unknown recoverable=unknown hard=unknown new_results=<k> requests=<n> reason=unknown deepen_blocked=unknown account_state=unknown`; `unknown` with `reason=queued` in a dry run whose queue is not empty while nothing is counted recoverable, such as `--force`; `unknown` in a dry run with something recoverable, in a run that was interrupted or stopped early, and in the ledger-error fallback; `requests` is the number of requests the run sent). A loop script runs `--live` passes and stops on `saturated=yes`, waits, and resumes; it is finished for good when `recoverable=0`. The loop rule: stop on `saturated=yes`; on `unknown` run once more and stop if that run says `requests=0`. **Soft but stuck:** error, timeout, empty or slow as the stored reason for 3 or more runs in a row (`--pending-runs`) stay recoverable but are counted apart (`of which STUCK k`). The history is kept in an additive `meta` block of `state/tool-fidelity.json`: `{recoverable, scope, at, history}`, where `history` holds the recorded runs, at most 5 per scope and 12 in all, `{at, scope, asked, newTested, deepened, rateShare, testedTotal, recoverable}` (each scope compares only its own runs, so a plain loop and a `--candidates` loop that alternate each build their own series; a lift, a named model, a forced or retried pass, an interrupted run and a run that sent nothing are not recorded and do not touch it; `--release-holds` keeps it). The `no-shrink` fallback uses the meta's own count ( `scope` is a stable hash of the flags that decide which models the count is about: `--candidates`, `--sample` and `--seed`, `--only`, `--include-tier`, `--allow`, `--levels`, the policy and tiers files; `--limit`, caps and lifts are not in it), and the next run compares ONLY under an equal scope. A run that is a manual lift (`--retry-accounts`, `--recheck-hard`, a named model lifted by `--only provider/model`) compares nothing, a meta block without a scope reads as no previous count, and `--release-holds` / `--reset-gone-holds --live` clear the meta block unless it holds a run history, which they keep). Malformed history entries are dropped when the file is read. **Run counts:** a pending entry also carries `rn`, the runs in a row with THIS reason (it restarts at 1 when the reason changes; a legacy entry reads as `rn = n`); STUCK and the verdict read `rn`, while `n` (every run) is unchanged because the funnel reads it. **The provider's own words:** an entry also carries `why`, the sentence the provider gave, clipped to 120 characters and redacted, so every block can be audited. **Dates:** every pending entry carries `since` (the first time that reason was recorded; an older entry reads as since its last time), the ledger rows carry it with the run count, and the verdict prints `oldest since, per reason` so you can judge the cool-down. **Completeness:** `TESTED t of N (complete for every level it is eligible for c of t; tested but optional levels not run u of t: L4 a, big b, spawn c, error-result d)`; this splits the tested figure, it does not change it. A live run that sends nothing prints the same lines (`saturated=yes`, `new_results=0`). Exit codes are unchanged. A run that is NOT a full measurement says so: a live run that sent nothing because nothing is queueable under its scope prints `saturated=yes` with a note `scope-exhausted: N recoverable model(s) are outside this run's scope/levels` (a loop on that scope should stop), and a run that was interrupted (Ctrl-C) or stopped early (`--max-minutes`, an outage) prints `saturation: not judged`, `saturated=unknown`, no `DONE` and writes no meta block. If the ledger itself could not be built the last line is the fallback `SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=<k>`.
+- *Order of the sweep's filters, quota, and what releases a hold.* The queue is built in this order: `--only` (the scope), then what is blocked (held providers, hard pending, NEEDS-OWNER), then `--limit` (and `--sample` draws only from models that can be asked), so a blocked model never takes a place of `--limit` or `--sample`. **Quota is soft:** a bare quota sentence (`quota`, `daily limit`, `per day`, `limit reached`, `allowance`) without money words (wallet, credit, balance, recharge, top-up, payment, funds, billing, plan) and without a rate or wait wording (`rate limit`, `per minute`, `try again in 20s`) is the reason `quota`: recoverable, counted as stuck at `rn` 3 or more, shown with its `since`, and never escalated to `pay` by itself (the owner decides); HTTP 402, `recharge`, `top up`, `insufficient balance|credits|funds`, `wallet`, `payment required`, `credit limit` and a sentence that names the `billing` or the `plan` stay `pay` (so `insufficient_quota ... check your plan and billing details` is `pay`); the same bare sentence on a 403, which would read as `auth`, is `quota` too (a hold for "daily limit reached" would be wrong), while real auth words (invalid key, unauthorized, forbidden key) stay `auth`. A provider answering `quota` three times in a row is left alone for the rest of the run with no wait (`quota exhausted`), its other models pending `quota-paused` (never asked: a model keeps the reason it had, and `quota-paused` never counts toward stuck). The same holds for a provider paused on RATE limits: the models it never let in are `rate-paused` (or keep the reason of their last real ask), unchanged run after run, never counted in `n` or `rn`, never stuck, and ignored by the policy funnel, which reads only the real `rate` / `quota` answers; no hold is written for it. The verdict prints one `stuck on <provider>: "<its own words>"` line per stuck provider. **A 402 with an availability-only sentence is not a pay:** HTTP 402 is `pay` by its status, but when the provider's own sentence says only that the upstream was unavailable (`anymodel: Upstream request failed.`, `temporarily unavailable`) and has no money word (wallet, credit, balance, recharge, top-up, payment, funds, billing, plan, subscription, upgrade, spend, limit reached, paid, purchase, deposit, invoice, usage limit, monthly), the answer is `upstream-unavailable` (soft, asked again, the sentence kept in `why`), never a sticky `pay` and never evidence for a provider hold; a money word keeps it `pay`. 401, 403 and 404 with such a sentence are still read by their status (auth, auth, gone). `--reset-transient` (dry by default, `--live` applies it under the lock) also drops the pending `pay` entries whose stored sentence is availability-only and has no money word, so those models are asked again (a sentence cut at the clip length, 120 characters, cannot be judged, as a money word after the cut is invisible: it stays, like an entry with no sentence). The dry run and the live run name the providers STILL held on `pay` with no money-word sentence among their pay entries, each with what its pay entries hold (`N availability-only sentence stored`, `N other sentence stored, no money word`, `N no sentence stored`, or `no pay entry on record`; the hold itself keeps no evidence, so this is a proxy): such a hold may rest on a bare 402 and keeps every model of the provider out of the queue even after the entries are dropped (`--release-holds <provider> --live` lifts it); `pay` entries with no stored sentence (written before `why` existed) are lifted by hand with `--release-holds <provider> --live`. **Wrong credentials are `auth` at any status:** a refusal whose own sentence says the key or token is wrong (`invalid API key`, `incorrect API key`, `unauthorized`, `authentication failed`, a missing or expired key, token or credentials) is the account's state even as a 400: never a schema strike and never an answer that releases a hold. The sentence must START with that phrase and the phrase must be its whole subject (`Invalid API key provided.`, `Unauthorized`); on a 400 or 422 it is evidence about THAT MODEL only (the model is pending `auth`, and the provider is held only on two distinct models with no answer, like pay), while a 401 or 403 keeps the first-answer rule; a schema sentence that merely contains the word key (`unknown key in properties`) is not matched. **A hold is released** when the provider ANSWERED in the run: any verdict record for it (t, v or x: a model with no tool support is still an answer) clears the hold and its stale `auth` / `canary-*` entries (`holdIsWrong`, which ignores a pay or gone hold for a provider that has confirmed t or v results, is unchanged); a model named with `--only provider/model` releases only its own pending entry, never the provider's hold or its other entries. **After a key change** `--retry-accounts` or `--recheck-hard auth` is required: an `auth` hold never ends by time, and a normal run will not ask the provider. `--release-holds <provider> --live` also deletes that provider's `pay` / `auth` / `gone` / `canary-*` pending entries when no hold exists. A lift that the cap defers says `repeat the same --recheck-hard command to continue` (the lifted models stay blocked for a normal run). `--merge-unsaved` also folds the side file's `held` and `pending` (the newer `at` wins, and a model that got its record from the side file is no longer pending; an entry that exists ONLY in the side file comes back only if its `at` is after the state file's own last write, so a hold released since does not return). A first strike counts as recoverable only when the level it failed at is one of the run's `--levels`; otherwise it counts as tested and the verdict says so.
+- *Models that already failed queue behind the ones never asked.* A model whose last ask ended without a verdict (rate, pay, gone, error, timeout, ...) goes behind the models that were never asked, ordered by how often it failed; a later `cap` wait does not erase that. Without this the same first few models of a big provider took the cap every run, failed every run, and the models behind them never ran.
+- *Small-context models.* With `--candidates policy` a model whose known context is too small for the 157 KB fixture is out of the L3 candidates (ledger reason `ctx-too-small-for-fixture`) but is still queued for L1, L2, spawn and the error result, which fit any window.
+- *The table of what is untested.* The dry run and the report print, per provider, why its models are untested: `held:state` (on hold), `paused:state` (paused by its canary in an earlier run), `cap` (waiting for the per-provider cap), `queued` (asked this run), or the stored reason (rate, pay, gone, error, not-run), tested and untested counts, and whether the provider can run now. It ends with how many untested models sit with a provider that can run.
+- *Held providers leave the queue before the cap.* The dry run prints a block `held providers`: each provider, its state, since when, when it can be retried and how many queued models it frees, plus the input tokens of cap that were freed. The per-provider cap is applied only to the providers that can run, and the share of the held ones is re-split among them (at most twice the cap; the dry run prints the new figure). Models of held providers are their own ledger bucket `held` in both ledgers: never `pending`, never `pending too long`.
+- *Rate limits are the moment's.* Three rate limits in a row make a provider wait out the Retry-After (at least 5 s, at most a minute) and be tried again in the same run; only a second such episode leaves it alone for the rest of the run (pending `rate`).
+- *Old canary entries.* `node refresh/tool-fidelity-cli.mjs --reset-canary [--live]` (dry by default; `--live` applies it under the lock, atomically) clears the `canary-gone` entries recorded under the old one-answer logic so the two-model logic judges them again, and turns `pay` / `auth` / `canary-pay` / `canary-auth` entries into holds at their own time (not where a newer record exists).
+- *The heartbeat is quiet about providers that are paused:* it prints counts (`paused: pay 2, gone 1, rate 1`), not names; the held ones are shown once, in the block at the start.
+- *No repeats.* A confirmed level is never sent again (the dry run and the ledger count it as done).
+- *Order.* `--order l3-first` (default) runs the 3a/3b pair and then the big step. `--order big-first` sends the big step first to a model with a known context of at least 200,000: a pass implies L3 (recorded `implied`), a failure then runs L3. The pilot report prints the expected cost of each order from the rates it measured.
+- *Telemetry.* The run prints, per request kind and per provider, actual input and output tokens and seconds against the estimate, the total wall time and a calibration line (`no usage was reported by any request` when none did: a zero is not a measurement). A table lists each provider that timed out: timeouts, median and longest seconds, and how many models were pending slow, so a slow provider reads as slow, not as untested. It is printed, never stored.
+- *Heartbeat.* Every 60 seconds a live run prints one line: elapsed time, models recorded and attempted of the queue, requests sent against the estimate with the timeouts so far, tokens reported so far against the estimate, the active providers, the paused ones (rate, canary) and, from the pace seen so far per request kind, how long the rest should take. Ctrl-C writes the finished records to the file first, then stops.
+- *A priced run needs an explicit `--max-spend`.* A live run that has any priced model in its queue (a listed price counts, also on a free-labelled provider) is refused unless `--max-spend` is given, with the estimate in the message. A run with nothing priced in it needs none. **What a model is costed at:** on a key whose tier is `free`, a model with NO listed price costs $0 (like the free-tier models; the estimate line says `an unlisted price on a free-labelled key: $0` and counts them), so a sweep of hundreds of unlisted models is not refused at `--max-spend 5`; a model with a LISTED price is costed at that price and the `--max-row-cost` ceiling applies to it (over it, the model stays pending `priced-over-row-cap`). The estimate counts only the models that WILL BE ASKED: the engine skips a priced row whose cost is over `--max-row-cost` before it sends anything, so such a model adds $0 and no request to the estimate that `liveRefusal` compares to `--max-spend` (and that the dry run prints as `estimate $X`, per tier and per provider); the estimate falls as `--max-row-cost` falls. The dry run prints `over the $C row ceiling, NOT asked and not in the estimate: N priced model(s) ... they would cost $X` for the held-back ones and `costliest models asked (K of M cost money): ...` (top 5 by estimated dollars). **Tripwire:** a row costed at $0 only because the key is free-labelled and the listing has no price (`unlistedOnFree`) whose response REPORTS a cost (the usage's own `cost`, in message_start or message_delta) is charged to the spend, counted in the run summary (`N unlisted-free model(s) reported a cost: $X`) and noted in the verdict, and its PROVIDER is left alone for the rest of the run: its other models (the ones skipped, and the ones waiting for the cap) are pending `spend-tripwire`, a NEEDS-OWNER reason that PERSISTS: a normal run does not ask them, and only the owner lifts it (`--recheck-hard spend-tripwire[,provider]` or `--recheck-hard owner`, or naming a model with `--only`; `--retry-accounts` does not). The tripped model keeps its own record. A reported cost is clamped to `--max-spend` per request. It is a tripwire, not a price: nothing is estimated from it. **LIMIT: the tripwire is inactive through CCR 3.0.22**: the gateway's usage rebuild (`nO()`/`eO()` in `@the-next-ai/ai-gateway`) drops `usage.cost`, so no response carries it to the probe; the code is kept (harmless, and live the day a gateway forwards the field), the tests use a fake gateway that emits it, and the dry run prints `spend tripwire: inactive through CCR 3.0.22 ...` whenever an unlisted-price model on a free-labelled key is in the run. Until then those models are trusted to be free by the key-tier label alone. **Exit code of the tool sweep** (its own, not the response sweep's `sweepExit`, which asks whether a probe came back `ok`): 0 when the run completed (records or partial records written, or nothing to ask, and for a Ctrl-C); 4 when the engine gave up on a dead gateway; 3 ONLY when requests were sent, no record and no partial record was written, and the models that ended on an unexplained failure (`error` or `timeout`) are at least HALF of the models that ended without a result (one timeout among 99 rate limits exits 0 with the SATURATION line): a real nothing-worked. A failed save is exit 1 whatever else happened (it outranks the 3; the records are in the side file). Rate limits, exhausted quotas and the account states (pay, auth, gone) are not failures of the sweep: a run that every provider rate-limited exits 0 and says so in the SATURATION line. 5 (busy) is unchanged. **Fixture cc-tools-3 (2026-10-06).** The path pattern of the long tool and of every bigTool no longer ends in `[^\0]+` (it ends in `.+`; the lookaheads stay) because the gateway returned EMPTY answers (HTTP 200, stop `end_turn`, 0 output tokens, no block) for that one construct on `codecraftapi`: 33 models were misclassified x or first-struck. `FIXTURE_ID` is `cc-tools-3` and `BIG_FIXTURE_ID` `cc-tools-big-3`. Records measured on `cc-tools-2` show `*` (against an older fixture: re-sweep recommended) but still count as TESTED, are NOT queued by a normal run at any level and are NOT re-swept automatically; re-ask them with `--retry-failed --l3 yes` (the class-x ones) or `--levels 123 --l3 yes` (a first strike is asked by a run that includes L3) when the owner wants. Observations on `codecraftapi`: every stream reports `in=0` input tokens, so an `l3w` of `in=0` says nothing about the input; `stream:false` through the gateway returns 502 `Upstream request failed` (provider openai). A few stored records carry a LEGACY `pt` p/f field (written by a pattern re-ask that existed from 8a2a162 to 121b031 and was removed): it is tolerated, preserved and ignored (never written, shown, ranked or used for a class). **Sanity-pass corrections (round 10).** (1) Class v needs real tool calling: a record whose L4 failed with ZERO calls (`l4w` `0 call of 2`) is class `t`, not `v` (L3 and the big step pass on an answer that is merely well formed); `N call of 2` with N >= 1 (a serial caller), any other L4 failure and a record with no stored note stay `v`. The stored class is derived, never trusted: a file record stored as `v` with such a note is READ as `t` (`loadFidelity` lists it as `reclassed`), and `--reclass-l4` (dry by default; `--live` writes the derived class under the lock, nothing else) lists and writes them. (2) Provider-stated limits: a size refusal whose own sentence states the limit ("maximum context length is 32768 tokens", "prompt is too long: 250000 tokens > 200000 maximum", "must be <= 8193", "exceeds the maximum number of tokens allowed (32768)") is parsed BEFORE the text is clipped (`statedLimit`; an estimate such as "Estimated input tokens: 103,620", a rate limit, an output limit and numbers under 1,000 or over 20,000,000 never count). The record keeps `ctxStated` (tokens, additive) and `capBelow` falls to capBelowFor(tokens * `STATED_BYTES_PER_TOKEN`), the constant being 3 bytes per token, a conservative bound. `--stated-limits` (dry by default, `--live` under the lock) applies the same to stored records whose `why` still holds the numbers; a record that PASSED a request above the resulting cap is listed as a CONFLICT and left alone. (3) `capBelow` is an UPPER bound of what is refused, never a proven size: what a model is proven to take is `maxBytes`, exposed as `provenBytes(rec)` (0 when nothing above L2 was answered). A model that passed 157 KB and was refused at the 400 KB big step has `capBelow` 390000 and is proven to 156873: the compiler uses `provenBytes` as the payload cap when the big step refused and a proof exists (source `proven`), so it never claims more than was proven. (4) Verdict buckets, each with its denominator: DEEPEN-BLOCKED is a pending `pay` on a model that HAS a passing L1+L2 record and an optional gap the run asks (it cannot deepen; its class stands); the verdict also prints `pay entries: N of M ... are on models that already have a passing L1+L2 record`. ACCOUNT-STATE is a `gone` on a provider with at least 5 gone entries where at least 5 models PASSED L1+L2 in the 24 hours before its first gone entry and those passers are at least 50% of the gone entries (an entitlement or a credit, not a missing model). Both stay sticky and are lifted as before (`--recheck-hard pay`, `--recheck-hard gone,<provider>`); the buckets are verdict-time classifications, the stored reasons are unchanged. The partition is recoverable + hard-blocked + tested + needs-owner + deepen-blocked + account-state = the population. The SATURATION line keeps its fields and gains `deepen_blocked=<n> account_state=<m>` AFTER `reason=`: `reason` is no longer the last field, so a loop script must SPLIT THE LINE ON SPACES and read the fields by name (never by position from the end, never with a regex anchored on the reason). A reader of an older build sees two extra words, nothing renamed. (5) First strikes at a level the run does not ask (an L3 first strike never retries under the default levels 1, 2, 6, 7): the verdict prints their count, up to 10 names and the exact command, e.g. `node refresh/tool-fidelity-cli.mjs --live --levels 123 --l3 yes --only <provider/model,...> --max-spend 5 --tf-max-tokens-per-provider 5000000` with the EXACT ids of the struck models (`--only <provider>` would also queue L3 for every tested model of that provider, about 40,000 tokens each); at most 10 ids per command, longer lists as several commands (there is no `--only-file`). `statedLimit` takes the figure next to the limit wording (limit, maximum, max, at most, allowed, must be <=, exceeds the context window of) when a sentence carries two token figures; a figure with no limit word beside it is ambiguous and gives null. **History of the store (issue #156).** Before any live run or migration that WRITES `state/tool-fidelity.json` (`--live`, `--reclass-l4 --live`, `--stated-limits --live`, `--reset-*` live, `--release-holds --live`, `--recheck-hard` live, `--merge-unsaved`) the current store is copied, atomically and REDACTED (every `why` goes through the redactor again), to `state/tool-fidelity-history/tool-fidelity-<UTC>.json` with the store's own mode; the copy is skipped when it is byte-identical to the newest one, the newest `--keep-history N` copies are kept (default 30, minimum 1) and the copy just written always survives. Only files of the rotation's own name are ever deleted: the manual `tool-fidelity.before-*.json` copies and anything else in either directory stay. A copy failure only prints a warning (there is no `--no-history`). A dry run copies nothing. A queued model whose stored reason is a NEEDS-OWNER one (`row-cost`, `priced-over-row-cap` after the ceiling was raised, `route-shape` when lifted) is read as `not-run` in the verdict while this run asks it. Paid tiers are untouched: they are not probed unless lifted, and a lifted run charges an unlisted price at the highest listed paid price of the whole probe set. The verdict names its labels: a model this run queues is never shown as `cap` (only the ones that wait for the cap now are), and `tested but optional levels not run: N of T model(s), G level gap(s)` counts models and level gaps apart (a model can miss more than one level).
+- *Restoring from the history (#156).* A copy in `state/tool-fidelity-history/tool-fidelity-<UTC>.json` equals the store except for compact one-line formatting (the store is already redacted when written, so the copy loses nothing): restore it by copying the file over `state/tool-fidelity.json` while no sweep is running (check `state/bench.lock` names no live pid). The manual `tool-fidelity.before-*.json` copies are never touched by the rotation. Do not put hand-made files whose names match the rotation pattern into the history folder (they count towards the rotation and can be pruned).
+
+**Thinking-only answers.** A reply that only thought and stopped at `max_tokens` is inconclusive. The first time it happens for a model
+in a run, the same request is asked again once with 2048 tokens instead of its small budget (and that model's later levels use 2048). A pass after the
+bump is a normal verdict; the report counts the escalated models. Still empty after the bump, the model is `pending: reasoning-budget`,
+never failed.
+
+**Coverage ledger.** Every model of a step ends in exactly one terminal state, and the dry run and the end-of-run report print the counts
+with their denominators (`coverage L1+L2 ...` over every listed model, `coverage L3 ...` over the probe-ok models split into candidates
+and excluded):
+
+| State | Meaning |
+|---|---|
+| `tested` | has a result for the step: its tier (`v`, `t`, `x`) and the evidence (`pppp big p`, `ppfn cap<150000`) |
+| `pending` | waiting, with the reason: `first-strike` (failed once, asked again, not yet `x`), a status from earlier runs (`rate`, `pay`, `auth`, `timeout`, `error`, `gone`, `empty`), `cap`, `spend`, `row-cost`, `queued` (this run will do it), `not-run` |
+| `excluded` | out by rule, with the reason: `ctx-below-floor`, `ctx-unknown`, `outside-toggles`, `invalid-id`, `relay-by-provenance`, `not-probe-ok` |
+
+`coverage()` in `refresh/tool-fidelity.mjs` builds the ledger and `assertPartition()` throws if a model is in no state, in two, or twice:
+a model dropped by a bug is a loud failure, never a smaller denominator. Three capped lists follow the counts: models that failed once
+(provisional, never reported as failed), models pending for `--pending-runs` runs in a row (default 3), and tested models whose record
+is against an older fixture (`*`, a re-sweep is recommended and never automatic). The run counts live in an optional top-level `pending` object in
+`state/tool-fidelity.json`: `"pending": { "provider/id": { "r": "rate", "n": 3, "at": "2026-10-05T10:00:00.000Z" } }`. `r` is a short code (`rate`, `pay`,
+`auth`, `timeout`, `error`, `gone`, `empty`, `reasoning-budget`, `request-cap`, `priced-over-row-cap`, `slow`, `route-shape`, `upstream-unavailable`, `cap`, `spend`, `row-cost`, `not-run`; lower case, digits and hyphens, at most 24 characters), `n` the
+number of runs in a row (1 to 9999) in which the model was in the queue and ended untested, `at` the last of them. It is bookkeeping, not a result: an entry goes away
+when the model gets a result or waits on its second strike, entries of models that left the probe set are dropped, at most 5,000 are kept, it is counted in the
+file's size cap, and the ledger ignores the entry of a model that is tested.
+
+**Inheritance marks (data only; nothing reads them yet).** `inherited(key, store, catalog)` says what the records of OTHER providers imply
+for a model that has no result of its own, so a planner can decide how to show it. A pass never propagates as a pass.
+
+| Mark | When | Meaning |
+|---|---|---|
+| `likely-x` (`from`) | the same model has a CONFIRMED failure at another provider | probably cannot take the tool set; the real probe may still say otherwise (`conflict: true` when another provider passed) |
+| `upper-bound` (level 3, `from`) | the same model passed L3 at another provider | at most that good, shown as `~3`; never a pass |
+| `claim-only` (`prior: "c"`) | only the catalogue's `tools` claim | a prior, never eligibility; `prior: "c"` is also added to the other marks when the claim is true |
+
+The helper returns null for a model that has its own confirmed result, ignores sources that failed once, alias rows, the same provider
+and untested records, and takes `catalog = { identityOf?, toolsClaim?, resellers? }` (the default identity is the last path segment of
+the id without a tier suffix; pass your own to use the catalogue's canonical ids). It is not wired into the compiler or the picker.
+
+**Context length unknown** is reported as its own count (the dry run and the end-of-run line): a model with no listed context length is
+not a failure, but the policy cannot rank it by context.
+
+```bash
+# Dry (the default): counts, request and token estimates, dollars, per-provider plan. Sends nothing, writes nothing.
+node refresh/tool-fidelity-cli.mjs
+# Live: L1+L2 for every probe-ok model that has no record yet. Free-tier providers first, then paid under the bench's row ceiling
+# and spend cap, which this pass measures on INPUT tokens as well as output. One sweep at a time (the bench's lock).
+node refresh/tool-fidelity-cli.mjs --live
+# One provider, or one model; a sample (one model per provider first).
+node refresh/tool-fidelity-cli.mjs --live --only groq
+node refresh/tool-fidelity-cli.mjs --live --limit 40
+# The large fixture and parallel calls: needs --l3 yes AND a named provider or an explicit cap. Level 5 is the 400 KB step.
+node refresh/tool-fidelity-cli.mjs --levels 34 --l3 yes --live --only groq/some-model
+node refresh/tool-fidelity-cli.mjs --levels 5 --l3 yes --live --only groq
+# Ask again for models that already have a record (a re-sweep), or ONLY for confirmed failures (never touches a record that passed).
+node refresh/tool-fidelity-cli.mjs --live --force --only groq
+node refresh/tool-fidelity-cli.mjs --live --retry-failed --l3 yes --only groq
+```
+
+`--tf-max-tokens-per-provider N` (default 150,000 input tokens per provider per run) keeps a provider with hundreds of models from
+spending its whole allowance at once: models past the cap simply wait, and the next run continues where this one stopped. A cap below the
+cost of one model is reported with the cap that is needed (a warning in the dry run, a refusal live). A run refuses to start when its own
+estimate is above `--max-spend`; a probe that stops part way is charged for the levels it completed. The dry run prints, with their
+denominators, how many models are probe-ok, how many have a record, how many against the current fixture, how many failed once and wait
+for a second try, how many `tools: false` models are in the set, how many have no listed context length, and how many are queued.
+
+The first live run is the owner's decision (it spends real quota on free tiers and a little money on paid ones). Later runs for
+newly discovered models follow the same caps. Nothing here is scheduled yet: `runIncremental` in `refresh/tool-fidelity-cli.mjs` is the
+function a scheduler will call, and `requeueL3Failures` in `refresh/tool-fidelity.mjs` is the function to call after a provider's key
+tier changes (a free key and a paid key can behave differently); it only returns the changed records and is not wired to `retier` yet.
+
+Nothing in the tests can write the real state file: the writer compares against a `realFile` the tests set to a temp file, and the test
+guard throws before any write under the real state folder. The records this version cannot read (a newer writer's fields, say) are kept
+in the file on every save, not deleted.
 
 ## 7. Troubleshooting
 

@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-10-01T00:00:00.000Z",
+  "params": {},
+  "models": {
+    "anthropic/claude-sonnet-5-5": {
+      "s": "ok",
+      "t": 700,
+      "a": 1790699779
+    },
+    "anthropic/claude-haiku-4-5": {
+      "s": "ok",
+      "t": 400,
+      "a": 1790699779
+    },
+    "anthropic/claude-opus-5": {
+      "s": "ok",
+      "t": 900,
+      "a": 1790699779
+    },
+    "fx-free-a/fxa-alpha": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-a/fxa-beta": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-a/fxa-gamma": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-a/fxa-big:free": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-a/auto": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-a/kilo-auto/free": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-a/fxa-dead": {
+      "s": "gone",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-free-b/fxb-one": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-dep/fxd-model:free": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-dep/fxd-plain": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-dep/fxd-old-free": {
+      "s": "pay",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-paid/fxp-plain": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-paid/fxp/free/x": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    },
+    "fx-mgmt/fxm-one": {
+      "s": "ok",
+      "t": 500,
+      "a": 1790699779
+    }
+  }
+}

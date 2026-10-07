@@ -1,0 +1,47 @@
+[
+  {
+    "added": "2026-09-01T00:00:00.0000000Z",
+    "bucket": "personal",
+    "envVarName": "LLM_PERSONAL_FX_FREE_A_FREE",
+    "id": "personal.fx-free-a.free",
+    "notes": "",
+    "provider": "fx-free-a",
+    "tier": "free"
+  },
+  {
+    "added": "2026-09-01T00:00:00.0000000Z",
+    "bucket": "personal",
+    "envVarName": "LLM_PERSONAL_FX_FREE_B_FREE",
+    "id": "personal.fx-free-b.free",
+    "notes": "",
+    "provider": "fx-free-b",
+    "tier": "free"
+  },
+  {
+    "added": "2026-09-01T00:00:00.0000000Z",
+    "bucket": "personal",
+    "envVarName": "LLM_PERSONAL_FX_DEP_FREE_DEPOSIT",
+    "id": "personal.fx-dep.free-deposit",
+    "notes": "",
+    "provider": "fx-dep",
+    "tier": "free-deposit"
+  },
+  {
+    "added": "2026-09-01T00:00:00.0000000Z",
+    "bucket": "personal",
+    "envVarName": "LLM_PERSONAL_FX_PAID_PAID",
+    "id": "personal.fx-paid.paid",
+    "notes": "",
+    "provider": "fx-paid",
+    "tier": "paid"
+  },
+  {
+    "added": "2026-09-01T00:00:00.0000000Z",
+    "bucket": "personal",
+    "envVarName": "LLM_PERSONAL_FX_MGMT_MANAGEMENT",
+    "id": "personal.fx-mgmt.management",
+    "notes": "",
+    "provider": "fx-mgmt",
+    "tier": "management"
+  }
+]

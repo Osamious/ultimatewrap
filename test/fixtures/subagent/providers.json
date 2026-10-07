@@ -1,0 +1,57 @@
+{
+  "Providers": [
+    {
+      "name": "anthropic",
+      "models": [
+        "claude-sonnet-5-5",
+        "claude-haiku-4-5",
+        "claude-opus-5"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "fx-free-a",
+      "models": [
+        "fxa-alpha",
+        "fxa-beta",
+        "fxa-gamma",
+        "fxa-big:free",
+        "auto",
+        "kilo-auto/free",
+        "fxa-dead"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "fx-free-b",
+      "models": [
+        "fxb-one"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "fx-dep",
+      "models": [
+        "fxd-model:free",
+        "fxd-plain",
+        "fxd-old-free"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "fx-paid",
+      "models": [
+        "fxp-plain",
+        "fxp/free/x"
+      ],
+      "enabled": true
+    },
+    {
+      "name": "fx-mgmt",
+      "models": [
+        "fxm-one"
+      ],
+      "enabled": true
+    }
+  ]
+}

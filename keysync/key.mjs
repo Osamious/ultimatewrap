@@ -22,6 +22,8 @@ import { loadVault, filterRegistry, chooseKeys, loadKeyChoices, KEY_CHOICES_FILE
   from "./keysync.mjs";
 import { setDefaultModel, clearDefaultModel, showDefaultModel, formatShow, SET_NOTE, CLEAR_NOTE, DefaultModelError }
   from "./default-model.mjs";
+import { tierList } from "../menu/tiers.mjs";
+import { tierError, runRetier } from "./retier.mjs";
 
 const VAULT_SCRIPT = path.join(os.homedir(), ".llmkeys", "ApiKeyVault.ps1");
 const dotSource = (cmd) => `. '${VAULT_SCRIPT.replace(/'/g, "''")}'; ${cmd}`;
@@ -81,11 +83,14 @@ function writeChoice(provider, id) {
 
 async function cmdAdd(args) {
   const [bucket, provider, tier] = args._;
-  if (!bucket || !provider || !tier) {
-    console.error("usage: key.mjs add <bucket> <provider> <tier> [--notes \"...\"]");
+  if (!bucket || !provider) {
+    console.error(`usage: key.mjs add <bucket> <provider> <tier> [--notes "..."]; valid tiers: ${tierList().join(", ")}`);
     process.exitCode = 1;
     return;
   }
+  // Before PowerShell is reached: a typo would otherwise create a key no tier scope recognises (plan 7.1).
+  const badTier = tierError(tier);
+  if (badTier) { console.error(badTier); process.exitCode = 1; return; }
   const notes = args.notes ?? "";
   const ok = runInherited(
     `Add-AndVerifyKey -Bucket ${q(bucket)} -Provider ${q(provider)} -Tier ${q(tier)} -Notes ${q(notes)}`);
@@ -215,6 +220,11 @@ function parseArgs(argv) {
 
 const [, , sub, ...rest] = process.argv;
 const args = parseArgs(rest);
+// `--no-rebuild` takes yes or no: EVERY occurrence is checked, before any work and before any subcommand parser can see (or drop) it; the last one decides
+if (rest.some((x, i) => x === "--no-rebuild" && !["yes", "no"].includes(rest[i + 1]))) { console.error("usage: --no-rebuild takes yes or no (yes skips the automatic subagent policy rebuild after the command)"); process.exit(1); }
+// `--no-rebuild yes` belongs to this CLI, not to the subcommand: retier has a parser of its own that refuses a flag it does not know
+const noRebuild = args["no-rebuild"] === "yes";
+const subRest = rest.filter((a, i) => a !== "--no-rebuild" && rest[i - 1] !== "--no-rebuild");
 
 switch (sub) {
   case "add": await cmdAdd(args); break;
@@ -223,7 +233,23 @@ switch (sub) {
   case "test": cmdTest(args); break;
   case "prefer": cmdPrefer(args); break;
   case "default-model": cmdDefaultModel(args); break;
+  case "retier":
+    process.exitCode = runRetier(subRest, { out: (s) => console.log(s), err: (s) => console.error(s) });
+    break;
+  case "subagent-policy": {
+    // Loaded lazily: the library pulls in the snapshot and bench readers the other subcommands never need.
+    const { runSubagentPolicy } = await import("./subagent-policy.mjs");
+    process.exitCode = await runSubagentPolicy(rest, { out: (s) => console.log(s), err: (s) => console.error(s) });
+    break;
+  }
   default:
-    console.error("usage: key.mjs <add|remove|list|test|prefer|default-model> ...");
+    console.error("usage: key.mjs <add|remove|list|test|prefer|retier|default-model|subagent-policy> ...");
     process.exitCode = 1;
+}
+
+// D-x: after a key add, remove or retier and a default-model set or clear that SUCCEEDED, the compile-only automatic rebuild of the subagent policy (stale-only, one line on stderr, never enforces, accepts no shrink).
+// Strictly non-fatal and never part of the exit code; `--no-rebuild yes` skips it; a dry retier changes nothing and a default-model show only reads.
+const changedState = ["add", "remove"].includes(sub) || (sub === "retier" && args.dry !== "yes") || (sub === "default-model" && (args._[0] === "set" || args._[0] === "clear"));
+if (changedState && !noRebuild && !process.exitCode) {
+  try { const { autoRebuildAfter } = await import("./subagent-policy.mjs"); await autoRebuildAfter({}); } catch { /* never fatal */ }
 }

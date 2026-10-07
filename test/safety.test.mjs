@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -14,7 +15,7 @@ import {
 // only rollback point, and a test that read the live directory into something
 // that then prunes would destroy exactly what this file exists to protect.
 const scratch = () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "uw-safety-"));
+  const d = mkTmp("uw-safety-");
   const settings = path.join(d, "settings.json");
   fs.writeFileSync(settings, JSON.stringify({ modelPicker: { options: [{ model: "a/b" }] } }));
   return { dir: d, settings };
@@ -240,7 +241,7 @@ test("keepSettings defaults to 5, so two bad runs cannot destroy the last good c
 
 // ---- capFailedSnapshots: same parser, INVERTED undatable policy ------------
 
-const snapDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-snaps-"));
+const snapDir = () => mkTmp("uw-snaps-");
 const writeSnap = (dir, stamp, ext = ".sqlite.dpapi") => {
   const p = path.join(dir, `config-${stamp}${ext}`);
   fs.writeFileSync(p, "x");

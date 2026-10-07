@@ -6,6 +6,7 @@ import { guardRealState } from "./fixtures/no-real-state.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { fileURLToPath } from "node:url";
 import { loadBench, cleanRecord, isLive, oldestStampOf, ageHistOf, recordAge, countStatuses, outdatedNotice, STATUSES, benchKey } from "../menu/bench-data.mjs";
 import { loadObserved, feedNote, cleanObservedRecord, observeEnabled, observeOffFile, OBSERVED_STATUSES, OBSERVED_MAX_ENTRIES, OBSERVED_MAX_BYTES, OBSERVED_SCHEMA } from "../menu/observed-data.mjs";
@@ -18,7 +19,7 @@ guardRealState(after, assert);
 
 const NOW = Math.floor(Date.now() / 1000);
 const DAY = 86400;
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-overlay-"));
+const tmp = () => mkTmp("uw-overlay-");
 const done = (d) => fs.rmSync(d, { recursive: true, force: true });
 const put = (dir, name, v) => fs.writeFileSync(path.join(dir, name), typeof v === "string" ? v : JSON.stringify(v));
 const bench = (models) => ({ schema: 1, generatedAt: new Date().toISOString(), models });

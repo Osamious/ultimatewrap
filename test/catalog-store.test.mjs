@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { copyOut, resolveCatalogPath, assertSchema, BUNDLE_PATH, STORE_FILE }
   from "../refresh/catalog-store.mjs";
 
@@ -22,7 +23,7 @@ test("assertSchema accepts schemaVersion 2 and rejects everything else", () => {
 });
 
 test("copyOut writes a flat copy, never touching the source", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-catalog-store-"));
+  const dir = mkTmp("uw-catalog-store-");
   const src = path.join(dir, "src.json");
   const dest = path.join(dir, "nested", "models.json");
   const srcText = JSON.stringify(SCHEMA_2);
@@ -37,7 +38,7 @@ test("copyOut writes a flat copy, never touching the source", () => {
 });
 
 test("copyOut refuses a schema mismatch before writing a bad copy over a good one", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-catalog-store-"));
+  const dir = mkTmp("uw-catalog-store-");
   const src = path.join(dir, "src.json");
   const dest = path.join(dir, "models.json");
   fs.writeFileSync(dest, JSON.stringify(SCHEMA_2));   // a good prior copy
@@ -51,7 +52,7 @@ test("copyOut refuses a schema mismatch before writing a bad copy over a good on
 });
 
 test("resolveCatalogPath prefers the local store when present", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-catalog-store-"));
+  const dir = mkTmp("uw-catalog-store-");
   const storeFile = path.join(dir, "models.json");
   fs.writeFileSync(storeFile, JSON.stringify(SCHEMA_2));
   assert.equal(resolveCatalogPath({ storeFile }), storeFile);
@@ -59,7 +60,7 @@ test("resolveCatalogPath prefers the local store when present", () => {
 });
 
 test("resolveCatalogPath falls back to the bundle path when no local copy exists, with a warning", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-catalog-store-"));
+  const dir = mkTmp("uw-catalog-store-");
   const storeFile = path.join(dir, "does-not-exist.json");
   const bundlePath = "C:\\fake\\bundle\\models.json";
 

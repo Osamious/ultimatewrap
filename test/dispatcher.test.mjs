@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { execFileSync, spawnSync } from "node:child_process";
 
@@ -31,7 +32,7 @@ const exiter = (dir, code) => {
   return f;
 };
 
-const scratchDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-dispatch-"));
+const scratchDir = () => mkTmp("uw-dispatch-");
 
 function dispatch(firstLine) {
   const dir = scratchDir();

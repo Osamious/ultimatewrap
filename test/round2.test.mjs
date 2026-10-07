@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { detectCaps, frame, frameWidth } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
 import { loadBench } from "../menu/bench-data.mjs";
@@ -23,7 +24,7 @@ const prow = (keyId, models, o = {}) => ({ keyId, provider: keyId.split(".")[1] 
 // -------------------------------------------------------------- 1. `- ok`
 
 const tmpBench = (models) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-r2-"));
+  const dir = mkTmp("uw-r2-");
   const file = path.join(dir, "bench.json");
   fs.writeFileSync(file, JSON.stringify({ schema: 1, generatedAt: new Date().toISOString(), models }));
   return { file, done: () => fs.rmSync(dir, { recursive: true, force: true }) };

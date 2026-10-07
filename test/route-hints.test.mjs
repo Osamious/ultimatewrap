@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { fileURLToPath } from "node:url";
 import { buildSnapshot, loadSnapshot, writeSnapshotFile } from "../menu/snapshot.mjs";
 import { payFreeNote, aliasMap, liveAlias, PAY_NOTE } from "../menu/route-hints.mjs";
@@ -99,7 +100,7 @@ test("additive fields: absent on ordinary rows, and an old snapshot without them
   assert.equal(Object.hasOwn(m, "badgeNote"), false);
   assert.equal(Object.hasOwn(m, "aliasOf"), false);
   assert.equal(snap.schemaVersion, 9, "the current schema");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-rh-"));
+  const dir = mkTmp("uw-rh-");
   const file = path.join(dir, "s.json");
   writeSnapshotFile(snap, file);
   assert.equal(loadSnapshot(file).ok, true);

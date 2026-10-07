@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { chooseKeys, filterRegistry, loadVault, loadKeyChoices } from "../keysync/keysync.mjs";
 
 const row = (id, provider, overrides = {}) =>
@@ -140,7 +141,7 @@ test("chooseKeys: the choice is genuinely read from data, not still hardcoded", 
 });
 
 test("loadKeyChoices: a missing file is {} (no choices recorded), never a throw", () => {
-  const missing = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-kc-")), "key-choices.json");
+  const missing = path.join(mkTmp("uw-kc-"), "key-choices.json");
   assert.deepEqual(loadKeyChoices(missing), {});
 });
 

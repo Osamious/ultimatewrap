@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { detectCaps, glyphsFor, frame, frameWidth, statusCount, painter, elisionHeads, keyIdPlan } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
 import { isUsable, isOk, BENCH_FRESH_MS, FUTURE_SKEW_MS, countStatuses, providerFlags } from "../menu/bench-data.mjs";
@@ -121,7 +122,7 @@ test("a build with no usable bench data keeps the previous counts, with the prev
 });
 
 test("main() says what the provider columns were built from, and keeps counts when bench.json is unusable", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-snap-"));
+  const dir = mkTmp("uw-snap-");
   const file = path.join(dir, "snapshot.json");
   const STAMP = new Date(Date.now() - 2 * DAY).toISOString();      // inside the 14-day window, whenever this runs
   const empty = () => ({ generatedAt: null, size: 0, get: () => null });

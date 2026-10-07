@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { toStored, mergeRecord, isFresh } from "../refresh/bench-store.mjs";
 import { cleanRecord, PREVIEW_CHARS } from "../menu/bench-data.mjs";
 import {
@@ -1468,7 +1469,7 @@ test("an `error` event AFTER content is not swallowed: the row stays ok (its TTF
 test("loadBench exposes the cut marker `x` (and an ok record's message) to readers", async () => {
   const { loadBench } = await import("../menu/bench-data.mjs");
   const os = await import("node:os"); const path = await import("node:path");
-  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-x-")), "bench.json");
+  const f = path.join(mkTmp("uw-x-"), "bench.json");
   fs.writeFileSync(f, JSON.stringify({ schema: 1, generatedAt: "x", models: {
     "a/cut": { s: "ok", t: 500, d: 4500, r: 95, o: 390, a: 1, p: "xxxx", x: 1 },
     "a/err": { s: "ok", t: 500, d: 900, a: 1, p: "Hello there", m: "stream error after first token: boom" },

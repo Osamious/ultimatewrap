@@ -30,44 +30,29 @@ export function listenerPid(port) {
 }
 
 function hashFile(file) {
-  if (!fs.existsSync(file)) return "(absent)";
-  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  // A locked or permission-denied file must not throw out of the tripwire (the safety check would abort the run it protects, and in teardown before any
+  // cleanup): it becomes its own fingerprint, so a file that turns unreadable still counts as a change.
+  try { return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex"); } catch (e) { return e && e.code === "ENOENT" ? "(absent)" : `(unreadable:${e && e.code})`; }
 }
 
 /**
- * Recursive directory hash. `content` mode also catches an in-place edit (used
- * for the small Claude-3p tree, and it catches a takeover writing a *different*
- * GUID than the one we know). `listing` mode fingerprints names/sizes/mtimes
- * only — enough to spot a new file appearing, and safe for large directories.
+ * Fingerprint of the NAMES in a directory (never contents, sizes or mtimes): `recursive` walks subdirectories (relative paths). A name that appears,
+ * disappears or changes is a change; a file being written to, a download in progress or an app's own churn is not.
  */
-function hashTree(dir, mode = "content") {
+function hashNames(dir, recursive = false) {
   if (!fs.existsSync(dir)) return "(absent)";
-  const h = crypto.createHash("sha256");
+  const names = [];
   const walk = (d) => {
     let entries;
-    try {
-      entries = fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-    } catch { return; } // unreadable subdir: ignore rather than abort the run
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; } // unreadable subdir: ignore rather than abort the run
     for (const e of entries) {
       const p = path.join(d, e.name);
-      if (e.isDirectory()) { walk(p); continue; }
-      // Relative path, not basename: two same-named files in different
-      // subdirectories could otherwise be swapped without changing the digest.
-      const rel = path.relative(dir, p);
-      if (mode === "content") {
-        // A single locked or permission-denied file previously threw out of the
-        // tripwire — i.e. the safety check aborted the run it existed to
-        // protect, and in teardown that happened before any cleanup.
-        let buf; try { buf = fs.readFileSync(p); } catch { continue; }
-        h.update(rel).update(buf);
-      } else {
-        let st; try { st = fs.statSync(p); } catch { continue; }
-        h.update(rel).update(String(st.size)).update(String(st.mtimeMs));
-      }
+      if (e.isDirectory() && recursive) { walk(p); continue; }
+      names.push(`${e.isDirectory() ? "d" : "f"}:${path.relative(dir, p)}`);
     }
   };
   walk(dir);
-  return h.digest("hex");
+  return crypto.createHash("sha256").update(names.sort().join("\n")).digest("hex");
 }
 
 /**
@@ -79,22 +64,49 @@ export function userPathFingerprint() {
   return ps(`[Environment]::GetEnvironmentVariable('Path','User')`);
 }
 
-export function makeTripwire(files = TRIPWIRE_FILES) {
-  const baseline = new Map(files.map((f) => [f, hashFile(f)]));
-  baseline.set(`tree:${LIVE_CLAUDE_3P_DIR}`, hashTree(LIVE_CLAUDE_3P_DIR));
-  // exportData writes every provider key to ~/Downloads in one RPC call; a new
-  // file appearing there during a run would be a key breach.
-  baseline.set(`list:${LIVE_DOWNLOADS}`, hashTree(LIVE_DOWNLOADS, "listing"));
-  // CCR can splice a bin dir into the persistent user PATH (HKCU\Environment),
-  // which no file hash would ever see.
-  baseline.set("env:userPath", userPathFingerprint());
+/**
+ * Claude-3p is the LIVE Claude desktop app's userData (hundreds of files; sentry/scope_v3.json, session.json and logs/ change every ~30 s while the app is
+ * open, and config.json / claude_desktop_config.json carry the app's own state: bootFrameLayout, quickWindowPosition, updaterBannerStagedAt, `preferences`...),
+ * so it is NOT content-hashed as a tree and its top-level names are NOT listed (per-launch host-creds-<guid>.json files appear there). What CCR's desktop sync
+ * rewrites on EVERY sync is the configLibrary folder (verified in CCR 3.0.22 dist/main/cli.js `Pl()`: hb(configLibraryFile, {..., inferenceModelsUpdatedAt: new Date()})
+ * changes <id>.json's bytes every time, vNe(metaFile) merges _meta.json), so the tripwire fingerprints that folder: the NAME of every entry, and the sha256 of the
+ * CONTENT of every *.json in it (<id>.json and _meta.json included). A sync that reached the real Claude-3p changes <id>.json, so it trips.
+ * claude_desktop_config.json is NOT hashed: CCR's write there (`SNe`) is an idempotent merge of deploymentMode:"3p" (already "3p" on this machine, so the bytes
+ * would not change and a hash could not detect a sync), while the desktop app rewrites `preferences` in the same file.
+ * NO LONGER COVERED by the tripwire (covered by the preload guard in the daemon tree, the LOCALAPPDATA redirect and assertDesktopSyncLandedInScratch): other
+ * Claude-3p files edited in place, new top-level or nested names, and model-catalog/.
+ */
+export const CLAUDE_3P_LIBRARY = "configLibrary";
+
+/** Names (f:/d: prefixed) of every entry in a directory plus the content sha256 of each *.json: a rename, a new or removed entry or an in-place edit of a .json changes it. */
+function hashLibrary(dir) {
+  if (!fs.existsSync(dir)) return "(absent)";
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return `(unreadable:${e && e.code})`; }
+  const rows = entries.map((e) => (e.isDirectory() ? `d:${e.name}` : `f:${e.name}:${/\.json$/i.test(e.name) ? hashFile(path.join(dir, e.name)) : "-"}`));
+  return crypto.createHash("sha256").update(rows.sort().join("\n")).digest("hex");
+}
+
+/** The named fingerprints the tripwire compares. Every directory is a parameter so tests run on a temp tree; the defaults are the live paths. */
+export function tripwireCollectors(files = TRIPWIRE_FILES, { claude3pDir = LIVE_CLAUDE_3P_DIR, downloadsDir = LIVE_DOWNLOADS, userPath = userPathFingerprint } = {}) {
+  const c = new Map(files.map((f) => [f, () => hashFile(f)]));
+  const lib = path.join(claude3pDir, CLAUDE_3P_LIBRARY);
+  c.set(`library:${lib}`, () => hashLibrary(lib));
+  // exportData writes every provider key to ~/Downloads in one RPC call; a new file appearing there during a run would be a key breach.
+  // NAMES only (recursive): a download in progress, or another process writing into an existing file, does not trip it.
+  c.set(`names:${downloadsDir}`, () => hashNames(downloadsDir, true));
+  // CCR can splice a bin dir into the persistent user PATH (HKCU\Environment), which no file hash would ever see.
+  c.set("env:userPath", userPath);
+  return c;
+}
+
+export function makeTripwire(files = TRIPWIRE_FILES, opts = {}) {
+  const collectors = tripwireCollectors(files, opts);
+  const baseline = new Map([...collectors].map(([k, fn]) => [k, fn()]));
   return {
     assert(stage) {
       for (const [key, want] of baseline) {
-        const got = key === "env:userPath" ? userPathFingerprint()
-          : key.startsWith("tree:") ? hashTree(key.slice(5), "content")
-          : key.startsWith("list:") ? hashTree(key.slice(5), "listing")
-          : hashFile(key);
+        const got = collectors.get(key)();
         if (got !== want) {
           fail(`${key} CHANGED during "${stage}" — a write reached live state. Stop and restore. ` +
             `(was ${want.slice(0, 12)}, now ${got.slice(0, 12)})`);
@@ -185,6 +197,8 @@ export function assertPayloadIsolated(cfg, { allowProviders = false } = {}) {
     if (target.toLowerCase() === LIVE_SETTINGS.toLowerCase()) fail(`profile "${p.id}" targets LIVE settings`);
     if (target.toLowerCase() !== SCRATCH_SETTINGS.toLowerCase()) fail(`profile "${p.id}" settingsFile "${p.settingsFile}" is not the scratch file`);
   }
+  // CCR's saveConfig arms a model auto-refresh loop for a provider with autoFetchModels, and its onConfigChanged runs the global profile apply with no applyProfile opt-out: refused for EVERY provider, whatever allowProviders says.
+  for (const p of cfg.Providers ?? []) if (p && p.autoFetchModels) fail(`provider "${p.name}" has autoFetchModels set: CCR's model auto-refresh would run the global profile apply (no applyProfile opt-out) on a config change`);
   if (!allowProviders && (cfg.Providers?.length ?? 0) > 0) {
     fail(`payload carries ${cfg.Providers.length} provider(s). A model-carrying save triggers CCR's ` +
       `Claude-desktop-app sync (dist gate is model-availability only). Pass {allowProviders:true} once ` +

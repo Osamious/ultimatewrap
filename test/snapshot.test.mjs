@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { buildSnapshot, writeSnapshotFile, loadSnapshot, contextIndex, main,
          SNAPSHOT_SCHEMA, PROVENANCE_RUNGS, buildProvenanceIndex } from "../menu/snapshot.mjs";
@@ -734,7 +735,7 @@ test("#113: a router pool never buys a 1M claim from its pool's window", () => {
 
 test("schema 9: a schema-6, 7 or 8 snapshot is rejected (no three-state status, no oldest-record stamp), and a current one loads", async () => {
   const fs2 = await import("node:fs"), os2 = await import("node:os"), path2 = await import("node:path");
-  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), "uw-schema8-"));
+  const dir = mkTmp("uw-schema8-");
   const file = path2.join(dir, "snapshot.json");
   try {
     for (const old of [6, 7, 8]) {

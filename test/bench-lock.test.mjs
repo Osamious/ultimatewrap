@@ -5,12 +5,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import {
   acquireLock, sweepStatus, readLock, findSweepProcesses, parseProcessList, pidAlive, hhmm,
 } from "../refresh/bench-lock.mjs";
 import { main, EXIT_BUSY, printPlan, summarize, parseArgs, recordedSpend } from "../refresh/bench-cli.mjs";
 
-const lockPath = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-lock-")), "state", "bench.lock");
+const lockPath = () => path.join(mkTmp("uw-lock-"), "state", "bench.lock");
 const NOW = Date.parse("2026-09-29T14:36:00");
 const alive = (...pids) => (p) => pids.includes(p);
 const none = () => [];

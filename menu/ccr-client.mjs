@@ -98,6 +98,12 @@ export const CONTRACT = Object.freeze({
   get requestLogsDb() { return requestLogsDb(); },
   clientHeader: "x-ccr-client",
   probeClient: "uw-probe",
+  // CCR's own subagent routing tag (F1): the grammar the injected Agent-tool text copies. Provider/model, slash form.
+  subagentTag: Object.freeze({
+    open: "<CCR-SUBAGENT-MODEL>",
+    close: "</CCR-SUBAGENT-MODEL>",
+    example: "Provider/model",
+  }),
   installDir: INSTALL_DIR,
   bundledCatalogue: path.join(INSTALL_DIR, "dist", "models.json"),
   // The bundle carrying the locally-patched gateway handshake timeout. Named here
