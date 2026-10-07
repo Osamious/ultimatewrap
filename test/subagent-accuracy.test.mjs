@@ -576,7 +576,7 @@ test("--write yes --live yes writes state/subagent/accuracy.json atomically in t
 
 test("a FAIL verdict is written too (it replaces an old PASS), and an unwritable target is exit 1 with no debris", async () => {
   const f = fixture(passRows().map((x, i) => (x.at && i % 40 === 0 ? { ...x, cls: "main" } : x)));
-  const r = await cli(["--state-dir", f.root, "--tally", "no", "--write", "yes", "--live", "yes", "--cc-version", "1", "--ccr-version", "1"]);
+  const r = await cli(["--state-dir", f.root, "--tally", "no", "--write", "yes", "--live", "yes", "--cc-version", "1.0.0", "--ccr-version", "1.0.0"]);
   assert.equal(r.code, 0); assert.equal(JSON.parse(fs.readFileSync(path.join(f.sub, "accuracy.json"), "utf8")).verdict, "FAIL");
   const g = fixture(passRows());
   fs.mkdirSync(path.join(g.sub, "accuracy.json"));                                // a directory where the file belongs
@@ -689,4 +689,165 @@ test("a PASS written with no compiled policy on disk carries a NOTE that it reco
   const r = await cli(["--state-dir", f.root, "--tally", "no", "--write", "yes", "--live", "yes", "--cc-version", "9.9.9", "--ccr-version", "3.0.22"]);
   assert.match(r.err, /NOTE: there is no compiled policy .*records no policy content hash/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.sub, "accuracy.json"), "utf8")).evidence.policyContentHash, null);
+});
+
+// ------------------------------------------------------------------ round 3: helper rows out of the consensus, whole versions, a start date
+test("the detector-consensus counters leave rc-labelled helper rows out (router v4 routes them to the aux path whatever their detectors say), and say how many", async () => {
+  const rows = [row({ cls: "sub", ag: 1, bl: 1, aid: "a", nt: 9 }), row({ cls: "main" }),
+    row({ cls: "aux", rc: "auxiliary", ag: 1, bl: 1, aid: "h1", nt: 4 }), row({ cls: "aux", rc: "compaction", ag: 0, bl: 0, nt: 0 }), row({ cls: "aux", rc: "compaction", ag: 1, bl: 0, aid: "h2", nt: 7 })];
+  const r = (await verdictOf(rows)).metrics;
+  assert.equal(r.CONS.subN, 1); assert.equal(r.CONS.subOk, 1); assert.equal(r.CONS.mainN, 1); assert.equal(r.CONS.mainOk, 1); assert.equal(r.CONS.helperExcluded, 3);
+  assert.match(r.CONS.reason, /3 rc-labelled helper rows are left out of both counts/);
+  assert.notEqual(r.T2.status, "FAIL");                                           // an rc helper the router routed to aux is the correct outcome, tool-carrying or not
+  assert.equal(r.T2.n, 3);
+  const before = (await verdictOf(rows.slice(0, 2))).metrics.CONS;                // the same two consensus rows alone: the counters do not move
+  assert.deepEqual([before.subN, before.subOk, before.mainN, before.mainOk], [1, 1, 1, 1]);
+});
+
+test("--cc-version and --ccr-version take exactly what the enforce gate takes: x.y.z with an optional -pre or +build tag; Claude Code may carry its own suffix, which is normalised away", async () => {
+  const f = fixture([row()]);
+  const rec = async (argv) => { const r = await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", ...argv]); return { code: r.code, err: r.err, json: r.code === 0 ? JSON.parse(r.out) : null }; };
+  for (const [v, want] of [["3.0.22", "3.0.22"], ["3.0.22-beta.1", "3.0.22-beta.1"], ["3.0.22+build5", "3.0.22+build5"], ["  3.0.22 ", "3.0.22"]]) {
+    const r = await rec(["--ccr-version", v]); assert.equal(r.code, 0, v); assert.equal(r.json.ccrVersion, want); assert.equal(r.json.metrics.T6.ccr, want);
+  }
+  const cc = await rec(["--cc-version", "2.1.289 (Claude Code)", "--ccr-version", "3.0.22"]);
+  assert.equal(cc.code, 0); assert.equal(cc.json.ccVersion, "2.1.289"); assert.equal(cc.json.ccrVersion, "3.0.22"); assert.equal(cc.json.metrics.T6.status, "PASS");
+  assert.equal((await rec(["--cc-version", "2.1.289", "--ccr-version", "3.0.22"])).json.ccVersion, "2.1.289");
+  for (const bad of ["v3.0.22", "1", "1.0", "3.0.22.1", "3.0.22 beta", "3.0.22-", "latest", "3.0.22 (Claude Code)"]) {
+    const r = await rec(["--ccr-version", bad]); assert.equal(r.code, 2, `ccr ${bad}`); assert.match(r.err, /whole version/);
+  }
+  for (const bad of ["v2.1.289", "(Claude Code)", "2.1.289 (claude code)", "2.1.289 (Claude Code) x", "2.1", "2.1.289 Claude Code"]) assert.equal((await rec(["--cc-version", bad])).code, 2, `cc ${bad}`);
+  // the engine applies the same rule: a free-text version never counts as recorded
+  assert.equal((await verdictOf(passRows(), { versions: { cc: "2.1.289 (Claude Code)", ccr: "3.0.22" } })).verdict, "PASS");
+  assert.equal((await verdictOf(passRows(), { versions: { cc: "v2.1.289", ccr: "3.0.22" } })).metrics.T6.status, "INSUFFICIENT");
+  assert.equal((await verdictOf(passRows(), { versions: { cc: "2.1.289", ccr: "3.0" } })).metrics.T6.status, "INSUFFICIENT");
+});
+
+test("a version the evaluator accepts is one the enforce gate accepts, and one it refuses is refused by the gate too", () => {
+  const sub = tmp();
+  const HASH = "0123456789abcdef";
+  const gate = (ccV, ccrV, installedCc = ccV) => {
+    fs.writeFileSync(path.join(sub, "accuracy.json"), J({ verdict: "PASS", at: iso(NOW), ccVersion: ccV, ccrVersion: ccrV, evidence: { policyContentHash: HASH, sha256: "x", classRowsCounted: 1 }, window: {} }));
+    return () => LIB.checkEnforcePreconditions({ stateDir: sub }, { providersLive: true }, { enforcement: "enforce" }, NOW, { contentHash: HASH, ccrVersion: () => ccrV, ccVersion: () => installedCc });
+  };
+  for (const v of ["3.0.22", "3.0.22-beta.1", "3.0.22+build5"]) { assert.ok(A.wholeVersion(v)); assert.doesNotThrow(gate(v, v), v); }
+  assert.equal(A.wholeVersion("2.1.289 (Claude Code)", { suffix: "(Claude Code)" }), "2.1.289");
+  assert.doesNotThrow(gate("2.1.289 (Claude Code)", "3.0.22", "2.1.289"), "the gate takes the text claude --version prints and compares it whole once the suffix is stripped");
+  assert.doesNotThrow(gate(A.wholeVersion("2.1.289 (Claude Code)", { suffix: "(Claude Code)" }), "3.0.22", "2.1.289"));
+  for (const bad of ["v3.0.22", "1.0", "3.0.22.1", "latest"]) { assert.equal(A.wholeVersion(bad), null, bad); assert.throws(gate("2.1.289", bad, "2.1.289"), /CCR/, bad); }
+});
+
+test("--since DATE bounds the START of the window: earlier rows are not counted, the header and the record say so, a bad or future date is a usage error, a duration still means the window length", async () => {
+  const rows = [row({ t: iso(Date.parse("2026-10-05T08:00:00Z")) }), row({ t: iso(Date.parse("2026-10-05T20:00:00Z")) }), row({ t: iso(Date.parse("2026-10-06T08:00:00Z")) })];
+  const f = fixture(rows);
+  const run = async (since) => cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", "--since", since]);
+  const none = JSON.parse((await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes"])).out);
+  assert.equal(none.populations.clientCounted, 3); assert.equal(none.window.from, null);
+  const d = JSON.parse((await run("2026-10-05T12:00:00Z")).out);
+  assert.equal(d.populations.clientCounted, 2); assert.equal(d.window.from, "2026-10-05T12:00:00.000Z"); assert.equal(d.window.since, "2026-10-05T12:00:00.000Z");
+  const day = JSON.parse((await run("2026-10-06")).out);
+  assert.equal(day.populations.clientCounted, 1); assert.equal(day.window.from, "2026-10-06T00:00:00.000Z");
+  const text = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-06"]);
+  assert.match(text.out, /\(window 2026-10-06 to 2026-10-06, bounded from 2026-10-06T00:00:00\.000Z by --since: discarded 2 client rows incl. 0 violations \(T1 misses 0, T2 0, T4 0\); the bound applies to every metric, newest counted request/);
+  assert.equal((await run("2026-10-06T23:00:00Z")).code, 2);                        // after now (2026-10-06T12:00Z): an empty window
+  assert.match((await run("2026-10-06T23:00:00Z")).err, /in the future/);
+  assert.equal((await run("2026-13-45")).code, 2);
+  assert.equal((await run("2026-02-30T99:00")).code, 2);
+  assert.equal(JSON.parse((await run("7d")).out).window.from, null);               // a duration is the window length, as before
+  assert.equal(JSON.parse((await run("2d")).out).populations.clientCounted, 3);
+  assert.equal((await run("31d")).code, 2);
+  // it is recorded in accuracy.json
+  const w = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-05", "--write", "yes", "--live", "yes"]);
+  assert.equal(w.code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.sub, "accuracy.json"), "utf8")).window.from, "2026-10-05T00:00:00.000Z");
+});
+
+test("the T2 FAIL text says when a --since date would exclude the old rows, names the newest violating day, and the date really excludes them", async () => {
+  const old = row({ t: iso(Date.parse("2026-10-05T10:00:00Z")), rc: "auxiliary", cls: "sub", ag: 1, bl: 1, aid: "h", nt: 3 });
+  const clean = Array.from({ length: 5 }, (_, i) => row({ t: iso(Date.parse("2026-10-06T08:00:00Z") + i), rc: "auxiliary", cls: "aux", ag: 1, aid: `c${i}`, nt: 3 }));
+  const a = (await verdictOf([old, ...clean])).metrics.T2;
+  assert.equal(a.status, "FAIL");
+  assert.match(a.reason, /; the newest is dated 2026-10-05T10:00:00\.000Z: if the router was fixed after that, --since 2026-10-05T10:00:01\.000Z starts the window just after it \(the bound applies to EVERY metric, T1 and T4 as well as T2, and what it discards is recorded as window\.excludedByFrom;/);
+  const b = (await verdictOf([old, ...clean], { sinceDate: "2026-10-05T10:00:01.000Z" })).metrics.T2;           // the instant excludes the old row: nothing left to fail
+  assert.equal(b.status, "INSUFFICIENT"); assert.equal(b.n, 5); assert.ok(!/--since/.test(b.reason));
+  const c = (await verdictOf([old, ...clean], { sinceDate: "2026-10-05T10:00:00.000Z" })).metrics.T2;           // an instant that does not exclude it: still FAIL, and the hint still names the instant that would
+  assert.equal(c.status, "FAIL"); assert.match(c.reason, /--since 2026-10-05T10:00:01\.000Z/);
+  // a violation seen only in the decision log carries the hint too; no violation, no hint
+  const dd = tmp(); writeLog(dd, "classify.jsonl", [row({ cls: "aux", ag: 1, nt: 0, aid: "x" })]);
+  writeLog(dd, "decisions.jsonl", [decision({ t: iso(Date.parse("2026-10-05T23:59:00Z")), tools: 0, ag: 1, bl: 0, ret: "groq/g1" })]);
+  const e = (await evalDir(dd)).record.metrics.T2;
+  assert.equal(e.status, "FAIL"); assert.match(e.reason, /the newest is dated 2026-10-05T23:59:00\.000Z.*--since 2026-10-05T23:59:01\.000Z/);
+  assert.ok(!/--since/.test((await verdictOf(clean)).metrics.T2.reason));
+  const f2 = (await verdictOf([old, ...clean], { sinceDate: "2026-10-05T10:00:01Z" })).metrics.T2;     // the old row is one second before the bound: excluded
+  assert.equal(f2.status, "INSUFFICIENT");
+});
+
+test("the T2 since hint also covers a violation seen only on a detector-shaped helper (no rc)", async () => {
+  const shaped = row({ t: iso(Date.parse("2026-10-04T10:00:00Z")), cls: "sub", ag: 1, bl: 0, aid: "z", nt: 0 });
+  const r = (await verdictOf([shaped])).metrics.T2;
+  assert.equal(r.status, "FAIL"); assert.match(r.reason, /the newest is dated 2026-10-04T10:00:00\.000Z.*--since 2026-10-04T10:00:01\.000Z/);
+});
+
+// ------------------------------------------------------------------ round 4: the bound's own effect is visible, the hint is an instant, a datetime states its zone, a day must exist
+test("the T2 hint is an INSTANT just after the newest violating row: on the same UTC day as clean rows it keeps them, where the next-day date would be in the future or discard them", async () => {
+  const day = Date.parse("2026-10-06T00:00:00Z");
+  const bad = row({ t: iso(day + 7 * 3600000), rc: "auxiliary", cls: "sub", ag: 1, bl: 1, aid: "h", nt: 3 });
+  const clean = Array.from({ length: 5 }, (_, i) => row({ t: iso(day + 8 * 3600000 + i), rc: "auxiliary", cls: "aux", ag: 1, aid: `c${i}`, nt: 3 }));
+  const a = (await verdictOf([bad, ...clean])).metrics.T2;
+  const hint = /--since (\d{4}-\d{2}-\d{2}T[0-9:.]+Z) starts the window just after it/.exec(a.reason);
+  assert.ok(hint, a.reason);
+  assert.equal(hint[1], iso(day + 7 * 3600000 + 1000));
+  assert.ok(Date.parse(hint[1]) < NOW, "the suggested instant is not in the future");
+  const f = fixture([bad, ...clean]);
+  const r = await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", "--since", hint[1]]);
+  assert.equal(r.code, 0, r.err);                                                   // the hint is accepted as it stands (Z, milliseconds)
+  const j = JSON.parse(r.out);
+  assert.equal(j.metrics.T2.n, 5); assert.notEqual(j.metrics.T2.status, "FAIL");   // the clean rows of the same day are kept
+  assert.equal(j.window.excludedByFrom.t2Viol, 1);
+  const nextDay = await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", "--since", "2026-10-07"]);
+  assert.equal(nextDay.code, 2); assert.match(nextDay.err, /in the future/);        // what the old hint said: refused, and it would have discarded every clean row
+});
+
+test("window.excludedByFrom records what the --since bound discarded (client rows, T1 misses, T2 violations, T4 misses, decision-log legs too), the header prints it, and nothing without a bound", async () => {
+  const before = Date.parse("2026-10-05T10:00:00Z"), after = Date.parse("2026-10-06T08:00:00Z");
+  const rows = [
+    row({ t: iso(before), rc: "subagent", cls: "main", ag: 1, bl: 1, aid: "a1", nt: 9 }),           // T1 miss
+    row({ t: iso(before + 1), rc: "auxiliary", cls: "sub", ag: 1, bl: 1, aid: "h1", nt: 3 }),      // T2 violation
+    row({ t: iso(before + 2), rc: "main", cls: "sub" }),                                           // T4 miss
+    row({ t: iso(before + 3), rc: "main", cls: "main" }),                                          // a clean row: discarded, not a violation
+    row({ t: iso(before + 4), hasSid: false, sid: "s9zzzzzz", rc: "main", cls: "sub" }),           // probe traffic: not a client row
+    row({ t: iso(NOW - 40 * DAY), rc: "main", cls: "sub" }),                                       // older than the window anyway: not discarded BY the bound
+    row({ t: iso(after), rc: "main", cls: "main" }),
+  ];
+  const f = fixture(rows);
+  writeLog(f.sub, "decisions.jsonl", [decision({ t: iso(before + 10), tools: 0, ag: 1, bl: 0, ret: "groq/g1" }), decision({ t: iso(before + 11), act: "main-learn", role: "main", ag: 1, bl: 0, tools: 5 }),
+    decision({ t: iso(after), tools: 0, ag: 1, bl: 0, ret: "groq/g1" })]);
+  const none = JSON.parse((await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes"])).out);
+  assert.equal(none.window.excludedByFrom, null); assert.equal(none.window.from, null);
+  const r = await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", "--since", "2026-10-06"]);
+  const j = JSON.parse(r.out);
+  assert.deepEqual(j.window.excludedByFrom, { rows: 4, t1Miss: 1, t2Viol: 2, t4Miss: 2, violations: 5 });
+  assert.equal(j.populations.clientCounted, 1);                                      // only the row after the bound is in the verdict
+  assert.equal(j.metrics.T2.rewritten, 1);                                           // the decision row AFTER the bound still counts
+  const t = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-06"]);
+  assert.match(t.out, /bounded from 2026-10-06T00:00:00\.000Z by --since: discarded 4 client rows incl. 5 violations \(T1 misses 1, T2 2, T4 2\); the bound applies to every metric/);
+  assert.match(t.out, /^CLASSIFIER ACCURACY: \w+ /);
+  const w = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-06", "--write", "yes", "--live", "yes"]);
+  assert.equal(w.code, 0);
+  const rec = JSON.parse(fs.readFileSync(path.join(f.sub, "accuracy.json"), "utf8"));
+  assert.equal(rec.window.from, "2026-10-06T00:00:00.000Z"); assert.equal(rec.window.excludedByFrom.violations, 5);
+  assert.match(A.USAGE, /in EVERY metric \(T1, T2, T4 and T5 alike, not T2 only\)/);
+});
+
+test("--since DATETIME must state its zone (Z or an offset) and the day must exist", async () => {
+  const f = fixture([row({ t: iso(Date.parse("2026-10-06T08:30:00Z")) })]);
+  const run = (since) => cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", "--since", since]);
+  for (const bare of ["2026-10-05T10:00", "2026-10-05T10:00:00", "2026-10-05T10:00:00.250"]) { const r = await run(bare); assert.equal(r.code, 2, bare); assert.match(r.err.split(String.fromCharCode(10))[0], /needs Z or an offset/); }
+  assert.equal((await run("2026-10-06T10:00:00+02:00")).code, 0);
+  assert.equal(JSON.parse((await run("2026-10-06T10:00:00+02:00")).out).window.from, "2026-10-06T08:00:00.000Z");   // the offset is converted, not dropped
+  assert.equal(JSON.parse((await run("2026-10-06T08:30:00.000Z")).out).populations.clientCounted, 1);               // the bound is inclusive
+  assert.equal(JSON.parse((await run("2026-10-06T08:30:00.001Z")).out).populations.clientCounted, 0);
+  for (const bad of ["2026-02-30", "2026-04-31", "2026-02-29", "2026-02-30T10:00:00Z", "2026-13-01", "2026-00-10", "2026-06-00", "0050-01-01", "2026-10-06T25:00:00Z"]) assert.equal((await run(bad)).code, 2, bad);
+  assert.equal((await run("2024-02-29")).code, 0);                                    // a real leap day
+  assert.equal((await run("2026-01-31")).code, 0);
 });

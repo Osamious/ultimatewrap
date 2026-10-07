@@ -233,24 +233,24 @@ export function compareShares(modelled, observed, top = 8) {
 // ------------------------------------------------------------------ the evaluator
 const obsAcc = () => ({ n: 0, keep: 0, moved: 0, none: 0, byProvider: new Map(), byModel: new Map(), askedByProvider: new Map() });
 const armsOf = () => ({ sub: 0, exempt: 0, main: 0, other: 0 });
-function newAcc(nowMs, sinceMsV) {
+function newAcc(nowMs, sinceMsV, fromMs = null) {
   const win = Math.min(sinceMsV, THRESHOLDS.maxAgeDays * DAY_MS);
   return {
-    cutoff: nowMs - win, nowMs, windowMs: win,
+    cutoff: Math.max(nowMs - win, fromMs ?? -Infinity), nowMs, windowMs: win, fromMs, excl: fromMs === null ? null : newAcc(nowMs, sinceMsV, null),
     rows: 0, inWindow: 0, future: 0, probe: 0, probeAgentShaped: 0, malformed: 0, noToolCount: 0, client: 0, counted: 0, newest: 0, oldest: Infinity,
     cls: { main: 0, sub: 0, aux: 0, exempt: 0, other: 0 }, sessionCounts: new Map(), days: new Set(),
     rcLogged: 0, atLogged: 0,
-    cons: { sub: { n: 0, ok: 0 }, main: { n: 0, ok: 0 } },          // detector consensus: REPORTED, never gated (the class is a function of these signals)
+    cons: { sub: { n: 0, ok: 0 }, main: { n: 0, ok: 0 }, helperExcluded: 0 },          // detector consensus: REPORTED, never gated (the class is a function of these signals)
     t1: { n: 0, sub: 0, exempt: 0, missBy: { main: 0, aux: 0, other: 0 }, agents: new Map(), agentsCapped: false },   // rc-labelled tool-carrying subagent requests; agents: key -> missed?
     single: { n: 0, sub: 0 },                                      // exactly one detector, no rc: uncorroborated
     subTypes: new Map(), builtAgents: new Set(), agentsCapped: false,
     toolless: { n: 0 },
-    helper: { rc: { n: 0, aux: 0, viol: armsOf(), passthroughMain: 0, byType: new Map() }, shaped: { n: 0, aux: 0, viol: armsOf() }, unlabelledMain: 0 },
+    helper: { lastViolMs: 0, rc: { n: 0, aux: 0, viol: armsOf(), passthroughMain: 0, byType: new Map() }, shaped: { n: 0, aux: 0, viol: armsOf() }, unlabelledMain: 0 },
     main: { n: 0, notMain: armsOf(), sessions: new Set(), models: new Map() },   // rc-labelled main requests
     builtIn: { n: 0, noAgentId: 0, agents: new Set() },
     matrix: {},
     mainBySid: new Map(), subAgg: new Map(), subRequests: 0, subAggDropped: 0, askMain: { known: 0, same: 0 },
-    dec: { rows: 0, probe: 0, helperRows: 0, helperRewritten: 0, mainLearnNonMain: 0, observed: obsAcc(), observedLive: obsAcc(), hashes: new Set() },
+    dec: { lastRewriteMs: 0, rows: 0, probe: 0, helperRows: 0, helperRewritten: 0, mainLearnNonMain: 0, observed: obsAcc(), observedLive: obsAcc(), hashes: new Set() },
     ag: { rows: 0, probe: 0, observed: obsAcc() },
     hash: crypto.createHash("sha256"),
   };
@@ -265,7 +265,7 @@ function feedClass(acc, o) {
   acc.rows += 1;
   const r = normClassRow(o);
   if (!r) { acc.malformed += 1; return; }
-  if (r.ms < acc.cutoff) return;
+  if (r.ms < acc.cutoff) { if (acc.excl) feedClass(acc.excl, o); return; }   // before the --since bound: counted in a side accumulator, so the bound's effect is visible, never in the verdict
   if (r.ms > acc.nowMs + THRESHOLDS.futureToleranceMs) { acc.future += 1; return; }   // a future-dated line is a clock fault (and could mint a second UTC day): not counted
   acc.inWindow += 1;
   if (r.probe) { acc.probe += 1; if (r.ag || r.bl) acc.probeAgentShaped += 1; return; }
@@ -282,7 +282,9 @@ function feedClass(acc, o) {
   const agentShaped = r.ag || r.bl, tools = r.nt > 0, key = agentKey(r);
   const rcSub = r.rc === "subagent" || r.rc === "workflow", rcHelper = r.rc === "compaction" || r.rc === "auxiliary";
   // ---- detector consensus (REPORTED only): what the two signals say, whatever rc says
-  if (!agentShaped) { acc.cons.main.n += 1; if (r.cls === "main") acc.cons.main.ok += 1; }
+  // an rc-labelled helper is routed to the aux path whatever its detectors say (router v4), so it is NOT a consensus sample: counted apart, never as a regression of the sub or main counters
+  if (rcHelper) acc.cons.helperExcluded += 1;
+  else if (!agentShaped) { acc.cons.main.n += 1; if (r.cls === "main") acc.cons.main.ok += 1; }
   else if (r.ag && r.bl && tools) { acc.cons.sub.n += 1; if (r.cls === "sub" || r.cls === "exempt") acc.cons.sub.ok += 1; }
   // ---- types and agents
   if (agentShaped && tools && r.rc !== "main" && !rcHelper) {
@@ -311,12 +313,12 @@ function feedClass(acc, o) {
     } else { acc.toolless.n += 1; addMatrix(acc, "sub-toolless", r.cls); }
   } else if (rcHelper) {
     const h = acc.helper.rc; h.n += 1;
-    if (r.cls === "aux") h.aux += 1; else if (helperViolation(r.cls, agentShaped)) h.viol[r.cls] += 1; else h.passthroughMain += 1;
+    if (r.cls === "aux") h.aux += 1; else if (helperViolation(r.cls, agentShaped)) { h.viol[r.cls] += 1; acc.helper.lastViolMs = Math.max(acc.helper.lastViolMs, r.ms); } else h.passthroughMain += 1;
     bumpType(h.byType, r.rc);
     addMatrix(acc, `helper-${r.rc}`, r.cls);
   } else if (agentShaped && !tools) {
     const h = acc.helper.shaped; h.n += 1;                          // helper-shaped by the detectors alone: reported, and a violation still fails (a router that calls it sub is wrong whatever rc says)
-    if (r.cls === "aux") h.aux += 1; else if (helperViolation(r.cls, true)) h.viol[r.cls] += 1;
+    if (r.cls === "aux") h.aux += 1; else if (helperViolation(r.cls, true)) { h.viol[r.cls] += 1; acc.helper.lastViolMs = Math.max(acc.helper.lastViolMs, r.ms); }
     addMatrix(acc, "helper-shaped", r.cls);
   } else if (!agentShaped && !tools && !r.rc && r.cls === "main") acc.helper.unlabelledMain += 1;
   if (!r.rc && agentShaped && tools && !(r.ag && r.bl)) { acc.single.n += 1; if (r.cls === "sub" || r.cls === "exempt") acc.single.sub += 1; addMatrix(acc, "single-detector", r.cls); }
@@ -342,10 +344,14 @@ function feedObserved(o, d) {
 }
 function feedDecision(acc, o, liveHash) {
   const d = normDecision(o);
+  if (d && d.ms < acc.cutoff && acc.excl) feedDecision(acc.excl, o, liveHash);
   if (!d || d.ms < acc.cutoff || d.ms > acc.nowMs + THRESHOLDS.futureToleranceMs) return;
   acc.dec.rows += 1;
   if (isProbeSid(d.sid)) { acc.dec.probe += 1; return; }
-  if ((d.ag || d.bl) && d.tools === 0) { acc.dec.helperRows += 1; if (d.asked && d.ret && d.ret !== d.asked) acc.dec.helperRewritten += 1; }
+  if ((d.ag || d.bl) && d.tools === 0) { acc.dec.helperRows += 1; if (d.asked && d.ret && d.ret !== d.asked) { acc.dec.helperRewritten += 1; acc.dec.lastRewriteMs = Math.max(acc.dec.lastRewriteMs, d.ms); } }
+  // Only a main-learn row with an agent id or the billing flag is seen here. NOT detected: a main-class rc helper (rc auxiliary or compaction, no detector, Agent tool present) that router v3 sends down the
+  // main path, where it calls learnMain with the helper's asked model; its decision row carries no detector and cannot be told from a real main request. Router v4 routes every rc helper to the aux path,
+  // so it can no longer reach learnMain: the leg is only a gap against v3 logs, and nothing is polluted while the helper asks the main model itself. Deliberately no counter for it.
   if (d.act === "main-learn" && (d.ag || d.bl)) acc.dec.mainLearnNonMain += 1;
   if (d.role === "sub") {
     if (d.ph && OBSERVED_ACTS.has(d.act)) acc.dec.hashes.add(d.ph);
@@ -361,6 +367,13 @@ function feedAgent(acc, o) {
   feedObserved(acc.ag.observed, a);
 }
 
+/** What the --since bound discarded (null without a bound): client rows before it, and how many of them were T1 misses, T2 violations or T4 misses, so a bound can never hide its own effect. */
+function excludedByFrom(acc) {
+  const x = acc.excl;
+  if (!x) return null;
+  const t1Miss = x.t1.missBy.main + x.t1.missBy.aux + x.t1.missBy.other, t2Viol = sumArms(x.helper.rc.viol) + sumArms(x.helper.shaped.viol) + x.dec.helperRewritten, t4Miss = sumArms(x.main.notMain) + x.dec.mainLearnNonMain;
+  return { rows: x.counted, t1Miss, t2Viol, t4Miss, violations: t1Miss + t2Viol + t4Miss };
+}
 const mk = (id, name, status, reason, extra = {}) => ({ id, name, status, reason, ...extra });
 const sumArms = (a) => a.sub + a.exempt + a.main + a.other;
 /**
@@ -395,14 +408,16 @@ export function evaluate(acc, { versions = {}, nowMs = acc.nowMs } = {}) {
   // ---- detector consensus: REPORTED, never gated
   {
     const c = acc.cons;
-    metrics.CONS = mk("CONS", "detector consensus", "REPORTED", `${num(c.sub.ok)} of ${num(c.sub.n)} requests with both detectors set and tools were classified sub, ${num(c.main.ok)} of ${num(c.main.n)} requests with neither detector set were classified main; the router's class is a function of these two signals, so this checks only that it agrees with itself and is not gated`, { subN: c.sub.n, subOk: c.sub.ok, mainN: c.main.n, mainOk: c.main.ok });
+    metrics.CONS = mk("CONS", "detector consensus", "REPORTED", `${num(c.sub.ok)} of ${num(c.sub.n)} requests with both detectors set and tools were classified sub, ${num(c.main.ok)} of ${num(c.main.n)} requests with neither detector set were classified main (${num(c.helperExcluded)} rc-labelled helper rows are left out of both counts: the router routes them to the aux path whatever their detectors say); the router's class is a function of these two signals, so this checks only that it agrees with itself and is not gated`, { helperExcluded: c.helperExcluded, subN: c.sub.n, subOk: c.sub.ok, mainN: c.main.n, mainOk: c.main.ok });
   }
   // ---- T2: rc-labelled helpers, plus the zero-tolerance legs
   const hr = acc.helper.rc, hs = acc.helper.shaped;
   const hViol = sumArms(hr.viol) + sumArms(hs.viol) + acc.dec.helperRewritten;
   {
     let status, reason;
-    if (hViol > 0) { status = "FAIL"; reason = `${hViol} helper calls classified sub, exempt or other (or main with a detector set), or returned on another model: ${sumArms(hr.viol)} of ${num(hr.n)} rc-labelled helper requests, ${sumArms(hs.viol)} of ${num(hs.n)} detector-shaped helper requests, ${acc.dec.helperRewritten} of ${num(acc.dec.helperRows)} helper-shaped decision-log rows`; }
+    const lastViol = Math.max(acc.helper.lastViolMs, acc.dec.lastRewriteMs), instantAfter = (ms) => new Date(ms + 1000).toISOString();
+    const sinceHint = lastViol > 0 && (acc.fromMs === null || acc.fromMs <= lastViol) ? `; the newest is dated ${new Date(lastViol).toISOString()}: if the router was fixed after that, --since ${instantAfter(lastViol)} starts the window just after it (the bound applies to EVERY metric, T1 and T4 as well as T2, and what it discards is recorded as window.excludedByFrom; older rows keep the old misclassification until they age out of the ${T.maxAgeDays}-day window)` : "";
+    if (hViol > 0) { status = "FAIL"; reason = `${hViol} helper calls classified sub, exempt or other (or main with a detector set), or returned on another model: ${sumArms(hr.viol)} of ${num(hr.n)} rc-labelled helper requests, ${sumArms(hs.viol)} of ${num(hs.n)} detector-shaped helper requests, ${acc.dec.helperRewritten} of ${num(acc.dec.helperRows)} helper-shaped decision-log rows${sinceHint}`; }
     else if (hr.n < T.t2MinHelpers) { status = "INSUFFICIENT"; reason = `${num(hr.n)} of ${num(T.t2MinHelpers)} rc-labelled helper requests (compaction or auxiliary); no helper call rewritten so far in ${num(hs.n)} detector-shaped helper requests`; missing.push(`T2 needs ${num(T.t2MinHelpers - hr.n)} more rc-labelled helper requests`); }
     else { status = "PASS"; reason = `0 helper calls rewritten of ${num(hr.n)} rc-labelled helper requests (${num(hr.passthroughMain)} passed through as main, never rewritten)`; }
     metrics.T2 = mk("T2", "helper calls rewritten", status, reason, { n: hr.n, aux: hr.aux, rewritten: hViol, classifiedSub: hr.viol.sub + hs.viol.sub, passthroughMain: hr.passthroughMain, detectorShaped: hs.n,
@@ -431,8 +446,8 @@ export function evaluate(acc, { versions = {}, nowMs = acc.nowMs } = {}) {
   }
   // ---- T6
   {
-    const ok = typeof versions.cc === "string" && versions.cc && typeof versions.ccr === "string" && versions.ccr;
-    metrics.T6 = mk("T6", "versions recorded", ok ? "PASS" : "INSUFFICIENT", ok ? `Claude Code ${clip(versions.cc, 40)}, CCR ${clip(versions.ccr, 40)}, measured ${new Date(nowMs).toISOString().slice(0, 10)}` : "Claude Code and CCR versions are not recorded: pass --cc-version and --ccr-version (an update of either invalidates the verdict)", { cc: versions.cc ?? null, ccr: versions.ccr ?? null });
+    const cc = wholeVersion(versions.cc, { suffix: "(Claude Code)" }), ccr = wholeVersion(versions.ccr), ok = !!(cc && ccr);
+    metrics.T6 = mk("T6", "versions recorded", ok ? "PASS" : "INSUFFICIENT", ok ? `Claude Code ${clip(cc, 40)}, CCR ${clip(ccr, 40)}, measured ${new Date(nowMs).toISOString().slice(0, 10)}` : "Claude Code and CCR versions are not recorded as whole versions (x.y.z): pass --cc-version and --ccr-version (an update of either invalidates the verdict)", { cc: cc ?? null, ccr: ccr ?? null });
     if (!ok) missing.push("T6 needs --cc-version and --ccr-version");
   }
   // ---- minimums
@@ -489,8 +504,8 @@ const tallyOut = (t) => ({ mode: t.mode, source: t.source, rows: t.rows, request
 /**
  * The whole evaluation of a state folder. `p` = resolved paths ({stateDir, ...}). Returns {record, text}: record is the JSON shape, text the lines.
  */
-export async function runEvaluation(p, { nowMs = Date.now(), sinceMsV = 30 * DAY_MS, versions = {}, tally = true, providersFile = false, sample = null } = {}) {
-  const acc = newAcc(nowMs, sinceMsV);
+export async function runEvaluation(p, { nowMs = Date.now(), sinceMsV = 30 * DAY_MS, sinceDate = null, versions = {}, tally = true, providersFile = false, sample = null } = {}) {
+  const acc = newAcc(nowMs, sinceMsV, sinceDate === null ? null : Date.parse(sinceDate));
   let liveHash = null;
   const lv = readJsonFile(p.compiledFile ?? path.join(p.stateDir, "policy.json"));
   if (lv.ok && typeof lv.value?.contentHash === "string") liveHash = lv.value.contentHash.slice(0, 16);
@@ -516,9 +531,9 @@ export async function runEvaluation(p, { nowMs = Date.now(), sinceMsV = 30 * DAY
   }
   const evidence = { classRowsCounted: acc.counted, sha256: acc.hash.digest("hex"), policyContentHash: lv.ok && typeof lv.value?.contentHash === "string" ? lv.value.contentHash : null };
   const record = {
-    schema: ACCURACY_SCHEMA, verdict: ev.verdict, at: new Date(nowMs).toISOString(), ccVersion: versions.cc ?? null, ccrVersion: versions.ccr ?? null,
+    schema: ACCURACY_SCHEMA, verdict: ev.verdict, at: new Date(nowMs).toISOString(), ccVersion: ev.metrics.T6.cc, ccrVersion: ev.metrics.T6.ccr,
     minSamples: MIN_SAMPLES, thresholds: THRESHOLDS, matrix: ev.matrix, groundTruthMissing: ev.groundTruthMissing,
-    window: { since: new Date(acc.cutoff).toISOString(), until: new Date(nowMs).toISOString(), days: ev.days, newestAgeDays: ev.newestAgeDays === null ? null : +ev.newestAgeDays.toFixed(2) },
+    window: { from: sinceDate === null ? null : new Date(acc.fromMs).toISOString(), excludedByFrom: excludedByFrom(acc), since: new Date(acc.cutoff).toISOString(), until: new Date(nowMs).toISOString(), days: ev.days, newestAgeDays: ev.newestAgeDays === null ? null : +ev.newestAgeDays.toFixed(2) },
     populations: { classifierLines: acc.rows, inWindow: acc.inWindow, probeExcluded: acc.probe, probeAgentShaped: acc.probeAgentShaped, futureExcluded: acc.future, unreadableOrMalformed: acc.malformed + clog.unreadableLines, noToolCount: acc.noToolCount, clientCounted: acc.counted, sessions: acc.sessionCounts.size, sessionsQualified: ev.sessions, rcLogged: acc.rcLogged, atLogged: acc.atLogged,
       classes: acc.cls, decisionRows: acc.dec.rows, decisionProbeExcluded: acc.dec.probe, agentRows: acc.ag.rows, agentProbeExcluded: acc.ag.probe },
     metrics: ev.metrics, age: ev.age, minimums: ev.minimums, missing: ev.missing, typeCounts: ev.typeCounts, helperTypeCounts: ev.helperTypeCounts,
@@ -543,7 +558,7 @@ const fileLine = (name, l) => {
 const shareLine = (label, n, of) => `${label} ${num(Math.round(n))} (${pctText(n, of)})`;
 export function renderText(r) {
   const L = [], P = r.populations;
-  L.push(`CLASSIFIER ACCURACY: ${r.verdict}   (window ${r.window.since.slice(0, 10)} to ${r.window.until.slice(0, 10)}, newest counted request ${r.window.newestAgeDays === null ? "n/a" : `${r.window.newestAgeDays} days`} old)`);
+  L.push(`CLASSIFIER ACCURACY: ${r.verdict}   (window ${r.window.since.slice(0, 10)} to ${r.window.until.slice(0, 10)}${r.window.from ? `, bounded from ${r.window.from} by --since: discarded ${num(r.window.excludedByFrom.rows)} client rows incl. ${num(r.window.excludedByFrom.violations)} violations (T1 misses ${r.window.excludedByFrom.t1Miss}, T2 ${r.window.excludedByFrom.t2Viol}, T4 ${r.window.excludedByFrom.t4Miss}); the bound applies to every metric` : ""}, newest counted request ${r.window.newestAgeDays === null ? "n/a" : `${r.window.newestAgeDays} days`} old)`);
   if (r.groundTruthMissing) L.push(`GROUND TRUTH MISSING: rc is logged on 0 of ${num(P.clientCounted)} rows; ${HINT_LINE}. Without it T1, T2 and T4 can only show that the router agrees with itself, so they cannot reach PASS. If the setting is already in ~/.claude/settings.json, only Claude Code sessions started after it send rc; running sessions keep the old behaviour until restarted.`);
   L.push(fileLine("classifier log", r.logs.classify));
   L.push(fileLine("decision log", r.logs.decisions));
@@ -594,9 +609,10 @@ export function renderText(r) {
 
 // ------------------------------------------------------------------ CLI
 export const USAGE = [
-  "usage: node keysync/subagent-accuracy.mjs [--since 7d|30d] [--json yes] [--write yes --live yes] [--cc-version V --ccr-version V] [--tally no]",
+  "usage: node keysync/subagent-accuracy.mjs [--since 7d|30d|DATE] [--json yes] [--write yes --live yes] [--cc-version V --ccr-version V] [--tally no]",
   "  Reads the router's classifier, decision and agent logs (read-only), excludes sessionless probe traffic, prints T1..T6 with PASS, FAIL or INSUFFICIENT and the shadow tally of the three modes.",
   "  A PASS needs rc (the client's own request class: CLAUDE_CODE_GATEWAY_HINT_HEADERS=1); detector-only evidence stays INSUFFICIENT.",
+  "  --since DATE  start the window at a date (2026-10-07 or 2026-10-07T09:30:00Z, UTC): rows logged before it are not counted, in EVERY metric (T1, T2, T4 and T5 alike, not T2 only). A datetime needs Z or an offset. Use it after a router fix, so rows from before the fix do not fail T2. Printed in the header with what it discarded, recorded in accuracy.json as window.from and window.excludedByFrom. Default: none.",
   "  --since       evidence window, a number and h or d, at most 30d (a written PASS expires after 30 days; older lines are not counted). Default 30d. The newest counted request must be under 7 days old.",
   "  --json yes    print the whole record as JSON and nothing else on stdout (notes go to stderr).",
   "  --write yes --live yes   write state/subagent/accuracy.json (atomic). Dry by default; BOTH flags are required. The file replaces the previous verdict, including a PASS (a warning says so).",
@@ -605,6 +621,13 @@ export const USAGE = [
   "  Test flags (a fixture run): --state-dir DIR plus any of --snapshot-file --bench-file --observed-file --tool-fidelity-file --settings-file --default-model-file --registry-file --key-choices-file --vault-providers-file --providers-file --policy-file.",
   "  Exit: 0 computed (any verdict, INSUFFICIENT included), 1 write or read failure, 2 usage.",
 ].join("\n");
+const ISO_RE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))?$/;   // a date, or a datetime that STATES its zone (Z or an offset): a bare datetime would mean a different instant on every machine
+const ISO_NO_ZONE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+/** True when the date part names a real day: 2026-02-30 would be read as March 2 by the parser, so it is refused (the date is rebuilt from its parts and must give the same text back). */
+const realDay = (v) => { const [y, m, d] = v.slice(0, 10).split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)).toISOString().slice(0, 10) === v.slice(0, 10); };
+/** The enforce gate's own rule (keysync/subagent-policy.mjs wholeVersion): x.y.z with an optional -pre or +build tag, nothing else; `suffix` is stripped first (Claude Code prints "2.1.289 (Claude Code)"). null when it is not a whole version. */
+const VERSION_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
+export const wholeVersion = (v, { suffix = "" } = {}) => { let t = typeof v === "string" ? v.trim() : ""; if (suffix && t.endsWith(suffix)) t = t.slice(0, -suffix.length).trim(); return VERSION_RE.test(t) ? t : null; };
 const VALUE_FLAGS = ["since", "cc-version", "ccr-version", ...FILE_FLAGS];
 const BOOL_FLAGS = ["json", "write", "live", "tally"];
 export function parseAccuracyArgs(argv) {
@@ -619,12 +642,22 @@ export function parseAccuracyArgs(argv) {
     if (v === undefined || v.startsWith("--")) throw bad(`flag ${a} needs an explicit value${BOOL_FLAGS.includes(name) ? " (yes or no)" : ""}`);
     i += 1;
     if (BOOL_FLAGS.includes(name)) { if (v !== "yes" && v !== "no") throw bad(`flag ${a} takes exactly yes or no, found ${JSON.stringify(clip(v, 20))}`); flags[name] = v === "yes"; continue; }
+    if (name === "since" && ISO_NO_ZONE_RE.test(v)) throw bad(`flag --since ${JSON.stringify(clip(v, 40))} needs Z or an offset (like 2026-10-07T09:30:00Z or 2026-10-07T09:30:00+02:00): a datetime without a zone is a different instant on every machine`);
+    if (name === "since" && ISO_RE.test(v)) {                       // a date bounds the START of the window (rows logged before it are not counted); a duration is the length of the window
+      const ms = Date.parse(v);
+      if (!Number.isFinite(ms) || !realDay(v)) throw bad(`flag --since takes a real date like 2026-10-07 or 2026-10-07T09:30:00Z, found ${JSON.stringify(clip(v, 40))}`);
+      flags.sinceDate = new Date(ms).toISOString(); continue;
+    }
     if (name === "since") {
-      if (!/^[1-9]\d{0,3}[hd]$/.test(v)) throw bad(`flag --since takes a number and h or d, like 24h, 7d or 30d, found ${JSON.stringify(clip(v, 20))}`);
+      if (!/^[1-9]\d{0,3}[hd]$/.test(v)) throw bad(`flag --since takes a number and h or d, like 24h, 7d or 30d, or a date like 2026-10-07, found ${JSON.stringify(clip(v, 20))}`);
       if (Number(v.slice(0, -1)) * UNITS[v.slice(-1)] > THRESHOLDS.maxAgeDays * DAY_MS) throw bad(`flag --since ${v} is longer than ${THRESHOLDS.maxAgeDays}d: a written PASS expires after ${THRESHOLDS.maxAgeDays} days, so older traffic is never counted`);
       flags[name] = v; continue;
     }
-    if (name === "cc-version" || name === "ccr-version") { if (!/^[A-Za-z0-9._+~-]{1,40}$/.test(v)) throw bad(`flag ${a} takes a version of letters, digits and . _ + ~ -, found ${JSON.stringify(clip(v, 40))}`); flags[name] = v; continue; }
+    if (name === "cc-version" || name === "ccr-version") {
+      const w = wholeVersion(v, name === "cc-version" ? { suffix: "(Claude Code)" } : {});
+      if (!w) throw bad(`flag ${a} takes a whole version, x.y.z with an optional -pre or +build tag${name === "cc-version" ? ` (the text \`claude --version\` prints, like "2.1.289 (Claude Code)", is accepted)` : ""}, found ${JSON.stringify(clip(v, 40))}: the enforce gate refuses anything else`);
+      flags[name] = w; continue;
+    }
     if (v.trim() === "") throw bad(`flag ${a} needs a file path`);
     flags[name] = v;
   }
@@ -638,11 +671,12 @@ export async function runSubagentAccuracy(argv, io, env = process.env, opts = {}
   let flags;
   try { flags = parseAccuracyArgs(argv); } catch (e) { if (e instanceof PolicyError) { io.err(e.message); io.err(USAGE); return 2; } throw e; }
   const nowMs = opts.now ?? Date.now();
+  if (flags.sinceDate && Date.parse(flags.sinceDate) > nowMs + THRESHOLDS.futureToleranceMs) { io.err(`flag --since ${flags.sinceDate} is in the future: the window would be empty`); return 2; }
   let p;
   try { p = resolvePaths(flags, { env }); } catch (e) { if (e instanceof PolicyError) { io.err(e.message); return 2; } throw e; }
   let rec;
   try {
-    rec = await runEvaluation(p, { nowMs, sinceMsV: flags.since ? Number(flags.since.slice(0, -1)) * UNITS[flags.since.slice(-1)] : 30 * DAY_MS, versions: { cc: flags["cc-version"], ccr: flags["ccr-version"] }, tally: flags.tally !== false, providersFile: !!flags["providers-file"] });
+    rec = await runEvaluation(p, { nowMs, sinceDate: flags.sinceDate ?? null, sinceMsV: flags.since ? Number(flags.since.slice(0, -1)) * UNITS[flags.since.slice(-1)] : 30 * DAY_MS, versions: { cc: flags["cc-version"], ccr: flags["ccr-version"] }, tally: flags.tally !== false, providersFile: !!flags["providers-file"] });
   } catch (e) { io.err(`cannot evaluate: ${clip(e?.code ?? e?.message ?? "error", 120)}`); return 1; }
   const note = flags.json ? io.err : io.out;
   if (flags.json) io.out(JSON.stringify(rec.record, null, 2)); else for (const l of rec.text) io.out(l);
