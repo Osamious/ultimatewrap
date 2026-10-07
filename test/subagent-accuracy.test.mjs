@@ -748,7 +748,7 @@ test("--since DATE bounds the START of the window: earlier rows are not counted,
   const day = JSON.parse((await run("2026-10-06")).out);
   assert.equal(day.populations.clientCounted, 1); assert.equal(day.window.from, "2026-10-06T00:00:00.000Z");
   const text = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-06"]);
-  assert.match(text.out, /\(window 2026-10-06 to 2026-10-06, bounded from 2026-10-06T00:00:00\.000Z by --since: discarded 2 client rows incl. 0 violations \(T1 misses 0, T2 0, T4 0\); the bound applies to every metric, newest counted request/);
+  assert.match(text.out, /\(window 2026-10-06 to 2026-10-06, bounded from 2026-10-06T00:00:00\.000Z by --since: discarded 2 client rows incl. 0 violations \(T1 misses 0, T2 0, T4 0, T5 0\); the bound applies to every metric, newest counted request/);
   assert.equal((await run("2026-10-06T23:00:00Z")).code, 2);                        // after now (2026-10-06T12:00Z): an empty window
   assert.match((await run("2026-10-06T23:00:00Z")).err, /in the future/);
   assert.equal((await run("2026-13-45")).code, 2);
@@ -815,6 +815,7 @@ test("window.excludedByFrom records what the --since bound discarded (client row
     row({ t: iso(before + 1), rc: "auxiliary", cls: "sub", ag: 1, bl: 1, aid: "h1", nt: 3 }),      // T2 violation
     row({ t: iso(before + 2), rc: "main", cls: "sub" }),                                           // T4 miss
     row({ t: iso(before + 3), rc: "main", cls: "main" }),                                          // a clean row: discarded, not a violation
+    row({ t: iso(before + 5), cls: "sub", ag: 0, bl: 1, nt: 9 }),                                 // T5: the billing flag without an agent id
     row({ t: iso(before + 4), hasSid: false, sid: "s9zzzzzz", rc: "main", cls: "sub" }),           // probe traffic: not a client row
     row({ t: iso(NOW - 40 * DAY), rc: "main", cls: "sub" }),                                       // older than the window anyway: not discarded BY the bound
     row({ t: iso(after), rc: "main", cls: "main" }),
@@ -826,16 +827,16 @@ test("window.excludedByFrom records what the --since bound discarded (client row
   assert.equal(none.window.excludedByFrom, null); assert.equal(none.window.from, null);
   const r = await cli(["--state-dir", f.root, "--tally", "no", "--json", "yes", "--since", "2026-10-06"]);
   const j = JSON.parse(r.out);
-  assert.deepEqual(j.window.excludedByFrom, { rows: 4, t1Miss: 1, t2Viol: 2, t4Miss: 2, violations: 5 });
+  assert.deepEqual(j.window.excludedByFrom, { rows: 5, t1Miss: 1, t2Viol: 2, t4Miss: 2, t5Disagree: 1, violations: 6 });
   assert.equal(j.populations.clientCounted, 1);                                      // only the row after the bound is in the verdict
   assert.equal(j.metrics.T2.rewritten, 1);                                           // the decision row AFTER the bound still counts
   const t = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-06"]);
-  assert.match(t.out, /bounded from 2026-10-06T00:00:00\.000Z by --since: discarded 4 client rows incl. 5 violations \(T1 misses 1, T2 2, T4 2\); the bound applies to every metric/);
+  assert.match(t.out, /bounded from 2026-10-06T00:00:00\.000Z by --since: discarded 5 client rows incl. 6 violations \(T1 misses 1, T2 2, T4 2, T5 1\); the bound applies to every metric/);
   assert.match(t.out, /^CLASSIFIER ACCURACY: \w+ /);
   const w = await cli(["--state-dir", f.root, "--tally", "no", "--since", "2026-10-06", "--write", "yes", "--live", "yes"]);
   assert.equal(w.code, 0);
   const rec = JSON.parse(fs.readFileSync(path.join(f.sub, "accuracy.json"), "utf8"));
-  assert.equal(rec.window.from, "2026-10-06T00:00:00.000Z"); assert.equal(rec.window.excludedByFrom.violations, 5);
+  assert.equal(rec.window.from, "2026-10-06T00:00:00.000Z"); assert.equal(rec.window.excludedByFrom.violations, 6); assert.equal(rec.window.excludedByFrom.t5Disagree, 1);
   assert.match(A.USAGE, /in EVERY metric \(T1, T2, T4 and T5 alike, not T2 only\)/);
 });
 

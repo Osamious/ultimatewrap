@@ -372,7 +372,8 @@ function excludedByFrom(acc) {
   const x = acc.excl;
   if (!x) return null;
   const t1Miss = x.t1.missBy.main + x.t1.missBy.aux + x.t1.missBy.other, t2Viol = sumArms(x.helper.rc.viol) + sumArms(x.helper.shaped.viol) + x.dec.helperRewritten, t4Miss = sumArms(x.main.notMain) + x.dec.mainLearnNonMain;
-  return { rows: x.counted, t1Miss, t2Viol, t4Miss, violations: t1Miss + t2Viol + t4Miss };
+  const t5Disagree = x.builtIn.noAgentId;
+  return { rows: x.counted, t1Miss, t2Viol, t4Miss, t5Disagree, violations: t1Miss + t2Viol + t4Miss + t5Disagree };
 }
 const mk = (id, name, status, reason, extra = {}) => ({ id, name, status, reason, ...extra });
 const sumArms = (a) => a.sub + a.exempt + a.main + a.other;
@@ -558,7 +559,7 @@ const fileLine = (name, l) => {
 const shareLine = (label, n, of) => `${label} ${num(Math.round(n))} (${pctText(n, of)})`;
 export function renderText(r) {
   const L = [], P = r.populations;
-  L.push(`CLASSIFIER ACCURACY: ${r.verdict}   (window ${r.window.since.slice(0, 10)} to ${r.window.until.slice(0, 10)}${r.window.from ? `, bounded from ${r.window.from} by --since: discarded ${num(r.window.excludedByFrom.rows)} client rows incl. ${num(r.window.excludedByFrom.violations)} violations (T1 misses ${r.window.excludedByFrom.t1Miss}, T2 ${r.window.excludedByFrom.t2Viol}, T4 ${r.window.excludedByFrom.t4Miss}); the bound applies to every metric` : ""}, newest counted request ${r.window.newestAgeDays === null ? "n/a" : `${r.window.newestAgeDays} days`} old)`);
+  L.push(`CLASSIFIER ACCURACY: ${r.verdict}   (window ${r.window.since.slice(0, 10)} to ${r.window.until.slice(0, 10)}${r.window.from ? `, bounded from ${r.window.from} by --since: discarded ${num(r.window.excludedByFrom.rows)} client rows incl. ${num(r.window.excludedByFrom.violations)} violations (T1 misses ${r.window.excludedByFrom.t1Miss}, T2 ${r.window.excludedByFrom.t2Viol}, T4 ${r.window.excludedByFrom.t4Miss}, T5 ${r.window.excludedByFrom.t5Disagree}); the bound applies to every metric` : ""}, newest counted request ${r.window.newestAgeDays === null ? "n/a" : `${r.window.newestAgeDays} days`} old)`);
   if (r.groundTruthMissing) L.push(`GROUND TRUTH MISSING: rc is logged on 0 of ${num(P.clientCounted)} rows; ${HINT_LINE}. Without it T1, T2 and T4 can only show that the router agrees with itself, so they cannot reach PASS. If the setting is already in ~/.claude/settings.json, only Claude Code sessions started after it send rc; running sessions keep the old behaviour until restarted.`);
   L.push(fileLine("classifier log", r.logs.classify));
   L.push(fileLine("decision log", r.logs.decisions));
