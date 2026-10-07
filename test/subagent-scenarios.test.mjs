@@ -394,7 +394,7 @@ function fakeWorld(bug = {}) {
   const rows = () => (w.policy && typeof w.policy === "object" ? w.policy.models : []);
   const norm = (st) => (typeof st === "number" ? { status: st, retryAfter: null } : { status: st?.status ?? 200, retryAfter: st?.retryAfter ?? null });
   const forward = (model, aid, tools) => {
-    const r = { seq: ++w.seq, method: "POST", path: "/v1/messages", model: bareOf(model), headers: aid ? { "x-claude-code-agent-id": aid, "x-claude-code-session-id": "child-sess" } : {}, toolNames: tools ? ["Bash"] : [], sent: null };
+    const r = { seq: ++w.seq, method: "POST", path: "/v1/messages", model: bareOf(model), headers: aid ? { "x-claude-code-agent-id": aid, "x-claude-code-session-id": "child-sess" } : {}, toolNames: tools ? ["Bash"] : [], sent: null, t: new Date(1_800_000_000_000 + w.seq * 1000).toISOString() };
     const st = norm(w.script.decide?.(r) ?? 200);
     r.sent = { status: st.status, retryAfter: st.retryAfter, cut: null };
     w.records.push(r);
@@ -427,7 +427,7 @@ function fakeWorld(bug = {}) {
     if (shape === "main") { w.main.set(session, model); count("main"); const st = forward(model, null, true); return { status: st.status, ms: 5, headers: {} }; }
     if (shape === "bg" || shape === "aux") { count(shape === "aux" ? "aux" : "bg"); const st = forward(bug.rewriteAux ? "uwstub/m-free" : model, aid, false); return { status: st.status, ms: 5, headers: {} }; }
     count("sub");
-    w.classify.push({ aid: String(aid).slice(0, 12), cls: bug.mainClass ? "main" : "sub" });
+    w.classify.push({ t: new Date(1_800_000_000_000 + (w.seq + 1) * 1000 - 100).toISOString(), aid: String(aid).slice(0, 12), cls: bug.mainClass ? "main" : "sub" });      // 100 ms before the stub's arrival of the request that follows
     const pol = w.policy, ms = bug.slow ? 90000 : 5;
     const warn = (c) => { if (!w.warnings.some((x) => x.code === c)) { w.warnings.push({ code: c }); publish(); } };      // a new warning code forces a status flush
     const plain = () => { const st = forward(model, aid, true); return { status: st.status, ms, headers: {} }; };
@@ -729,12 +729,14 @@ test("real mode: EACH of scenarios 1, 2, 3 and 11 sets onMain in its stub script
     return { code: 0 };
   };
   const origReset = g.prims.reset; g.prims.reset = async () => { await origReset(); };
-  const results = {};
+  const results = {}, texts = {};
   for (const id of ["1", "2", "3", "11"]) {
     current = id;
     const r = await S.runScenarios(g.prims, { only: [id], real: true });
-    results[id] = r.find((x) => x.scn.id === id).result.verdict;
+    results[id] = r.find((x) => x.scn.id === id).result.verdict; texts[id] = r.find((x) => x.scn.id === id).result.text;
   }
+  assert.ok(/gaps between the stub's arrivals \(s\): 1\.0, 1\.0/.test(texts["3"]) && /the client took \d+\.\d s in all/.test(texts["3"]), `the real scenario 3 line reports the measured schedule and the client's wall time: ${texts["3"]}`);
+  assert.ok(/start-up to the first arrival -?\d+\.\d s; last arrival to the client's exit -?\d+\.\d s; router decision to the stub's arrival at most 0\.1 s over \d+ requests/.test(texts["3"]), `the real scenario 3 line carries the edges and the router's decision times: ${texts["3"]}`);
   assert.deepEqual(seen, { 1: true, 2: true, 3: true, 11: true }, "every REAL scenario's stub script spawns a subagent");
   assert.deepEqual(results, { 1: "PASS", 2: "PASS", 3: "PASS", 11: "DEGRADED" });
 });
@@ -1558,18 +1560,20 @@ test("R10-5 scenario 11 REAL end to end against the fake sandbox: a client that 
 // ====================================================================================== fix round 11 (run 13: scenario 3 real: the client retries on its own, the judge now says what the router controls)
 const claudeOk = { code: 0, reason: "", err: "", subtype: "success", isError: false, turns: 1, denials: [], mode: "dontAsk", reasons: [], called: ["Task"], result: "x" };
 /** Evidence of scenario 3 with a REAL client: n requests of one agent at the stub (retry-count header 0..n-1), the router's counters over the same window. */
+/** arrival times (ISO) of n requests whose gaps follow the client's backoff times `factor` (1 = the nominal 0.5, 1, 2, 4, 8, 16, 32, 32... s) */
+const arrivals = (n, factor = 1.1) => { let t = Date.UTC(2026, 9, 7); return Array.from({ length: n }, (_, i) => { if (i > 0) t += Math.min(32000, 500 * 2 ** (i - 1)) * factor; return new Date(t).toISOString(); }); };
 const ev3 = (n, over = {}, counters = {}) => {
-  const recs = Array.from({ length: n }, (_, i) => { const r = rec({ model: "m-big", aid: "real-a", status: 429 }); r.headers["x-stainless-retry-count"] = String(i); return r; });
-  return { client: "real claude -p", aid: "real-a", claude: claudeOk, steer: { models: Array(6).fill("m-big"), healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] }, responses: [{ status: 429, ms: 60000 }], records: recs, nextReached: true,
+  const ts = arrivals(n), recs = Array.from({ length: n }, (_, i) => { const r = rec({ model: "m-big", aid: "real-a", status: 429 }); r.headers["x-stainless-retry-count"] = String(i); r.t = ts[i]; return r; });
+  return { client: "real claude -p", aid: "real-a", claude: claudeOk, steer: { models: Array(6).fill("m-big"), healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] }, clientWallMs: 185000, records: recs, nextReached: true,
     status0: { counters: { sub: 0, retry: 0, handoff: 0, handoffNone: 0, handoffCap: 0, coolMark: 0 } },
     status1: { counters: { sub: n + 1, retry: n - 1, handoff: 0, handoffNone: n - 1, handoffCap: 0, coolMark: 1, ...counters } }, ...over };
 };
 
 test("R11-1 scenario 3 REAL: the client's own policy is the bound (CLIENT_MAX_RETRIES 10, so 11 requests pass and 12 fail); a replay keeps its limit of 8; the line reports the client's request count and the retry-count values", () => {
-  assert.equal(S.CLIENT_MAX_RETRIES, 10); assert.equal(S.HANDOFF_MAX_PER_HOUR, 3); assert.equal(S.REAL_CLIENT_CEILING_MS, 180000);
+  assert.equal(S.CLIENT_MAX_RETRIES, 10); assert.equal(S.HANDOFF_MAX_PER_HOUR, 3); assert.equal(S.REAL_CLIENT_KILL_MS, 300000);
   const r = ok("3", ev3(11));
   assert.equal(r.verdict, "PASS", r.text);
-  assert.match(r.text, /the real client made 11 requests of its own retry policy \(up to 1 \+ 10; retry-count header values seen: 0,1,2,3,4,5,6,7,8,9,10\), the router routed each once: retry \+10, handoff \+0, handoffNone \+10/);
+  assert.match(r.text, /the real client made 11 requests of its own retry policy \(up to 1 \+ 10; retry-count header values seen: 0,1,2,3,4,5,6,7,8,9,10\), the router routed each once: retry \+10, handoff \+0, handoffNone \+10; gaps between the stub's arrivals \(s\): 0\.6, 1\.1, 2\.2, 4\.4, 8\.8, 17\.6, 35\.2, 35\.2, 35\.2, 35\.2; the client's own bounds \(s\): 2\.6, 3\.3, 4\.5, 7\.0, 12\.0, 22\.0, 42\.0, 42\.0, 42\.0, 42\.0; .*the client took 185\.0 s in all/);
   const storm = ok("3", ev3(12, {}, { sub: 13, retry: 11, handoffNone: 11 }));
   assert.equal(storm.verdict, "FAIL"); assert.match(storm.text, /12 requests reached the stub for one agent \(limit 11: the client's own 1 \+ 10 retries\): a retry storm, more than the client itself sends \(retry-count values seen: 0,1,/);
   const replay = ok("3", { ...ev3(9, {}, { sub: 10, retry: 8, handoffNone: 8 }), client: "replay", responses: [{ status: 429, ms: 30 }] });
@@ -1586,9 +1590,9 @@ test("R11-2 what the ROUTER controls: a router (or anything downstream) that mul
   const blocked = ok("3", ev3(11, { nextReached: false }, { sub: 11 }));
   assert.equal(blocked.verdict, "FAIL"); assert.match(blocked.text, /routing was BLOCKED by the cooldown/, "the next agent never reached the stub: its request is not subtracted, so the window of 11 is 11 routed and the downstream check passes");
   const helperMix = (mutate, sub) => { const e = ev3(11, {}, { sub }); mutate(e.records); return ok("3", e); };
-  const auxShaped = helperMix((rs) => { rs[0].toolNames = []; rs[1].toolNames = []; }, 10);
+  const auxShaped = helperMix((rs) => { rs[9].toolNames = []; rs[10].toolNames = []; }, 10);
   assert.equal(auxShaped.verdict, "PASS", `two aux-shaped requests (agent id, no tools) are routed as aux: 9 sub-shaped + the next agent = 10: ${auxShaped.text}`);
-  const labelled = helperMix((rs) => { rs[0].headers["x-claude-code-request-class"] = "auxiliary"; rs[1].headers["x-claude-code-request-class"] = "compaction"; }, 10);
+  const labelled = helperMix((rs) => { rs[9].headers["x-claude-code-request-class"] = "auxiliary"; rs[10].headers["x-claude-code-request-class"] = "compaction"; }, 10);
   assert.equal(labelled.verdict, "PASS", `two helper-labelled requests are routed as aux: ${labelled.text}`);
   assert.equal(helperMix((rs) => { rs[0].headers["x-claude-code-request-class"] = "subagent"; rs[1].headers["x-claude-code-request-class"] = "main"; }, 10).verdict, "FAIL", "a subagent- or main-labelled request is still sub-shaped here: 11 against 9 routed");
   assert.equal(helperMix((rs) => { rs[0].toolNames = []; }, 9).verdict, "FAIL", "one aux-shaped request excluded, 10 sub-shaped against 8 routed");
@@ -1601,12 +1605,56 @@ test("R11-2 what the ROUTER controls: a router (or anything downstream) that mul
   assert.equal(ok("3", ev3(11, {}, { handoffNone: 0, handoffCap: 1 })).verdict, "FAIL", "a cap decision alone still lacks handoffNone: the existing check fires");
 });
 
-test("R11-3 scenario 3 REAL hang: a client killed on the harness timeout FAILS; the whole client run may take up to 180 s (the 10 backoffs, about a minute), a replay keeps 20 s per answer", () => {
+test("R11-3 scenario 3 REAL hang: judged by the gaps between the stub's arrivals against the client's own backoff (never by its total time) and by a kill on the harness timeout, AFTER every router-side check; a replay keeps 20 s per answer", () => {
+  assert.equal(S.CLIENT_GAP_SLACK_MS, 2000); assert.equal(S.CLIENT_EDGE_MS, 60000); assert.equal(S.clientGapBoundMs(1), 2625); assert.equal(S.clientGapBoundMs(2), 3250); assert.equal(S.clientGapBoundMs(6), 22000); assert.equal(S.clientGapBoundMs(7), 42000); assert.equal(S.clientGapBoundMs(10), 42000);
   const killed = ok("3", ev3(11, { claude: { ...claudeOk, code: null, reason: "timed out; the process tree was killed" } }));
-  assert.equal(killed.verdict, "FAIL"); assert.match(killed.text, /killed on the harness timeout instead of failing by itself: the agent hung/);
-  assert.equal(ok("3", ev3(11, { responses: [{ status: 429, ms: 100000 }] })).verdict, "PASS", "100 s of backoff is fine for a real client");
-  assert.equal(ok("3", ev3(11, { responses: [{ status: 429, ms: 200000 }] })).verdict, "FAIL", "over the real ceiling");
-  assert.equal(ok("3", { ...ev3(5, {}, { sub: 6, retry: 4, handoffNone: 4 }), client: "replay", responses: [{ status: 429, ms: 90000 }] }).verdict, "FAIL", "a replay answer over 20 s");
+  assert.equal(killed.verdict, "FAIL"); assert.match(killed.text, /killed on the harness timeout \(300 s\) instead of failing by itself: the agent hung/);
+  assert.equal(ok("3", ev3(11, { clientWallMs: 100000 })).verdict, "PASS"); assert.equal(ok("3", ev3(11, { clientWallMs: 250000 })).verdict, "PASS", "a client that sleeps 160 to 199 s in all is healthy: its total time is not judged");
+  assert.match(ok("3", ev3(11, { clientWallMs: undefined })).text, /the client took an unrecorded time in all/);
+  const withGaps = (gaps) => { const e = ev3(gaps.length + 1); let t = Date.parse(e.records[0].t); e.records.forEach((r, i) => { if (i > 0) t += gaps[i - 1]; r.t = new Date(t).toISOString(); }); return e; };
+  const nominal = Array.from({ length: 10 }, (_, i) => Math.min(32000, 500 * 2 ** i) * 1.25);
+  assert.equal(ok("3", withGaps(nominal)).verdict, "PASS", "the longest schedule the client may have (full jitter) passes");
+  assert.equal(ok("3", withGaps(nominal.map((g, i) => g + (i === 3 ? 2000 : 0)))).verdict, "PASS", "up to the slack of 2 s above the bound passes");
+  const stall = ok("3", withGaps(nominal.map((g, i) => g + (i === 3 ? 2001 : 0))));
+  assert.equal(stall.verdict, "FAIL"); assert.match(stall.text, /the gap before request 5 of the agent was 7\.0 s, over the client's own backoff of at most 7\.0 s \(with 2 s of slack\)/);
+  const early = ok("3", withGaps([20000, ...nominal.slice(1)])); assert.equal(early.verdict, "FAIL"); assert.match(early.text, /the gap before request 2 of the agent was 20\.0 s, over the client's own backoff of at most 2\.6 s \(with 2 s of slack\): something between the client and the stub stalled \(gaps between the stub's arrivals \(s\): 20\.0,/);
+  assert.equal(ok("3", withGaps([1000, 2000, 20000, ...nominal.slice(3)])).verdict, "FAIL", "20 s before request 4 is far beyond the 10 s the client waits there");
+  assert.equal(ok("3", withGaps([1000, 2000, 3000, 4000, 8000, 20000, ...nominal.slice(6)])).verdict, "PASS", "the same 20 s is fine before request 7: the client waits up to 25 s plus slack there");
+  const noT = ev3(11); noT.records.forEach((r) => { delete r.t; }); assert.equal(ok("3", noT).verdict, "FAIL"); assert.match(ok("3", noT).text, /carry no arrival time \(t\): the stall check could not run/);
+  const one = ev3(1, {}, { sub: 2, retry: 0, handoffNone: 1 }); one.records.forEach((r) => { delete r.t; }); assert.equal(ok("3", one).verdict, "PASS", "a single request has no gap to judge, so no arrival time is needed");
+  // the router-side checks come FIRST: a stall or a kill cannot hide a router failure
+  const both = ok("3", { ...withGaps([20000, ...nominal.slice(1)]), status1: { counters: { sub: 12, retry: 10, handoff: 0, handoffNone: 0, handoffCap: 0, coolMark: 1 } } });
+  assert.equal(both.verdict, "FAIL"); assert.match(both.text, /the router made no handoff decision at all|handoffNone was not counted/, "the router-side failure is the one reported");
+  const killedAndBad = ok("3", ev3(11, { claude: { ...claudeOk, code: null, reason: "timed out; the process tree was killed" } }, { handoff: 4 })); assert.match(killedAndBad.text, /handoff storm/);
+  const replayT = ok("3", { ...ev3(5, {}, { sub: 6, retry: 4, handoffNone: 4 }), client: "replay", responses: [{ status: 429, ms: 90000 }] }); assert.equal(replayT.verdict, "FAIL"); assert.match(replayT.text, /took more than 20000 ms: the agent hung/);
+  assert.equal(ok("3", { ...ev3(5, {}, { sub: 6, retry: 4, handoffNone: 4 }), client: "replay", responses: [{ status: 429, ms: 30 }] }).verdict, "PASS", "a replay needs no arrival times");
+  assert.match(S.realSpawnClaude.toString(), /timeoutMs = REAL_CLIENT_KILL_MS/, "the real client's kill defaults to 300 s");
+  const plan = S.planLines().join("\n");
+  assert.match(plan, /A real client is killed with its whole process tree after 300 s \(REAL_CLIENT_KILL_MS; it was 240 s\)\. On a 429 without Retry-After, Claude Code 2\.1\.289 retries 10 times and waits min\(32 s, 0\.5 s \* 2\^\(n-1\)\) plus up to 25% before each, 160 to 199 s in all/, "the plan says why the kill is 300 s");
+  assert.match(plan, /a hang there is judged by the gaps between the stub's arrival times of the agent's requests \(each at most its own backoff plus 2 s, so a stall in the router or the gateway shows; the client's start-up before the first arrival and its tail after the last arrival at most 60 s each; and, when the router's classify lines can be paired with the arrivals, no request held more than 2 s between the router's decision and the stub\), after every router-side check, and by the client having to be killed, never by the client's total time/);
+});
+
+test("R11-3b scenario 3 REAL: the client's start-up and its tail (same host clock as the stub's arrival times) may take 60 s each; the router's own decision time of each request is compared with the stub's arrival when its classify lines can be paired; the gaps are taken over the sub-shaped requests only", () => {
+  const T0 = Date.parse(arrivals(1)[0]), last = (e) => Date.parse(e.records[e.records.length - 1].t);
+  const e0 = ev3(11); const edge = (startLead, endTail) => ({ clientStartMs: T0 - startLead, clientEndMs: last(e0) + endTail });
+  assert.equal(ok("3", ev3(11, edge(60000, 60000))).verdict, "PASS", "exactly 60 s each is allowed"); assert.match(ok("3", ev3(11, edge(60000, 60000))).text, /start-up to the first arrival 60\.0 s; last arrival to the client's exit 60\.0 s/);
+  const su = ok("3", ev3(11, edge(60001, 0))); assert.equal(su.verdict, "FAIL"); assert.match(su.text, /first request reached the stub 60\.0 s after the client was started, over 60 s: the client's start-up/);
+  const tl = ok("3", ev3(11, edge(0, 60001))); assert.equal(tl.verdict, "FAIL"); assert.match(tl.text, /the client exited 60\.0 s after the agent's last request reached the stub, over 60 s: something held the client after its last answer/);
+  assert.equal(ok("3", ev3(11, edge(-5000, -5000))).verdict, "PASS", "a client clock slightly behind the stub's is not a failure"); assert.equal(ok("3", ev3(11, edge(-70000, -70000))).verdict, "PASS", "only a LATE client (a positive lag over 60 s) fails: a negative lag is a clock offset, not a hang"); assert.equal(ok("3", ev3(11, { clientStartMs: undefined, clientEndMs: undefined })).verdict, "PASS", "no start or end time: that check is skipped");
+  const classify = (e, delayMs) => e.records.map((r) => ({ t: new Date(Date.parse(r.t) - delayMs).toISOString(), cls: "sub", aid: "real-a" }));
+  const paired = ok("3", ev3(11, { classify: classify(e0, 150) })); assert.equal(paired.verdict, "PASS"); assert.match(paired.text, /router decision to the stub's arrival at most 0\.1 s over 11 requests/);
+  const held = classify(e0, 150); held[4].t = new Date(Date.parse(e0.records[4].t) - 2001).toISOString();
+  const slow = ok("3", ev3(11, { classify: held })); assert.equal(slow.verdict, "FAIL"); assert.match(slow.text, /the router's decision for request 5 of the agent was logged 2\.0 s before the stub saw it, over 2 s: the router or the gateway held the request/);
+  const okEdge = classify(e0, 150); okEdge[4].t = new Date(Date.parse(e0.records[4].t) - 2000).toISOString(); assert.equal(ok("3", ev3(11, { classify: okEdge })).verdict, "PASS", "2 s exactly is allowed");
+  assert.equal(ok("3", ev3(11, { classify: classify(e0, 150).reverse() })).verdict, "PASS", "the router's lines are paired by time, not by the order they were given in");
+  assert.match(ok("3", ev3(11, { classify: [...classify(e0, 150), { t: e0.records[0].t, cls: "sub", aid: "real-a" }] })).text, /router decision times not compared \(12 classify rows for 11 stub arrivals\)/, "more rows than arrivals: no guessing at a pairing");
+  assert.match(ok("3", ev3(11, { classify: classify(e0, 150).slice(0, 5) })).text, /router decision times not compared \(5 classify rows for 11 stub arrivals\)/); assert.match(ok("3", ev3(11)).text, /router decision times not compared \(no classify rows for the agent\)/);
+  const other = classify(e0, 150).map((c) => ({ ...c, aid: "someone-else" })); assert.match(ok("3", ev3(11, { classify: other })).text, /no classify rows for the agent/, "only this agent's rows");
+  const auxRows = classify(e0, 150).map((c) => ({ ...c, cls: "aux" })); assert.match(ok("3", ev3(11, { classify: auxRows })).text, /no classify rows for the agent/, "only its sub rows");
+  const e1 = ev3(1, {}, { sub: 2, retry: 0, handoffNone: 1 }), aux1 = rec({ model: "m-big", aid: "real-a", status: 429 }); aux1.headers["x-claude-code-request-class"] = "auxiliary"; delete e1.records[0].t; e1.records.push(aux1);
+  assert.equal(ok("3", e1).verdict, "PASS", "one sub-shaped request has no gap to judge: the arrival time of a helper-labelled sibling is not needed");
+  const e10 = ev3(10, {}, { sub: 11, retry: 9, handoffNone: 9 }), aux = rec({ model: "m-big", aid: "real-a", status: 429 }); aux.headers["x-claude-code-request-class"] = "auxiliary"; aux.t = new Date(Date.parse(e10.records[9].t) + 100000).toISOString(); e10.records.push(aux);
+  assert.equal(ok("3", e10).verdict, "PASS", "a helper-labelled request of the agent 100 s later is not part of the retry schedule: the gaps are taken over the sub-shaped list only");
 });
 
 test("R11-4 against a fake sandbox whose requests are MULTIPLIED downstream of the router, scenario 3 FAILS; a client at its default retries passes", async () => {
