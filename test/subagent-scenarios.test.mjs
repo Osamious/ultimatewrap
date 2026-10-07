@@ -217,7 +217,7 @@ test("judge 3 (all limited): PASS needs the cooldown to STEER (six agents served
   assert.equal(ok("3", { ...ev, status1: { counters: { coolMark: 3 } } }).verdict, "FAIL", "handoffNone not counted");
   assert.equal(ok("3", { ...ev, status1: { counters: { handoffNone: 1 } } }).verdict, "FAIL", "no cooling mark");
   assert.equal(ok("3", { ...ev, nextReached: false }).verdict, "FAIL", "routing was blocked");
-  assert.equal(ok("3", { ...ev, responses: [{ status: 200, ms: 5 }] }).verdict, "FAIL", "the agent was not limited");
+  assert.equal(ok("3", { ...ev, records: [...recs, rec({ model: "m-main", aid: "a3", status: 200 })] }).verdict, "FAIL", "the stub's last answer is not the limit: the agent was not limited");
 });
 
 test("judge 4 (team agents): an `@` id with a parent is sub in the stub, the classifier log and the agent log; classed main or served the wrong model FAILS", () => {
@@ -398,6 +398,7 @@ function fakeWorld(bug = {}) {
     const st = norm(w.script.decide?.(r) ?? 200);
     r.sent = { status: st.status, retryAfter: st.retryAfter, cut: null };
     w.records.push(r);
+    if (bug.multiply && aid) w.records.push({ ...r, seq: ++w.seq });                     // a defect DOWNSTREAM of the router: every agent request reaches the stub twice
     return st;
   };
   const cooled = (m) => w.cooling.has(m) || w.cooling.has("prov:uwstub");                 // router coolFail: two DISTINCT models of one provider failing within five minutes cool the provider key too
@@ -1535,6 +1536,12 @@ test("R10-4 scenario 11 in REAL mode when the client retried once: served anothe
   const unexplained = ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand({ from: "uwstub/m-main" })] });
   assert.equal(unexplained.verdict, "FAIL"); assert.match(unexplained.text, /no handoff line from uwstub\/m-free: the steering is unexplained/);
   assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand({ to: "uwstub/m-free" })] }).verdict, "FAIL", "a handoff back to the same model is no steering");
+  const refused = ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]).map((r, i) => (i ? { ...r, status: 429 } : r)), agents: [hand()] });
+  assert.equal(refused.verdict, "FAIL"); assert.match(refused.text, /steered the retry to m-big, but it ended with status 429 \(m-free 429, m-big 429\): a steered retry that is still refused is no steering/);
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]).map((r, i) => (i ? { ...r, status: 503 } : r)), agents: [hand()] }).verdict, "FAIL", "5xx too");
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]).map((r, i) => (i ? { ...r, status: 300 } : r)), agents: [hand()] }).verdict, "FAIL", "anything outside 200-299");
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]).map((r, i) => (i ? { ...r, status: null } : r)), agents: [hand()] }).verdict, "DEGRADED", "a missing status is not a failure");
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]).map((r, i) => (i ? { ...r, status: 204 } : r)), agents: [hand()] }).verdict, "DEGRADED", "any 2xx");
   assert.equal(ok("11", { ...base, recordsForFirst: 3, first: undefined }).verdict, "FINDING", "no per-request evidence: the old finding");
   assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [hand()], nextModels: ["m-big", "m-free", "m-big"] }).verdict, "FINDING", "the avoidance check still applies after a steered retry");
   assert.equal(ok("11", { ...base, recordsForFirst: 1, first: first(["uwstub/m-free"]), agents: [] }).verdict, "DEGRADED", "the one-request case is unchanged");
@@ -1546,4 +1553,88 @@ test("R10-5 scenario 11 REAL end to end against the fake sandbox: a client that 
   assert.equal(good[0].result.verdict, "DEGRADED", good[0].result.text); assert.match(good[0].result.text, /the real client retried 1 time\(s\) instead of failing at once \(client behaviour\), and the router steered the retry: handoff uwstub\/m-free -> /);
   const bad = await S.runScenarios(mk({ noHandoff: true }).prims, { only: ["11"], real: true });
   assert.equal(bad[0].result.verdict, "FAIL", bad[0].result.text); assert.match(bad[0].result.text, /SAME limited model uwstub\/m-free/);
+});
+
+// ====================================================================================== fix round 11 (run 13: scenario 3 real: the client retries on its own, the judge now says what the router controls)
+const claudeOk = { code: 0, reason: "", err: "", subtype: "success", isError: false, turns: 1, denials: [], mode: "dontAsk", reasons: [], called: ["Task"], result: "x" };
+/** Evidence of scenario 3 with a REAL client: n requests of one agent at the stub (retry-count header 0..n-1), the router's counters over the same window. */
+const ev3 = (n, over = {}, counters = {}) => {
+  const recs = Array.from({ length: n }, (_, i) => { const r = rec({ model: "m-big", aid: "real-a", status: 429 }); r.headers["x-stainless-retry-count"] = String(i); return r; });
+  return { client: "real claude -p", aid: "real-a", claude: claudeOk, steer: { models: Array(6).fill("m-big"), healthy: "uwstub/m-big", cooled: ["uwstub/m-free"] }, responses: [{ status: 429, ms: 60000 }], records: recs, nextReached: true,
+    status0: { counters: { sub: 0, retry: 0, handoff: 0, handoffNone: 0, handoffCap: 0, coolMark: 0 } },
+    status1: { counters: { sub: n + 1, retry: n - 1, handoff: 0, handoffNone: n - 1, handoffCap: 0, coolMark: 1, ...counters } }, ...over };
+};
+
+test("R11-1 scenario 3 REAL: the client's own policy is the bound (CLIENT_MAX_RETRIES 10, so 11 requests pass and 12 fail); a replay keeps its limit of 8; the line reports the client's request count and the retry-count values", () => {
+  assert.equal(S.CLIENT_MAX_RETRIES, 10); assert.equal(S.HANDOFF_MAX_PER_HOUR, 3); assert.equal(S.REAL_CLIENT_CEILING_MS, 180000);
+  const r = ok("3", ev3(11));
+  assert.equal(r.verdict, "PASS", r.text);
+  assert.match(r.text, /the real client made 11 requests of its own retry policy \(up to 1 \+ 10; retry-count header values seen: 0,1,2,3,4,5,6,7,8,9,10\), the router routed each once: retry \+10, handoff \+0, handoffNone \+10/);
+  const storm = ok("3", ev3(12, {}, { sub: 13, retry: 11, handoffNone: 11 }));
+  assert.equal(storm.verdict, "FAIL"); assert.match(storm.text, /12 requests reached the stub for one agent \(limit 11: the client's own 1 \+ 10 retries\): a retry storm, more than the client itself sends \(retry-count values seen: 0,1,/);
+  const replay = ok("3", { ...ev3(9, {}, { sub: 10, retry: 8, handoffNone: 8 }), client: "replay", responses: [{ status: 429, ms: 30 }] });
+  assert.equal(replay.verdict, "FAIL"); assert.match(replay.text, /limit 8\):/);
+  assert.equal(ok("3", { ...ev3(8, {}, { sub: 9, retry: 7, handoffNone: 7 }), client: "replay", responses: [{ status: 429, ms: 30 }] }).verdict, "PASS", "8 is still fine for a replay");
+});
+
+test("R11-2 what the ROUTER controls: a router (or anything downstream) that multiplies requests FAILS; more retry signals than requests, more than 3 handoffs and no handoff decision at all FAIL; the checks need the router's sub counter and skip without it", () => {
+  const down = ok("3", ev3(11, {}, { sub: 6 }));
+  assert.equal(down.verdict, "FAIL"); assert.match(down.text, /the stub received 11 subagent-shaped requests for the agent but the router routed only 5 subagent requests for it in the same window: something DOWNSTREAM of the router multiplied them/);
+  assert.equal(ok("3", ev3(11, {}, { sub: 10 })).verdict, "FAIL", "ONE request more at the stub than the router routed is already a multiplication");
+  assert.equal(ok("3", ev3(11, {}, { sub: 11 })).verdict, "FAIL", "the window holds the next agent's request too: 11 in the window is 10 routed for the agent, one fewer than the stub received");
+  assert.equal(ok("3", ev3(11, {}, { sub: 12 })).verdict, "PASS", "11 routed for the agent plus the next agent's request: exactly right");
+  const blocked = ok("3", ev3(11, { nextReached: false }, { sub: 11 }));
+  assert.equal(blocked.verdict, "FAIL"); assert.match(blocked.text, /routing was BLOCKED by the cooldown/, "the next agent never reached the stub: its request is not subtracted, so the window of 11 is 11 routed and the downstream check passes");
+  const helperMix = (mutate, sub) => { const e = ev3(11, {}, { sub }); mutate(e.records); return ok("3", e); };
+  const auxShaped = helperMix((rs) => { rs[0].toolNames = []; rs[1].toolNames = []; }, 10);
+  assert.equal(auxShaped.verdict, "PASS", `two aux-shaped requests (agent id, no tools) are routed as aux: 9 sub-shaped + the next agent = 10: ${auxShaped.text}`);
+  const labelled = helperMix((rs) => { rs[0].headers["x-claude-code-request-class"] = "auxiliary"; rs[1].headers["x-claude-code-request-class"] = "compaction"; }, 10);
+  assert.equal(labelled.verdict, "PASS", `two helper-labelled requests are routed as aux: ${labelled.text}`);
+  assert.equal(helperMix((rs) => { rs[0].headers["x-claude-code-request-class"] = "subagent"; rs[1].headers["x-claude-code-request-class"] = "main"; }, 10).verdict, "FAIL", "a subagent- or main-labelled request is still sub-shaped here: 11 against 9 routed");
+  assert.equal(helperMix((rs) => { rs[0].toolNames = []; }, 9).verdict, "FAIL", "one aux-shaped request excluded, 10 sub-shaped against 8 routed");
+  const noSub = ev3(11); delete noSub.status0.counters.sub; delete noSub.status1.counters.sub;
+  assert.equal(ok("3", noSub).verdict, "PASS", "without the sub counter that one check is skipped, never invented");
+  const amp = ok("3", ev3(11, {}, { retry: 12 })); assert.equal(amp.verdict, "FAIL"); assert.match(amp.text, /the router counted 12 retry signals for 11 requests of the agent: it amplified the retries/);
+  const hs = ok("3", ev3(11, {}, { handoff: 4 })); assert.equal(hs.verdict, "FAIL"); assert.match(hs.text, /handed the agent off 4 times \(its cap is 3 an hour\): a handoff storm/);
+  assert.equal(ok("3", ev3(11, {}, { handoff: 3 })).verdict, "PASS", "3 handoffs are the cap, not a storm");
+  const none = ok("3", ev3(11, {}, { handoffNone: 0 })); assert.equal(none.verdict, "FAIL"); assert.match(none.text, /the router made no handoff decision at all/);
+  assert.equal(ok("3", ev3(11, {}, { handoffNone: 0, handoffCap: 1 })).verdict, "FAIL", "a cap decision alone still lacks handoffNone: the existing check fires");
+});
+
+test("R11-3 scenario 3 REAL hang: a client killed on the harness timeout FAILS; the whole client run may take up to 180 s (the 10 backoffs, about a minute), a replay keeps 20 s per answer", () => {
+  const killed = ok("3", ev3(11, { claude: { ...claudeOk, code: null, reason: "timed out; the process tree was killed" } }));
+  assert.equal(killed.verdict, "FAIL"); assert.match(killed.text, /killed on the harness timeout instead of failing by itself: the agent hung/);
+  assert.equal(ok("3", ev3(11, { responses: [{ status: 429, ms: 100000 }] })).verdict, "PASS", "100 s of backoff is fine for a real client");
+  assert.equal(ok("3", ev3(11, { responses: [{ status: 429, ms: 200000 }] })).verdict, "FAIL", "over the real ceiling");
+  assert.equal(ok("3", { ...ev3(5, {}, { sub: 6, retry: 4, handoffNone: 4 }), client: "replay", responses: [{ status: 429, ms: 90000 }] }).verdict, "FAIL", "a replay answer over 20 s");
+});
+
+test("R11-4 against a fake sandbox whose requests are MULTIPLIED downstream of the router, scenario 3 FAILS; a client at its default retries passes", async () => {
+  const bad = await S.runScenarios(fakeWorld({ multiply: true }).prims, { only: ["3"] });
+  assert.equal(bad[0].result.verdict, "FAIL", bad[0].result.text); assert.match(bad[0].result.text, /retry storm|DOWNSTREAM/);
+  const good = await S.runScenarios(fakeWorld({}).prims, { only: ["3"] });
+  assert.equal(good[0].result.verdict, "PASS", good[0].result.text);
+});
+
+test("R11-5 scenario 11: every retry must land on a model the router handed the agent off to (a retry served another model that is not a handoff target FAILS), and a handoff line with an EMPTY agent id belongs to no agent", () => {
+  const base = { client: "real claude -p", failed: true, aid: "real-agent", chosen: "uwstub/m-free", nextModels: ["m-big", "m-big", "m-big"], overlay: true, recordsForFirst: 3 };
+  const first = (models) => models.map((m, i) => ({ model: m, status: i === 0 ? 429 : 200, retryAfter: i === 0 ? 3600 : null }));
+  const hand = (over = {}) => ({ v: 2, path: "handoff", act: "handoff", aid: "real-agent", aid_full: "real-agent", from: "uwstub/m-free", to: "uwstub/m-big", hop: 1, rsrc: "len", reason: "retry:len:1", ...over });
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big", "uwstub/m-big"]), agents: [hand()] }).verdict, "DEGRADED", "every retry on the handoff target");
+  const stray = ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-big", "uwstub/m-main"]), agents: [hand()] });
+  assert.equal(stray.verdict, "FAIL"); assert.match(stray.text, /1 of 2 retries were served m-main, which is not a model the router handed the agent off to \(m-big\)/);
+  assert.equal(ok("11", { ...base, first: first(["uwstub/m-free", "uwstub/m-main", "uwstub/m-big"]), agents: [hand(), hand({ to: "uwstub/m-main", hop: 2 })] }).verdict, "DEGRADED", "two handoffs, both retries on a target");
+  const empty = ok("11", { ...base, recordsForFirst: 2, first: first(["uwstub/m-free", "uwstub/m-big"]), agents: [{ ...hand(), aid: "", aid_full: undefined }] });
+  assert.equal(empty.verdict, "FAIL"); assert.match(empty.text, /no handoff line from uwstub\/m-free: the steering is unexplained/, "a line with an empty id used to match every agent");
+});
+
+test("R11-6 the agent log is read AFTER the last settle in scenarios 11 and 3 (never mid-flight)", async () => {
+  for (const [id, real] of [["11", true], ["3", false]]) {
+    const f = fakeWorld({}), ev = [];
+    if (real) f.prims.claude = async () => { await f.prims.send("main", { model: ANCHOR, session: "l3" }); await f.prims.send("sub", { model: ASKED_MODEL, tag: "uwstub/m-free", agentId: "real-agent", session: "l3", messages: 3, agentTool: false }); return { code: 0, text: "{}" }; };
+    const prims2 = { ...f.prims, settle: async () => { ev.push("settle"); return f.prims.settle(); }, readLog: async (n) => { ev.push(`read ${n}`); return f.prims.readLog(n); } };
+    await S.runScenarios(prims2, { only: [id], real });
+    const lastRead = ev.lastIndexOf("read agents.jsonl"), lastSettle = ev.lastIndexOf("settle");
+    assert.ok(lastRead > lastSettle && lastRead >= 0, `scenario ${id}: the last read of the agent log (${lastRead}) comes after the last settle (${lastSettle})`);
+  }
 });
