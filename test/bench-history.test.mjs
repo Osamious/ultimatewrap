@@ -5,11 +5,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { archiveBench } from "../refresh/bench-store.mjs";
 import { parseArgs, main, DEFAULTS } from "../refresh/bench-cli.mjs";
 import { BENCH_SCHEMA } from "../menu/bench-data.mjs";
 
-const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-history-"));
+const scratch = () => mkTmp("uw-history-");
 const bench = (models = { "s/a": { s: "ok", a: 1, t: 5, p: "hi" } }) => JSON.stringify({ schema: BENCH_SCHEMA, generatedAt: "x", models });
 const at = (iso) => () => new Date(iso);
 const list = (d) => (fs.existsSync(d) ? fs.readdirSync(d).sort() : []);

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { initState, reduce, view, carryAcrossRebuild, TOGGLE_DEFAULTS, BENCH_FIELDS } from "../menu/pick-state.mjs";
 import { detectCaps, painter, frame, frameWidth, layoutFor, probedCell, ageLabel, FRAME_MIN, FRAME_MAX, MODEL_ID_MIN, MODEL_ID_MAX } from "../menu/style.mjs";
 import { legendLines } from "../menu/legend.mjs";
@@ -112,7 +113,7 @@ test("ageHistOf and oldestStampOf ignore skip records and records with an invali
   const a = sec(NOW - 3 * DAY * 1000);
   const recs = { "p/ok": { s: "ok", a }, "p/skip": { s: "skip", a: sec(NOW - 30 * DAY * 1000) }, "p/bad": { s: "weird", a: sec(NOW - 40 * DAY * 1000) },
                  "p/nostatus": { a: sec(NOW - 50 * DAY * 1000) }, "p/noa": { s: "ok" } };
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-r6-"));
+  const dir = mkTmp("uw-r6-");
   const file = path.join(dir, "bench.json");
   fs.writeFileSync(file, JSON.stringify({ schema: 1, generatedAt: new Date(NOW).toISOString(), models: recs }));
   const b = loadBench(file);
@@ -132,7 +133,7 @@ test("ageHistOf and oldestStampOf ignore skip records and records with an invali
 // ---------------------------------------------------------------- A5: wording and a distinct reason
 
 test("a schema-9 file with no rows array is a damaged file with its own sentence, not 'expected 9, found 9'", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-r6s-"));
+  const dir = mkTmp("uw-r6s-");
   const f = path.join(dir, "snapshot.json");
   fs.writeFileSync(f, JSON.stringify({ schemaVersion: SNAPSHOT_SCHEMA }));
   const r = loadSnapshot(f);

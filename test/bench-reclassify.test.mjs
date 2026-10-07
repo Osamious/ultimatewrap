@@ -5,12 +5,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { reclassifyNotice, reclassifyNotices, readBench, isFresh } from "../refresh/bench-store.mjs";
 import { parseArgs, main, EXIT_BUSY } from "../refresh/bench-cli.mjs";
 import { acquireLock } from "../refresh/bench-lock.mjs";
 import { loadBench, BENCH_SCHEMA } from "../menu/bench-data.mjs";
 
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-rcn-"));
+const tmp = () => mkTmp("uw-rcn-");
 const NOTICE = "The account behind this API key doesn't ";
 const NOW = Date.parse("2026-09-29T12:00:00Z");
 const DAY = 864e5;

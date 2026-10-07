@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -31,7 +32,7 @@ const join = (lines, eol) => lines.join(eol) + eol;
 
 /** A synthetic install tree; `deps()` points the script at it. Cleaned up by the caller. */
 function tree({ eol = "\n", version = "3.0.22", libVersion = "1.0.18", cli, lib } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uwpatch-test-"));
+  const root = mkTmp("uwpatch-test-");
   const pkg = path.join(root, "pkg");
   const cliPath = path.join(pkg, "dist", "main", "cli.js");
   const libDir = path.join(pkg, "node_modules", "@the-next-ai", "ai-gateway");
@@ -655,7 +656,7 @@ test("version guard fails closed when no verified version is recorded; --force-v
 }));
 
 test("run as the entry point through a junction/symlink still runs (real paths are compared)", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uwpatch-link-"));
+  const dir = mkTmp("uwpatch-link-");
   const link = path.join(dir, "link");
   try {
     try { fs.symlinkSync(path.join(ROOT, "keysync"), link, "junction"); } catch { return; }   // cannot create one here: nothing to test

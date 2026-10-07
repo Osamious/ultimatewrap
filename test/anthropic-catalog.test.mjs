@@ -2,11 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { fetchAnthropicIds, fetchAnthropicCatalog } from "../keysync/anthropic-catalog.mjs";
 import { atomicWriteJson } from "../keysync/safety.mjs";
 
-const tmpdir = (tag) => fs.mkdtempSync(path.join(os.tmpdir(), tag));
+const tmpdir = mkTmp;
 
 const okModels = (ids) => ({
   ok: true,

@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { spawnSync } from "node:child_process";
 import {
   DefaultModelError, DEFAULT_MODEL_ENV_KEYS, validateShape, envFormOf, load, resolveDefault,
@@ -23,7 +24,7 @@ import { assertSettingsInvariants, restartRelevantFingerprint } from "../keysync
 import { admitId } from "../menu/sanitize.mjs";
 
 const SONNET55 = "anthropic/claude-sonnet-5-5[1m]";
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-defmodel-"));
+const tmp = () => mkTmp("uw-defmodel-");
 const write = (dir, name, text) => { const f = path.join(dir, name); fs.writeFileSync(f, text); return f; };
 
 // ------------------------------------------------------------- the CCR mirror

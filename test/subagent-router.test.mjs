@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -46,7 +47,7 @@ const cfg = (...ps) => ({ Providers: ps.map(([name, models, enabled]) => ({ name
 const CFG = cfg(["anthropic", ["claude-sonnet-5-5", "claude-haiku-4-5", "claude-opus-5"]], ["groq", ["g1", "g2", "g3", "g4"]], ["cohere", ["c1"]]);
 
 function env(policy, { slot = IDENT, file = NEXT } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-rt-"));
+  const dir = mkTmp("uw-rt-");
   const spike = path.join(dir, "spike"), state = path.join(dir, "state", "subagent");
   fs.mkdirSync(spike, { recursive: true }); fs.mkdirSync(state, { recursive: true });
   const live = path.join(spike, "uw-router.cjs");
@@ -75,7 +76,7 @@ async function drainWrites() {
 function patchedRouter(pairs) {
   let src = fs.readFileSync(NEXT, "utf8");
   for (const [a, b] of pairs) { assert.equal(src.split(a).length, 2, `patch anchor must be unique: ${a.slice(0, 60)}`); src = src.replace(a, () => b); }
-  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-patch-")), "uw-router.patched.cjs");
+  const f = path.join(mkTmp("uw-patch-"), "uw-router.patched.cjs");
   fs.writeFileSync(f, src);
   return f;
 }
@@ -124,7 +125,7 @@ test("exact slot, never a substring: longer ids and [1m] spellings are served as
 test("differential against git 6edfdee: policy absent, 500 generated ids, only the asserted intended differences", async () => {
   const g = spawnSync("git", ["show", "6edfdee:spike/uw-router.cjs"], { cwd: ROOT, encoding: "utf8" });
   assert.equal(g.status, 0, g.stderr);
-  const oldDir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-old-"));
+  const oldDir = mkTmp("uw-old-");
   fs.mkdirSync(path.join(oldDir, "spike"));
   fs.writeFileSync(path.join(oldDir, "spike", "uw-router.cjs"), g.stdout);
   fs.writeFileSync(path.join(oldDir, "spike", "slot.json"), JSON.stringify(IDENT));
@@ -885,7 +886,7 @@ test("budget (loose ceiling): 10,000 warm synthetic calls through the clock seam
 test("integration: the router serves a policy compiled by the library from the fixtures (substitute from the real compiled lists)", async () => {
   const { fixtureFlagMap } = await import("./fixtures/subagent-flags.mjs");
   const lib = await import("../keysync/subagent-policy.mjs");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-int-"));
+  const dir = mkTmp("uw-int-");
   const p = lib.resolvePaths(fixtureFlagMap(dir));
   const g = await lib.gatherInputs(p);
   const { compiled } = lib.compile(g, { ...lib.OWNER_DEFAULTS, source: "all-providers", mode: "free", freeScope: "providers", enforcement: "enforce" });
@@ -900,7 +901,7 @@ test("integration: the router serves a policy compiled by the library from the f
 test("Q6 + banded spread (ar-4): the top-3 spread follows rank key 2b; BANDED (the default) keeps it inside the lead price class, banded:false is the old spread over three classes", async () => {
   const { fixtureFlagMap } = await import("./fixtures/subagent-flags.mjs");
   const lib = await import("../keysync/subagent-policy.mjs");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-q6-"));
+  const dir = mkTmp("uw-q6-");
   const flags = fixtureFlagMap(dir);
   const rdj = (f) => JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")), wrj = (f, o) => fs.writeFileSync(path.join(dir, f), JSON.stringify(o));
   const snap = rdj("snapshot.json");
@@ -1013,6 +1014,7 @@ const fs = require("node:fs"), os = require("node:os"), path = require("node:pat
 const { createRequire } = require("node:module");
 const [, , src, nStr] = process.argv, N = Number(nStr);
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-leak-"));
+process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));      // issue #157: this child left its folder behind
 fs.mkdirSync(path.join(dir, "spike")); fs.mkdirSync(path.join(dir, "state", "subagent"), { recursive: true });
 const file = path.join(dir, "spike", "uw-router.cjs");
 fs.copyFileSync(src, file); fs.writeFileSync(path.join(dir, "spike", "slot.json"), JSON.stringify({ model: "x/y" }));
@@ -1026,7 +1028,7 @@ const REQ = { body: { model: "claude-opus-5" }, headers: {} };
   process.stdout.write(String((h1 - h0) / 1024 / N));
 })();`;
 function kbPerRequire(routerFile, n = 2500) {
-  const script = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-leakrun-")), "leak.cjs");
+  const script = path.join(mkTmp("uw-leakrun-"), "leak.cjs");
   fs.writeFileSync(script, LEAK_SCRIPT);
   const r = spawnSync(process.execPath, ["--expose-gc", script, routerFile, String(n)], { encoding: "utf8", timeout: 120000 });
   assert.equal(r.status, 0, r.stderr);
@@ -1036,7 +1038,7 @@ test("S-F2 REGRESSION: re-requiring the router the way CCR does (delete the cach
   const withLoader = kbPerRequire(NEXT);
   const bare = SRC.replace(/\nmodule\.exports = \(function load\(\) \{[\s\S]*$/, "\nmodule.exports = __uwImpl('');\n");           // the same bytes, evaluated on EVERY load
   assert.notEqual(bare, SRC, "the control really removed the loader");
-  const control = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-leakctl-")), "uw-router.control.cjs");
+  const control = path.join(mkTmp("uw-leakctl-"), "uw-router.control.cjs");
   fs.writeFileSync(control, bare);
   const without = kbPerRequire(control);
   console.log(`  S-F2 leak: ${withLoader.toFixed(2)} KB a require with the loader, ${without.toFixed(2)} KB without (2,500 requires each)`);
@@ -1046,7 +1048,7 @@ test("S-F2 REGRESSION: re-requiring the router the way CCR does (delete the cach
 });
 
 test("S-F2: the loader evaluates the body once per process and re-exports it (same function, same state, same seam) while the file is unchanged; a CHANGED file (new mtime and size) loads the NEW code without a restart and replaces the old entry; two different files never share an implementation", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-once-"));
+  const dir = mkTmp("uw-once-");
   fs.mkdirSync(path.join(dir, "spike")); fs.mkdirSync(path.join(dir, "state", "subagent"), { recursive: true });
   const live = path.join(dir, "spike", "uw-router.cjs");
   fs.copyFileSync(NEXT, live); fs.writeFileSync(path.join(dir, "spike", "slot.json"), JSON.stringify(IDENT));
@@ -1084,7 +1086,7 @@ test("S-F2: the loader evaluates the body once per process and re-exports it (sa
 
 // ---------------------------------------------------------------------------------------------- second fix round: the loader (SEC-1, M3, O4b splice)
 const loaderTree = () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-ldr-"));
+  const dir = mkTmp("uw-ldr-");
   fs.mkdirSync(path.join(dir, "spike")); fs.mkdirSync(path.join(dir, "state", "subagent"), { recursive: true });
   const live = path.join(dir, "spike", "uw-router.cjs");
   fs.writeFileSync(path.join(dir, "spike", "slot.json"), JSON.stringify(IDENT));
@@ -2237,7 +2239,7 @@ test("ar-8 REGRESSION: the router recomputes the content hash on a cache miss: a
   }
   // the round trip: compile -> serialise -> parse -> the router accepts it, for owner variants of the fixture trio
   const { fixtureFlagMap } = await import("./fixtures/subagent-flags.mjs");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-hash-"));
+  const dir = mkTmp("uw-hash-");
   const p = LIB.resolvePaths(fixtureFlagMap(dir)), g = await LIB.gatherInputs(p);
   let n = 0;
   for (const source of ["same-provider", "all-providers"]) for (const mode of ["dynamic", "free", "inherit"]) for (const banded of [true, false]) for (const enforcement of ["shadow", "enforce"]) {
@@ -2321,7 +2323,7 @@ test("ar-10: rollout.canaryPct 30 enforces 28-32% of 10,000 synthetic agents, st
 
 test("ar-10: enforcement, classLog and handoffNotice are OUTSIDE the hash, so flipping them leaves the contentHash and the injected marker text byte-identical; canaryPct (rollout) and minRouter never enter it; banded and mode do", async () => {
   const { fixtureFlagMap } = await import("./fixtures/subagent-flags.mjs");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-ro-"));
+  const dir = mkTmp("uw-ro-");
   const p = LIB.resolvePaths(fixtureFlagMap(dir)), g = await LIB.gatherInputs(p);
   const base = { ...LIB.OWNER_DEFAULTS, source: "all-providers", mode: "dynamic", inject: "on" };
   const ref = LIB.compile(g, base).compiled;
@@ -2362,7 +2364,7 @@ test("ar-15: the tools scan is capped at 1,024 entries with an exact-spelling fa
 
 test("ar-15: lists.all is stored as null when it is the identity and the router reads it by index; a null list over zero rows is the empty set", async () => {
   const { fixtureFlagMap } = await import("./fixtures/subagent-flags.mjs");
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-all-"));
+  const dir = mkTmp("uw-all-");
   const p = LIB.resolvePaths(fixtureFlagMap(dir)), g = await LIB.gatherInputs(p);
   const all = LIB.compile(g, { ...LIB.OWNER_DEFAULTS, source: "all-providers", mode: "dynamic" }).compiled;
   assert.equal(all.lists.all, null, "all-providers: the identity list is not stored");
@@ -2377,7 +2379,7 @@ test("ar-15: lists.all is stored as null when it is the identity and the router 
 });
 
 test("ar-16: TIME: the default clock is monotonic (a faked Date.now does not move it); +7 h expires sticky and main, -2 h neither expires nor revives anything; a persisted time more than 5 minutes ahead counts as now", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-clock-"));
+  const dir = mkTmp("uw-clock-");
   fs.mkdirSync(path.join(dir, "spike"));
   fs.copyFileSync(NEXT, path.join(dir, "spike", "uw-router.cjs"));
   const fresh = req$(path.join(dir, "spike", "uw-router.cjs"));
@@ -3498,7 +3500,7 @@ test("R7: the first status write is asynchronous like every other (no synchronou
 });
 
 test("S-F12: the real-state guard also wraps appendFileSync, rmSync, copyFileSync, lstat/truncate/utimes, the async callback forms (writeFile, rename, rm, appendFile, ...) and fs.promises", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uw-guard-"));
+  const root = mkTmp("uw-guard-");
   const { guardRealState } = await import("./fixtures/no-real-state.mjs");
   let hook; const touched = guardRealState((fn) => { hook = fn; }, assert, { root });
   const f = path.join(root, "a.txt"), g = path.join(root, "b.txt");

@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { pathToFileURL } from "node:url";
 import {
   buildProviders, validate, bucketFor, normalizeModel, outputKind, capabilityKind,
@@ -156,7 +157,7 @@ test("MUTATION: reverting the candidate set to discovery-only DELETES tabiai and
       `from ${JSON.stringify(new URL("../refresh/catalog-store.mjs", import.meta.url).href)}`);
   assert.notEqual(mutated, src, "the mutation must actually change the source");
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r11-mutant-"));
+  const dir = mkTmp("r11-mutant-");
   const file = path.join(dir, "keysync-discovery-only.mjs");
   fs.writeFileSync(file, mutated);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 
@@ -10,7 +11,7 @@ const REPORT = path.join(os.homedir(), ".uw", "state", "conmode.json");
 
 const run = (child) => {
   try { fs.unlinkSync(REPORT); } catch {}
-  const buf = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-buf-")), "b.md");
+  const buf = path.join(mkTmp("uw-buf-"), "b.md");
   fs.writeFileSync(buf, "m\n");
   let code = 0, out = "";
   try {

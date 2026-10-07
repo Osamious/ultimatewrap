@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { fileURLToPath } from "node:url";
 import { STATUSES, statusCode, statusTone, countStatuses, providerFlags, loadBench, benchKey,
          BENCH_FRESH_MS } from "../menu/bench-data.mjs";
@@ -14,7 +15,7 @@ import { initState, reduce, view } from "../menu/pick-state.mjs";
 import { firstFrame } from "../menu/uwpick.mjs";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-benchcounts-"));
+const tmp = () => mkTmp("uw-benchcounts-");
 const NOW = 1_800_000_000_000;                          // ms
 const secs = (agoMs) => Math.floor((NOW - agoMs) / 1000);
 const DAY = 24 * 3600 * 1000;

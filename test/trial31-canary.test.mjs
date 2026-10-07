@@ -10,12 +10,13 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const TRIAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "harness", "trial31");
 const PRELOAD = path.join(TRIAL, "preload-guard.cjs").replace(/\\/g, "/");
-const mkTemp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-trial31-canary-"));
+const mkTemp = () => mkTmp("uw-trial31-canary-");
 const q = (p) => `--require "${p.replace(/\\/g, "/")}"`;
 
 function guardedEnv(root, protectedRoot, { portRange = "39456-39457", preload = PRELOAD, realPorts = "3456,3457,3458,4517" } = {}) {

@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { TIERS, tierList, isTier } from "../menu/tiers.mjs";
@@ -16,7 +17,7 @@ import { realFileHashes, assertRealFilesUntouched } from "./fixtures/no-real-sta
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const KEY = path.join(ROOT, "keysync", "key.mjs");
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-tiers-"));
+const tmp = () => mkTmp("uw-tiers-");
 const rd = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
 const dirs = [];
 

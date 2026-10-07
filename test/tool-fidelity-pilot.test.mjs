@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs, { existsSync as rawExists } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { spawnSync } from "node:child_process";
 import { guardRealState } from "./fixtures/no-real-state.mjs";
 import { realFileState } from "./fixtures/real-file-state.mjs";
@@ -168,7 +169,7 @@ test("THINKING-ONLY escalation at the CLI: a model whose budget went on thinking
 test("the temp-dir helper CLEANS UP what it made, and only that: a foreign directory with the same prefix is left alone", () => {
   const mine = freshDir(), mine2 = freshDir();
   fs.writeFileSync(path.join(mine, "f"), "1");
-  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "uw-tf-foreign-"));
+  const foreign = mkTmp("uw-tf-foreign-");
   try {
     assert.ok(madeDirs().includes(mine) && madeDirs().includes(mine2) && !madeDirs().includes(foreign));
     assert.ok(cleanupDirs() >= 2);
@@ -185,7 +186,7 @@ test("the stream limits are pinned by number: 2 MiB, 20,000 events, 64 blocks (c
 });
 
 test("a test FILE that uses the helper leaves no directory behind when it finishes (the after-hook, proven in a child run with its own temp folder)", () => {
-  const sbx = fs.mkdtempSync(path.join(os.tmpdir(), "uw-tf-sbx-"));
+  const sbx = mkTmp("uw-tf-sbx-");
   try {
     const helpers = new URL("./fixtures/tool-fidelity-helpers.mjs", import.meta.url).href;
     const tiny = path.join(sbx, "tiny.test.mjs");

@@ -6,13 +6,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { main } from "../refresh/bench-cli.mjs";
 
 const M = (id, o = {}) => ({ id, badge: "PAID", pin: 1, pout: 2, outputKind: "text", routable: true, ...o });
 const snapshot = { ok: true, snap: { rows: [
   { provider: "a", models: [M("x"), M("y")] }, { provider: "b", models: [M("z")] }, { provider: "c", models: [M("w"), M("v"), M("u")] },
 ] } };
-const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-sel-"));
+const dir = () => mkTmp("uw-sel-");
 const list = (d, text) => { const f = path.join(d, "list.txt"); fs.writeFileSync(f, text); return f; };
 const run = async (argv, d) => {
   const err = [], log = [], e = console.error, l = console.log;

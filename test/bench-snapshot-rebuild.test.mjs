@@ -6,6 +6,7 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { fileURLToPath } from "node:url";
 import { rebuildAfterRun, buildSnapshotChild, parseArgs, modelsSig } from "../refresh/bench-cli.mjs";
 import { BENCH_SCHEMA } from "../menu/bench-data.mjs";
@@ -232,7 +233,7 @@ test("M2: Ctrl-C during the rebuild kills the child and prints one line; nothing
 // ------------------------------------------------------------ L3: did the records change
 
 test("L3: modelsSig ignores generatedAt but sees a changed, added or removed record", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-sig-")), f = path.join(dir, "bench.json");
+  const dir = mkTmp("uw-sig-"), f = path.join(dir, "bench.json");
   const write = (models, generatedAt) => fs.writeFileSync(f, JSON.stringify({ schema: BENCH_SCHEMA, generatedAt, models }));
   write({ "s/a": { s: "ok", a: 1 }, "o/b": { s: "gone", a: 1 } }, "t1");
   const base = modelsSig(f);

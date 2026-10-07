@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { readHealth, resolveHealth, makeHealthOf, outranks,
          SOURCE_RANK, MAX_HEALTH_AGE_MS } from "../menu/health.mjs";
@@ -41,7 +42,7 @@ test("a provider is healthy if ANY of its credentials answered", () => {
 });
 
 test("writeHealthFromProbeFile writes an atomic file and returns the fold", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-health-writer-"));
+  const dir = mkTmp("uw-health-writer-");
   const src = path.join(dir, "probe.json");
   const out = path.join(dir, "health.json");
   fs.writeFileSync(src, JSON.stringify({ at: "2026-09-02T19:53:00.000Z", results: [
@@ -54,7 +55,7 @@ test("writeHealthFromProbeFile writes an atomic file and returns the fold", () =
 });
 
 test("writeHealthFromProbeFile returns null for a file with no results", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-health-writer-"));
+  const dir = mkTmp("uw-health-writer-");
   const src = path.join(dir, "missing.json");
   assert.equal(writeHealthFromProbeFile(src, path.join(dir, "health.json")), null);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -67,7 +68,7 @@ const fresh = { generatedAt: "2026-09-09T00:00:00Z", providers: {} };
 const old = { generatedAt: "2026-06-01T00:00:00Z", providers: {} };
 
 test("a missing file reads as empty rather than throwing", () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "uw-health-"));
+  const d = mkTmp("uw-health-");
   assert.deepEqual(readHealth(path.join(d, "nope.json")), { generatedAt: null, providers: {} });
   fs.rmSync(d, { recursive: true, force: true });
 });

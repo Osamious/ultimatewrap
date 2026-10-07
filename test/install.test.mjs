@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { wrapCommand, unwrapCommand } from "../menu/hud-shim.mjs";
@@ -10,7 +11,7 @@ import { wrapCommand, unwrapCommand } from "../menu/hud-shim.mjs";
 // the original `require("node:path")` calls threw ReferenceError before any
 // assertion ran -- the same defect ccr-client.mjs carried in Task A4.
 const PS1 = "C:/Users/osami/.uw/menu/install.ps1";
-const tmpdir = (tag) => fs.mkdtempSync(path.join(os.tmpdir(), tag));
+const tmpdir = mkTmp;
 
 // -WhatIf and -StateFile keep this off the real User environment entirely.
 function plan(args, stateFile, currentEditor) {

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { parseArgs, main, readWatermark, readSince, openReadOnly, verdict, rowMatches, EXIT } from "../refresh/spike-client-tag.mjs";
@@ -21,7 +22,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A temp usage database; the writable handle is closed and the folder removed when the test ends. */
 const tmpDb = (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-spike-"));
+  const dir = mkTmp("uw-spike-");
   const file = path.join(dir, "usage.sqlite");
   const db = new DatabaseSync(file);
   db.exec("create table usage_events (id integer primary key, created_at text, request_id text, client text, provider text, model text, status_code integer, duration_ms integer, output_tokens integer, secret_body text)");

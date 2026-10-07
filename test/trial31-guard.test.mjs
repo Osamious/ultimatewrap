@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -367,7 +368,7 @@ test("install: omitted modules are skipped (the installer is total over its inpu
 
 // ---------- integration: the real preload in a real node process, temp dirs only ----------
 const PRELOAD = path.join(TRIAL, "preload-guard.cjs").replace(/\\/g, "/");
-function mkTemp() { return fs.mkdtempSync(path.join(os.tmpdir(), "uw-trial31-test-")); }
+function mkTemp() { return mkTmp("uw-trial31-test-"); }
 function guardedEnv(root, prot) {
   return {
     SystemRoot: process.env.SystemRoot, PATH: process.env.PATH, PATHEXT: process.env.PATHEXT, ComSpec: process.env.ComSpec,

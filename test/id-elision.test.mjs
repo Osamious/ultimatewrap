@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { detectCaps, painter, glyphsFor, padId, elisionHeads, elisionPlan, frame, frameWidth, layoutFor } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
 import { sanitizeCells, sanitizeDisplay } from "../menu/sanitize.mjs";
@@ -344,7 +345,7 @@ test("escape sequences injected into any meta string never reach the output", ()
 });
 
 test("loadBench rejects a generatedAt that does not look like a timestamp", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-idel-"));
+  const dir = mkTmp("uw-idel-");
   const write = (generatedAt) => { const f = path.join(dir, "b.json"); fs.writeFileSync(f, JSON.stringify({ schema: 1, generatedAt, models: { "a/b": { s: "ok", a: 1 } } })); return loadBench(f); };
   assert.equal(write("2026-09-29T12:35:00.000Z").generatedAt, "2026-09-29T12:35:00.000Z");
   assert.equal(write("\x1b]0;PWN\x07").generatedAt, null);

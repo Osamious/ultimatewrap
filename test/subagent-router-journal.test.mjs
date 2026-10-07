@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { createRequire } from "node:module";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -37,7 +38,7 @@ const sub = (agent, { sid = "s1", model = "nowhere/x", len } = {}) => ({ body: {
 const mainReq = (model, sid = "s1") => ({ body: { model, tools: [{ name: "Agent" }, { name: "Read" }] }, headers: { "x-claude-code-session-id": sid }, sessionId: sid });
 
 function tree(pol) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-jr-"));
+  const dir = mkTmp("uw-jr-");
   const spike = path.join(dir, "spike"), state = path.join(dir, "state", "subagent");
   fs.mkdirSync(spike, { recursive: true }); fs.mkdirSync(state, { recursive: true });
   fs.copyFileSync(NEXT, path.join(spike, "uw-router.cjs"));

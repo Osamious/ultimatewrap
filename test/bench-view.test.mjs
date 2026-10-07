@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { fileURLToPath } from "node:url";
 import { detectCaps, frame, frameWidth, layoutFor, FRAME_MIN, FRAME_MAX, MODEL_ID_MAX, MODEL_ID_MIN } from "../menu/style.mjs";
 import { initState, reduce, view } from "../menu/pick-state.mjs";
@@ -437,7 +438,7 @@ test("uwpick loads bench.json exactly once, and only when a model screen is abou
 // -------------------------------------------------------------------- scale
 
 test("loading and drawing on a 6,000-row catalogue reads the bench file once and stays fast", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uw-benchview-"));
+  const dir = mkTmp("uw-benchview-");
   const file = path.join(dir, "bench.json");
   const rows = snapRows(60, 100);
   const models = {};

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import { fileURLToPath } from "node:url";
 import {
   parseArgs, dropFresh, limitGroups, summarize, medianSeconds, DEFAULTS, ECONOMY_DEFAULTS, ECONOMY_BREAKERS, printPlan, unprobedLines,
@@ -479,7 +480,7 @@ const cap = async (fn) => {
   console.error = (...a) => err.push(a.join(" ")); console.log = (...a) => log.push(a.join(" "));
   try { return { code: await fn(), err, log }; } finally { console.error = e; console.log = l; }
 };
-const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-redact-"));
+const scratch = () => mkTmp("uw-redact-");
 const none = () => [];
 
 test("main --redact rewrites the given bench.json, prints the count, and releases the lock", async () => {
@@ -519,7 +520,7 @@ test("main --redact on a missing file says so and exits 1", async () => {
 // ------------------------------------------------- the gateway credential
 
 const settingsFile = (obj) => {
-  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uw-gw-")), "settings.json");
+  const f = path.join(mkTmp("uw-gw-"), "settings.json");
   fs.writeFileSync(f, typeof obj === "string" ? obj : JSON.stringify(obj));
   return f;
 };

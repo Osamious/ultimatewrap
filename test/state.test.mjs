@@ -2,12 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { mkTmp } from "./helpers/tmp.mjs";
 import os from "node:os";
 import { loadPickerState, recordRecent, toggleFavourite, recordHandoff } from "../menu/state.mjs";
 
 // Never the live file: every test gets its own scratch path.
 const scratch = () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "uw-state-"));
+  const d = mkTmp("uw-state-");
   return path.join(d, "picker.json");
 };
 
@@ -85,7 +86,7 @@ test("the written file is valid JSON with only the two keys", () => {
 });
 
 test("recordHandoff appends one parseable line per call", () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "uw-handoff-"));
+  const d = mkTmp("uw-handoff-");
   const f = path.join(d, "handoff.json");
   recordHandoff({ sentinel: "m", wrote: false }, f);
   recordHandoff({ sentinel: "model", wrote: true }, f);
