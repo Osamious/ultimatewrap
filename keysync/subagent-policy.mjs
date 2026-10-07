@@ -923,6 +923,65 @@ export function autoRebuildArgv(extra = []) {
   for (let i = 0; i < extra.length; i++) if (allowed.has(extra[i]) && i + 1 < extra.length) { kept.push(extra[i], String(extra[i + 1])); i += 1; }
   return ["rebuild", ...kept, "--auto", "yes", "--live", "yes"];
 }
+// ------------------------------------------------------------------ the rebuild lock (issue #158)
+export const REBUILD_LOCK_STALE_MS = 120000;                 // a lock older than this, or one whose process is gone, is taken over: it never blocks forever
+export const TAKEOVER_STALE_MS = 10000;                      // the short-lived file that serialises a takeover; a leftover of a crashed taker is removed after this
+const rebuildLockFile = (p) => path.join(p.stateDir, "rebuild.lock");
+const pidAliveDefault = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; } };
+const LOCK_RETRY = new Set(["EPERM", "EACCES", "EBUSY"]), LOCK_FAIL_OPEN = new Set(["ENOENT", "EROFS", "ENOSPC"]);
+const readText = (f) => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
+/**
+ * Takes state/subagent/rebuild.lock for a writer of the compiled policy (set, rebuild, undo, clear, the automatic rebuild): an exclusive create (O_EXCL) holding {pid, at, token}. Returns {ok: true, release, note?} or
+ * {ok: false, heldBy}. A held lock whose age passes REBUILD_LOCK_STALE_MS or whose pid is gone is TAKEN OVER with no window in which two takers can both win: the takeover itself is serialised by a second exclusive file
+ * (rebuild.lock.takeover); under it the taker re-reads the lock, removes it only if it is still exactly the text it judged stale, creates its own and drops the takeover file. A busy file (EPERM, EACCES, EBUSY) is retried a few
+ * times; a folder that cannot hold a lock (ENOENT, EROFS, ENOSPC) lets the writer run as before, with a note. \`open\` is a seam for a test; \`release\` removes the file only while it still holds this taker's token.
+ */
+export function takeRebuildLock(p, { nowMs = Date.now(), pidAlive = pidAliveDefault, open = fs.openSync } = {}) {
+  const file = rebuildLockFile(p), takeFile = `${file}.takeover`, dir = path.dirname(file), up = path.dirname(dir);
+  const token = JSON.stringify({ pid: process.pid, at: new Date(nowMs).toISOString(), n: Math.random().toString(36).slice(2) });
+  // a folder this call had to create is removed again on release (when nothing else went into it): a refused command leaves no empty state folder behind
+  const madeDir = !fs.existsSync(dir), madeUp = !fs.existsSync(up);
+  const tidy = () => { if (madeDir) { try { fs.rmdirSync(dir); if (madeUp) fs.rmdirSync(up); } catch { /* not empty: something was written there */ } } };
+  const dropIfMine = (f) => { try { if (readText(f) === token) fs.rmSync(f, { force: true }); } catch { /* already gone */ } };
+  const failOpen = (e) => ({ ok: true, release() { tidy(); }, note: `NOTE: the rebuild lock could not be created (${e?.code ?? "error"}); this run is not serialised with another writer` });
+  const create = (f) => { const fd = open(f, "wx"); try { fs.writeSync(fd, token); } finally { fs.closeSync(fd); } };
+  const mine = { ok: true, release() { dropIfMine(file); tidy(); } };
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { return failOpen(e); }
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try { create(file); return mine; }
+    catch (e) {
+      if (e?.code !== "EEXIST") { if (LOCK_FAIL_OPEN.has(e?.code)) return failOpen(e); sleepMs(10 * (attempt + 1)); continue; }       // busy or unknown: try again in a moment
+    }
+    const snap = readText(file);                               // held: is it stale?
+    if (snap === null) continue;
+    let info = null; try { info = JSON.parse(snap); } catch { /* torn: judged by its time on disk */ }
+    let age; try { const t = Date.parse(info?.at ?? ""); age = nowMs - (Number.isFinite(t) ? t : fs.statSync(file).mtimeMs); } catch { continue; }
+    const dead = Number.isInteger(info?.pid) && info.pid !== process.pid && !pidAlive(info.pid);
+    if (!(age > REBUILD_LOCK_STALE_MS || dead)) return { ok: false, heldBy: info };
+    try { create(takeFile); }                                  // the takeover is serialised: one taker at a time
+    catch (e) {
+      if (e?.code !== "EEXIST") { if (LOCK_FAIL_OPEN.has(e?.code)) return failOpen(e); sleepMs(10 * (attempt + 1)); continue; }
+      let ta; try { ta = nowMs - fs.statSync(takeFile).mtimeMs; } catch { continue; }
+      if (ta > TAKEOVER_STALE_MS) { try { fs.rmSync(takeFile, { force: true }); } catch { /* another taker did */ } } else sleepMs(10 * (attempt + 1));
+      continue;
+    }
+    try {
+      if (readText(file) === snap) fs.rmSync(file, { force: true });      // only the very lock that was judged stale, never a fresh one that replaced it
+      try { create(file); return mine; } catch (e) { if (e?.code !== "EEXIST") return failOpen(e); }
+    } finally { dropIfMine(takeFile); }
+  }
+  return { ok: false, heldBy: null };
+}
+/** Runs \`fn\` while holding the rebuild lock; a held lock is E_LOCKED (one line, exit 1; the automatic rebuild promises no retry), and the lock is released when \`fn\` returns or throws. \`io\` receives the fail-open note. */
+async function withRebuildLock(p, fn, io, { auto = false } = {}) {
+  const lock = takeRebuildLock(p);
+  if (!lock.ok) throw new PolicyError("E_LOCKED", `E_LOCKED: another policy rebuild is running${Number.isInteger(lock.heldBy?.pid) ? ` (pid ${lock.heldBy.pid})` : ""}; ${auto ? "the policy stays as it is until the next trigger or a manual rebuild" : "retry in a minute"}`, 1);
+  let r;
+  try { r = await fn(); } finally { lock.release(); }
+  if (lock.note) io?.err?.(lock.note);                      // after a SUCCESSFUL run only: a failure's own line stays the first thing the user reads
+  return r;
+}
+
 /**
  * The automatic rebuild for the callers that keep the policy current after a sweep or a keysync run (D-x): runs `rebuild --auto yes --live yes` IN PROCESS and is strictly non-fatal: it never throws, never sets
  * process.exitCode, and returns the exit code the rebuild would have had and the lines it printed (the caller prints them and ignores the code). `--auto` accepts no shrink and no unverified version and never turns
@@ -936,6 +995,15 @@ export async function autoRebuild({ extra = [], env = process.env } = {}) {
   } catch (e) {
     return { code: 1, lines: [...lines, `subagent policy: the automatic rebuild failed (${printable(e?.message ?? e, 160)}); the saved policy is unchanged`] };
   }
+}
+
+/**
+ * What a sweep or a keysync run calls once its OWN state is saved (D-x): the automatic rebuild, its lines to stderr, strictly non-fatal. It never throws and returns the rebuild's result or null; the caller's exit code is
+ * decided before and after it without looking at the result. `rebuild` and `write` are seams for a test.
+ */
+export async function autoRebuildAfter({ write = (l) => { try { console.error(l); } catch { /* a closed pipe must not fail a good run */ } }, rebuild = autoRebuild, extra, env } = {}) {
+  try { const r = await rebuild({ extra, env }); for (const l of r?.lines ?? []) write(l); return r ?? null; }
+  catch { return null; }
 }
 
 /** The one pause sentence (`PAUSED:` here, in the verdict and in undo): a runnable way out unless there is none that can succeed. */
@@ -1017,7 +1085,9 @@ const liveSfx = (p) => (p.fixture ? "" : " --live yes");
 /** The one runnable way out of a pause (the printed command carries its own prefix and `--live yes`). */
 const RESUME_COMMAND = `${CLI} resume --live yes`;
 
-async function cmdSet(p, flags, io, opts = {}) {
+// a real save is a writer of the compiled policy: it takes the rebuild lock (a preview writes nothing)
+async function cmdSet(p, flags, io, opts = {}) { return flags.dry ? cmdSetLocked(p, flags, io, opts) : withRebuildLock(p, () => cmdSetLocked(p, flags, io, opts), io); }
+async function cmdSetLocked(p, flags, io, opts = {}) {
   const existing = loadOwner(p.policyFile);
   const notes = [];
   const owner = mergeOwner(existing, flags, notes);
@@ -1753,7 +1823,8 @@ async function hygieneLines(p, compiled, nowMs, indent = "") {
   return items.flatMap((x) => { const r = codeRow(x.code); return [`${indent}${x.code}: ${x.text}`, ...(r ? [`${indent}  fix: ${r.fix}${r.fixNote ? ` (${r.fixNote})` : ""}`] : [])]; });
 }
 
-async function cmdRebuild(p, flags, io, opts = {}) {
+async function cmdRebuild(p, flags, io, opts = {}) { return withRebuildLock(p, () => cmdRebuildLocked(p, flags, io, opts), io, { auto: !!flags.auto }); }
+async function cmdRebuildLocked(p, flags, io, opts = {}) {
   // `--auto yes` is the automatic rebuild after a sweep or a keysync run: stale-only, one line, and it can only LOWER what the owner saved: it accepts no shrink and no unverified version, and never turns enforcement on
   const auto = !!flags.auto;
   if (auto) flags = { ...flags, "if-stale": true, "accept-shrink": undefined, "accept-unverified-cc": undefined };
@@ -1941,11 +2012,11 @@ export async function runSubagentPolicy(argv, io, env = process.env, opts = {}) 
       case "last": return await cmdLast(p, flags, io, target, opts);
       case "preset": return await cmdPreset(p, flags, io, target, opts);
       case "wizard": return await cmdWizard(p, flags, io, opts);
-      case "clear": return await cmdClear(p, flags, io);
+      case "clear": return await withRebuildLock(p, () => cmdClear(p, flags, io), io);      // clear removes the compiled policy: a writer like the others (pause and rollback stay unlocked: the emergency flip)
       case "rollback": return await cmdRollback(p, flags, io, "rollback");
       case "pause": return await cmdRollback(p, flags, io, "pause");
       case "resume": return await cmdResume(p, flags, io, opts);
-      case "undo": return await cmdUndo(p, flags, io, opts);
+      case "undo": return await withRebuildLock(p, () => cmdUndo(p, flags, io, opts), io);
       case "why": return await cmdWhy(p, flags, io, target);
       // loaded on demand, like key.mjs loads this module: the report pulls in the SQLite reader, the self-test the sandbox harness constants, and no other command needs either
       case "report": return await (await import("./subagent-report.mjs")).cmdReport(p, flags, io, opts);

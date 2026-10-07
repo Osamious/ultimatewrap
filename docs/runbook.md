@@ -435,10 +435,28 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   version whatever flags come with it, and it never turns enforcement on (an owner file that says enforce stays shadow in the compiled
   file until the owner's own `rebuild`; it can only lower). `autoRebuild()` in the library runs it in process and never throws or sets
   the exit code of its caller.
+  Where it runs (D-x): at the end of a live tool sweep (`refresh/tool-fidelity-cli.mjs`, after its store is saved), of a live bench
+  sweep that changed bench.json (`refresh/bench-cli.mjs`, after the closing snapshot rebuild), of a verified `--target live` keysync
+  write (`keysync/run.mjs`) and after a successful `key.mjs add`, `remove`, `retier` (not `--dry yes`) and `default-model set` or
+  `clear`. Each prints its one line on stderr, is strictly non-fatal and never changes the exit code of the command; `--no-rebuild yes`
+  on that command skips it. It is stale-only and accepts no shrink: a bench run whose snapshot was rebuilt from stale discovery caches
+  (the 2026-10-06 incident) gets one `E_SHRINK` line and the saved policy is left as it was. `key.mjs prefer` does not trigger it.
+  Not after Ctrl-C or after the gateway gave up (exit 4) in a tool sweep, nor after a bench run whose gateway gave up. The live
+  migrations of the tool sweep (`--reclass-l4`, `--stated-limits`, `--release-holds`, `--reset-gone-holds`, `--reset-awkward-json`, `--reset-transient`, `--reset-canary`, `--merge-unsaved`)
+  do NOT trigger it: after one of them the policy stays as it was until the next trigger or a manual `rebuild --live yes`.
+  `--release-holds`, `--reset-gone-holds` and `--reset-canary` change what the compile reads (holds and pending entries), so after one of them the
+  saved policy is out of date until the next trigger or a manual `rebuild --live yes`.
+  `--no-rebuild` takes yes or no in `key.mjs`, `keysync/run.mjs` and both sweeps; any other value is a usage error before any work.
   Serialisation: the compiled file and the owner file are written atomically (a temp file named for the process, flushed, then renamed
-  over the target), so the router never reads a torn file; there is NO lock. Do not run a manual `set` or `rebuild` while an automatic
-  rebuild is finishing: both read first and write last, so if they race the later write wins and `status` shows STALE (or the compile
-  carries the older toggles) until the next `rebuild`.
+  over the target), so the router never reads a torn file, and every writer of the compiled policy (a real `set`, which also covers `resume`,
+  `preset` and `wizard`, `rebuild`, `rebuild --auto`, `undo` and `clear`) takes `state/subagent/rebuild.lock` first (an exclusive create
+  holding the process id and the time). While it is held another writer stops with `E_LOCKED: another policy rebuild is running; retry in a
+  minute` and writes nothing; the automatic rebuild after a sweep says instead that the policy stays as it is until the next trigger or a
+  manual rebuild. `pause` and `rollback` stay UNLOCKED on purpose: they are the emergency flip and never wait for a rebuild. A lock older
+  than 120 seconds, or whose process is gone, is taken over without a window in which two takers can both win (the takeover is serialised by
+  a second exclusive file, `rebuild.lock.takeover`, that is itself dropped after 10 seconds if a taker crashed); a busy file (EPERM, EACCES,
+  EBUSY) is retried a few times; a folder that cannot hold a lock (ENOENT, EROFS, ENOSPC) lets the writer run, with a one-line note that it
+  is not serialised. A `set --dry yes` and the read commands take no lock.
   `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
   `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves

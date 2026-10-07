@@ -103,6 +103,7 @@ const ROWS = [
   e("E_TIER_INVALID", "The key tier is not one of free, free-deposit, paid, subscription, management.", "node keysync/key.mjs list", "7.1"),
   e("E_PRECONDITION", "A condition for this step is not met (for example enforcement needs live providers and a passing classifier record).", STATUS, "7"),
   e("E_SHRINK", "The rebuild was refused: the snapshot or the eligible set shrank by more than 25% against the saved policy (the usual cause is stale provider caches, not real model removals). The saved policy is untouched and nothing was written.", "node refresh/cli.mjs", "7", "refresh discovery first (this only plans the run; add --live, which needs your OK), or accept a real shrink with rebuild --accept-shrink yes --live yes"),
+  e("E_LOCKED", "Another policy rebuild (a save, a rebuild, an undo or the automatic rebuild after a sweep) is writing the compiled policy right now, so this command stopped without writing anything.", STATUS, "7", "wait a minute and run the command again; a lock left by a crashed writer is taken over after two minutes"),
   e("E_EMPTY", "The saved toggles leave no model that can stand in for a subagent; nothing was written.", PRESET_ANY, "7", PRESET_ANY_NOTE),
   e("E_UNKNOWN_MODEL", "That model id is not in the snapshot.", `${CLI} explain <provider/model>`, "7"),
   e("E_OWNER_CORRUPT", "Your saved policy file is unreadable or invalid.", `${CLI} clear --live yes`, "7"),

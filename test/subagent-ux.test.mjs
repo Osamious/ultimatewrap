@@ -1103,7 +1103,7 @@ test("code table (F14, F15): EVERY fix command of EVERY row parses through the r
     if (r.degrades) assert.doesNotMatch(r.fix, /--dry yes|preset( \w[\w-]*)?$/, `${r.code}: a degrading code's fix is a repair, not a preview`);
   }
   assert.ok(parsed >= 50, `parsed ${parsed} subagent-policy fix commands`);
-  assert.equal(CODES.length, 138, "the table holds 138 rows");
+  assert.equal(CODES.length, 139, "the table holds 139 rows");
   // the rows the review named
   assert.equal(codeRow("FREE_PROMISE_BREAK").fix, `${CLI} show --detail yes`);
   assert.equal(codeRow("UNKNOWN_MAIN").fix, `${CLI} status`); assert.match(codeRow("UNKNOWN_MAIN").fixNote, /start a request in the main session first/);

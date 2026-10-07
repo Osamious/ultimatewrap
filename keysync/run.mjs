@@ -41,6 +41,11 @@ const has = (f) => args.includes(f);
 const val = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : d; };
 const target = val("--target", "dry");
 const dry = has("--dry") || target === "dry";
+// `--no-rebuild` takes yes or no: refused before any work (an unknown value must not silently mean "rebuild")
+// EVERY occurrence is checked; the last one decides
+const noRebuildAt = args.flatMap((x, i) => (x === "--no-rebuild" ? [i] : []));
+if (noRebuildAt.some((i) => !["yes", "no"].includes(args[i + 1]))) { console.error("--no-rebuild takes yes or no (yes skips the automatic subagent policy rebuild after a live write)"); process.exit(2); }
+const noRebuild = noRebuildAt.length > 0 && args[noRebuildAt.at(-1) + 1] === "yes";
 
 // 45 since 2026-09-13: vyncai (vyceai.com) added, discovery-admitted (7 ids).
 // 46 since 2026-09-13: apinex (api.apinex.bond) added, discovery-admitted (25 ids).
@@ -2187,6 +2192,12 @@ if (writeVerified) {
     console.log(`WARNING: backup cleanup failed (${String(e.message).slice(0, 120)}); ` +
       `the write itself succeeded. Stale backups may remain in ${path.dirname(SETTINGS)}`);
   }
+}
+
+// D-x: after a verified LIVE write the provider list the subagent policy was compiled from has changed: the compile-only automatic rebuild (stale-only, one line on stderr, never enforces, accepts no shrink) keeps it
+// current. Strictly non-fatal and outside the exit code; `--no-rebuild yes` skips it.
+if (writeVerified && target === "live" && !noRebuild) {
+  try { const { autoRebuildAfter } = await import("./subagent-policy.mjs"); await autoRebuildAfter({}); } catch { /* never fatal: the apply already succeeded */ }
 }
 
 // ---- end entry-point guard (see isEntry above) ----

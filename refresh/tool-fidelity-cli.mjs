@@ -108,6 +108,7 @@ export function parseArgs(argv) {
     if (a === "--live") o.live = true;
     else if (a === "--force") o.force = true;
     else if (a === "--retry-failed") o.retryFailed = true;
+    else if (a === "--no-rebuild") { const v = argv[++i]; if (v !== "yes" && v !== "no") return { error: "--no-rebuild takes yes or no (yes skips the automatic subagent policy rebuild at the end of a live pass)" }; o.noRebuild = v === "yes"; }
     else if (a === "--merge-unsaved") o.mergeUnsaved = true;
     else if (a === "--reset-awkward-json") o.resetAwkwardJson = true;
     else if (a === "--reset-transient") o.resetTransient = true;
@@ -1294,8 +1295,19 @@ async function runLive({ o, p, loaded, stored, outFile, gw, fetchImpl, deps, ben
       history: rec ? scopedHistory : null, thisRun: rec ? runEntry : null, runs: o.saturateRuns, gain: o.saturateGain, yieldPct: o.saturateYield });
     for (const line of saturationLines(verdict, sat, partial ? "aborted" : null, { history: rec ? [...scopedHistory, runEntry].slice(-HISTORY_PER_SCOPE) : scopedHistory, starved })) console.log(line);
   } else console.log(`SATURATION saturated=unknown recoverable=unknown hard=unknown new_results=${recorded} requests=${telemetry.total().n} reason=unknown deepen_blocked=unknown account_state=unknown`);
+  if (saved && o.live && !(signalStop || ac.signal.aborted || interrupts > 0 || code === 4)) await policyAfterRun(o, deps, outFile);      // not after Ctrl-C and not after the gateway gave up (exit 4): the pass did not finish          // D-x: keep the subagent policy current; after the final save, strictly non-fatal, never part of the exit code
   if (!saved) return 1;                                                  // a failed save is the loudest fact of the run: it outranks the 3 (the records are in the side file)
   return Math.max(code, toolSweepExit({ gaveUp: false, signal: signalStop || ac.signal.aborted || interrupts > 0, requests: telemetry.total().n, records: recorded, outcomes: other }));
+}
+
+/**
+ * D-x: after a live pass has SAVED its store, the compile-only automatic rebuild of the subagent policy (stale-only, one line on stderr, never enforces, accepts no shrink). Strictly non-fatal: nothing here can throw or change the
+ * exit code of the pass. It runs for the real store, or when a caller injects `deps.autoRebuildAfter` (a test); `--no-rebuild yes` skips it.
+ */
+export async function policyAfterRun(o, deps = {}, outFile = deps.outFile ?? REAL_FILE) {
+  if (o.noRebuild) return;
+  if (!deps.autoRebuildAfter && outFile !== REAL_FILE) return;           // a test with its own store never reaches the real policy
+  try { const { autoRebuildAfter } = await import("../keysync/subagent-policy.mjs"); await (deps.autoRebuildAfter ?? autoRebuildAfter)({}); } catch { /* never fatal: the pass's own result stands */ }
 }
 
 /**

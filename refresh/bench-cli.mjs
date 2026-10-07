@@ -195,6 +195,7 @@ export function parseArgs(argv) {
     else if (a === "--redact") o.redact = true;
     else if (a === "--reclassify-notices") o.reclassify = true;
     else if (a === "--dry") o.dry = true;
+    else if (a === "--no-rebuild") { const v = argv[++i]; if (v !== "yes" && v !== "no") return { error: "--no-rebuild takes yes or no (yes skips the automatic subagent policy rebuild at the end of a live run)" }; o.noRebuild = v === "yes"; }
     else if (a === "--only-file") {
       const v = argv[++i];
       if (!v) return { error: "--only-file needs a path: one provider/id per line, # for comments" };
@@ -539,6 +540,17 @@ export const EXIT_BUSY = 5;
  * lockless sweep). Nothing else is injectable, and a test that reaches past the lock
  * check would touch the real state directory, so tests stop at the lock.
  */
+/**
+ * D-x: after a live run that CHANGED bench.json and after the closing snapshot rebuild, the compile-only automatic rebuild of the subagent policy (stale-only, one line on stderr, never enforces, accepts no shrink: the
+ * 2026-10-06 incident was this very moment, a snapshot rebuilt from stale discovery caches). Strictly non-fatal: nothing here can throw or change the exit code. It runs for the real bench file, or when a caller injects
+ * `deps.autoRebuildAfter` (a test); `--no-rebuild yes` skips it.
+ */
+export async function policyAfterRun(o, deps = {}, wrote = true) {
+  if (o.noRebuild || !wrote) return;
+  if (!deps.autoRebuildAfter && deps.benchFile) return;                  // a test with its own bench file never reaches the real policy
+  try { const { autoRebuildAfter } = await import("../keysync/subagent-policy.mjs"); await (deps.autoRebuildAfter ?? autoRebuildAfter)({}); } catch { /* never fatal: the run's own result stands */ }
+}
+
 export async function main(argv = process.argv.slice(2), deps = {}) {
   const o = parseArgs(argv);
   if (o.error) { console.error(`bench: ${o.error}`); return 2; }
@@ -756,6 +768,7 @@ async function runMain(o, lockDeps, deps = {}) {
     signal: rebuilding.signal,
     healthy: async () => !result.outage?.gaveUp && (await gatewayUp(gw.base)),      // an outage is exactly when a rebuild would degrade routability
   });
+  await policyAfterRun(o, deps, wrote && !result.outage?.gaveUp);                                            // D-x: after the snapshot rebuild, strictly non-fatal, never part of the exit code
   return code;
 }
 
