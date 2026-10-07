@@ -425,6 +425,20 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   the evaluator writes it and this command checks its date, policy hash and versions, but nothing signs it, so anyone who can write
   `state/subagent/` can write a PASS; the evidence hash is printed, never re-derived. Both are inside the owner's own account and
   were left as they are on purpose; the router is not changed for them.
+  `--accept-unverified-cc yes` is NOT persisted: it covers that one `set` or `rebuild` only, so a later `rebuild --if-stale yes` without it
+  drops to shadow with CLASSIFIER_UNMEASURED while the installed Claude Code version stays unreadable. `clear` followed by `set` starts a
+  new route baseline (the baseline lives in the compiled file, which `clear` removes). The eligible-ROWS rule has no peak (a ratchet
+  limit): under the same toggles each rebuild may lose up to 25% of the rows against the previous policy, so repeated small row losses
+  add up unseen unless the route count moves too.
+  `rebuild --auto yes` is the form for the automatic rebuild after a sweep or a keysync run (D-x): stale-only, silent when current,
+  ONE line when it rebuilt, no output and exit 0 when no policy was ever saved; it accepts no shrink and no unverified Claude Code
+  version whatever flags come with it, and it never turns enforcement on (an owner file that says enforce stays shadow in the compiled
+  file until the owner's own `rebuild`; it can only lower). `autoRebuild()` in the library runs it in process and never throws or sets
+  the exit code of its caller.
+  Serialisation: the compiled file and the owner file are written atomically (a temp file named for the process, flushed, then renamed
+  over the target), so the router never reads a torn file; there is NO lock. Do not run a manual `set` or `rebuild` while an automatic
+  rebuild is finishing: both read first and write last, so if they race the later write wins and `status` shows STALE (or the compile
+  carries the older toggles) until the next `rebuild`.
   `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
   `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves

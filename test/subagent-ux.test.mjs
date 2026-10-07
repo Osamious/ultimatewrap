@@ -1677,3 +1677,130 @@ test("--accept-unverified-cc yes (round 2): with the installed Claude Code versi
   assert.equal(yes.status, 0, yes.err); assert.match(yes.out, /^accuracy: PASS of .* Claude Code 2\.1\.289 \(NOT compared with the installed version: accepted by --accept-unverified-cc yes\)/m);
   assert.throws(() => lib.parseArgs(["explain", "a/b", "--accept-unverified-cc", "yes"]), (e) => e.code === "E_USAGE");
 });
+
+// ---- round 3 (ux lane): `rebuild --auto yes`, the automatic rebuild of D-x
+test("rebuild --auto yes: nothing to do without a saved policy or when current (silent, exit 0); one plain line when it rebuilt; it accepts no shrink (not even with --accept-shrink) and leaves the saved compile untouched", async () => {
+  const s = setup();
+  const none = await run(["rebuild", "--auto", "yes", ...s.F]);
+  assert.deepEqual([none.status, none.out, none.err], [0, "", ""], "no owner file: nothing to keep up to date, no error");
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const current = await run(["rebuild", "--auto", "yes", ...s.F]);
+  assert.deepEqual([current.status, current.out, current.err], [0, "", ""], "up to date: silent");
+  // a small change of the snapshot: stale, rebuilt, ONE line
+  const sn = rd(s.m["snapshot-file"]);
+  sn.rows[0].models = sn.rows[0].models.slice(0, -1); sn.builtAt = new Date(Date.now() + 1000).toISOString();
+  wr(s.m["snapshot-file"], sn);
+  const small = await run(["rebuild", "--auto", "yes", ...s.F]);
+  assert.equal(small.status, 0, small.err); assert.equal(small.out.split("\n").length, 1);
+  assert.match(small.out, /^subagent policy: rebuilt \(\d+ eligible models, was 14\)$/);
+  // a big shrink: refused in one line, never accepted
+  cutRoutes(s, 6, 3000);
+  const before = fs.readFileSync(s.compiled);
+  for (const extra of [[], ["--accept-shrink", "yes"], ["--accept-unverified-cc", "yes"]]) {
+    const r = await run(["rebuild", "--auto", "yes", ...extra, ...s.F]);
+    assert.equal(r.status, 1, r.out); assert.equal(r.err.split("\n").length, 1);
+    assert.match(r.err, /^E_SHRINK: the snapshot shrank from 18 to 6 routes.*the automatic rebuild never accepts a shrink/);
+    assert.ok(Buffer.compare(fs.readFileSync(s.compiled), before) === 0, "the saved compile is untouched");
+  }
+  assert.equal((await run(["rebuild", "--accept-shrink", "yes", ...s.F])).status, 0, "only the owner's own rebuild accepts it");
+  assert.throws(() => lib.parseArgs(["set", "--mode", "dynamic", "--auto", "yes", "--live", "yes"]), (e) => e.code === "E_USAGE", "--auto belongs to rebuild only");
+});
+
+test("rebuild --auto yes never turns enforcement on: an owner file that says enforce stays shadow in the compiled file until the owner's own rebuild, and an enforcing compile stays enforcing while the PASS holds", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const H = rd(s.compiled).contentHash;
+  const live = await lib.readProviders(lib.resolvePaths(fixtureFlagMap(s.dir)));
+  wr(path.join(s.state, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ef".repeat(32), policyContentHash: H } });
+  const opts = { liveProviders: live, enforceOpts: { ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" } };
+  wr(s.owner, { ...rd(s.owner), enforcement: "enforce" });
+  const auto = await run(["rebuild", "--auto", "yes", ...s.F], opts);
+  assert.equal(auto.status, 0, auto.err);
+  assert.match(auto.out, /^subagent policy: rebuilt \(\d+ eligible models, was \d+\); enforcement stays shadow: the owner file says enforcement=enforce but an automatic rebuild never turns enforcement on \(run `node keysync\/key\.mjs subagent-policy rebuild --live yes` yourself\)/);
+  let c = rd(s.compiled); assert.equal(c.owner.enforcement, "shadow"); assert.equal(c.gate.code, "CLASSIFIER_UNMEASURED");
+  assert.equal((await run(["rebuild", "--auto", "yes", ...s.F], opts)).out, "", "and the next automatic run is silent (current)");
+  assert.equal(rd(s.compiled).owner.enforcement, "shadow");
+  // the owner's own rebuild turns it on (the PASS holds) ...
+  assert.equal((await run(["rebuild", ...s.F], opts)).status, 0);
+  assert.equal(rd(s.compiled).owner.enforcement, "enforce");
+  // ... and an automatic rebuild that follows a change that does not move the policy hash (a newer bench stamp) keeps it on, while a lapsed precondition still lowers it
+  const restamp = (n) => { const bn = rd(s.m["bench-file"]); bn.generatedAt = new Date(Date.now() + n).toISOString(); wr(s.m["bench-file"], bn); };
+  restamp(1000);
+  const kept = await run(["rebuild", "--auto", "yes", ...s.F], opts);
+  assert.equal(kept.status, 0, kept.err); assert.match(kept.out, /^subagent policy: rebuilt /); assert.ok(!/enforcement stays shadow/.test(kept.out));
+  assert.equal(rd(s.compiled).owner.enforcement, "enforce");
+  restamp(2000);
+  const lowered = await run(["rebuild", "--auto", "yes", ...s.F], { ...opts, enforceOpts: { ccrVersion: () => "9.9.9", ccVersion: () => "2.1.289" } });
+  assert.equal(lowered.status, 0); assert.match(lowered.out, /enforcement stays shadow: .*measured on CCR 3\.0\.22 but CCR 9\.9\.9 is installed/);
+  assert.equal(rd(s.compiled).owner.enforcement, "shadow");
+  // a change that moves the policy voids the PASS (it was measured against the old policy), automatic or not
+  assert.equal((await run(["rebuild", ...s.F], opts)).status, 0); assert.equal(rd(s.compiled).owner.enforcement, "enforce");
+  const sn = rd(s.m["snapshot-file"]); sn.rows[0].models = sn.rows[0].models.slice(0, -1); sn.builtAt = new Date(Date.now() + 5000).toISOString(); wr(s.m["snapshot-file"], sn);
+  const moved = await run(["rebuild", "--auto", "yes", ...s.F], opts);
+  assert.match(moved.out, /enforcement stays shadow: .*was measured against policy [0-9a-f]{12} but the policy is [0-9a-f]{12}/);
+  void c;
+});
+
+test("autoRebuild (the library hook): a rebuild that is refused comes back as a result with the one-line refusal and the process exit code is untouched; a good one returns its line", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const before = process.exitCode;
+  const ok = await lib.autoRebuild({ extra: s.F });
+  assert.deepEqual([ok.code, ok.lines], [0, []], "current: nothing printed");
+  cutRoutes(s, 6, 1000);
+  const c0 = fs.readFileSync(s.compiled);
+  const refused = await lib.autoRebuild({ extra: s.F });
+  assert.equal(refused.code, 1); assert.equal(refused.lines.length, 1); assert.match(refused.lines[0], /^E_SHRINK: the snapshot shrank from 18 to 6 routes/);
+  assert.ok(Buffer.compare(fs.readFileSync(s.compiled), c0) === 0);
+  assert.equal(process.exitCode, before, "a failing rebuild leaves the caller's exit code as it was");
+  // a caller's own result is unaffected whatever the hook returns
+  let callerCode = 0;
+  const sweep = async () => { callerCode = 0; try { const r = await lib.autoRebuild({ extra: s.F }); void r; } catch { callerCode = 99; } return callerCode; };
+  assert.equal(await sweep(), 0);
+});
+
+test("accept-unverified-cc hint (round 3): resume and undo have no such flag of their own, so their refusal names the `set` command that has it", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const H = rd(s.compiled).contentHash;
+  const live = await lib.readProviders(lib.resolvePaths(fixtureFlagMap(s.dir)));
+  wr(path.join(s.state, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ef".repeat(32), policyContentHash: H } });
+  const opts = { liveProviders: live, enforceOpts: { ccrVersion: () => "3.0.22", ccVersion: () => null } };
+  const HINT = /so it is not compared; run `node keysync\/key\.mjs subagent-policy set --enforce enforce --accept-unverified-cc yes` to enforce on the recorded version anyway/;
+  // resume: the owner file says enforce, the policy is paused
+  wr(s.owner, { ...rd(s.owner), enforcement: "enforce" });
+  assert.equal((await run(["pause", ...s.P])).status, 0);
+  const resume = await run(["resume", ...s.F], opts);
+  assert.equal(resume.status, 1, resume.out); assert.match(resume.err, HINT); assert.ok(fs.existsSync(s.flag), "still paused");
+  // a plain set names its own flag
+  const plain = await run(["set", ...DYN, "--enforce", "enforce", ...s.F], opts);
+  assert.match(plain.err, /pass --accept-unverified-cc yes to enforce on the recorded version anyway/);
+  // undo: save an enforcing policy (with the flag), then a shadow one, then undo goes back to the enforcing one and is refused into the pause
+  wr(s.owner, { ...rd(s.owner), enforcement: "shadow" });
+  assert.equal((await run(["set", ...DYN, "--enforce", "shadow", ...s.F], opts)).status, 0);       // a set lifts the pause (shadow needs nothing)
+  assert.equal((await run(["set", ...DYN, "--enforce", "enforce", "--accept-unverified-cc", "yes", ...s.F], opts)).status, 0);
+  assert.equal((await run(["set", ...DYN, "--enforce", "shadow", ...s.F], opts)).status, 0);
+  const undo = await run(["undo", ...s.F], opts);
+  assert.equal(undo.status, 1, undo.out + undo.err); assert.match(undo.err, HINT); assert.ok(fs.existsSync(s.flag), "refused into the pause");
+});
+
+test("autoRebuild (round 3 security): extra flags that try to switch --auto off or accept a shrink or an unverified Claude Code version change nothing: still refused, saved compile untouched; and rebuild --auto with --accept-unverified-cc still holds enforcement", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  cutRoutes(s, 6, 1000);
+  const c0 = fs.readFileSync(s.compiled);
+  const r = await lib.autoRebuild({ extra: [...s.F, "--auto", "no", "--accept-shrink", "yes", "--accept-unverified-cc", "yes", "--if-stale", "no"] });
+  assert.equal(r.code, 1); assert.equal(r.lines.length, 1); assert.match(r.lines[0], /^E_SHRINK: the snapshot shrank from 18 to 6 routes.*the automatic rebuild never accepts a shrink/);
+  assert.ok(Buffer.compare(fs.readFileSync(s.compiled), c0) === 0, "the saved compile is untouched");
+  // unverified Claude Code: the flag is dropped by --auto itself (a direct rebuild --auto with the flag), enforcement stays shadow
+  const s2 = setup();
+  assert.equal((await SET(s2, ...DYN)).status, 0);
+  const H = rd(s2.compiled).contentHash;
+  const live = await lib.readProviders(lib.resolvePaths(fixtureFlagMap(s2.dir)));
+  wr(path.join(s2.state, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ef".repeat(32), policyContentHash: H } });
+  wr(s2.owner, { ...rd(s2.owner), enforcement: "enforce" });
+  const opts = { liveProviders: live, enforceOpts: { ccrVersion: () => "3.0.22", ccVersion: () => null } };
+  const held = await run(["rebuild", "--auto", "yes", "--accept-unverified-cc", "yes", ...s2.F], opts);
+  assert.equal(held.status, 0, held.err); assert.match(held.out, /enforcement stays shadow: /);
+  assert.equal(rd(s2.compiled).owner.enforcement, "shadow");
+});

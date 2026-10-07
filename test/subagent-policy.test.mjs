@@ -2010,3 +2010,93 @@ test("shrink guard (round 2): the baseline is the PEAK route count since the las
   assert.match(lib.shrinkText(f, { via: "set", live: false }), /subagent-policy set --accept-shrink yes` \(it saves/);
   assert.doesNotMatch(lib.shrinkText(f, { via: "set" }), /or pass --accept-shrink yes/);
 });
+
+// ---- round 3: caller-specific hints, bare-version hint, --discovery-dir wording, the automatic rebuild
+test("enforce reader (round 3): the Claude Code refusal names the command a caller can run (a caller without its own flag is told `set --enforce enforce --accept-unverified-cc yes`); a malformed recorded version says to pass a bare x.y.z to the accuracy tool", async () => {
+  const dir = tmp(); const p = lib.resolvePaths(fixtureFlagMap(dir));
+  const live = await lib.gatherInputs(p, { nowMs: NOW, liveProviders: await lib.readProviders(p) });
+  const enforce = { ...lib.OWNER_DEFAULTS, mode: "dynamic", enforcement: "enforce" };
+  const H = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+  const file = path.join(dir, "state", "subagent", "accuracy.json");
+  const rec = (over = {}) => ({ schema: 1, verdict: "PASS", at: new Date(NOW - 3600000).toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ab".repeat(32), policyContentHash: H }, ...over });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const seam = (over = {}) => ({ contentHash: H, ccrVersion: () => "3.0.22", ccVersion: () => null, ...over });
+  const msg = (r, o) => { fs.writeFileSync(file, JSON.stringify(r)); try { lib.checkEnforcePreconditions(p, live, enforce, NOW, o); return null; } catch (e) { return e.message; } };
+  assert.match(msg(rec(), seam()), /so it is not compared; pass --accept-unverified-cc yes to enforce on the recorded version anyway \(evidence: /, "set and rebuild have the flag themselves");
+  assert.match(msg(rec(), seam({ via: "other", live: true })), /so it is not compared; run `node keysync\/key\.mjs subagent-policy set --enforce enforce --accept-unverified-cc yes --live yes` to enforce on the recorded version anyway \(evidence: /);
+  assert.match(msg(rec(), seam({ via: "other", live: false })), /run `node keysync\/key\.mjs subagent-policy set --enforce enforce --accept-unverified-cc yes` to enforce/, "a fixture run needs no --live");
+  assert.ok(!/pass --accept-unverified-cc yes/.test(msg(rec(), seam({ via: "other" }))), "the caller without the flag is not told to pass it");
+  // the bare x.y.z hint (the accuracy tool does not normalise what it is given)
+  assert.match(msg(rec({ ccrVersion: "v3.0.22" }), seam({ ccVersion: () => "2.1.289" })), /records a CCR version that is not a whole x\.y\.z \("v3\.0\.22"\); run the accuracy evaluation again and pass a bare x\.y\.z as --ccr-version \(for example 3\.0\.22\)/);
+  assert.match(msg(rec({ ccVersion: "Claude Code 2.1.289" }), seam({ ccVersion: () => "2.1.289" })), /records a Claude Code version that is not a whole x\.y\.z \("Claude Code 2\.1\.289"\); run the accuracy evaluation again and pass a bare x\.y\.z as --cc-version \(for example 2\.1\.289\)/);
+});
+
+test("--discovery-dir on a live run: a refusal and a blank value say a folder and never talk about a test-flag run; the file flags keep their wording", () => {
+  const prot = tmp();
+  const live = (e) => e.code === "E_USAGE" && !/test-flag/.test(e.message) && /leave --discovery-dir out to read the default discovery folder$/.test(e.message);
+  assert.throws(() => lib.resolvePaths({ "discovery-dir": path.join(prot, "d") }, { protect: [prot] }), (e) => live(e) && /lies under/.test(e.message));
+  assert.throws(() => lib.resolvePaths({ "discovery-dir": String.raw`\\localhost\C$\d` }), (e) => live(e) && /name a local folder of your own/.test(e.message));
+  assert.throws(() => lib.parseArgs(["status", "--discovery-dir", " "]), (e) => /^flag --discovery-dir needs a folder path, found an empty or blank value$/.test(e.message));
+  assert.throws(() => lib.resolvePaths({ "discovery-dir": "" }), (e) => /^flag --discovery-dir needs a folder path/.test(e.message));
+  // a fixture run (a file flag is given) and every file flag keep the old words
+  const fx = path.join(tmp(), "state");
+  assert.throws(() => lib.resolvePaths({ "state-dir": fx, "snapshot-file": path.join(prot, "s.json") }, { protect: [prot] }), (e) => /a test-flag run names its own temp folders$/.test(e.message));
+  assert.throws(() => lib.parseArgs(["show", "--snapshot-file", " "]), (e) => /^flag --snapshot-file needs a file path/.test(e.message));
+  assert.throws(() => lib.resolvePaths({ "state-dir": fx, "snapshot-file": String.raw`\\localhost\C$\s.json` }), (e) => /a test-flag run names its own local temp folders$/.test(e.message));
+});
+
+test("the automatic rebuild (D-x): autoRebuild never throws and never sets the exit code; `rebuild --auto yes` is quiet when current, one line when it rebuilt, and accepts no shrink and no unverified version", async () => {
+  const lines = (r) => r.lines.join("\n");
+  const before = process.exitCode;
+  // an unreadable argument, a thrown non-policy error and a policy refusal: all come back as a result
+  const boom = new Proxy({}, { get() { throw new Error("boom"); } });
+  const thrown = await lib.autoRebuild({ env: boom });
+  assert.deepEqual([thrown.code, /^subagent policy: the automatic rebuild failed \(boom\); the saved policy is unchanged$/.test(thrown.lines.at(-1))], [1, true]);
+  // a fixture folder with no saved policy: nothing to keep up to date, no error (and nothing but the fixture is read: a non-file flag in `extra` is dropped, so it can never select the real files)
+  const fxFlags = Object.entries(fixtureFlagMap(tmp())).flatMap(([k, v]) => [`--${k}`, v]);
+  const none = await lib.autoRebuild({ extra: ["--bogus", "yes", ...fxFlags] });
+  assert.deepEqual([none.code, none.lines], [0, []]);
+  assert.equal(process.exitCode, before, "the process exit code was not touched");
+  assert.ok(!/child_process/.test(fs.readFileSync(new URL("../keysync/subagent-policy.mjs", import.meta.url), "utf8").replace(/\/\/.*$/gm, "")), "the library still starts no child process");
+});
+
+test("autoRebuildArgv (round 3 security): only file flags survive from a caller's extra flags and the forced flags come last, so --auto no, --accept-shrink yes and --accept-unverified-cc yes can never reach the rebuild", () => {
+  const hostile = ["--auto", "no", "--accept-shrink", "yes", "--accept-unverified-cc", "yes", "--if-stale", "no", "--state-dir", "S", "--live", "no", "--enforce", "enforce", "--snapshot-file", "F", "--discovery-dir", "D", "--accept-shrink"];
+  const argv = lib.autoRebuildArgv(hostile);
+  assert.deepEqual(argv, ["rebuild", "--state-dir", "S", "--snapshot-file", "F", "--discovery-dir", "D", "--auto", "yes", "--live", "yes"]);
+  assert.deepEqual(lib.autoRebuildArgv([]), ["rebuild", "--auto", "yes", "--live", "yes"]);
+  assert.deepEqual(lib.autoRebuildArgv(undefined), ["rebuild", "--auto", "yes", "--live", "yes"]);
+  assert.deepEqual(lib.autoRebuildArgv(["--state-dir"]), ["rebuild", "--auto", "yes", "--live", "yes"], "a file flag with no value is dropped");
+  for (const f of lib.FILE_FLAGS) assert.deepEqual(lib.autoRebuildArgv([`--${f}`, "x"]).slice(0, 3), ["rebuild", `--${f}`, "x"], f);
+  // the parser reads the forced flags
+  const parsed = lib.parseArgs(lib.autoRebuildArgv([...Object.entries(fixtureFlagMap(tmp())).flatMap(([k, v]) => [`--${k}`, v]), "--auto", "no", "--accept-shrink", "yes", "--accept-unverified-cc", "yes"]));
+  assert.deepEqual([parsed.cmd, parsed.flags.auto, parsed.flags.live, parsed.flags["accept-shrink"], parsed.flags["accept-unverified-cc"]], ["rebuild", true, true, undefined, undefined]);
+});
+
+test("enforce reader: the evidence line states a window bounded by --since (from, rows and violations discarded) and only PRINTS it; no bound, a non-object excludedByFrom and hostile fields print as before or n/a, never a control byte and never a refusal", async () => {
+  const dir = tmp(); const p = lib.resolvePaths(fixtureFlagMap(dir));
+  const live = await lib.gatherInputs(p, { nowMs: NOW, liveProviders: await lib.readProviders(p) });
+  const enforce = { ...lib.OWNER_DEFAULTS, mode: "dynamic", enforcement: "enforce" };
+  const H = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+  const seam = { contentHash: H, ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" };
+  const file = path.join(dir, "state", "subagent", "accuracy.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const win = (over) => ({ since: "2026-09-06T00:00:00.000Z", until: "2026-10-05T00:00:00.000Z", days: 30, ...over });
+  const line = (w) => { fs.writeFileSync(file, JSON.stringify({ schema: 1, verdict: "PASS", at: new Date(NOW - 3600000).toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", window: w, evidence: { classRowsCounted: 5, sha256: "ab".repeat(32), policyContentHash: H } })); return lib.checkEnforcePreconditions(p, live, enforce, NOW, seam)[0]; };
+  const base = "window 2026-09-06 to 2026-10-05, measured ";
+  // with a bound
+  assert.match(line(win({ from: "2026-10-01T00:00:00.000Z", excludedByFrom: { rows: 1234, t1Miss: 1, t2Viol: 2, t4Miss: 0, violations: 3 } })), /window 2026-09-06 to 2026-10-05, bounded from 2026-10-01T00:00:00\.000Z, discarded 1,234 rows incl\. 3 violations, measured \d{4}-\d{2}-\d{2}$/);
+  // without: the line is exactly as it was
+  for (const w of [win({}), win({ from: null, excludedByFrom: null }), win({ from: "2026-10-01T00:00:00.000Z" }), win({ excludedByFrom: { rows: 1, violations: 0 } }), win({ from: "2026-10-01", excludedByFrom: "x" }), win({ from: "2026-10-01", excludedByFrom: [1] }), win({ from: 5, excludedByFrom: { rows: 1 } })])
+    assert.ok(line(w).includes(base) && !/bounded from/.test(line(w)), JSON.stringify(w));
+  // hostile fields: non-integers print n/a, a control byte in `from` is made printable, nothing is refused
+  assert.match(line(win({ from: "2026-10-01", excludedByFrom: { rows: "9", violations: 1.5 } })), /bounded from 2026-10-01, discarded n\/a rows incl\. n\/a violations, measured /);
+  assert.match(line(win({ from: "2026-10-01", excludedByFrom: { rows: null } })), /discarded n\/a rows incl\. n\/a violations/);
+  const hostile = line(win({ from: "\u001b[2J2026-10-01\u0007" + "x".repeat(200), excludedByFrom: { rows: -1, violations: 1e30 } }));
+  assert.ok(!/[\u0000-\u001f]/.test(hostile), "no control byte"); assert.ok(hostile.length < 400, "the date text is clipped");
+  // print only: a heavy discard still passes
+  assert.doesNotThrow(() => line(win({ from: "2026-10-04T00:00:00.000Z", excludedByFrom: { rows: 99999, violations: 99999 } })));
+  // and the refusals carry the same text
+  fs.writeFileSync(file, JSON.stringify({ schema: 1, verdict: "PASS", at: new Date(NOW - 3600000).toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.21", window: win({ from: "2026-10-01T00:00:00.000Z", excludedByFrom: { rows: 7, violations: 2 } }), evidence: { classRowsCounted: 5, sha256: "ab".repeat(32), policyContentHash: H } }));
+  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam), (e) => /was measured on CCR 3\.0\.21 .*\(evidence: .*window 2026-09-06 to 2026-10-05, bounded from 2026-10-01T00:00:00\.000Z, discarded 7 rows incl\. 2 violations, measured /.test(e.message));
+});
