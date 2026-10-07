@@ -436,8 +436,8 @@ test("F13: rebuild with an owner file that says enforce keeps the router in shad
     const lib = await import("../keysync/subagent-policy.mjs");
     const p = lib.resolvePaths(flags);
     const live = await lib.gatherInputs(p, { liveProviders: await lib.readProviders(p) });
-    fs.mkdirSync(p.stateDir, { recursive: true }); wr(path.join(p.stateDir, "accuracy.json"), { at: new Date().toISOString(), verdict: "PASS" });
-    assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, live, { ...SENTINEL_OWNER }));
+    fs.mkdirSync(p.stateDir, { recursive: true }); wr(path.join(p.stateDir, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 1, sha256: "ab".repeat(32), policyContentHash: "feedface" } });
+    assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, live, { ...SENTINEL_OWNER }, Date.now(), { contentHash: "feedface", ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" }));
     const ok = lib.compile(live, { ...lib.OWNER_DEFAULTS, ...SENTINEL_OWNER }).compiled;
     assert.equal(ok.owner.enforcement, "enforce"); assert.equal(ok.gate, undefined);
   })();

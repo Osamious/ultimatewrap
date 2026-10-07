@@ -400,6 +400,31 @@ node keysync/key.mjs subagent-policy help                   # the toggle map and
   providers fresh, M past the 7-day ceiling (not routed): a snapshot rebuild now would drop their models") when any cache
   is past the ceiling, and SNAPSHOT_DRIFT when the policy was compiled from a snapshot whose route count differs from the
   current one by more than 10%. `--discovery-dir` names another folder (a test).
+  ENFORCE READER (`set --enforce enforce`, and the `enforcement: enforce` a rebuild keeps): the accuracy verdict in
+  `state/subagent/accuracy.json` counts only when it is PASS, younger than 30 days and not dated more than 5 minutes in the
+  future, BOUND to the policy it was measured against (`evidence.policyContentHash` equals the content hash of the policy about
+  to be written, so a rebuild or a toggle change that moves the hash voids it and the compile carries shadow with the reason),
+  and measured on the installed CCR (`ccrVersion`, read from the installed package) and Claude Code (`ccVersion`, compared with
+  the launcher's own version file; when that cannot be read the field is required and printed, and the line says it was not
+  compared). Each refusal is one line with the evidence line (classified rows hashed, window). The reader never re-derives the
+  evidence hash (the evaluator owns it), reads fields by name and ignores extra fields.
+  Versions are compared WHOLE: a prerelease tag (3.0.22-evil), a v prefix or a fourth number is a different version (the text
+  `claude --version` prints, "2.1.289 (Claude Code)", is accepted for Claude Code). When the installed Claude Code version cannot
+  be read (no single launcher copy in its versions folder) the gate REFUSES; only `--accept-unverified-cc yes` (on `set` or
+  `rebuild`) lets the recorded version stand, and the printed line says it was not compared. A verdict file over 1 MiB is not read.
+  The shrink guard compares the route count with the PEAK baseline kept in `builtFrom.snapshotRoutesBaseline` (the highest count
+  since the last accepted shrink; `--accept-shrink yes` resets it to the accepted count), so two 20% steps cannot add up unseen;
+  the eligible-rows rule still compares with the previous policy only (a known limit: slow row loss under the same toggles shows
+  only through the route count). `resume`, `preset`, `wizard` and `undo` have no `--accept-shrink` of their own: their E_SHRINK line
+  names `set --accept-shrink yes`, and a refused `undo` keeps your earlier toggles saved and lands in the pause. `--discovery-dir`
+  gets the refusals of the file flags (blank, UNC, a protected folder).
+  KNOWN LIMITS of the enforce gate (documented, not closed here): (1) the router trusts `owner.enforcement` in the compiled policy
+  it reads and runs no gate of its own: every precondition above is checked by this command when it WRITES the policy, so a
+  hand-edited compiled file (or one written by another tool) that says enforce is obeyed: the content hash leaves `enforcement` out, so
+  changing that one field does not trip POLICY_HASH. (2) `accuracy.json` is self-attested:
+  the evaluator writes it and this command checks its date, policy hash and versions, but nothing signs it, so anyone who can write
+  `state/subagent/` can write a PASS; the evidence hash is printed, never re-derived. Both are inside the owner's own account and
+  were left as they are on purpose; the router is not changed for them.
   `--json yes` prints one JSON object whose shape is frozen (`schema` 3, a fixed key order with
   `traffic` last, pinned by a test); `last --json yes` keeps its own shape.
   `selftest` is the one-run check that the policy really changes a subagent's model and leaves

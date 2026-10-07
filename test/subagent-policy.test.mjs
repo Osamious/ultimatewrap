@@ -17,7 +17,9 @@ import { TIERS, isTier, tierList, RELAY_KEY_ID, RELAY_TIER, freeScopeOf, isExclu
 
 guardRealState(after, assert);
 const NOW = Date.parse("2026-10-03T00:00:00.000Z");
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "uw-pol-"));
+const made = [];
+const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), "uw-pol-")); made.push(d); return d; };
+after(() => { for (const d of made) if (path.dirname(d) === os.tmpdir() && path.basename(d).startsWith("uw-pol-")) fs.rmSync(d, { recursive: true, force: true }); });      // the tests leaked every folder they made (issue #157)
 const rd = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
 const wr = (f, o) => fs.writeFileSync(f, typeof o === "string" ? o : JSON.stringify(o));
 async function fx(mutate, over = {}) {
@@ -709,17 +711,20 @@ test("F13: providers read from a --providers-file are stamped providersLive: fal
   assert.equal(run(fixture).counts.allowed, 14, "the fixture providers are still USED");
   assert.equal(lib.compile(fixture, { ...lib.OWNER_DEFAULTS, source: "all-providers" }).compiled.builtFrom.providersLive, false);
   const accuracy = (o) => { fs.mkdirSync(path.join(dir, "state", "subagent"), { recursive: true }); wr(path.join(dir, "state", "subagent", "accuracy.json"), o); };
-  accuracy({ at: new Date(NOW).toISOString(), verdict: "PASS" });
+  const H = "c0ffee00c0ffee00";
+  const pass = (over = {}) => ({ schema: 1, verdict: "PASS", at: new Date(NOW).toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 10, sha256: "ab".repeat(32), policyContentHash: H }, ...over });
+  const seam = { contentHash: H, ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" };
+  accuracy(pass());
   const enforce = { ...lib.OWNER_DEFAULTS, mode: "dynamic", enforcement: "enforce" };
-  assert.throws(() => lib.checkEnforcePreconditions(p, fixture, enforce, NOW), (e) => e.code === "E_PRECONDITION" && /needs live Providers/.test(e.message), "a fresh PASS verdict does not help: the fixture is not live");
+  assert.throws(() => lib.checkEnforcePreconditions(p, fixture, enforce, NOW, seam), (e) => e.code === "E_PRECONDITION" && /needs live Providers/.test(e.message), "a fresh PASS verdict does not help: the fixture is not live");
   const live = await lib.gatherInputs(p, { nowMs: NOW, liveProviders: await lib.readProviders(p) });
   assert.equal(live.providersLive, true);
-  assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, live, enforce, NOW), "live + a PASS younger than 30 days");
-  accuracy({ at: new Date(NOW - 31 * 86400000).toISOString(), verdict: "PASS" });
-  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW), /blocked: state\/subagent\/accuracy\.json/, "expired");
-  accuracy({ at: new Date(NOW).toISOString(), verdict: "FAIL" });
-  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW), /blocked/);
-  assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, fixture, { ...enforce, enforcement: "shadow" }, NOW), "shadow needs nothing");
+  assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam), "live + a bound PASS younger than 30 days");
+  accuracy(pass({ at: new Date(NOW - 31 * 86400000).toISOString() }));
+  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam), /blocked: state\/subagent\/accuracy\.json/, "expired");
+  accuracy(pass({ verdict: "FAIL" }));
+  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam), /blocked/);
+  assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, fixture, { ...enforce, enforcement: "shadow" }, NOW, seam), "shadow needs nothing");
 });
 
 test("F22: counts carry their denominator: deposit-strict-skipped, ALIAS, CREDIT and DEPOSIT STRICT name the population, each definition its own", async () => {
@@ -1859,4 +1864,149 @@ test("S3-6 wording: the unverified rows are told apart (blocked by a recorded st
   const inp = syn(spec, { bench }); inp.classifyBench = (rec) => (/credit/.test(rec.m ?? "") ? "pay" : null);
   const ac = funnel(inp, T()).counts.accountState;
   assert.deepEqual(ac, { pay: 2, auth: 0, rate: 1 }, "status rate with a message that names the credit is counted as pay");
+});
+
+
+// ---- cr-accuracy finding 6: the enforce reader binds a PASS to the policy and the installed versions, and refuses a forged date
+test("enforce reader (cr-accuracy 6): a good file passes and prints its evidence line; a PASS dated in the future, bound to another policy, on another CCR or Claude Code version, or with garbled or missing fields is refused with ONE reason; extra fields are tolerated", async () => {
+  const dir = tmp(); const p = lib.resolvePaths(fixtureFlagMap(dir));
+  const live = await lib.gatherInputs(p, { nowMs: NOW, liveProviders: await lib.readProviders(p) });
+  const enforce = { ...lib.OWNER_DEFAULTS, mode: "dynamic", enforcement: "enforce" };
+  const H = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+  const good = (over = {}) => ({ schema: 1, verdict: "PASS", at: new Date(NOW - 3600000).toISOString(), ccVersion: "2.1.289 (Claude Code)", ccrVersion: "3.0.22", window: { since: "2026-09-06T00:00:00.000Z", until: "2026-10-05T00:00:00.000Z", days: 30 },
+    evidence: { classRowsCounted: 1756, sha256: "ab".repeat(32), policyContentHash: H }, someFutureField: { x: 1 }, ...over });
+  const put = (o) => { fs.mkdirSync(path.join(dir, "state", "subagent"), { recursive: true }); wr(path.join(dir, "state", "subagent", "accuracy.json"), o); };
+  const seam = (over = {}) => ({ contentHash: H, ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289", ...over });
+  const check = (o, s = seam(), now = NOW) => { put(o); return lib.checkEnforcePreconditions(p, live, enforce, now, s); };
+  const refused = (o, re, s, now) => assert.throws(() => check(o, s, now), (e) => e.code === "E_PRECONDITION" && e.exit === 1 && re.test(e.message) && !e.message.includes("\n"), JSON.stringify(o).slice(0, 80));
+  // a good file
+  const ok = check(good());
+  assert.equal(ok.length, 1); assert.match(ok[0], /^accuracy: PASS of \d{4}-\d{2}-\d{2}, bound to policy a1b2c3d4e5f6, CCR 3\.0\.22, Claude Code 2\.1\.289; evidence: 1,756 classified rows hashed abababababab, window 2026-09-06 to 2026-10-05, measured \d{4}-\d{2}-\d{2}$/);
+  assert.deepEqual(lib.checkEnforcePreconditions(p, live, { ...enforce, enforcement: "shadow" }, NOW, seam()), [], "shadow needs nothing");
+  // (a) the forged future date
+  refused(good({ at: "2999-01-01" }), /^--enforce enforce is blocked: state\/subagent\/accuracy\.json is dated 2999-01-01, in the future: a verdict cannot be newer than now \(evidence: 1,756 classified rows hashed abababababab, window 2026-09-06 to 2026-10-05, measured 2999-01-01\)$/);
+  assert.doesNotThrow(() => check(good({ at: new Date(NOW + 4 * 60000).toISOString() })), "4 minutes ahead is clock skew");
+  refused(good({ at: new Date(NOW + 5 * 60000 + 1000).toISOString() }), /in the future/);
+  // the base rules stay as they were (exact old text)
+  for (const bad of [good({ verdict: "FAIL" }), good({ verdict: "INSUFFICIENT" }), good({ at: "garbled" }), good({ at: undefined }), good({ at: 12345 }), good({ at: new Date(NOW - 31 * 86400000).toISOString() }), "not json", [1], null, 7])
+    refused(bad, /^--enforce enforce is blocked: state\/subagent\/accuracy\.json must hold a classifier verdict PASS younger than 30 days$/);
+  fs.rmSync(path.join(dir, "state", "subagent", "accuracy.json"));
+  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam()), /must hold a classifier verdict PASS younger than 30 days/, "no file");
+  // (b) bound to the policy
+  refused(good({ evidence: { ...good().evidence, policyContentHash: "0".repeat(32) } }), /^--enforce enforce is blocked: state\/subagent\/accuracy\.json was measured against policy 000000000000 but the policy is a1b2c3d4e5f6: a rebuild or a change of toggles that changes the policy voids it; run the accuracy evaluation again \(evidence: /);
+  for (const ev of [{ ...good().evidence, policyContentHash: null }, { ...good().evidence, policyContentHash: "" }, { ...good().evidence, policyContentHash: 12 }, { classRowsCounted: 5 }, null, "x", [1]])
+    refused(good({ evidence: ev }), /records no policy content hash/);
+  refused(good(), /cannot be bound: there is no compiled policy/, seam({ contentHash: undefined }));          // no hash given and no compiled file on disk
+  // ... and with no explicit hash the compiled file on disk is the policy (the live one)
+  const compiledA = lib.compile(live, { ...lib.OWNER_DEFAULTS, mode: "dynamic", source: "all-providers" }).compiled, compiledB = lib.compile(live, { ...lib.OWNER_DEFAULTS, mode: "free", source: "all-providers", freeScope: "providers" }).compiled;
+  assert.notEqual(compiledA.contentHash, compiledB.contentHash);
+  wr(path.join(dir, "state", "subagent", "policy.json"), compiledA);
+  assert.doesNotThrow(() => check(good({ evidence: { ...good().evidence, policyContentHash: compiledA.contentHash } }), seam({ contentHash: undefined })));
+  wr(path.join(dir, "state", "subagent", "policy.json"), compiledB);
+  refused(good({ evidence: { ...good().evidence, policyContentHash: compiledA.contentHash } }), /was measured against policy [0-9a-f]{12} but the policy is [0-9a-f]{12}: a rebuild/, seam({ contentHash: undefined }));
+  // (c) versions
+  refused(good({ ccrVersion: "3.0.21" }), /was measured on CCR 3\.0\.21 but CCR 3\.0\.22 is installed; run the accuracy evaluation again/);
+  assert.doesNotThrow(() => check(good({ ccrVersion: " 3.0.22 " })), "surrounding spaces are trimmed");
+  // WHOLE versions (finding 9): a prerelease tag is a different version; a v prefix, a fourth number and free text around the number are not a version this check reads
+  refused(good({ ccrVersion: "3.0.22-evil" }), /was measured on CCR 3\.0\.22-evil but CCR 3\.0\.22 is installed/);
+  refused(good({ ccrVersion: "3.0.22+build9" }), /was measured on CCR 3\.0\.22\+build9 but CCR 3\.0\.22 is installed/);
+  for (const v of ["v3.0.22", "3.0.22.9", "CCR v3.0.22 (installed)", "3.0", "3.0.22 and more"]) refused(good({ ccrVersion: v }), /records a CCR version that is not a whole x\.y\.z/);
+  for (const v of ["v2.1.289", "2.1.289.1", "Claude Code 2.1.289"]) refused(good({ ccVersion: v }), /records a Claude Code version that is not a whole x\.y\.z/);
+  refused(good({ ccVersion: "2.1.289-evil (Claude Code)" }), /was measured on Claude Code 2\.1\.289-evil but 2\.1\.289 is installed/);
+  assert.doesNotThrow(() => check(good({ ccVersion: "2.1.289" })), "the bare version is fine"); assert.doesNotThrow(() => check(good({ ccVersion: "2.1.289 (Claude Code)" })), "claude --version prints this");
+  // an installed version that is itself a prerelease is compared whole too
+  refused(good({ ccrVersion: "3.0.22" }), /was measured on CCR 3\.0\.22 but CCR 3\.0\.22-rc1 is installed/, seam({ ccrVersion: () => "3.0.22-rc1" }));
+  for (const v of [null, "", "   ", 3, {}]) refused(good({ ccrVersion: v }), /records no CCR version \(ccrVersion\)/);
+  for (const v of ["unknown", "x"]) refused(good({ ccrVersion: v }), /records a CCR version that is not a whole x\.y\.z/);
+  refused(good(), /cannot be bound to the installed CCR: its version cannot be read/, seam({ ccrVersion: () => null }));
+  refused(good({ ccVersion: "2.1.288" }), /was measured on Claude Code 2\.1\.288 but 2\.1\.289 is installed/);
+  for (const v of [null, "", 7]) refused(good({ ccVersion: v }), /records no Claude Code version \(ccVersion\)/);
+  refused(good({ ccVersion: "x" }), /records a Claude Code version that is not a whole x\.y\.z/);
+  // finding 3: no readable installed Claude Code version REFUSES the gate; only the owner's explicit --accept-unverified-cc yes lets the recorded version stand, and the line says it was not compared
+  refused(good(), /^--enforce enforce is blocked: state\/subagent\/accuracy\.json cannot be bound to the installed Claude Code: its version cannot be read here .*pass --accept-unverified-cc yes to enforce on the recorded version anyway \(evidence: /, seam({ ccVersion: () => null }));
+  const nocc = check(good(), seam({ ccVersion: () => null, acceptUnverifiedCc: true }));
+  assert.match(nocc[0], /Claude Code 2\.1\.289 \(NOT compared with the installed version: accepted by --accept-unverified-cc yes\)/);
+  refused(good({ ccVersion: null }), /records no Claude Code version/, seam({ ccVersion: () => null, acceptUnverifiedCc: true }));            // the accept flag never excuses a record with no version
+  refused(good({ ccVersion: "2.1.288" }), /was measured on Claude Code 2\.1\.288 but 2\.1\.289 is installed/, seam({ acceptUnverifiedCc: true }));            // ... nor a version that CAN be compared and differs
+  // evidence line with missing evidence fields prints n/a, never throws
+  assert.match(check(good({ evidence: { policyContentHash: H }, window: null }))[0], /evidence: n\/a classified rows hashed n\/a, window n\/a to n\/a/);
+  // the real readers: the installed CCR package and the Claude Code launcher resolve to version numbers on this machine (read only)
+  const ccr = lib.installedCcrVersion(); assert.ok(ccr === null || /^\d+\.\d+\.\d+$/.test(ccr));
+  const cc = lib.installedCcVersion(); assert.ok(cc === null || /^\d+\.\d+\.\d+$/.test(cc));
+  // the Claude Code reader: a launcher that is a copy of exactly one version file
+  const home = tmp(); const vd = path.join(home, ".local", "share", "claude", "versions"); fs.mkdirSync(vd, { recursive: true }); fs.mkdirSync(path.join(home, ".local", "bin"), { recursive: true });
+  fs.writeFileSync(path.join(vd, "2.1.287"), "aaaa"); fs.writeFileSync(path.join(vd, "2.1.289"), "bbbbbb"); fs.writeFileSync(path.join(home, ".local", "bin", "claude.exe"), "bbbbbb");
+  const t = new Date("2026-10-01T00:00:00Z"); for (const f of [path.join(vd, "2.1.287"), path.join(vd, "2.1.289"), path.join(home, ".local", "bin", "claude.exe")]) fs.utimesSync(f, t, t);
+  assert.equal(lib.installedCcVersion(home), "2.1.289");
+  fs.writeFileSync(path.join(vd, "2.1.288"), "cccccc"); const later = new Date("2026-10-02T00:00:00Z"); fs.utimesSync(path.join(vd, "2.1.288"), later, later);
+  assert.equal(lib.installedCcVersion(home), "2.1.289", "same size, a different modification time: not the launcher's copy");
+  fs.utimesSync(path.join(vd, "2.1.288"), t, t);
+  assert.equal(lib.installedCcVersion(home), null, "two version files with the launcher's size and time: ambiguous, so no version is claimed");
+  assert.equal(lib.installedCcVersion(path.join(home, "nowhere")), null);
+});
+
+// ---- round 2 of the security review: size cap, control characters, --discovery-dir refusals, the peak baseline of the shrink guard
+test("enforce reader (round 2): an accuracy.json over 1 MiB is not read; a control character in the record's own date never reaches the printed evidence line", async () => {
+  const dir = tmp(); const p = lib.resolvePaths(fixtureFlagMap(dir));
+  const live = await lib.gatherInputs(p, { nowMs: NOW, liveProviders: await lib.readProviders(p) });
+  const enforce = { ...lib.OWNER_DEFAULTS, mode: "dynamic", enforcement: "enforce" };
+  const H = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+  const seam = { contentHash: H, ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" };
+  const file = path.join(dir, "state", "subagent", "accuracy.json");
+  const rec = (over = {}) => ({ schema: 1, verdict: "PASS", at: new Date(NOW - 3600000).toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ab".repeat(32), policyContentHash: H }, ...over });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // the cap: a valid record padded with an extra field is fine at the cap and refused one byte over, whatever it says
+  const padded = (bytes) => { const base = JSON.stringify(rec({ pad: "" })); return JSON.stringify(rec({ pad: "x".repeat(bytes - base.length) })); };
+  fs.writeFileSync(file, padded(1024 * 1024));
+  assert.equal(fs.statSync(file).size, 1024 * 1024);
+  assert.doesNotThrow(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam), "exactly 1 MiB is read");
+  fs.writeFileSync(file, padded(1024 * 1024 + 1));
+  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, NOW, seam), (e) => e.code === "E_PRECONDITION" && /^--enforce enforce is blocked: state\/subagent\/accuracy\.json is larger than 1 MiB \(a verdict file is a few kilobytes\), so it is not read$/.test(e.message));
+  assert.equal(lib.ACCURACY_MAX_BYTES, 1024 * 1024);
+  // finding 8: the date text is the record's own; only a printable form is ever put in a line
+  const at = "(\u0007)Oct 5 2026 10:00:00 UTC";
+  assert.ok(Number.isFinite(Date.parse(at)));
+  fs.writeFileSync(file, JSON.stringify(rec({ at })));
+  const lines = lib.checkEnforcePreconditions(p, live, enforce, Date.parse(at) + 3600000, seam);
+  assert.ok(!/[\u0000-\u001f]/.test(lines.join("")), "no control character in the ok line");
+  fs.writeFileSync(file, JSON.stringify(rec({ at, ccrVersion: "3.0.21" })));
+  assert.throws(() => lib.checkEnforcePreconditions(p, live, enforce, Date.parse(at) + 3600000, seam), (e) => !/[\u0000-\u001f]/.test(e.message) && /measured on CCR 3\.0\.21/.test(e.message), "nor in a refusal");
+});
+
+test("--discovery-dir gets the refusals of the file flags: a blank value, a UNC path (before any realpath can open a connection) and a folder under a protected real folder are refused, a temp folder is read", () => {
+  const prot = tmp(), ok = tmp();
+  const usage = (e) => e.code === "E_USAGE";
+  assert.throws(() => lib.resolvePaths({ "discovery-dir": "" }), usage); assert.throws(() => lib.resolvePaths({ "discovery-dir": "   " }), usage);
+  for (const unc of [String.raw`\\localhost\C$\disc`, String.raw`\\127.0.0.1\C$\disc`, String.raw`\\?\UNC\evil\share\disc`]) assert.throws(() => lib.resolvePaths({ "discovery-dir": unc }), (e) => usage(e) && /UNC path/.test(e.message), unc);
+  assert.throws(() => lib.resolvePaths({ "discovery-dir": path.join(prot, "sub", "..", "disc") }, { protect: [prot] }), (e) => usage(e) && /lies under/.test(e.message), "under a protected folder, however it is spelled");
+  const r = lib.resolvePaths({ "discovery-dir": ok });
+  assert.deepEqual([r.discoveryDir, r.fixture], [path.resolve(ok), false], "a temp folder is accepted and does not turn the run into a fixture run");
+  // given through the CLI parser too: a UNC value never reaches a read
+  const here = lib.parseArgs(["status", "--discovery-dir", ok]);
+  assert.equal(here.flags["discovery-dir"], ok);
+});
+
+test("shrink guard (round 2): the baseline is the PEAK route count since the last accepted shrink, so two 20% steps add up; stampBaseline keeps the peak, resets on an accepted shrink and on a first compile", () => {
+  const pol = (routes, base, extra = {}) => ({ builtFrom: { snapshotRoutes: routes, ...(base === undefined ? {} : { snapshotRoutesBaseline: base }), ownerHash: "h" }, counts: { universe: routes, allowed: 50 }, ...extra });
+  const next = (routes) => ({ builtFrom: { snapshotRoutes: routes, ownerHash: "h" }, counts: { universe: routes, allowed: 50 } });
+  // 100 -> 80 passes (-20%) and the compile stamps the peak 100
+  let c = next(80); assert.equal(lib.shrinkFinding(pol(100, 100), c), null);
+  lib.stampBaseline(c, pol(100, 100), false); assert.equal(c.builtFrom.snapshotRoutesBaseline, 100);
+  // 80 -> 64 passes against the previous policy alone (-20%), and is refused against the peak (-36%)
+  const prev = { ...pol(80, 100) };
+  c = next(64);
+  const f = lib.shrinkFinding(prev, c);
+  assert.deepEqual([f?.routes, f?.routesBefore, f?.routesNow], [true, 100, 64], "the guard sees 100 -> 64, not 80 -> 64");
+  assert.match(lib.shrinkText(f), /^the snapshot shrank from 100 to 64 routes/);
+  assert.equal(lib.shrinkFinding({ ...prev, builtFrom: { ...prev.builtFrom, snapshotRoutesBaseline: 80 } }, c), null, "without the peak the same step passes (the blind spot this closes)");
+  // accepted: the baseline becomes the new count; growth raises the peak; a first compile starts at its own count; a policy from before the stamps uses what it has
+  lib.stampBaseline(c, prev, true); assert.equal(c.builtFrom.snapshotRoutesBaseline, 64);
+  c = next(120); lib.stampBaseline(c, pol(80, 100), false); assert.equal(c.builtFrom.snapshotRoutesBaseline, 120);
+  c = next(50); lib.stampBaseline(c, null, false); assert.equal(c.builtFrom.snapshotRoutesBaseline, 50);
+  c = next(70); lib.stampBaseline(c, { builtFrom: { ownerHash: "h" }, counts: { universe: 90, allowed: 5 } }, false); assert.equal(c.builtFrom.snapshotRoutesBaseline, 90);
+  c = { builtFrom: {} }; lib.stampBaseline(c, pol(80, 100), false); assert.equal(c.builtFrom.snapshotRoutesBaseline, undefined, "no count, no stamp");
+  // hint for a caller without its own --accept-shrink
+  assert.match(lib.shrinkText(f, { via: "set", live: true }), /: refresh discovery first \(node refresh\/cli\.mjs, needs your OK\), or accept the smaller snapshot first with `node keysync\/key\.mjs subagent-policy set --accept-shrink yes --live yes` \(it saves your current toggles again\)$/);
+  assert.match(lib.shrinkText(f, { via: "set", live: false }), /subagent-policy set --accept-shrink yes` \(it saves/);
+  assert.doesNotMatch(lib.shrinkText(f, { via: "set" }), /or pass --accept-shrink yes/);
 });

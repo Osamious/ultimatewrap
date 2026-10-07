@@ -1103,7 +1103,7 @@ test("code table (F14, F15): EVERY fix command of EVERY row parses through the r
     if (r.degrades) assert.doesNotMatch(r.fix, /--dry yes|preset( \w[\w-]*)?$/, `${r.code}: a degrading code's fix is a repair, not a preview`);
   }
   assert.ok(parsed >= 50, `parsed ${parsed} subagent-policy fix commands`);
-  assert.equal(CODES.length, 135, "the table holds 135 rows");
+  assert.equal(CODES.length, 138, "the table holds 138 rows");
   // the rows the review named
   assert.equal(codeRow("FREE_PROMISE_BREAK").fix, `${CLI} show --detail yes`);
   assert.equal(codeRow("UNKNOWN_MAIN").fix, `${CLI} status`); assert.match(codeRow("UNKNOWN_MAIN").fixNote, /start a request in the main session first/);
@@ -1357,4 +1357,323 @@ test("show and status (sanity pass 3): when the compile says some unverified row
     assert.ok(!/are not tool-tested/.test(o), "the old wording is gone once a split exists");
   }
   assert.match((await SHOW(s)).out, /3 of 9 bench-ok models left out: the tool sweep found them gone and no confirmed pass exists; 1 of them is on the same error for 10\+ runs in a row, not gone \(an --allow pin does not override it\)/);
+});
+
+// =====================================================================================================================
+// Hygiene guards (the 2026-10-06 incident): the SHRINK GUARD of rebuild and set, and the read-only discovery freshness line
+// =====================================================================================================================
+const mkDisc = (dir, recs) => {
+  fs.mkdirSync(dir, { recursive: true });
+  recs.forEach((r, i) => fs.writeFileSync(path.join(dir, `${String(i).padStart(2, "0")}${"a".repeat(30)}.json`), typeof r === "string" ? r : JSON.stringify(r)));
+  return dir;
+};
+const dayAgo = (d) => new Date(Date.now() - d * 86400000).toISOString();
+
+test("shrink guard (pure): the real incident numbers (snapshot 6,432 -> 2,009 routes, policy 92 -> 21 rows, 56 of 63 caches stale) are refused with the plain line; the 25% edge, growth, a missing baseline and a legitimate owner change are not", () => {
+  const prev = { builtFrom: { snapshotRoutes: 6432, ownerHash: "h1" }, counts: { universe: 6432, allowed: 92 } };
+  const now = (routes, rows, over = {}) => ({ builtFrom: { snapshotRoutes: routes, ownerHash: "h1", discovery: { providers: 63, fresh: 7, stale: 56, unreadable: 0, ceilingDays: 7 }, ...over }, counts: { universe: routes, allowed: rows } });
+  const f = lib.shrinkFinding(prev, now(2009, 21));
+  assert.deepEqual([f.routes, f.rows, f.routesBefore, f.routesNow, f.rowsBefore, f.rowsNow], [true, true, 6432, 2009, 92, 21]);
+  assert.equal(lib.shrinkText(f), "the snapshot shrank from 6,432 to 2,009 routes (56 of 63 discovery caches are older than 7 days), and the policy from 92 to 21 eligible models: refresh discovery first (node refresh/cli.mjs, needs your OK), or pass --accept-shrink yes");
+  assert.match(lib.shrinkText(f, { auto: true }), /^the snapshot shrank from 6,432 to 2,009 routes \(56 of 63 discovery caches are older than 7 days\), and the policy from 92 to 21 eligible models: refresh discovery first \(node refresh\/cli\.mjs, needs your OK\); the automatic rebuild never accepts a shrink, so run `node keysync\/key\.mjs subagent-policy rebuild --accept-shrink yes --live yes` yourself if it is real$/);
+  // the edge: exactly 25% is allowed, one route more is not
+  assert.equal(lib.shrinkFinding(prev, now(4824, 92)), null, "6432 -> 4824 is exactly -25%");
+  assert.equal(lib.shrinkFinding(prev, now(4823, 92))?.routes, true);
+  assert.equal(lib.shrinkFinding(prev, now(6432, 69)), null, "92 -> 69 is exactly -25%"); assert.equal(lib.shrinkFinding(prev, now(6432, 68))?.rows, true);
+  // rows only (same toggles): the text says the policy would shrink
+  const rowsOnly = lib.shrinkFinding(prev, now(6000, 40));
+  assert.deepEqual([rowsOnly.routes, rowsOnly.rows], [false, true]); assert.match(lib.shrinkText(rowsOnly), /^the policy would shrink from 92 to 40 eligible models \(56 of 63 discovery caches are older than 7 days\): refresh discovery first/);
+  // different toggles: fewer rows is the owner's choice; but a route shrink is refused whatever the toggles are
+  assert.equal(lib.shrinkFinding(prev, now(6000, 10, { ownerHash: "h2" })), null);
+  assert.equal(lib.shrinkFinding(prev, now(2009, 10, { ownerHash: "h2" }))?.routes, true);
+  assert.equal(lib.shrinkFinding(prev, now(9000, 200)), null, "growth");
+  assert.equal(lib.shrinkFinding(null, now(1, 1)), null, "no previous policy: no baseline"); assert.equal(lib.shrinkFinding({}, now(1, 1)), null);
+  // a policy compiled before the stamp existed uses counts.universe as its baseline
+  assert.equal(lib.shrinkFinding({ builtFrom: { ownerHash: "h1" }, counts: { universe: 6432, allowed: 92 } }, now(2009, 21))?.routes, true);
+  assert.equal(lib.shrinkFinding({ builtFrom: {}, counts: { allowed: 0, universe: 0 } }, now(10, 0)), null, "an empty earlier policy: nothing to lose");
+  // no discovery summary: the line has no parenthesis
+  assert.doesNotMatch(lib.shrinkText(lib.shrinkFinding(prev, { builtFrom: { snapshotRoutes: 2009, ownerHash: "h1" }, counts: { allowed: 21 } })), /discovery caches/);
+});
+
+test("shrink guard: `rebuild` after the snapshot lost more than 25% of its routes REFUSES (exit 1, E_SHRINK) and leaves the saved compile byte for byte; --accept-shrink yes passes; --if-stale never does and says so in one line", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const c0 = rd(s.compiled);
+  assert.equal(c0.builtFrom.snapshotRoutes, 18, "the stamp: the snapshot's route count");
+  const before = fs.readFileSync(s.compiled);
+  const sn = rd(s.m["snapshot-file"]);
+  const dropped = [];
+  for (const r of sn.rows) { const keep = Math.ceil(r.models.length / 3); dropped.push(...r.models.slice(keep)); r.models = r.models.slice(0, keep); }
+  const left = sn.rows.reduce((a, r) => a + r.models.length, 0);
+  assert.ok(left < 18 * 0.75, `the fixture snapshot now has ${left} routes`);
+  sn.builtAt = new Date().toISOString();                          // a rebuilt snapshot carries a new build time: that is what makes the compile stale
+  wr(s.m["snapshot-file"], sn);
+  const disc = mkDisc(path.join(s.dir, "disc"), [{ provider: "a", at: dayAgo(1) }, { provider: "b", at: dayAgo(9) }, { provider: "c", at: dayAgo(30) }]);
+  for (const argv of [["rebuild", "--discovery-dir", disc, ...s.F], ["rebuild", "--if-stale", "yes", "--discovery-dir", disc, ...s.F], ["rebuild", "--if-stale", "yes", "--accept-shrink", "yes", "--discovery-dir", disc, ...s.F]]) {
+    const r = await run(argv);
+    assert.equal(r.status, 1, r.out + r.err);
+    assert.ok(Buffer.compare(fs.readFileSync(s.compiled), before) === 0, "the saved policy is untouched: nothing was written");
+    assert.match(r.err, new RegExp(`^E_SHRINK: the snapshot shrank from 18 to ${left} routes \\(2 of 3 discovery caches are older than 7 days\\)`));
+  }
+  assert.match((await run(["rebuild", "--discovery-dir", disc, ...s.F])).err, /, or pass --accept-shrink yes$/);
+  const auto = await run(["rebuild", "--if-stale", "yes", "--accept-shrink", "yes", "--discovery-dir", disc, ...s.F]);
+  assert.equal(auto.err.split("\n").length, 1, "one line"); assert.match(auto.err, /the automatic rebuild never accepts a shrink/);
+  // the owner accepts: the rebuild writes, stamps the new count and the discovery summary, and the content hash is unaffected by the summary
+  const ok = await run(["rebuild", "--accept-shrink", "yes", "--discovery-dir", disc, ...s.F]);
+  assert.equal(ok.status, 0, ok.err);
+  const c1 = rd(s.compiled);
+  assert.equal(c1.builtFrom.snapshotRoutes, left);
+  assert.deepEqual(c1.builtFrom.discovery, { providers: 3, fresh: 1, stale: 2, unreadable: 0, ceilingDays: 7 });
+  assert.equal(lib.hashOf(c1), c1.contentHash);
+  // after that the new compile is the baseline: the same rebuild no longer refuses
+  assert.equal((await run(["rebuild", "--discovery-dir", disc, ...s.F])).status, 0);
+});
+
+test("shrink guard: a legitimate shrink (under 25%, or the owner narrowing the toggles) goes through; `set` is refused when the snapshot shrank, its preview says so, and nothing is written", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const owner0 = fs.readFileSync(s.owner), c0 = fs.readFileSync(s.compiled);
+  // the owner narrows the toggles: fewer rows by choice, the route count is the same: allowed
+  const narrow = await SET(s, "--source", "all-providers", "--mode", "free", "--free-scope", "providers");
+  assert.equal(narrow.status, 0, narrow.out + narrow.err);
+  assert.ok(rd(s.compiled).counts.allowed < rd(s.compiled).counts.universe);
+  // a snapshot that lost 2 of 18 routes (-11%) is a normal change
+  const sn = rd(s.m["snapshot-file"]);
+  sn.rows[0].models = sn.rows[0].models.slice(0, -1); sn.rows[1].models = sn.rows[1].models.slice(0, -1); sn.builtAt = new Date(Date.now() + 1000).toISOString();
+  wr(s.m["snapshot-file"], sn);
+  assert.equal((await run(["rebuild", ...s.F])).status, 0, "a small shrink is not a guard case");
+  // now the big one
+  const sn2 = rd(s.m["snapshot-file"]);
+  for (const r of sn2.rows) r.models = r.models.slice(0, 1); sn2.builtAt = new Date(Date.now() + 2000).toISOString();
+  wr(s.m["snapshot-file"], sn2);
+  const c1 = fs.readFileSync(s.compiled), o1 = fs.readFileSync(s.owner);
+  const dry = await SET(s, "--source", "all-providers", "--mode", "dynamic", "--dry", "yes");
+  assert.equal(dry.status, 0, dry.err); assert.match(dry.out, /^NOTE: saving this would be REFUSED \(E_SHRINK\): the snapshot shrank from \d+ to \d+ routes/m);
+  const real = await SET(s, "--source", "all-providers", "--mode", "dynamic");
+  assert.equal(real.status, 1, real.out); assert.match(real.err, /^E_SHRINK: the snapshot shrank/);
+  assert.ok(Buffer.compare(fs.readFileSync(s.compiled), c1) === 0 && Buffer.compare(fs.readFileSync(s.owner), o1) === 0, "set wrote neither the compiled file nor the owner file");
+  const acc = await SET(s, "--source", "all-providers", "--mode", "dynamic", "--accept-shrink", "yes");
+  assert.equal(acc.status, 0, acc.out + acc.err);
+  void owner0; void c0;
+});
+
+test("discovery freshness (read only): fresh and stale caches are counted per provider by the record's own time against the 7-day ceiling; unreadable, unstamped and oversize records are stale or unreadable, never fatal; an absent folder or a fixture run reads nothing", async () => {
+  const d = mkDisc(path.join(tmp(), "disc"), [
+    { provider: "p1", at: dayAgo(1) }, { provider: "p2", at: dayAgo(6.9) }, { provider: "p3", at: dayAgo(7.1) }, { provider: "p4", at: dayAgo(40) },
+    { provider: "p5" }, { provider: "p5b", at: "not a date" }, { provider: "p6", at: dayAgo(30) }, { provider: "p6", at: dayAgo(2) },      // p6 has a stale and a fresh record: fresh
+    "{torn", JSON.stringify({ at: dayAgo(1) }), JSON.stringify([1, 2]),
+  ]);
+  fs.writeFileSync(path.join(d, "notes.txt"), "x"); fs.writeFileSync(path.join(d, `${"b".repeat(32)}.json.tmp-123`), "{}");        // not records
+  fs.mkdirSync(path.join(d, `${"c".repeat(32)}.json`));                                   // a folder under a record name: unreadable, not fatal
+  fs.writeFileSync(path.join(d, `${"d".repeat(32)}.json`), Buffer.alloc(9 * 1024 * 1024, 32));   // over the 8 MiB read cap: unreadable
+  const r = await lib.readDiscoveryFreshness({ discoveryDir: d }, { nowMs: Date.now() });
+  assert.deepEqual(r, { providers: 7, fresh: 3, stale: 4, unreadable: 5, ceilingDays: 7 }, "p1 p2 p6 fresh; p3 p4 p5 p5b stale; the torn, nameless and non-object records, a folder and an oversize file are unreadable");
+  assert.equal(await lib.readDiscoveryFreshness({ discoveryDir: null }), null, "a fixture run without --discovery-dir reads nothing");
+  assert.equal(await lib.readDiscoveryFreshness({ discoveryDir: path.join(d, "nope") }), null, "an absent folder");
+  // the default is the discover module's own folder under LOCALAPPDATA (a temp stand-in here)
+  const root = tmp(); const real = path.join(root, "uw-keysync", "discovery"); mkDisc(real, [{ provider: "z", at: dayAgo(1) }]);
+  assert.deepEqual(await lib.readDiscoveryFreshness({ discoveryDir: undefined }, { env: { ["LOCAL" + "APPDATA"]: root } }), { providers: 1, fresh: 1, stale: 0, unreadable: 0, ceilingDays: 7 });
+  assert.equal(await lib.readDiscoveryFreshness({ discoveryDir: undefined }, { env: {} }), null, "no application-data root: nothing is guessed");
+  assert.equal(lib.resolvePaths({ "state-dir": path.join(tmp(), "st") }).discoveryDir, null, "a fixture run resolves no discovery folder");
+  // the ceiling is the routing's own: 7 days
+  assert.match(read("keysync/run.mjs"), /export const ROUTING_MAX_STALENESS_MS = 7 \* 24 \* 60 \* 60 \* 1000;/); assert.equal(lib.DISCOVERY_CEILING_MS, 7 * 24 * 60 * 60 * 1000);
+  // it never writes
+  const h = dirHash(d); await lib.readDiscoveryFreshness({ discoveryDir: d }); assert.deepEqual(dirHash(d), h);
+});
+
+test("status and show: a DISCOVERY_STALE line says how many provider caches are past the 7-day ceiling (a rebuild now would drop their models) with its fix; an all-fresh folder says nothing; SNAPSHOT_DRIFT names the two route counts when they differ by more than 10%", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const stale = mkDisc(path.join(s.dir, "d1"), [{ provider: "a", at: dayAgo(1) }, { provider: "b", at: dayAgo(9) }, { provider: "c", at: dayAgo(12) }]);
+  for (const cmd of [(x, d) => run(["status", "--discovery-dir", d, ...x.F]), (x, d) => run(["show", "--discovery-dir", d, ...x.F])]) {
+    const r = await cmd(s, stale);
+    assert.equal(r.status, 0, r.err);
+    assert.match(r.out, /^DISCOVERY_STALE: discovery: 1 of 3 providers fresh, 2 past the 7-day ceiling \(not routed\): a snapshot rebuild now would drop their models$/m);
+    assert.match(r.out, /^ {2}fix: node refresh\/cli\.mjs \(this only plans the run and makes no request; add --live/m);
+    assert.doesNotMatch(r.out, /SNAPSHOT_DRIFT/);
+    const fresh = await cmd(s, mkDisc(path.join(s.dir, "d2" + Math.random().toString(36).slice(2)), [{ provider: "a", at: dayAgo(1) }, { provider: "b", at: dayAgo(2) }]));
+    assert.doesNotMatch(fresh.out, /DISCOVERY_STALE/, "all fresh: no line");
+    assert.doesNotMatch((await run(["status", ...s.F])).out, /DISCOVERY_STALE/, "a fixture run without the flag reads no folder");
+  }
+  // drift: the policy says 18 routes; the snapshot now has 18 -> no line; edit the stamp so they differ by more than 10%, then by less
+  const c = rd(s.compiled);
+  wr(s.compiled, { ...c, builtFrom: { ...c.builtFrom, snapshotRoutes: 25 } });
+  for (const out of [(await STATUS(s)).out, (await SHOW(s)).out]) assert.match(out, /^SNAPSHOT_DRIFT: the policy was compiled from a snapshot of 25 routes, now 18$/m);
+  assert.match((await STATUS(s)).out, /^ {2}fix: node keysync\/key\.mjs subagent-policy rebuild --live yes \(a rebuild that would lose more than 25%/m);
+  wr(s.compiled, { ...c, builtFrom: { ...c.builtFrom, snapshotRoutes: 19 } });
+  assert.doesNotMatch((await STATUS(s)).out, /SNAPSHOT_DRIFT/, "19 vs 18 is within 10%");
+  const old = { ...c, builtFrom: Object.fromEntries(Object.entries(c.builtFrom).filter(([k]) => k !== "snapshotRoutes")), counts: { ...c.counts, universe: 30 } };
+  wr(s.compiled, old);
+  assert.match((await STATUS(s)).out, /^SNAPSHOT_DRIFT: the policy was compiled from a snapshot of 30 routes, now 18$/m, "a policy without the stamp uses counts.universe");
+});
+
+test("rebuild --if-stale stays cheap: an up-to-date policy is decided from the stamps alone (nothing compiles, the discovery folder is never read); the discovery summary and the route count are outside the content hash and outside the stale test", async () => {
+  const s = setup();
+  const d = mkDisc(path.join(s.dir, "disc"), [{ provider: "a", at: dayAgo(1) }]);
+  assert.equal((await run(["set", ...DYN, "--discovery-dir", d, ...s.F])).status, 0);
+  const c = rd(s.compiled);
+  assert.deepEqual(c.builtFrom.discovery, { providers: 1, fresh: 1, stale: 0, unreadable: 0, ceilingDays: 7 });
+  const stripped = { ...c, builtFrom: Object.fromEntries(Object.entries(c.builtFrom).filter(([k]) => k !== "discovery" && k !== "snapshotRoutes")) };
+  assert.equal(lib.hashOf(stripped), c.contentHash, "neither stamp is routing content");
+  const n0 = lib.compileStats.compiles;
+  fs.rmSync(d, { recursive: true });                               // were the folder read, its absence would show; the cheap path does not look
+  assert.equal((await run(["rebuild", "--if-stale", "yes", "--discovery-dir", d, ...s.F])).out, "up to date: nothing to rebuild");
+  assert.equal(lib.compileStats.compiles, n0, "no compile ran");
+  assert.ok(!/discovery|snapshotRoutes/.test(read("keysync/subagent-policy.mjs").match(/const cheapSame = \[[^\]]*\]/)[0]), "the stamp comparison does not mention the new stamps");
+  // a discovery summary that only aged does not make the file differ
+  const d2 = mkDisc(path.join(s.dir, "disc2"), [{ provider: "a", at: dayAgo(1) }, { provider: "b", at: dayAgo(20) }]);
+  const r = await run(["rebuild", "--discovery-dir", d2, ...s.F]);
+  assert.equal(r.status, 0, r.err); assert.match(r.out, /\(unchanged, not rewritten\)/);
+  assert.deepEqual(rd(s.compiled).builtFrom.discovery, { providers: 1, fresh: 1, stale: 0, unreadable: 0, ceilingDays: 7 }, "the file on disk is the earlier one");
+});
+
+test("hygiene codes: DISCOVERY_STALE, SNAPSHOT_DRIFT and E_SHRINK have rows with plain words and a runnable fix; the parser accepts the new flags", () => {
+  for (const code of ["DISCOVERY_STALE", "SNAPSHOT_DRIFT", "E_SHRINK"]) { const r = codeRow(code); assert.ok(r, code); assert.ok(r.plain.length > 40 && r.fix.startsWith("node ")); }
+  assert.equal(codeRow("E_SHRINK").kind, "error"); assert.equal(codeRow("DISCOVERY_STALE").fix, "node refresh/cli.mjs");
+  assert.doesNotThrow(() => lib.parseArgs(["rebuild", "--accept-shrink", "yes", "--discovery-dir", "x", "--live", "yes"]));
+  assert.doesNotThrow(() => lib.parseArgs(["set", "--mode", "dynamic", "--accept-shrink", "yes", "--live", "yes"]));
+  assert.doesNotThrow(() => lib.parseArgs(["status", "--discovery-dir", "x", "--live", "yes"].slice(0, 3)));
+  assert.throws(() => lib.parseArgs(["explain", "a/b", "--accept-shrink", "yes"]), (e) => e.code === "E_USAGE");
+});
+
+test("enforce reader at rebuild (cr-accuracy 6): an owner file that says enforce compiles as enforce only while the accuracy PASS is bound to the policy about to be written; a toggle change that moves the hash keeps the router in shadow with the reason, and a forged future PASS never enforces", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const H = rd(s.compiled).contentHash;
+  const live = await lib.readProviders(lib.resolvePaths(fixtureFlagMap(s.dir)));
+  const acc = (over = {}) => wr(path.join(s.state, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", window: { since: "2026-09-06T00:00:00.000Z", until: "2026-10-05T00:00:00.000Z" }, evidence: { classRowsCounted: 99, sha256: "cd".repeat(32), policyContentHash: H }, ...over });
+  const opts = { liveProviders: live, enforceOpts: { ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" } };
+  const setOwner = (o) => wr(s.owner, { ...rd(s.owner), ...o });
+  acc(); setOwner({ enforcement: "enforce" });
+  const ok = await run(["rebuild", ...s.F], opts);
+  assert.equal(ok.status, 0, ok.err + ok.out);
+  assert.equal(rd(s.compiled).owner.enforcement, "enforce"); assert.equal(rd(s.compiled).gate, undefined);
+  // the forged future PASS
+  acc({ at: "2999-01-01" });
+  const forged = await run(["rebuild", ...s.F], opts);
+  assert.match(forged.out, /^CLASSIFIER_UNMEASURED: .*is dated 2999-01-01, in the future/m); assert.equal(rd(s.compiled).owner.enforcement, "shadow");
+  // a PASS bound to an old policy: the owner changes the toggles (the hash moves), the PASS no longer applies, the compile carries shadow and says why
+  acc(); setOwner({ enforcement: "enforce", mode: "free", freeScope: "providers" });
+  const moved = await run(["rebuild", ...s.F], opts);
+  assert.equal(moved.status, 0, moved.err);
+  assert.match(moved.out, /^CLASSIFIER_UNMEASURED: .*was measured against policy [0-9a-f]{12} but the policy is [0-9a-f]{12}/m);
+  const c = rd(s.compiled); assert.equal(c.owner.enforcement, "shadow"); assert.equal(c.gate.code, "CLASSIFIER_UNMEASURED"); assert.notEqual(c.contentHash, H);
+  // measured again against the new policy: it enforces
+  acc({ evidence: { classRowsCounted: 99, sha256: "cd".repeat(32), policyContentHash: c.contentHash } });
+  assert.equal((await run(["rebuild", ...s.F], opts)).status, 0);
+  assert.equal(rd(s.compiled).owner.enforcement, "enforce");
+  // another CCR version voids it
+  const other = await run(["rebuild", ...s.F], { ...opts, enforceOpts: { ccrVersion: () => "3.1.0", ccVersion: () => "2.1.289" } });
+  assert.match(other.out, /^CLASSIFIER_UNMEASURED: .*measured on CCR 3\.0\.22 but CCR 3\.1\.0 is installed/m);
+});
+
+test("enforce reader at set (cr-accuracy 6): `set --enforce enforce` is refused when the PASS was measured against another policy than the one the set would write, and passes when it is bound to it; nothing is written on a refusal", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const H = rd(s.compiled).contentHash;
+  const live = await lib.readProviders(lib.resolvePaths(fixtureFlagMap(s.dir)));
+  const opts = { liveProviders: live, enforceOpts: { ccrVersion: () => "3.0.22", ccVersion: () => "2.1.289" } };
+  const acc = (hash) => wr(path.join(s.state, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ef".repeat(32), policyContentHash: hash } });
+  acc(H);
+  const owner0 = fs.readFileSync(s.owner), c0 = fs.readFileSync(s.compiled);
+  const moved = await run(["set", "--source", "all-providers", "--mode", "free", "--free-scope", "providers", "--enforce", "enforce", ...s.F], opts);
+  assert.equal(moved.status, 1, moved.out);
+  assert.match(moved.err, /^E_PRECONDITION: --enforce enforce is blocked: state\/subagent\/accuracy\.json was measured against policy [0-9a-f]{12} but the policy is [0-9a-f]{12}/);
+  assert.ok(Buffer.compare(fs.readFileSync(s.owner), owner0) === 0 && Buffer.compare(fs.readFileSync(s.compiled), c0) === 0, "nothing written");
+  // the same toggles (enforcement is outside the hash): the PASS applies, and the set prints the evidence line
+  const same = await run(["set", ...DYN, "--enforce", "enforce", ...s.F], opts);
+  assert.equal(same.status, 0, same.err + same.out);
+  assert.match(same.out, /^accuracy: PASS of \d{4}-\d{2}-\d{2}, bound to policy [0-9a-f]{12}, CCR 3\.0\.22, Claude Code 2\.1\.289; evidence: 5 classified rows hashed efefefefefef, window n\/a to n\/a, measured /m);
+});
+
+// ---- round 2 of the security review (ux lane): peak baseline end to end, the hints of callers without --accept-shrink, undo and the shrink guard, --accept-unverified-cc
+const cutRoutes = (s, total, bump) => {
+  const sn = rd(s.m["snapshot-file"]);
+  let have = sn.rows.reduce((a, r) => a + r.models.length, 0);
+  for (let i = sn.rows.length - 1; i >= 0 && have > total; i--) while (sn.rows[i].models.length > 0 && have > total) { sn.rows[i].models.pop(); have -= 1; }
+  sn.builtAt = new Date(Date.now() + bump).toISOString();                      // a rebuilt snapshot carries a new build time
+  wr(s.m["snapshot-file"], sn);
+  return have;
+};
+
+test("shrink guard (round 2): small steps that add up are refused against the PEAK baseline; --accept-shrink yes resets it; the baseline is stamped in builtFrom, outside the hash", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  assert.deepEqual([rd(s.compiled).builtFrom.snapshotRoutes, rd(s.compiled).builtFrom.snapshotRoutesBaseline], [18, 18]);
+  cutRoutes(s, 15, 1000);                                                       // -17%: a normal change
+  const step1 = await run(["rebuild", ...s.F]);
+  assert.equal(step1.status, 0, step1.err + step1.out);
+  assert.deepEqual([rd(s.compiled).builtFrom.snapshotRoutes, rd(s.compiled).builtFrom.snapshotRoutesBaseline], [15, 18], "the peak stays 18");
+  assert.equal(lib.hashOf(rd(s.compiled)), rd(s.compiled).contentHash, "the baseline is not routing content");
+  cutRoutes(s, 12, 2000);                                                       // -20% against the policy on disk (15), -33% against the peak (18)
+  const before = fs.readFileSync(s.compiled);
+  const step2 = await run(["rebuild", ...s.F]);
+  assert.equal(step2.status, 1, step2.out);
+  assert.match(step2.err, /^E_SHRINK: the snapshot shrank from 18 to 12 routes/);
+  assert.ok(Buffer.compare(fs.readFileSync(s.compiled), before) === 0, "nothing written");
+  const auto = await run(["rebuild", "--if-stale", "yes", ...s.F]);
+  assert.equal(auto.status, 1); assert.match(auto.err, /the snapshot shrank from 18 to 12 routes/);
+  // the owner accepts: the baseline is reset to the accepted count, and the next small step passes
+  assert.equal((await run(["rebuild", "--accept-shrink", "yes", ...s.F])).status, 0);
+  assert.deepEqual([rd(s.compiled).builtFrom.snapshotRoutes, rd(s.compiled).builtFrom.snapshotRoutesBaseline], [12, 12]);
+  cutRoutes(s, 10, 3000);
+  assert.equal((await run(["rebuild", ...s.F])).status, 0, "-17% against the accepted 12");
+  assert.equal(rd(s.compiled).builtFrom.snapshotRoutesBaseline, 12);
+});
+
+test("shrink guard (round 2): a caller with no --accept-shrink of its own (preset, resume) is told the `set` command that accepts it; undo runs the guard and lands in the pause", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  assert.equal((await SET(s, ...FREE)).status, 0);                               // a second, different save: undo has a step to go back to
+  const owner1 = fs.readFileSync(s.owner);
+  cutRoutes(s, 8, 1000);                                                         // a big shrink
+  const SET_HINT = /: refresh discovery first \(node refresh\/cli\.mjs, needs your OK\), or accept the smaller snapshot first with `node keysync\/key\.mjs subagent-policy set --accept-shrink yes` \(it saves your current toggles again\)$/;
+  // preset (a save with its own flags)
+  const preset = await run(["preset", "any", "--confirm", "yes", ...s.F]);
+  assert.equal(preset.status, 1, preset.out); assert.match(preset.err, /^E_SHRINK: the snapshot shrank from 18 to 8 routes/); assert.match(preset.err, SET_HINT);
+  assert.ok(Buffer.compare(fs.readFileSync(s.owner), owner1) === 0, "nothing saved");
+  // resume after a pause
+  assert.equal((await run(["pause", ...s.P])).status, 0);
+  const resume = await run(["resume", ...s.F]);
+  assert.equal(resume.status, 1, resume.out); assert.match(resume.err, SET_HINT); assert.ok(fs.existsSync(s.flag), "still paused");
+  // plain set keeps its own wording
+  const plain = await run(["set", "--source", "all-providers", "--mode", "dynamic", ...s.F]);
+  assert.match(plain.err, /, or pass --accept-shrink yes$/);
+  // undo: the earlier toggles come back and are saved, the compile is refused, the policy is paused, with the hint
+  assert.equal((await run(["set", ...FREE, "--accept-shrink", "yes", ...s.F])).status, 0, "(reset the baseline and lift the pause so undo has something to do)");
+  assert.equal((await SET(s, ...DYN)).status, 0);                                // owner now dynamic, previous free
+  const ownerDyn = rd(s.owner);
+  cutRoutes(s, 5, 2000);
+  const undo = await run(["undo", ...s.F]);
+  assert.equal(undo.status, 1, undo.out + undo.err);
+  assert.match(undo.err, /E_SHRINK: the snapshot shrank from 8 to 5 routes/); assert.match(undo.err, /subagent-policy set --accept-shrink yes/);
+  assert.ok(fs.existsSync(s.flag), "undo fell to the pause");
+  assert.match(undo.out, /^UNDO restored your earlier toggles .* but could not apply them\. PAUSED:/m);
+  assert.equal(rd(s.owner).mode, "free", "the earlier (free) toggles are the saved ones"); assert.notEqual(rd(s.owner).mode, ownerDyn.mode);
+});
+
+test("--accept-unverified-cc yes (round 2): with the installed Claude Code version unreadable a rebuild keeps shadow and says how to accept; the flag (set and rebuild) lets the recorded version stand", async () => {
+  const s = setup();
+  assert.equal((await SET(s, ...DYN)).status, 0);
+  const H = rd(s.compiled).contentHash;
+  const live = await lib.readProviders(lib.resolvePaths(fixtureFlagMap(s.dir)));
+  wr(path.join(s.state, "accuracy.json"), { schema: 1, verdict: "PASS", at: new Date().toISOString(), ccVersion: "2.1.289", ccrVersion: "3.0.22", evidence: { classRowsCounted: 5, sha256: "ef".repeat(32), policyContentHash: H } });
+  const opts = { liveProviders: live, enforceOpts: { ccrVersion: () => "3.0.22", ccVersion: () => null } };
+  wr(s.owner, { ...rd(s.owner), enforcement: "enforce" });
+  const refused = await run(["rebuild", ...s.F], opts);
+  assert.equal(refused.status, 0, refused.err);
+  assert.match(refused.out, /^CLASSIFIER_UNMEASURED: .*cannot be bound to the installed Claude Code: its version cannot be read here .*pass --accept-unverified-cc yes/m);
+  assert.equal(rd(s.compiled).owner.enforcement, "shadow");
+  const accepted = await run(["rebuild", "--accept-unverified-cc", "yes", ...s.F], opts);
+  assert.equal(accepted.status, 0, accepted.err);
+  assert.equal(rd(s.compiled).owner.enforcement, "enforce"); assert.equal(rd(s.compiled).gate, undefined);
+  // set --enforce enforce: refused without the flag (nothing written), passes with it and prints the 'not compared' line
+  wr(s.owner, { ...rd(s.owner), enforcement: "shadow" });
+  const c0 = fs.readFileSync(s.compiled), o0 = fs.readFileSync(s.owner);
+  const no = await run(["set", ...DYN, "--enforce", "enforce", ...s.F], opts);
+  assert.equal(no.status, 1); assert.match(no.err, /^E_PRECONDITION: --enforce enforce is blocked: .*accuracy\.json cannot be bound to the installed Claude Code/);
+  assert.ok(Buffer.compare(fs.readFileSync(s.owner), o0) === 0 && Buffer.compare(fs.readFileSync(s.compiled), c0) === 0, "nothing written");
+  const yes = await run(["set", ...DYN, "--enforce", "enforce", "--accept-unverified-cc", "yes", ...s.F], opts);
+  assert.equal(yes.status, 0, yes.err); assert.match(yes.out, /^accuracy: PASS of .* Claude Code 2\.1\.289 \(NOT compared with the installed version: accepted by --accept-unverified-cc yes\)/m);
+  assert.throws(() => lib.parseArgs(["explain", "a/b", "--accept-unverified-cc", "yes"]), (e) => e.code === "E_USAGE");
 });

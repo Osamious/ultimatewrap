@@ -19,7 +19,7 @@ import { capBand, sizeCell } from "../menu/payload-cap.mjs";
 import { load as loadDefaultModel, DEFAULT_MODEL_FILE } from "./default-model.mjs";
 import { filterRegistry, chooseKeys } from "./keysync.mjs";
 import { CONTRACT as CC } from "../menu/cc-contract.mjs";
-import { CONTRACT as CCR, rpc, requestLogsDb, dataDir } from "../menu/ccr-client.mjs";
+import { CONTRACT as CCR, rpc, requestLogsDb, dataDir, ccrVersion as ccrPackageVersion } from "../menu/ccr-client.mjs";
 import { funnel, emptyStage, FREE_TAG, SCOPE_NAMES, FREE_SCOPES, DEFAULT_MIN_SET, SUBSTITUTE_FLOOR, SUBSTITUTE_K, PREMIUM_RULE,
   providerOf, stripOneM, CTX_VALUES, CTX_FLOORS, ctxSpec, ctxLabel, ctxClassOf, TTFT_BUCKETS, knownIssueText, payloadSampleText, RANK_LABELS, SWEEP_MIN_N, SWEEP_STUCK_RUNS, BIG_PROVEN_BYTES } from "../menu/subagent-funnel.mjs";
 import { POOL_ALIAS_RE } from "../menu/pool-rule.mjs";
@@ -58,18 +58,18 @@ export const ENUMS = Object.freeze({
   source: ["same-provider", "all-providers"], mode: ["dynamic", "inherit", "free"], "free-scope": [...FREE_SCOPES],
   ctx: [...CTX_VALUES], enforce: ["shadow", "enforce"], inject: ["off", "on"], unverified: ["allow-warn", "allow-t", "pin-only"],
 });
-const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause", "outcomes", "plan", "approve-plan", "run", "real"];
+const BOOLS = ["dry", "allow-empty", "quiet", "if-stale", "banded", "handoff-notice", "live", "detail", "json", "confirm", "lift-pause", "outcomes", "plan", "approve-plan", "run", "real", "accept-shrink", "accept-unverified-cc"];
 export const FILE_FLAGS = Object.freeze(["policy-file", "state-dir", "providers-file", "snapshot-file", "bench-file", "observed-file",
   "default-model-file", "registry-file", "key-choices-file", "vault-providers-file", "settings-file", "tool-fidelity-file"]);
 const OWNER_FLAGS = ["source", "mode", "free-scope", "ctx", "enforce", "inject", "unverified", "allow", "banded", "handoff-notice"];
 const WHATIF_FLAGS = ["source", "mode", "free-scope", "ctx"];
 const CMD_FLAGS = Object.freeze({
-  set: [...OWNER_FLAGS, "dry", "allow-empty", "min-set", "live", "detail", ...FILE_FLAGS],
-  show: ["detail", ...FILE_FLAGS], explain: [...WHATIF_FLAGS, ...FILE_FLAGS], rebuild: ["quiet", "if-stale", "min-set", "live", ...FILE_FLAGS],
+  set: [...OWNER_FLAGS, "dry", "allow-empty", "min-set", "live", "detail", "accept-shrink", "accept-unverified-cc", "discovery-dir", ...FILE_FLAGS],
+  show: ["detail", "discovery-dir", ...FILE_FLAGS], explain: [...WHATIF_FLAGS, ...FILE_FLAGS], rebuild: ["quiet", "if-stale", "min-set", "live", "accept-shrink", "accept-unverified-cc", "discovery-dir", ...FILE_FLAGS],
   clear: ["policy-file", "state-dir", "live"], rollback: ["policy-file", "state-dir"],
   // the S1d wave: status and last only read; pause is rollback by another name; resume and undo write the owner file again (D-ar, I36: they need --live yes);
   // preset and wizard are sugar over set; why reads the code table
-  status: [...FILE_FLAGS], last: ["since", "json", "state-dir"], pause: ["policy-file", "state-dir"],
+  status: ["discovery-dir", ...FILE_FLAGS], last: ["since", "json", "state-dir"], pause: ["policy-file", "state-dir"],
   resume: ["min-set", "live", ...FILE_FLAGS], undo: ["min-set", "live", "lift-pause", ...FILE_FLAGS],
   preset: ["confirm", "dry", "live", "detail", "min-set", ...FILE_FLAGS], wizard: ["min-set", "live", ...FILE_FLAGS], why: [],
   // S2a and S2c: report only reads (the prices come from the snapshot, the ground truth from the request log, both named by a fixture run); selftest prints, approves or runs
@@ -231,7 +231,7 @@ const isUnder = (child, dir) => { const c = normCase(child), d = normCase(dir); 
 
 export function resolvePaths(flags, { env = process.env, protect = protectedDirs(os.homedir(), env) } = {}) {
   const given = (k) => flags[k] !== undefined;
-  for (const k of [...FILE_FLAGS, "logs-file"]) if (given(k) && String(flags[k]).trim() === "") throw usage(`flag --${k} needs a file path, found an empty or blank value`);   // truthiness would send it to a REAL default
+  for (const k of [...FILE_FLAGS, "logs-file", "discovery-dir"]) if (given(k) && String(flags[k]).trim() === "") throw usage(`flag --${k} needs a file path, found an empty or blank value`);   // truthiness would send it to a REAL default
   // `--state-dir` names the state ROOT (the stand-in for ~/.uw/state); the policy files live in its `subagent` folder, as the
   // router's own location-derived path does, and the tool-fidelity file sits at its top level.
   const stateRoot = given("state-dir") ? path.resolve(flags["state-dir"]) : STATE_ROOT;
@@ -242,9 +242,9 @@ export function resolvePaths(flags, { env = process.env, protect = protectedDirs
   const fixture = FILE_FLAGS.some(given);
   // Defence in depth: a fixture run names its own temp folders. An explicit path whose realpath (or whose nearest existing
   // ancestor's) lies under a real folder is refused, however it was spelled (a junction, a `..`, a different case, a short name).
-  if (fixture) {
+  if (fixture || given("discovery-dir")) {
     const real = protect.flatMap((d) => [path.resolve(d), realish(d)]);
-    for (const k of [...FILE_FLAGS, "logs-file"]) {
+    for (const k of [...FILE_FLAGS, "logs-file", "discovery-dir"]) {
       if (!given(k)) continue;
       // SEC-3: the RESOLVED path is tested for a UNC prefix BEFORE realish() runs: realish() calls realpath, and realpath of a remote UNC path makes Windows open an SMB connection (42 s to be refused). A local junction that leads to a UNC target is still caught by the second test below.
       const abs = path.resolve(flags[k]);
@@ -271,6 +271,8 @@ export function resolvePaths(flags, { env = process.env, protect = protectedDirs
     vaultProvidersFile: f("vault-providers-file", path.join(LLMKEYS, "providers.json")),
     settingsFile: f("settings-file", CC.paths.settings),
     toolFidelityFile: given("tool-fidelity-file") ? path.resolve(flags["tool-fidelity-file"]) : path.join(stateRoot, "tool-fidelity.json"),   // always under the state root in use
+    // the discovery cache folder, READ ONLY (record times only): --discovery-dir names one (a test), a fixture run without it reads none (null), a real run reads the discover module's own default (undefined: resolved when read)
+    discoveryDir: given("discovery-dir") ? path.resolve(flags["discovery-dir"]) : fixture ? null : undefined,
   };
 }
 
@@ -406,7 +408,7 @@ export async function gatherInputs(p, { nowMs = Date.now(), liveProviders } = {}
   return {
     funnelInputs: { rows: snap.snap.rows, bench, nowMs, providers, tiers: tiersRes.tiers, toolFidelity: tf, aliasValues, defaultModel, classifyBench: (rec) => classifyTight(typeof rec?.m === "string" ? rec.m : "") },   // F6: the bench's own tight reading of a stored message (pay, auth, gone or null)
     providersLive: live, tiersRes, defaultModel, warnings,
-    stamps: { snapshotBuiltAt: snap.snap.builtAt ?? null, snapshotSchema: snap.snap.schemaVersion, benchGeneratedAt: bench.generatedAt,
+    stamps: { snapshotBuiltAt: snap.snap.builtAt ?? null, snapshotSchema: snap.snap.schemaVersion, snapshotRoutes: snapshotRoutesOf(snap.snap.rows), benchGeneratedAt: bench.generatedAt,
       observedWrittenAt: bench.overlayWrittenAt, tfAsOf: tf?.generatedAt ?? null,
       // the inputs with no timestamp of their own (settings env aliases, the default model, the tool-fidelity file body): `rebuild --if-stale` compares this stamp instead of compiling to find out
       inputsHash: sha(JSON.stringify({ aliasValues, defaultModel, tf }), 12) },
@@ -482,7 +484,9 @@ export const ownerHashOf = (owner) => sha(JSON.stringify([owner.source, owner.mo
 /** Counts the full compiles this process ran (a test asserts that `rebuild --if-stale yes` on an unchanged input compiles nothing). */
 export const compileStats = { compiles: 0 };
 /** Same compiled content apart from the compile time: what decides whether the file is rewritten at all. */
-const sameCompiled = (a, b) => !!a && JSON.stringify({ ...a, compiledAt: 0 }) === JSON.stringify({ ...b, compiledAt: 0 });
+// builtFrom.discovery is a diagnostic of the moment of the compile (it changes as caches age), not an input of the routing: a compile that differs only by it is not a different file
+const noDiscovery = (c) => (isObject(c?.builtFrom) && "discovery" in c.builtFrom ? { ...c, builtFrom: Object.fromEntries(Object.entries(c.builtFrom).filter(([k]) => k !== "discovery")) } : c);
+const sameCompiled = (a, b) => !!a && JSON.stringify({ ...noDiscovery(a), compiledAt: 0 }) === JSON.stringify({ ...noDiscovery(b), compiledAt: 0 });
 
 const identityList = (a, n) => Array.isArray(a) && a.length === n && a.every((v, i) => v === i);
 export function compile(g, owner, { now = () => new Date(), minSet, gate } = {}) {
@@ -834,14 +838,69 @@ function mergeOwner(existing, flags, notes) {
   return base;
 }
 
-export function checkEnforcePreconditions(p, g, owner, nowMs = Date.now()) {
-  if (owner.enforcement !== "enforce") return;
+export const ACCURACY_FUTURE_SLACK_MS = 5 * 60 * 1000;     // a verdict dated further ahead than this is forged or from a wrong clock: refused
+export const ACCURACY_MAX_BYTES = 1024 * 1024;             // a verdict file is a few kilobytes; a bigger file is not read
+/** A whole version: x.y.z with an optional -prerelease or +build tag, nothing else (no leading v, no fourth number, no free text around it). */
+const VERSION_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
+/** The version a record states, compared WHOLE: the text `claude --version` prints ("2.1.289 (Claude Code)") is accepted for Claude Code, everything else must be the version alone. null when it is not a whole version. */
+const wholeVersion = (v, { suffix = "" } = {}) => { let t = typeof v === "string" ? v.trim() : ""; if (suffix && t.endsWith(suffix)) t = t.slice(0, -suffix.length).trim(); return VERSION_RE.test(t) ? t : null; };
+/** The installed CCR package version, whole (the same read `uw doctor` uses: the installed package.json), or null when it cannot be read or is not a whole version. */
+export const installedCcrVersion = () => { try { return wholeVersion(ccrPackageVersion()); } catch { return null; } };
+/**
+ * The installed Claude Code version, read-only and without running it: the native launcher (~/.local/bin/claude.exe) is a copy of exactly one file of ~/.local/share/claude/versions/<x.y.z>, so the version is
+ * the one file there with the same size and modification time. null when no single file matches (another install layout): the enforce gate then REFUSES unless the owner passes --accept-unverified-cc yes.
+ */
+export function installedCcVersion(home = os.homedir()) {
+  try {
+    const exe = fs.statSync(path.join(home, ".local", "bin", "claude.exe")), dir = path.join(home, ".local", "share", "claude", "versions");
+    const hits = fs.readdirSync(dir).filter((n) => /^\d+\.\d+\.\d+$/.test(n)).filter((n) => { const st = fs.statSync(path.join(dir, n)); return st.isFile() && st.size === exe.size && Math.abs(st.mtimeMs - exe.mtimeMs) < 2000; });
+    return hits.length === 1 ? hits[0] : null;
+  } catch { return null; }
+}
+/**
+ * The enforce preconditions. A classifier verdict PASS in state/subagent/accuracy.json (at most 1 MiB) counts only when it is: younger than 30 days and not dated in the future (more than 5 minutes ahead), BOUND to the
+ * policy it was measured against (evidence.policyContentHash equals the content hash of the policy that would be enforced: `opts.contentHash` for the compile about to be written, else the compiled file on disk), and
+ * measured on the installed CCR (ccrVersion) and Claude Code (ccVersion), each compared WHOLE (a prerelease tag, a v prefix or a fourth number is a different version). When the installed Claude Code version cannot
+ * be read the gate refuses, unless `opts.acceptUnverifiedCc` (the owner's --accept-unverified-cc yes). The evaluator owns the evidence hash: it is printed, never re-derived here.
+ * Returns the evidence lines of a pass (for the caller to print); throws E_PRECONDITION with ONE reason otherwise. Extra fields in the record are ignored; fields are read by name.
+ */
+export function checkEnforcePreconditions(p, g, owner, nowMs = Date.now(), opts = {}) {
+  if (owner.enforcement !== "enforce") return [];
   if (!g.providersLive) throw new PolicyError("E_PRECONDITION", "--enforce enforce needs live Providers (a gateway-down compile cannot prove resolvability)", 1);
-  const acc = readJsonFile(path.join(p.stateDir, "accuracy.json"));
-  const at = acc.ok ? Date.parse(acc.value?.at ?? "") : NaN;
-  if (!acc.ok || acc.value?.verdict !== "PASS" || !Number.isFinite(at) || nowMs - at > ACCURACY_MAX_AGE_MS) {
+  const accFile = path.join(p.stateDir, "accuracy.json");
+  let tooBig = false;
+  try { tooBig = fs.statSync(accFile).size > ACCURACY_MAX_BYTES; } catch { /* absent or unreadable: the read below says so */ }
+  if (tooBig) throw new PolicyError("E_PRECONDITION", `--enforce enforce is blocked: state/subagent/accuracy.json is larger than ${ACCURACY_MAX_BYTES / 1024 / 1024} MiB (a verdict file is a few kilobytes), so it is not read`, 1);
+  const acc = readJsonFile(accFile);
+  const rec = acc.ok && isObject(acc.value) ? acc.value : null;
+  const at = rec ? Date.parse(typeof rec.at === "string" ? rec.at : "") : NaN;
+  if (!rec || rec.verdict !== "PASS" || !Number.isFinite(at) || nowMs - at > ACCURACY_MAX_AGE_MS) {
     throw new PolicyError("E_PRECONDITION", "--enforce enforce is blocked: state/subagent/accuracy.json must hold a classifier verdict PASS younger than 30 days", 1);
   }
+  const ev = isObject(rec.evidence) ? rec.evidence : {}, win = isObject(rec.window) ? rec.window : {};
+  const day = (v) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? printable(v.slice(0, 10), 10) : "n/a");
+  const measured = printable(rec.at.slice(0, 10), 10);
+  const evidence = `evidence: ${Number.isInteger(ev.classRowsCounted) ? n(ev.classRowsCounted) : "n/a"} classified rows hashed ${typeof ev.sha256 === "string" ? printable(ev.sha256.slice(0, 12), 12) : "n/a"}, window ${day(win.since)} to ${day(win.until)}, measured ${measured}`;
+  const refuse = (why) => new PolicyError("E_PRECONDITION", `--enforce enforce is blocked: state/subagent/accuracy.json ${why} (${evidence})`, 1);
+  if (at - nowMs > ACCURACY_FUTURE_SLACK_MS) throw refuse(`is dated ${printable(rec.at, 40)}, in the future: a verdict cannot be newer than now`);
+  const bound = typeof ev.policyContentHash === "string" && ev.policyContentHash !== "" ? ev.policyContentHash : null;
+  if (!bound) throw refuse("records no policy content hash (evidence.policyContentHash): a PASS must be bound to the policy it was measured against; run the accuracy evaluation again");
+  let current = typeof opts.contentHash === "string" ? opts.contentHash : null;
+  if (current === null) { const cr = readCompiled(p.compiledFile); current = cr.ok && typeof cr.value.contentHash === "string" ? cr.value.contentHash : null; }
+  if (current === null) throw refuse("cannot be bound: there is no compiled policy to compare its policy hash with");
+  if (bound !== current) throw refuse(`was measured against policy ${printable(bound.slice(0, 12), 12)} but the policy is ${printable(current.slice(0, 12), 12)}: a rebuild or a change of toggles that changes the policy voids it; run the accuracy evaluation again`);
+  const stated = (v) => (typeof v === "string" && v.trim() !== "");
+  if (!stated(rec.ccrVersion)) throw refuse("records no CCR version (ccrVersion)");
+  const ccrRec = wholeVersion(rec.ccrVersion), ccrNow = (opts.ccrVersion ?? installedCcrVersion)();
+  if (ccrRec === null) throw refuse(`records a CCR version that is not a whole x.y.z (${JSON.stringify(printable(rec.ccrVersion, 30))})`);
+  if (ccrNow === null) throw refuse("cannot be bound to the installed CCR: its version cannot be read");
+  if (ccrRec !== ccrNow) throw refuse(`was measured on CCR ${printable(ccrRec, 30)} but CCR ${printable(ccrNow, 30)} is installed; run the accuracy evaluation again`);
+  if (!stated(rec.ccVersion)) throw refuse("records no Claude Code version (ccVersion)");
+  const ccRec = wholeVersion(rec.ccVersion, { suffix: "(Claude Code)" }), ccNow = (opts.ccVersion ?? installedCcVersion)();
+  if (ccRec === null) throw refuse(`records a Claude Code version that is not a whole x.y.z (${JSON.stringify(printable(rec.ccVersion, 30))})`);
+  if (ccNow === null && !opts.acceptUnverifiedCc) throw refuse("cannot be bound to the installed Claude Code: its version cannot be read here (no single launcher copy in its versions folder), so it is not compared; pass --accept-unverified-cc yes to enforce on the recorded version anyway");
+  if (ccNow !== null && ccRec !== ccNow) throw refuse(`was measured on Claude Code ${printable(ccRec, 30)} but ${printable(ccNow, 30)} is installed; run the accuracy evaluation again`);
+  return [`accuracy: PASS of ${measured}, bound to policy ${printable(bound.slice(0, 12), 12)}, CCR ${ccrNow}, Claude Code ${ccRec}${ccNow === null ? " (NOT compared with the installed version: accepted by --accept-unverified-cc yes)" : ""}; ${evidence}`];
 }
 
 /** The one pause sentence (`PAUSED:` here, in the verdict and in undo): a runnable way out unless there is none that can succeed. */
@@ -928,8 +987,9 @@ async function cmdSet(p, flags, io, opts = {}) {
   const notes = [];
   const owner = mergeOwner(existing, flags, notes);
   validateOwner({ ...owner, schema: 1 });
-  const g = await gatherInputs(p);
+  const g = await gatherInputs(p, opts.liveProviders === undefined ? {} : { liveProviders: opts.liveProviders });      // liveProviders and enforceOpts are library-level seams for a unit test; the CLI never passes them
   ensureNoUnreadableTiers(g, owner);
+  await attachDiscovery(g, p);
   const { compiled, res } = compile(g, owner, { minSet: flags["min-set"] });
   if (res.refuse) throw new PolicyError("E_TIER_UNREADABLE", `E_TIER_UNREADABLE: ${res.refuse.text} (${g.tiersRes.reason ?? "unreadable"})`, 4);
   const lines = [];
@@ -940,10 +1000,14 @@ async function cmdSet(p, flags, io, opts = {}) {
     else if (owner.source === "same-provider" && main.provider && subOf(res, main.provider) === 0) refused = refusal(g, owner, res, main, "main", p.fixture);
   }
   if (refused && !flags["allow-empty"]) throw refused;
-  checkEnforcePreconditions(p, g, owner);
+  const accuracyLines = checkEnforcePreconditions(p, g, owner, Date.now(), { ...opts.enforceOpts, contentHash: compiled.contentHash, acceptUnverifiedCc: !!flags["accept-unverified-cc"] });
   const sr = readStatus(p.statusFile), nowMs = opts.now ?? Date.now();
   const prev = readCompiled(p.compiledFile);
+  stampBaseline(compiled, prev.ok ? prev.value : null, !!flags["accept-shrink"]);
   const unchanged = prev.ok && sameCompiled(prev.value, compiled);
+  const viaOther = !!opts.resumed || opts.saveHint !== undefined;          // resume, preset and wizard have no --accept-shrink of their own
+  const shrink = unchanged || flags["accept-shrink"] ? null : shrinkFinding(prev.ok ? prev.value : null, compiled);      // the SHRINK GUARD (see cmdRebuild): a real save is refused with nothing written; a preview says so
+  if (shrink && !flags.dry) throw new PolicyError("E_SHRINK", `E_SHRINK: ${shrinkText(shrink, { via: viaOther ? "set" : "rebuild", live: !p.fixture })}`, 1);
   const pausedNow = readFlag(p) !== false;
   // the state the saved policy would be in (a real set also lifts a pause). A PREVIEW is judged as if the router had picked it up (it is not compiled yet, so "waiting" would say nothing about the choice).
   // A real set judges the file as it will stand on disk: an unchanged compile is not rewritten, so the router's earlier report of it still counts.
@@ -954,6 +1018,8 @@ async function cmdSet(p, flags, io, opts = {}) {
   if (flags.dry) { const hint = opts.saveHint === undefined ? `to save this: ${setCommand(owner, { live: !p.fixture })}` : opts.saveHint; if (hint) lines.push(hint); }
   else lines.push(fixLine(v));
   lines.push(`change: ${delta}`, `policy: ${plainPolicy(owner)}`);
+  if (shrink) lines.push(`NOTE: saving this would be REFUSED (E_SHRINK): ${shrinkText(shrink, { via: viaOther ? "set" : "rebuild", live: !p.fixture })}`);
+  lines.push(...accuracyLines);
   const att = attentionLines(res, g, owner, flags["min-set"] ?? DEFAULT_MIN_SET);
   if (flags.dry && pausedNow) lines.push("NOTE: the policy is paused now; saving it for real lifts the pause");
   if (owner.mode === "inherit" && !flags.detail) lines.push(`exempt under inherit: ${res.exempt.join(", ") || "(none)"}`);
@@ -1099,6 +1165,7 @@ async function cmdShow(p, flags, io, opts = {}) {
     for (const w of Array.isArray(s.warnings) ? s.warnings : []) if (isObject(w)) L.push(`  router warning ${printable(w.code, 40)}${w.detail ? `: ${printable(w.detail)}` : ""}`);
     for (const [sid, m] of Object.entries(isObject(s.mainBySession) ? s.mainBySession : {})) if (isObject(m)) L.push(`  main of session ${printable(sid, 16)}: ${printable(m.model)}`);
   }
+  L.push(...await hygieneLines(p, cr.ok ? cr.value : null, nowMs));
   L.push(HELPER_CALLS_NOTE, ROLLOUT_NOTE);
   for (const l of L) io.out(l);
   return 0;
@@ -1138,6 +1205,7 @@ async function cmdStatus(p, flags, io, opts = {}) {
     if (v.state === "WAITING") L.push("  (this report predates your latest save, or comes from a router still on the older copy: the router uses the new one from its next request)");
     L.push(...warningLines(status.warnings, "warning "));
   } else L.push(sr.reason === "missing" ? "router: no status file yet (it has not run with a policy)" : `router: status unreadable right now (${sr.reason})`);
+  L.push(...await hygieneLines(p, compiled, nowMs));
   for (const l of L) io.out(l);
   return 0;
 }
@@ -1437,6 +1505,7 @@ async function cmdUndo(p, flags, io, opts = {}) {
   try {
     const g = await gatherInputs(p);
     ensureNoUnreadableTiers(g, prevOwner);
+    await attachDiscovery(g, p);
     const { compiled, res } = compile(g, prevOwner, { minSet: flags["min-set"] });
     if (res.refuse) throw new PolicyError("E_TIER_UNREADABLE", `E_TIER_UNREADABLE: ${res.refuse.text} (${g.tiersRes.reason ?? "unreadable"})`, 4);
     const main = mainProviderOf(p, g);
@@ -1444,8 +1513,11 @@ async function cmdUndo(p, flags, io, opts = {}) {
       if (res.empty) throw refusal(g, prevOwner, res, main, "all", p.fixture);
       if (prevOwner.source === "same-provider" && main.provider && subOf(res, main.provider) === 0) throw refusal(g, prevOwner, res, main, "main", p.fixture);
     }
-    checkEnforcePreconditions(p, g, prevOwner);
+    checkEnforcePreconditions(p, g, prevOwner, Date.now(), { contentHash: compiled.contentHash });
     const prevC = readCompiled(p.compiledFile);
+    const shrink = shrinkFinding(prevC.ok ? prevC.value : null, compiled);      // the SHRINK GUARD: a refusal lands in the pause below (the earlier toggles stay saved), as any other refusal of undo does
+    if (shrink) throw new PolicyError("E_SHRINK", `E_SHRINK: ${shrinkText(shrink, { via: "set", live: !p.fixture })}`, 1);
+    stampBaseline(compiled, prevC.ok ? prevC.value : null, false);
     if (!sameCompiled(prevC.ok ? prevC.value : null, compiled)) writeFileRetry(p.compiledFile, JSON.stringify(compiled) + "\n");
     fs.rmSync(p.flagFile, { force: true }); fs.rmSync(pausedFromOf(p), { force: true });
     const sr = readStatus(p.statusFile);
@@ -1545,23 +1617,121 @@ async function cmdWizard(p, flags, io, opts = {}) {
 }
 
 /** The enforce preconditions of `set`, evaluated for a rebuild: null when met (or not asked for), else the PolicyError naming what is unmet. */
-function enforceGate(p, g, owner) {
-  try { checkEnforcePreconditions(p, g, owner); return null; }
+function enforceGate(p, g, owner, contentHash, extra = {}) {
+  try { checkEnforcePreconditions(p, g, owner, Date.now(), { ...extra, ...(contentHash === undefined ? {} : { contentHash }) }); return null; }
   catch (e) { if (e instanceof PolicyError) return e; throw e; }
 }
 
-async function cmdRebuild(p, flags, io) {
+// ------------------------------------------------------------------ hygiene guards (the 2026-10-06 incident: a bench run's automatic snapshot rebuild applied the 7-day discovery routing ceiling to 56 of 63 stale
+// caches, the snapshot fell from 6,432 routes to 2,009 and a policy rebuild from 92 rows to 21)
+export const DISCOVERY_CEILING_MS = 7 * 86400000;           // mirrors ROUTING_MAX_STALENESS_MS of the keysync pipeline (its module runs the pipeline when imported, so the number is copied; a test pins the two)
+export const SHRINK_MAX = 0.25;                              // a rebuild that loses more than this share of the routes or (same toggles) of the eligible rows is refused
+export const SNAPSHOT_DRIFT_MAX = 0.10;                      // the policy was compiled from a snapshot that differs from the current one by more than this share: a warning
+const DISCOVERY_RECORD = /^[0-9a-f]{32}\.json$/;
+const DISCOVERY_MAX_BYTES = 8 * 1024 * 1024;
+export const snapshotRoutesOf = (rows) => (Array.isArray(rows) ? rows.reduce((a, r) => a + (isObject(r) && Array.isArray(r.models) ? r.models.length : 0), 0) : 0);
+/**
+ * How many provider caches of the discovery folder are fresh (record time within the 7-day ceiling the routing applies) and how many are past it: {providers, fresh, stale, unreadable, ceilingDays} or null
+ * when no folder is read. READ ONLY: it parses each record's own provider and `at` and nothing else (no ACL change, no write, no request). Two records of one provider count once, fresh if either is.
+ */
+export async function readDiscoveryFreshness(p, { nowMs = Date.now(), env = process.env } = {}) {
+  let dir = p.discoveryDir;
+  if (dir === null) return null;
+  if (dir === undefined) { try { dir = (await import("../refresh/discover.mjs")).cacheRoot(env); } catch { return null; } }
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  const by = new Map();
+  let unreadable = 0;
+  for (const name of names) {
+    if (!DISCOVERY_RECORD.test(name)) continue;
+    try {
+      const f = path.join(dir, name), st = fs.statSync(f);
+      if (!st.isFile() || st.size > DISCOVERY_MAX_BYTES) { unreadable += 1; continue; }
+      const rec = JSON.parse(fs.readFileSync(f, "utf8"));
+      if (!isObject(rec) || typeof rec.provider !== "string" || rec.provider === "") { unreadable += 1; continue; }
+      const at = Date.parse(String(rec.at ?? ""));
+      by.set(rec.provider, (by.get(rec.provider) ?? false) || (Number.isFinite(at) && nowMs - at <= DISCOVERY_CEILING_MS));      // an unstamped or unreadable time is stale, as in the routing
+    } catch { unreadable += 1; }
+  }
+  const fresh = [...by.values()].filter(Boolean).length;
+  return { providers: by.size, fresh, stale: by.size - fresh, unreadable, ceilingDays: DISCOVERY_CEILING_MS / 86400000 };
+}
+/** The discovery summary of this moment, recorded in `builtFrom.discovery` by a compile that is about to be written (outside the content hash). Nothing when no folder is read. */
+async function attachDiscovery(g, p, nowMs = Date.now()) {
+  const d = await readDiscoveryFreshness(p, { nowMs });
+  if (d) g.stamps = { ...g.stamps, discovery: d };
+}
+/**
+ * The SHRINK GUARD: null, or what shrank. The new compile is compared with the policy it would replace, and the snapshot's route count with the PEAK baseline the policies kept (builtFrom.snapshotRoutesBaseline: the
+ * highest count since the last accepted shrink; or builtFrom.snapshotRoutes / counts.universe of a policy compiled before the stamps existed), so several small shrinks cannot add up to a big one unseen: it fell by more than SHRINK_MAX, or, when the owner toggles are the SAME (an owner who narrows the toggles shrinks the set on purpose), the eligible rows did. Pure.
+ */
+export function shrinkFinding(prevValue, compiled) {
+  if (!isObject(prevValue) || !isObject(compiled)) return null;
+  const pb = isObject(prevValue.builtFrom) ? prevValue.builtFrom : {}, nb = isObject(compiled.builtFrom) ? compiled.builtFrom : {};
+  const int = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
+  const seen = [int(pb.snapshotRoutesBaseline), int(pb.snapshotRoutes), int(prevValue.counts?.universe)].filter((v) => v !== null);
+  const routesBefore = seen.length ? Math.max(...seen) : null, routesNow = int(nb.snapshotRoutes) ?? int(compiled.counts?.universe);
+  const rowsBefore = int(prevValue.counts?.allowed), rowsNow = int(compiled.counts?.allowed);
+  const ownerSame = typeof pb.ownerHash === "string" && pb.ownerHash === nb.ownerHash;
+  const shrank = (a, b) => a !== null && b !== null && a > 0 && b < a * (1 - SHRINK_MAX);
+  const routes = shrank(routesBefore, routesNow), rows = ownerSame && shrank(rowsBefore, rowsNow);
+  if (!routes && !rows) return null;
+  return { routes, rows, routesBefore, routesNow, rowsBefore, rowsNow, discovery: isObject(nb.discovery) ? nb.discovery : null };
+}
+/**
+ * Stamps the peak route count a compile keeps for the guard (builtFrom.snapshotRoutesBaseline, outside the content hash): the larger of the previous baseline and this snapshot, or exactly this snapshot when the owner
+ * accepted the shrink (--accept-shrink yes) or there was no earlier policy. Mutates `compiled`.
+ */
+export function stampBaseline(compiled, prevValue, accepted = false) {
+  const now = Number.isInteger(compiled?.builtFrom?.snapshotRoutes) ? compiled.builtFrom.snapshotRoutes : null;
+  if (now === null) return;
+  const pb = isObject(prevValue?.builtFrom) ? prevValue.builtFrom : {};
+  const before = [pb.snapshotRoutesBaseline, pb.snapshotRoutes, prevValue?.counts?.universe].filter((v) => Number.isInteger(v) && v >= 0);
+  compiled.builtFrom.snapshotRoutesBaseline = accepted || !before.length ? now : Math.max(now, ...before);
+}
+/**
+ * The one plain line of a refusal; `auto` is the automatic rebuild (`--if-stale yes`), which can never accept a shrink. `via: "set"` is for a caller that has no --accept-shrink of its own (resume, preset, wizard, undo):
+ * it names the `set` command that does.
+ */
+export function shrinkText(f, { auto = false, via = "rebuild", live = true } = {}) {
+  const d = f.discovery;
+  const disc = d && d.providers > 0 ? ` (${d.stale} of ${d.providers} discovery caches are older than ${d.ceilingDays} days)` : "";
+  const what = f.routes ? `the snapshot shrank from ${n(f.routesBefore)} to ${n(f.routesNow)} routes${disc}${f.rows ? `, and the policy from ${n(f.rowsBefore)} to ${n(f.rowsNow)} eligible models` : ""}`
+    : `the policy would shrink from ${n(f.rowsBefore)} to ${n(f.rowsNow)} eligible models${disc}`;
+  return auto ? `${what}: refresh discovery first (node refresh/cli.mjs, needs your OK); the automatic rebuild never accepts a shrink, so run \`${CLI} rebuild --accept-shrink yes --live yes\` yourself if it is real`
+    : via === "set" ? `${what}: refresh discovery first (node refresh/cli.mjs, needs your OK), or accept the smaller snapshot first with \`${CLI} set --accept-shrink yes${live ? " --live yes" : ""}\` (it saves your current toggles again)`
+    : `${what}: refresh discovery first (node refresh/cli.mjs, needs your OK), or pass --accept-shrink yes`;
+}
+/** Read-only hygiene lines for status and show: how much of the discovery cache the 7-day routing ceiling would drop, and whether the policy was compiled from a snapshot that differs from the current one. */
+async function hygieneLines(p, compiled, nowMs, indent = "") {
+  const items = [];
+  const d = await readDiscoveryFreshness(p, { nowMs });
+  if (d && (d.stale > 0 || d.unreadable > 0)) {
+    items.push({ code: "DISCOVERY_STALE", text: `discovery: ${d.fresh} of ${d.providers} providers fresh, ${d.stale} past the ${d.ceilingDays}-day ceiling (not routed): a snapshot rebuild now would drop their models${d.unreadable ? `; ${d.unreadable} cache ${d.unreadable === 1 ? "file" : "files"} unreadable` : ""}` });
+  }
+  if (compiled && isObject(compiled.builtFrom)) {
+    const before = Number.isInteger(compiled.builtFrom.snapshotRoutes) ? compiled.builtFrom.snapshotRoutes : Number.isInteger(compiled.counts?.universe) ? compiled.counts.universe : null;
+    let now = null;
+    try { const sn = loadSnapshot(p.snapshotFile); if (sn.ok) now = snapshotRoutesOf(sn.snap.rows); } catch { now = null; }
+    if (before && now !== null && Math.abs(now - before) / before > SNAPSHOT_DRIFT_MAX) items.push({ code: "SNAPSHOT_DRIFT", text: `the policy was compiled from a snapshot of ${n(before)} routes, now ${n(now)}` });
+  }
+  return items.flatMap((x) => { const r = codeRow(x.code); return [`${indent}${x.code}: ${x.text}`, ...(r ? [`${indent}  fix: ${r.fix}${r.fixNote ? ` (${r.fixNote})` : ""}`] : [])]; });
+}
+
+async function cmdRebuild(p, flags, io, opts = {}) {
   const owner = loadOwner(p.policyFile);
   if (!owner) throw new PolicyError("E_PRECONDITION", "no owner policy file: nothing to rebuild (run `set` first)", 1);
-  const g = await gatherInputs(p);
+  const g = await gatherInputs(p, opts.liveProviders === undefined ? {} : { liveProviders: opts.liveProviders });      // liveProviders and enforceOpts are library-level seams for a unit test; the CLI never passes them
   ensureNoUnreadableTiers(g, owner);
   const prev = readCompiled(p.compiledFile);
   // The owner says enforce but a precondition of `set --enforce enforce` no longer holds (the gateway cannot be read, the
   // classifier verdict has expired): the rebuild keeps the ROUTER in shadow behaviour (the compiled file carries shadow) and
   // says so, instead of compiling a policy that enforces on evidence that is gone. The owner file is never changed.
-  const gate = enforceGate(p, g, owner);
-  const eff = gate ? { ...owner, enforcement: "shadow" } : owner;
-  const gateOut = gate ? { code: "CLASSIFIER_UNMEASURED", text: `CLASSIFIER_UNMEASURED: the owner file says enforcement=enforce but ${gate.message.replace(/^E_PRECONDITION: /, "")}; the compiled file carries enforcement=shadow, so the router stays in shadow behaviour until the precondition holds and \`rebuild\` is run again` } : undefined;
+  const enforceExtra = { ...opts.enforceOpts, acceptUnverifiedCc: !!flags["accept-unverified-cc"] };
+  let gate = enforceGate(p, g, owner, undefined, enforceExtra);
+  let eff = gate ? { ...owner, enforcement: "shadow" } : owner;
+  const gateOutOf = (gt) => gt ? { code: "CLASSIFIER_UNMEASURED", text: `CLASSIFIER_UNMEASURED: the owner file says enforcement=enforce but ${gt.message.replace(/^E_PRECONDITION: /, "")}; the compiled file carries enforcement=shadow, so the router stays in shadow behaviour until the precondition holds and \`rebuild\` is run again` } : undefined;
+  let gateOut = gateOutOf(gate);
   // `--if-stale yes` compares the CHEAP stamps before it compiles anything (router v2, ar-14): the inputs' own stamps, the hash of the inputs that carry no stamp
   // (settings aliases, default model, tool-fidelity body), the providers and tiers hashes, the owner toggles and the gate. All equal means the compile would write the
   // same bytes, so it never runs; the stamps are the ones a compile records in `builtFrom`.
@@ -1576,8 +1746,18 @@ async function cmdRebuild(p, flags, io) {
       return 0;
     }
   }
-  const { compiled, res } = compile(g, eff, { minSet: flags["min-set"], gate: gateOut });      // the gate is part of the measured file (the 1 MiB cap is on what is written)
+  await attachDiscovery(g, p);                                    // read only; after the cheap stamp comparison above, so an up-to-date rebuild never reads the cache folder
+  let { compiled, res } = compile(g, eff, { minSet: flags["min-set"], gate: gateOut });      // the gate is part of the measured file (the 1 MiB cap is on what is written)
+  if (!gate && owner.enforcement === "enforce") {
+    // the accuracy PASS binds to the policy that will be ENFORCED: the hash of this compile (the toggle `enforcement` is outside the hash, so it is known before the gate); a PASS measured against another policy keeps the router in shadow
+    const late = enforceGate(p, g, owner, compiled.contentHash, enforceExtra);
+    if (late) { gate = late; eff = { ...owner, enforcement: "shadow" }; gateOut = gateOutOf(late); ({ compiled, res } = compile(g, eff, { minSet: flags["min-set"], gate: gateOut })); }
+  }
   if (res.refuse) throw new PolicyError("E_TIER_UNREADABLE", `E_TIER_UNREADABLE: ${res.refuse.text}`, 4);
+  // the SHRINK GUARD: the previous policy stays untouched and nothing is written; only an explicit `--accept-shrink yes` passes it, never the automatic `--if-stale yes` rebuild
+  const shrink = flags["accept-shrink"] && !flags["if-stale"] ? null : shrinkFinding(prev.ok ? prev.value : null, compiled);
+  if (shrink) throw new PolicyError("E_SHRINK", `E_SHRINK: ${shrinkText(shrink, { auto: !!flags["if-stale"] })}`, 1);
+  stampBaseline(compiled, prev.ok ? prev.value : null, !!flags["accept-shrink"] && !flags["if-stale"]);
   const same = sameCompiled(prev.ok ? prev.value : null, compiled);
   if (!same) writeFileRetry(p.compiledFile, JSON.stringify(compiled) + "\n");
   if (!flags.quiet) io.out(`rebuilt ${p.compiledFile}: contentHash ${compiled.contentHash}${same ? " (unchanged, not rewritten)" : ""}; allowed ${res.counts.allowed}`);
@@ -1729,7 +1909,7 @@ export async function runSubagentPolicy(argv, io, env = process.env, opts = {}) 
       // loaded on demand, like key.mjs loads this module: the report pulls in the SQLite reader, the self-test the sandbox harness constants, and no other command needs either
       case "report": return await (await import("./subagent-report.mjs")).cmdReport(p, flags, io, opts);
       case "selftest": return await (await import("./subagent-selftest.mjs")).cmdSelftest(p, flags, io, opts);
-      case "rebuild": return await cmdRebuild(p, flags, io);
+      case "rebuild": return await cmdRebuild(p, flags, io, opts);
       case "explain": return await cmdExplain(p, flags, io, target);
       default: throw usage(`unknown subcommand ${cmd}`);
     }
@@ -1773,7 +1953,7 @@ export const usageText = [
   "  selftest --plan yes       what a sandbox self-test would do, and its plan hash; it starts nothing (the run needs your typed approval: --approve-plan yes, then --run yes)",
   "  why [CODE]                what a warning or error code means in plain words, and the command that fixes it",
   "  pause | resume | undo     pause: subagents run as they asked from the next request (your toggles are kept); resume: continue (checked like set --enforce enforce); undo: back one step (refused while paused unless --lift-pause yes)",
-  "  rebuild [--if-stale yes]  recompile the saved policy after a bench sweep, keysync run or key change",
+  "  rebuild [--if-stale yes] [--accept-shrink yes]  recompile the saved policy after a bench sweep, keysync run or key change; it refuses (E_SHRINK) when the snapshot or the eligible set shrank by more than 25%, and only --accept-shrink yes passes (never --if-stale)",
   "  clear                     remove the policy; the router goes back to exact legacy behaviour",
   "  rollback                  the same as pause",
   "  help                      this text",
